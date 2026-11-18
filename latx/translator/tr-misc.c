@@ -1630,6 +1630,263 @@ bool translate_rdtsc(IR1_INST *pir1)
     return true;
 }
 
+/*
+ * CLI/STI change the interrupt-enable flag.
+ *
+ * They used to be nops, which is invisible until something depends on IF: a
+ * kernel that does `cli` around a critical section and then expects interrupts
+ * not to be delivered, or an idle loop that expects the next tick to arrive.
+ * Both bits live in CPUX86State.eflags, and the TB-building code consults that
+ * same field, so updating it here is enough for the driver to see the change
+ * at the next block boundary.
+ */
+static bool translate_if_flag(IR1_INST *pir1, bool enable)
+{
+    IR2_OPND eflags = ra_alloc_itemp();
+
+    la_ld_d(eflags, env_ir2_opnd, lsenv_offset_of_eflags(lsenv));
+    if (enable) {
+        la_ori(eflags, eflags, IF_MASK);
+    } else {
+        IR2_OPND mask = ra_alloc_itemp();
+
+        la_ori(mask, zero_ir2_opnd, IF_MASK);
+        la_andn(eflags, eflags, mask);
+        ra_free_temp(mask);
+    }
+    la_st_d(eflags, env_ir2_opnd, lsenv_offset_of_eflags(lsenv));
+    ra_free_temp(eflags);
+    return true;
+}
+
+bool translate_cli(IR1_INST *pir1)
+{
+    return translate_if_flag(pir1, false);
+}
+
+bool translate_sti(IR1_INST *pir1)
+{
+    return translate_if_flag(pir1, true);
+}
+
+/*
+ * LTR/STR touch the task register.  Linux loads it once per CPU during boot
+ * and reads it only for diagnostics; the selector is all this state keeps, so
+ * that is all these do.  A real descriptor fetch would need the GDT base and a
+ * limit check, which belongs with segment loading rather than here.
+ */
+bool translate_ltr(IR1_INST *pir1)
+{
+    IR2_OPND value = load_ireg_from_ir1(ir1_get_opnd(pir1, 0),
+                                        UNKNOWN_EXTENSION, false);
+
+    la_st_d(value, env_ir2_opnd, lsenv_offset_of_seg_selector(lsenv, R_TR));
+    return true;
+}
+
+bool translate_str(IR1_INST *pir1)
+{
+    IR2_OPND selector = ra_alloc_itemp();
+
+    la_ld_d(selector, env_ir2_opnd,
+            lsenv_offset_of_seg_selector(lsenv, R_TR));
+    store_ireg_to_ir1(selector, ir1_get_opnd(pir1, 0), false);
+    ra_free_temp(selector);
+    return true;
+}
+
+/*
+ * SGDT/SIDT write {limit, base} to memory, which is the inverse of the
+ * descriptor-table loads the LGDT/LIDT path already maintains.
+ */
+static bool translate_store_descriptor_table(IR1_INST *pir1, bool is_gdt)
+{
+    IR1_OPND *mem = ir1_get_opnd(pir1, 0);
+    int size = ir1_opnd_size(mem) >> 3;
+    int base_off = is_gdt ? lsenv_offset_of_gdt_base(lsenv)
+                          : lsenv_offset_of_idt_base(lsenv);
+    int limit_off = is_gdt ? lsenv_offset_of_gdt_limit(lsenv)
+                           : lsenv_offset_of_idt_limit(lsenv);
+    IR2_OPND base, limit, addr;
+    int imm = 0;
+
+    if (size != 6 && size != 10) {
+        return false;
+    }
+
+    addr = ra_alloc_itemp();
+    {
+        IR2_OPND mem_opnd = convert_mem(mem, &imm);
+
+        if (imm) {
+            la_addi_d(addr, mem_opnd, imm);
+        } else {
+            la_or(addr, mem_opnd, zero_ir2_opnd);
+        }
+    }
+
+    limit = ra_alloc_itemp();
+    la_ld_d(limit, env_ir2_opnd, limit_off);
+    la_st_h(limit, addr, 0);
+
+    base = ra_alloc_itemp();
+    la_ld_d(base, env_ir2_opnd, base_off);
+    la_st_w(base, addr, 2);
+    if (size == 10) {
+        la_srli_d(base, base, 32);
+        la_st_w(base, addr, 8);
+    }
+
+    ra_free_temp(base);
+    ra_free_temp(limit);
+    ra_free_temp(addr);
+    return true;
+}
+
+bool translate_sgdt(IR1_INST *pir1)
+{
+    return translate_store_descriptor_table(pir1, true);
+}
+
+bool translate_sidt(IR1_INST *pir1)
+{
+    return translate_store_descriptor_table(pir1, false);
+}
+
+/*
+ * MSW is the machine status word, the low 16 bits of CR0.  CLTS is the same
+ * register's task-switched bit.
+ */
+bool translate_smsw(IR1_INST *pir1)
+{
+    IR2_OPND cr0 = ra_alloc_itemp();
+    IR2_OPND value = ra_alloc_itemp();
+
+    la_ld_d(cr0, env_ir2_opnd, (int)offsetof(CPUX86State, cr[0]));
+    la_bstrpick_d(value, cr0, 15, 0);
+    store_ireg_to_ir1(value, ir1_get_opnd(pir1, 0),
+                      ir1_opnd_size(ir1_get_opnd(pir1, 0)) == 32);
+    ra_free_temp(value);
+    ra_free_temp(cr0);
+    return true;
+}
+
+bool translate_lmsw(IR1_INST *pir1)
+{
+    IR2_OPND value, cr0, fn;
+
+    value = load_ireg_from_ir1(ir1_get_opnd(pir1, 0), UNKNOWN_EXTENSION,
+                               false);
+    cr0 = ra_alloc_itemp();
+    la_ld_d(cr0, env_ir2_opnd, (int)offsetof(CPUX86State, cr[0]));
+
+    /*
+     * Only the low four bits are written, and PE cannot be cleared once set.
+     * The mode-dependent hflags live in helper_write_crN, so the update goes
+     * through it rather than poking CR0 here.
+     */
+    {
+        IR2_OPND mask = ra_alloc_itemp();
+
+        la_ori(mask, zero_ir2_opnd, 0xe);
+        la_andn(cr0, cr0, mask);
+        la_andi(value, value, 0xf);
+        la_or(cr0, cr0, value);
+        ra_free_temp(mask);
+    }
+
+    fn = ra_alloc_itemp();
+    aot_load_host_addr(fn, (ADDR)helper_write_crN, LOAD_HELPER_WRITE_CR, 0);
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    li_d(a1_ir2_opnd, 0);
+    la_mov64(a2_ir2_opnd, cr0);
+    la_jirl(ra_ir2_opnd, fn, 0);
+    ra_free_temp(fn);
+    ra_free_temp(cr0);
+    return true;
+}
+
+/*
+ * SWAPGS exchanges the GS base with MSR_KERNEL_GS_BASE.
+ *
+ * Linux uses it as the first instruction of every syscall entry and the last
+ * of every return: the user-mode GS base lives in the MSR while the kernel
+ * runs, and GS holds the per-CPU area.  Getting this wrong is silent -- the
+ * kernel simply reads the wrong percpu pointer -- so it is a plain
+ * load/load/store pair with no fast path and no condition.
+ */
+bool translate_swapgs(IR1_INST *pir1)
+{
+    IR2_OPND user_gs = ra_alloc_itemp();
+    IR2_OPND kernel_gs = ra_alloc_itemp();
+
+    la_ld_d(user_gs, env_ir2_opnd, lsenv_offset_of_seg_base(lsenv, R_GS));
+    la_ld_d(kernel_gs, env_ir2_opnd,
+            (int)offsetof(CPUX86State, kernelgsbase));
+    la_st_d(kernel_gs, env_ir2_opnd, lsenv_offset_of_seg_base(lsenv, R_GS));
+    la_st_d(user_gs, env_ir2_opnd,
+            (int)offsetof(CPUX86State, kernelgsbase));
+    ra_free_temp(user_gs);
+    ra_free_temp(kernel_gs);
+    return true;
+}
+
+/*
+ * SYSRET returns from ring 0 to ring 3 at the address in RCX.
+ *
+ * The 64-bit form loads RIP from RCX, CS from STAR[63:48] + 16 and SS from
+ * STAR[63:48] + 8, restores RFLAGS with the mask the kernel already applied
+ * (FMASK is the entry side), and leaves RSP alone -- the kernel has switched
+ * stacks by then.  Returning to 32-bit compatibility mode is refused: a
+ * 64-bit guest that executes that form is a bug worth surfacing, not a case
+ * to guess about.
+ */
+bool translate_sysret(IR1_INST *pir1)
+{
+    IR2_OPND star;
+
+    if (!CODEIS64) {
+        return false;
+    }
+
+    /*
+     * RIP comes from RCX, and it goes straight into the epilogue's eip source:
+     * that register is what the exit path stores, so writing the environment
+     * here would be overwritten on the way out.
+     */
+    {
+        IR2_OPND eip_opnd = ra_alloc_dbt_arg2();
+
+        la_or(eip_opnd, ra_alloc_gpr(ecx_index), zero_ir2_opnd);
+    }
+
+    /* CS/SS selectors are STAR[63:48] + 16 / + 8. */
+    star = ra_alloc_itemp();
+    la_ld_d(star, env_ir2_opnd, (int)offsetof(CPUX86State, star));
+    la_srli_d(star, star, 48);
+
+    {
+        IR2_OPND cs = ra_alloc_itemp();
+        IR2_OPND ss = ra_alloc_itemp();
+
+        la_addi_d(cs, star, 16);
+        la_st_d(cs, env_ir2_opnd, lsenv_offset_of_seg_selector(lsenv, R_CS));
+        la_addi_d(ss, star, 8);
+        la_st_d(ss, env_ir2_opnd, lsenv_offset_of_seg_selector(lsenv, R_SS));
+        ra_free_temp(cs);
+        ra_free_temp(ss);
+    }
+    ra_free_temp(star);
+
+    /*
+     * The return to ring 3 is the driver's business: this translator runs one
+     * block at TB granularity and the loop re-reads CPL from hflags, so all
+     * that is left is to leave the block through the usual exit.
+     */
+    tr_generate_exit_tb(pir1, 0);
+    return true;
+}
+
 bool translate_rdtscp(IR1_INST *pir1)
 {
     /* The normal path skips the exception helper's register saves. */
