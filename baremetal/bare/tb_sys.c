@@ -330,6 +330,7 @@ static uint32_t g_timer_vector = 0x20;       /* PIC default vector        */
 /* A copy of the real kernel entry point, and scratch for its translation. */
 #define KERNEL_ENTRY_PC  0x0000a000
 #define CODE_SCRATCH     0x0008c000
+#define OVMF_RESET_PC    0x0000a400
 
 /* Local APIC window, as a guest physical range. */
 #define APIC_MMIO_BASE  0xfee00000ULL
@@ -2087,6 +2088,57 @@ void kmain(void)
      * executes before it has a stack of its own -- the part that cannot be
      * skipped by starting the guest somewhere more convenient.
      */
+    /*
+     * The OVMF reset vector, verbatim from edk2's x64 code.fd (the last 16
+     * bytes of the firmware volume, which QEMU maps so the volume's end lands
+     * at 0xFFFFFFF0):
+     *
+     *   mov eax, cr0 ; test al, 1 ; jz +5 ; jmp ... ; jmp $
+     *
+     * This is the first code an x86 machine executes, and it is entered with
+     * CS.base = 0xFFFF0000, so it exercises the 32-bit operand forms and a
+     * taken/not-taken branch pair before anything else in the firmware runs.
+     */
+    {
+        static const uint8_t ovmf_reset[] = {
+            0x0f, 0x20, 0xc0, 0xa8, 0x01, 0x74, 0x05,
+            0xe9, 0x0c, 0xff, 0xff, 0xff, 0xe9, 0xf1, 0xfe,
+        };
+        uint64_t pc = OVMF_RESET_PC;
+        int emitted;
+
+        memcpy((void *)(uintptr_t)pc, ovmf_reset, sizeof(ovmf_reset));
+        emitted = tb_harness_translate_at(pc, (uint8_t *)(uintptr_t)
+                                          (CODE_SCRATCH + 0x8000), 4096);
+        check(emitted > 0, "OVMF reset vector translates");
+        latx_bare_uart_puts("tb-sys: ovmf_reset_bytes=");
+        puthex((uint64_t)emitted);
+        latx_bare_uart_puts("\n");
+
+        /*
+         * Translate is not the same as execute.  Run the block with CR0.PE
+         * set, which is the state OVMF's reset vector tests: `test al,1` is
+         * non-zero, so `jz +5` must not be taken and control leaves the block
+         * at the `jmp` that follows it.
+         */
+        env.cr[0] = 0x80000011;         /* PE | ET | PG-like high bit */
+        env.eip = OVMF_RESET_PC;
+        env.regs[R_EAX] = 0;
+        env.eflags = 0x2;
+        latx_x86_tlb_flush_all();
+        tb_sys_run_plv3((void *)(uintptr_t)pro_buf,
+                        (void *)(uintptr_t)(CODE_SCRATCH + 0x8000), &env);
+        check(env.regs[R_EAX] == 0x80000011u,
+              "mov eax,cr0 read CR0 into EAX");
+        check(env.eip == OVMF_RESET_PC + 7,
+              "CR0.PE set: the jz at +5 is not taken");
+        latx_bare_uart_puts("tb-sys: ovmf_eax=");
+        puthex(env.regs[R_EAX]);
+        latx_bare_uart_puts(" ovmf_eip=");
+        puthex(env.eip);
+        latx_bare_uart_puts("\n");
+    }
+
     {
         static const uint8_t kernel_entry[] = {
             0x49, 0x89, 0xf7, 0x48, 0x8d, 0x25, 0xbe, 0x3e,
