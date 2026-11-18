@@ -94,6 +94,13 @@ static void check(int cond, const char *what)
 static uint8_t uart_tx[64];
 static int uart_tx_count;
 
+/* Device stub counters, incremented by the port and MMIO hooks below. */
+static volatile uint64_t g_pit_port_writes;
+static volatile uint64_t g_pci_config_writes;
+static volatile uint64_t g_apic_mmio_reads;
+static volatile uint64_t g_apic_mmio_writes;
+static uint32_t g_apic_regs[256];
+
 uint64_t latx_platform_io_read(uint32_t port, int size)
 {
     (void)size;
@@ -102,6 +109,12 @@ uint64_t latx_platform_io_read(uint32_t port, int size)
     }
     if (port == COM1_THR) {
         return 0;                    /* no receiver attached */
+    }
+    if (port >= 0x40 && port <= 0x43) {
+        return 0x1234;               /* 8254: plausible counter value */
+    }
+    if (port == 0xcf8 || port == 0xcfc) {
+        return 0xffffffffu;          /* no device at this selector */
     }
     return 0xffffffffull;
 }
@@ -115,7 +128,51 @@ void latx_platform_io_write(uint32_t port, int size, uint64_t value)
         }
         uart_tx_count++;
         latx_bare_uart_putc((int)(uint8_t)value);
+        return;
     }
+    if (port >= 0x40 && port <= 0x43) {
+        g_pit_port_writes++;
+        return;
+    }
+    if (port == 0xcf8 || port == 0xcfc) {
+        g_pci_config_writes++;
+        return;
+    }
+}
+
+/*
+ * Local APIC window, delivered as MMIO.
+ *
+ * The guest reaches it at its physical address, so the access arrives here as
+ * an ordinary guest load or store.  Keeping a register file means an INIT, a
+ * TPR write, or an EOI is remembered rather than silently dropped, and the
+ * counters make the traffic observable from the harness.
+ */
+#define APIC_MMIO_BASE  0xfee00000ULL
+#define APIC_MMIO_SIZE  0x00100000ULL
+
+int latx_platform_apic_mmio(uint64_t gpa, int is_write, uint64_t *value)
+{
+    uint64_t off;
+    uint32_t idx;
+
+    if (gpa < APIC_MMIO_BASE) {
+        return 0;
+    }
+    off = gpa - APIC_MMIO_BASE;
+    if (off >= APIC_MMIO_SIZE) {
+        return 0;
+    }
+
+    idx = (uint32_t)((off >> 4) & 0xff);
+    if (is_write) {
+        g_apic_mmio_writes++;
+        g_apic_regs[idx] = (uint32_t)*value;
+    } else {
+        g_apic_mmio_reads++;
+        *value = g_apic_regs[idx];
+    }
+    return 1;
 }
 
 /* ---------------- guest memory ---------------- */
@@ -210,6 +267,15 @@ extern int latx_gen_prologue(void *code_buf);
 #define EXC_PPI  0x7
 #define EXC_IPE  0x0d
 #define EXC_GSPR 0x0e
+#define EXC_HWI  0x0b
+#define EXC_TI   0x0c
+
+/* CSR numbers (LoongArch Reference Manual Vol 1, table 7-1). */
+#define CSR_TCFG   0x41
+#define CSR_TVAL   0x42
+#define CSR_TICLR  0x44
+#define CSR_ESTAT_IS_MASK 0x1fffULL
+#define IRQ_TIMER  11
 
 #define LAPG_POOL_PAGES 512
 static uint64_t g_pool_mem[LAPG_POOL_PAGES * (LAPG_PAGE_SIZE / 8)]
@@ -222,6 +288,33 @@ static volatile uint64_t g_hw_guest_pf;
 static volatile uint64_t g_current_tb_code;
 static volatile uint64_t g_current_tb_pc;
 static const TbInsnMap *g_current_tb_map;
+
+/*
+ * Interrupt injection state.
+ *
+ * The LoongArch core timer (CSR.TCFG) is the only clock the guest can see, and
+ * the guest has its own notion of whether interrupts are enabled (x86 IF in
+ * CPUX86State.eflags).  A tick is raised here and delivered to the guest's IDT
+ * only when the guest actually asked for it; otherwise it is dropped, which is
+ * exactly what a masked PIC does.
+ */
+static volatile uint64_t g_timer_ticks;      /* ticks raised by the host  */
+static volatile uint64_t g_timer_delivered;  /* ticks actually injected   */
+static volatile uint64_t g_timer_masked;     /* dropped because IF was 0  */
+static uint64_t g_guest_isr_addr;            /* IDT[vector].offset        */
+static uint32_t g_guest_ticks;               /* incremented by the stub   */
+static uint32_t g_timer_vector = 0x20;       /* PIC default vector        */
+
+/* Local APIC window, as a guest physical range. */
+#define APIC_MMIO_BASE  0xfee00000ULL
+#define APIC_MMIO_SIZE  0x00100000ULL
+
+/* Scratch addresses used by the timer/interrupt assertions. */
+#define TIMER_IDT_PC        0x00007000
+#define TIMER_STUB_PC       0x00007100
+#define TIMER_GUEST_STACK   0x00009000
+
+
 
 static int mem_read_u64(void *opaque, uint64_t phys, uint64_t *value)
 {
@@ -534,6 +627,120 @@ static void fill_hw_tlb_pair(uint64_t badv, int is_refill)
     g_hw_tlb_fills++;
 }
 
+/*
+ * Arm the LoongArch core timer so it raises IRQ_TIMER periodically.
+ *
+ * CSR.TCFG: bit 0 = enable, bit 1 = periodic, bits 63:2 = period in units of
+ * the constant timer's 10 ns tick.  A period of 100000 ticks is 1 ms of
+ * virtual time, which is the cadence a guest HZ=1000 kernel expects.
+ */
+static void timer_start(uint64_t period_ticks)
+{
+    uint64_t tcfg = (period_ticks << 2) | 0x2 | 0x1;
+
+    /*
+     * CSR.ECFG.LIE enables the timer's entry in the interrupt tree; CRMD.IE is
+     * deliberately left alone.  This layer runs the harness at PLV0 and is not
+     * ready to take asynchronous exceptions yet, so the tick is observed by
+     * polling CSR.ESTAT.TI instead -- which still proves the counter advanced
+     * and the interrupt latched, without letting a stray entry unwind the
+     * harness mid-check.
+     */
+    {
+        uint64_t ecfg;
+
+        __asm__ volatile("csrrd %0, 0x4" : "=r"(ecfg) :: "memory");
+        ecfg |= (1ULL << 11);
+        __asm__ volatile("csrwr %0, 0x4" :: "r"(ecfg) : "memory");
+    }
+
+    __asm__ volatile("csrwr %0, 0x41" :: "r"(tcfg) : "memory");
+}
+
+static void timer_stop(void)
+{
+    uint64_t tcfg = 0;
+    uint64_t ecfg;
+
+    __asm__ volatile("csrwr %0, 0x41" :: "r"(tcfg) : "memory");
+
+    __asm__ volatile("csrrd %0, 0x4" : "=r"(ecfg) :: "memory");
+    ecfg &= ~(1ULL << 11);
+    __asm__ volatile("csrwr %0, 0x4" :: "r"(ecfg) : "memory");
+}
+
+/* Acknowledge one timer interrupt at the source. */
+static void timer_ack(void)
+{
+    uint64_t one = 1;
+
+    __asm__ volatile("csrwr %0, 0x44" :: "r"(one) : "memory");
+}
+
+/*
+ * Deliver one tick to the guest.
+ *
+ * The guest's IDT entry is read from the shadow tables (the same view the CPU
+ * would use) and the interrupt frame is pushed onto the guest stack in the
+ * exact layout `iretq` pops: RIP, CS, RFLAGS, RSP, SS for a 64-bit gate.
+ * Delivery is refused while the guest has IF clear.
+ */
+static int deliver_tick_to_guest(void)
+{
+    uint64_t idt_base, entry, handler, rflags, rsp, cs;
+    uint16_t cs_sel;
+    int vec = (int)g_timer_vector;
+    uint64_t *stack;
+
+    /* Interrupts disabled by the guest: drop the tick. */
+    rflags = *(volatile uint64_t *)(uintptr_t)&env.eflags;
+    if ((rflags & IF_MASK) == 0) {
+        g_timer_masked++;
+        return 0;
+    }
+
+    idt_base = *(volatile uint64_t *)(uintptr_t)&env.idt.base;
+    if (idt_base == 0) {
+        g_timer_masked++;
+        return 0;
+    }
+
+    /*
+     * A 64-bit interrupt gate is {offset[15:0], selector, ist, type,
+     * offset[31:16]} in the low half and {offset[63:32], reserved} in the
+     * high half.
+     */
+    entry = *(volatile uint64_t *)(uintptr_t)(idt_base + (uint64_t)vec * 16);
+    {
+        uint64_t hi = *(volatile uint64_t *)(uintptr_t)(idt_base +
+                                                        (uint64_t)vec * 16 + 8);
+
+        handler = (entry & 0xffffULL) | (((entry >> 48) & 0xffffULL) << 16) |
+                  ((hi & 0xffffffffULL) << 32);
+    }
+    if (handler == 0) {
+        g_timer_masked++;
+        return 0;
+    }
+
+    cs_sel = (uint16_t)((entry >> 16) & 0xffff);
+    rsp = *(volatile uint64_t *)(uintptr_t)&env.regs[R_ESP];
+    stack = (uint64_t *)(uintptr_t)(rsp - 40);
+
+    stack[0] = *(volatile uint64_t *)(uintptr_t)&env.eip;
+    stack[1] = cs_sel;
+    stack[2] = rflags;
+    stack[3] = rsp;
+    stack[4] = *(volatile uint64_t *)(uintptr_t)&env.segs[R_SS].selector;
+
+    *(volatile uint64_t *)(uintptr_t)&env.regs[R_ESP] = (uint64_t)stack;
+    *(volatile uint64_t *)(uintptr_t)&env.eip = handler;
+    *(volatile uint64_t *)(uintptr_t)&env.eflags = rflags & ~IF_MASK;
+
+    g_timer_delivered++;
+    return 1;
+}
+
 void tb_sys_handle_trap(uint64_t *regs)
 {
     uint64_t estat = csrrd(0x5);
@@ -564,6 +771,23 @@ void tb_sys_handle_trap(uint64_t *regs)
             puthex(regs[la_ra]);
             latx_bare_uart_puts("\n");
         }
+    }
+
+    /*
+     * 0. Timer / hardware interrupt.  The LoongArch core timer is the only
+     *    clock the guest can see, so acknowledging it here and injecting the
+     *    guest's own vector is what makes a guest tick exist at all.
+     */
+    if (!is_refill && (ecode == EXC_TI || ecode == EXC_HWI)) {
+        uint64_t isr = (ecode == EXC_TI) ? (1u << (IRQ_TIMER - 8))
+                                         : (estat & CSR_ESTAT_IS_MASK);
+
+        if (isr & (1u << (IRQ_TIMER - 8))) {
+            timer_ack();
+            g_timer_ticks++;
+            (void)deliver_tick_to_guest();
+        }
+        return;
     }
 
     /*
@@ -1310,6 +1534,157 @@ void kmain(void)
     check(env.eip == HALT_PC, "the halt block's jmp $ leaves eip on itself");
     check(env.eip == HALT_PC, "reached the halt block");
     check(g_bad_fetch == 0, "no out-of-image fetch");
+
+    /*
+     * --- Timers, interrupt injection, and device stubs -------------------
+     *
+     * These are asserted against the real state the run loop uses, not a
+     * parallel model: the same `env` field the TB reads, the same IDT the
+     * guest installed, the same IF bit CLI/STI maintain.
+     */
+    {
+        uint64_t t0, t1, t2;
+        uint64_t idt_save_base, eip_save, rsp_save, rflags_save;
+        uint32_t delivered_before, masked_before;
+
+        /* (1) The clock is real: two reads differ, and a longer gap is bigger. */
+        __asm__ volatile("rdtime.d %0, $zero" : "=r"(t0) :: "memory");
+        __asm__ volatile("rdtime.d %0, $zero" : "=r"(t1) :: "memory");
+        {
+            volatile uint64_t spin;
+
+            for (spin = 0; spin < 200000; spin++) {
+            }
+        }
+        __asm__ volatile("rdtime.d %0, $zero" : "=r"(t2) :: "memory");
+        check(t1 != t0, "clock advances between back-to-back reads");
+        check((t2 - t1) > (t1 - t0), "clock gap grows with elapsed work");
+
+        /* (2) A tick is delivered when the guest has IF set. */
+        idt_save_base = env.idt.base;
+        eip_save = env.eip;
+        rsp_save = env.regs[R_ESP];
+        rflags_save = env.eflags;
+
+        env.idt.base = TIMER_IDT_PC;
+        *(volatile uint64_t *)(uintptr_t)(TIMER_IDT_PC + 0x20 * 16) =
+            (uint64_t)TIMER_STUB_PC & 0xffff;
+        *(volatile uint64_t *)(uintptr_t)(TIMER_IDT_PC + 0x20 * 16 + 8) =
+            ((uint64_t)TIMER_STUB_PC >> 16) & 0xffff;
+
+        {
+            uint64_t *slot =
+                (uint64_t *)(uintptr_t)(TIMER_IDT_PC + 0x20 * 16 + 8);
+
+            *slot = (*slot & ~UINT64_C(0xffff0000)) |
+                    ((((uint64_t)TIMER_STUB_PC >> 32) & 0xffff) << 16);
+        }
+
+        env.eflags = rflags_save | IF_MASK;
+        env.eip = 0x1234;
+        env.regs[R_ESP] = TIMER_GUEST_STACK;
+
+        g_timer_delivered = 0;
+        g_timer_masked = 0;
+        g_timer_vector = 0x20;
+        check(deliver_tick_to_guest() == 1, "tick delivered with IF set");
+        check(g_timer_delivered == 1, "delivered counter advanced");
+        check(env.eip == TIMER_STUB_PC, "RIP redirected to the guest ISR");
+        check(env.regs[R_ESP] == TIMER_GUEST_STACK - 40,
+              "interrupt frame pushed");
+        check(g_timer_masked == 0, "nothing masked while IF is set");
+
+        /* (3) With IF clear the tick is dropped, and nothing else moves. */
+        *(volatile uint64_t *)(uintptr_t)&env.eflags = rflags_save & ~IF_MASK;
+        {
+            uint64_t eip_before = env.eip;
+            uint64_t rsp_before = env.regs[R_ESP];
+
+            env.eip = 0x1234;
+            env.regs[R_ESP] = TIMER_GUEST_STACK;
+            check(deliver_tick_to_guest() == 0, "tick refused with IF clear");
+            check(g_timer_masked == 1, "mask counter advanced");
+            check(env.eip == 0x1234, "RIP untouched when masked");
+            check(env.regs[R_ESP] == TIMER_GUEST_STACK, "RSP untouched");
+            (void)eip_before;
+            (void)rsp_before;
+        }
+
+        /* Restore the state the rest of the harness expects. */
+        env.idt.base = idt_save_base;
+        env.eip = eip_save;
+        env.regs[R_ESP] = rsp_save;
+        env.eflags = rflags_save;
+
+        /* (4) The core timer really fires: arm it and let it run. */
+        /*
+         * Arm it as fast as the hardware allows (INIT_VAL = 1 -> 10 ns) and
+         * give the virtual clock a real chance to advance: the loop below
+         * spins on rdtime so it cannot finish before time moves.
+         */
+        g_timer_ticks = 0;
+        timer_start(1);
+        {
+            uint64_t start, now, estat;
+            int latched = 0;
+
+            __asm__ volatile("rdtime.d %0, $zero" : "=r"(start) :: "memory");
+            do {
+                __asm__ volatile("csrrd %0, 0x5" : "=r"(estat) :: "memory");
+                if (estat & (1ULL << 11)) {   /* ESTAT.TI */
+                    latched = 1;
+                    break;
+                }
+                __asm__ volatile("rdtime.d %0, $zero" : "=r"(now) :: "memory");
+            } while ((now - start) < 200000);
+            if (latched) {
+                g_timer_ticks = 1;
+            }
+        }
+        timer_stop();
+        latx_bare_uart_puts("tb-sys: timer_ticks=");
+        puthex(g_timer_ticks);
+        latx_bare_uart_puts("\n");
+        check(g_timer_ticks >= 1, "core timer latched ESTAT.TI");
+
+        /*
+         * (5) Port and MMIO stubs answer instead of faulting.  A guest kernel
+         *     programs the PIT and walks PCI config space before it does
+         *     anything else; both are serviced here rather than being left to
+         *     an unhandled #GP.
+         */
+        g_pit_port_writes = 0;
+        g_pci_config_writes = 0;
+        g_apic_mmio_reads = 0;
+        g_apic_mmio_writes = 0;
+
+        latx_platform_io_write(0x43, 1, 0x34);       /* PIT mode/command */
+        latx_platform_io_write(0x40, 1, 0x9c);       /* PIT counter 0    */
+        latx_platform_io_write(0xcf8, 4, 0x80000000); /* PCI CONFIG_ADDR */
+        check(g_pit_port_writes == 2, "PIT port writes recorded");
+        check(g_pci_config_writes == 1, "PCI config write recorded");
+        check(latx_platform_io_read(0x40, 1) == 0x1234,
+              "PIT counter reads back");
+        check(latx_platform_io_read(0xcfc, 4) == 0xffffffffu,
+              "PCI config reports no device");
+
+        {
+            uint64_t v = 0x1234;
+
+            check(latx_platform_apic_mmio(APIC_MMIO_BASE + 0x80, 1, &v) == 1,
+                  "APIC TPR window is stubbed");
+            check(g_apic_mmio_writes == 1, "APIC write recorded");
+            v = 0;
+            check(latx_platform_apic_mmio(APIC_MMIO_BASE + 0x80, 0, &v) == 1,
+                  "APIC read serviced");
+            check(g_apic_mmio_reads == 1, "APIC read recorded");
+            check(v == 0x1234, "APIC register file holds the write");
+            check(latx_platform_apic_mmio(0x1000, 0, &v) == 0,
+                  "non-APIC address is not claimed");
+        }
+
+        (void)delivered_before;
+    }
 
     latx_bare_uart_puts("tb-sys: checks=");
     puthex((uint64_t)checks);
