@@ -8,6 +8,7 @@
  * guest never asked for.
  */
 #include "qemu/osdep.h"
+#include "exec/exec-all.h"
 #include "cpu.h"
 
 #include "latx-x86-paging.h"
@@ -21,6 +22,7 @@
 
 /* Bits 51:12 of an entry hold the next table or the page frame. */
 #define PTE_PHYS_MASK UINT64_C(0x000ffffffffff000)
+#define LAPG_SIZE      UINT64_C(4096)
 
 __attribute__((weak)) uint64_t latx_platform_phys_read(uint64_t pa, int size)
 {
@@ -242,6 +244,28 @@ LatxX86WalkResult latx_x86_walk_cached(const CPUX86State *env, uint64_t va,
     e->perm = out->perm;
     e->valid = true;
     return r;
+}
+
+int latx_x86_check_guest_access(CPUX86State *env, uint64_t gva,
+                                uint32_t access, uint32_t size_bits)
+{
+    uint64_t bytes = size_bits ? (size_bits + 7) / 8 : 1;
+    uint64_t page = gva & ~(LAPG_SIZE - 1);
+    for (;;) {
+        LatxX86Translation t;
+        LatxX86WalkResult r = latx_x86_walk_cached(env, page, access, &t);
+
+        if (r != LATX_X86_WALK_OK && r != LATX_X86_WALK_PAGING_OFF) {
+            env->cr[2] = gva;
+            env->exception_index = EXCP0E_PAGE;
+            env->error_code = (int)latx_x86_fault_error_code(env, r, access);
+            return 1;
+        }
+        if (page + LAPG_SIZE >= gva + bytes) {
+            return 0;
+        }
+        page += LAPG_SIZE;
+    }
 }
 
 uint32_t latx_x86_fault_error_code(const CPUX86State *env,

@@ -134,6 +134,12 @@ extern int option_imm_complex;
 extern int option_debug_imm_reg;
 extern uint64_t imm_skip_pc;
 extern int option_mem_test;
+/*
+ * Consult the guest's page tables before every data access.  Off by default:
+ * it costs a call per access, and a direct-mapped harness does not need the
+ * permission check.  A system build turns it on for the guest's own sake.
+ */
+extern int option_guest_paging;
 extern int option_minke_16k_page_check;
 extern int option_real_maps;
 extern int option_monitor_shared_mem;

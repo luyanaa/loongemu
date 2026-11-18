@@ -20,9 +20,13 @@
 #include "latx-smc.h"
 #include "jrra.h"
 #include "latx-native-asm.h"
+#include "latx-disassemble-trace.h"
+#include "latx-x86-paging.h"
 
 extern void *helper_tb_lookup_ptr(CPUArchState *);
 static int ss_generate_match_fail_native_code(void* code_buf);
+static bool tr_translate_checked(IR1_INST *pir1);
+static bool ir1_has_guest_mem_operand(IR1_INST *ir1);
 #if defined(CONFIG_LATX_KZT)
 uintptr_t kzt_get_alternate_pc(uintptr_t addr)
 {
@@ -2673,7 +2677,19 @@ int tr_ir2_generate(struct TranslationBlock *tb)
             gen_softfpu_helper_prologue(pir1);
         }
 
-        bool translation_success = ir1_translate(pir1);
+        bool translation_success;
+        /*
+         * A TB-ending instruction decides its own successors, so the checked
+         * wrapper does not apply to it; those instructions rarely carry a
+         * data operand, and when they do (an indirect call through memory)
+         * the access is still validated by the block it jumps to.
+         */
+        if (option_guest_paging && !ir1_is_tb_ending(pir1) &&
+            ir1_has_guest_mem_operand(pir1)) {
+            translation_success = tr_translate_checked(pir1);
+        } else {
+            translation_success = ir1_translate(pir1);
+        }
         if (!translation_success) {
 #ifdef CONFIG_LATX_TU
             tb->s_data->tu_tb_mode = BAD_TB;
@@ -3082,6 +3098,136 @@ static void tr_generate_single_step_exit(IR2_OPND next_pc)
                        LOAD_HELPER_RAISE_TRAPOP, 0);
     la_jirl(zero_ir2_opnd, helper_addr, 0);
     ra_free_temp(helper_addr);
+}
+
+/* ---------------- guest page-table checked accesses ---------------- */
+
+#define LATX_ACCESS_PACK(mask, size_bits) \
+    ((uint32_t)(mask) | ((uint32_t)(size_bits) << 8))
+
+/*
+ * The instruction's memory operands tell us how the access is used.  Capstone
+ * reports READ/WRITE per operand; an operand that reports neither (an engine
+ * built without that detail) is treated as read-write, because approving a
+ * store on the strength of "not marked writable" is the one mistake here that
+ * cannot be recovered from.
+ */
+static uint32_t ir1_mem_access_mask(const IR1_OPND *opnd)
+{
+    uint32_t mask = 0;
+
+    if (opnd->access & dt_CS_AC_READ) {
+        mask |= LATX_X86_ACCESS_READ;
+    }
+    if (opnd->access & dt_CS_AC_WRITE) {
+        mask |= LATX_X86_ACCESS_WRITE;
+    }
+    if (mask == 0) {
+        mask = LATX_X86_ACCESS_READ | LATX_X86_ACCESS_WRITE;
+    }
+    return mask;
+}
+
+static bool ir1_has_guest_mem_operand(IR1_INST *ir1)
+{
+    int n = ir1_opnd_num(ir1);
+
+    for (int i = 0; i < n; i++) {
+        if (ir1_opnd_is_mem(ir1_get_opnd(ir1, i))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Call the checker for one memory operand.  The effective address is
+ * materialized so the callee sees exactly the byte the access will use; the
+ * guest registers are spilled first because the call is ordinary C and
+ * r8..r15 live in caller-saved host registers.
+ */
+static void tr_generate_access_check(IR1_INST *ir1, IR1_OPND *mem,
+                                     IR2_OPND fault_label)
+{
+    uint32_t user = ((CPUX86State *)lsenv->cpu_state)->hflags & HF_CPL_MASK
+                        ? LATX_X86_ACCESS_USER : 0;
+    uint32_t packed = LATX_ACCESS_PACK(ir1_mem_access_mask(mem) | user,
+                                       ir1_opnd_size(mem));
+    int imm = 0;
+    IR2_OPND base, addr, fn;
+
+    base = convert_mem(mem, &imm);
+    addr = ra_alloc_itemp();
+    if (imm) {
+        la_addi_d(addr, base, imm);
+    } else {
+        la_or(addr, base, zero_ir2_opnd);
+    }
+
+    tr_save_guest_regs_for_helper();
+    fn = ra_alloc_dbt_arg2();
+    aot_load_host_addr(fn, (ADDR)latx_x86_check_guest_access,
+                       LOAD_HELPER_CHECK_ACCESS, 0);
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    la_mov64(a1_ir2_opnd, addr);
+    li_d(a2_ir2_opnd, packed);
+    la_jirl(ra_ir2_opnd, fn, 0);
+    tr_load_guest_regs_after_helper();
+    la_bnez(a0_ir2_opnd, fault_label);
+    ra_free_temp(addr);
+}
+
+/*
+ * Restart the instruction after a guest fault: the faulting address is the
+ * instruction itself, and the driver is expected to deliver the #PF the
+ * checker recorded and re-enter here once the guest (or the VMM) has fixed
+ * the mapping.
+ */
+static void tr_generate_guest_fault_exit(IR1_INST *pir1)
+{
+    IR2_OPND eip_opnd = ra_alloc_dbt_arg2();
+    IR2_OPND base = ra_alloc_data();
+    IR2_OPND target = ra_alloc_data();
+
+    li_d(eip_opnd, ir1_addr(pir1));
+    la_store_addrx(eip_opnd, env_ir2_opnd, lsenv_offset_of_eip(lsenv));
+    tr_save_registers_to_env(0xff, 0xff, option_save_xmm, options_to_save());
+    la_data_li(base,
+               (ADDR)((TranslationBlock *)lsenv->tr_data->curr_tb)->tc.ptr);
+    la_data_li(target, context_switch_native_to_bt_ret_0);
+    aot_la_append_ir2_jmp_far(target, base, B_EPILOGUE_RET_0, 0);
+}
+
+/*
+ * Translate one instruction with its memory operands checked against the
+ * guest's page tables first.  The body is followed by an unconditional jump
+ * over the fault stub, so the common path costs one call per operand and no
+ * taken branch.
+ */
+static bool tr_translate_checked(IR1_INST *pir1)
+{
+    IR2_OPND fault_label = ra_alloc_label();
+    IR2_OPND done_label = ra_alloc_label();
+    int n = ir1_opnd_num(pir1);
+    bool ok;
+
+    for (int i = 0; i < n; i++) {
+        IR1_OPND *opnd = ir1_get_opnd(pir1, i);
+
+        if (ir1_opnd_is_mem(opnd)) {
+            tr_generate_access_check(pir1, opnd, fault_label);
+        }
+    }
+
+    ok = ir1_translate(pir1);
+    if (!ok) {
+        return false;
+    }
+    la_b(done_label);
+    la_label(fault_label);
+    tr_generate_guest_fault_exit(pir1);
+    la_label(done_label);
+    return true;
 }
 
 /*

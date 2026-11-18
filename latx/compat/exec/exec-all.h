@@ -59,6 +59,7 @@
 #define EXCP05_BOUND   5
 #define EXCP06_ILLOP   6
 #define EXCP0D_GPF     13
+#define EXCP0E_PAGE    14
 #define EXCP00_DIVZ    0
 #define EXCP10_COPR    16
 #define EXCP_DEBUG     0x10001

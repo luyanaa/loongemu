@@ -51,6 +51,7 @@ int option_imm_complex = 0;
 int option_debug_imm_reg = 0;
 uint64_t imm_skip_pc = 0;
 int option_mem_test = 0;
+int option_guest_paging = 0;
 int option_minke_16k_page_check = 0;
 int option_real_maps = 0;
 int option_monitor_shared_mem = 0;

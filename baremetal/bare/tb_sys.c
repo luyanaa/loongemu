@@ -32,6 +32,7 @@
 #include "ir2.h"
 #include "translate.h"
 
+#include "latx-options.h"
 #include "latx-x86-paging.h"
 
 #include "loongemu/tb_cache.h"
@@ -119,6 +120,9 @@ void latx_platform_io_write(uint32_t port, int size, uint64_t value)
 #define GUEST_RAM_SIZE (64 * 1024)
 #define GUEST_BASE     0x0
 #define PROGRAM_PC     0x0ffe
+#define GDT_PC         0x1200
+#define STR_PC         0x6000
+#define STORE_PC       0x1500
 
 static uint8_t guest_ram[GUEST_RAM_SIZE] __attribute__((aligned(4096)));
 
@@ -171,19 +175,17 @@ typedef void (*TbEntry)(void *tb_code, void *env);
  * at 0x0ffe, so its immediate straddles the 4 KiB boundary at 0x1000 and
  * instruction fetch has to cross a page to decode it.
  *
- * Offsets below are relative to PROGRAM_PC.  Two encoding details matter
- * here: EFER.LME is bit 8 (the value written is 0x100, not 1), and
- * `mov r32, imm32` is always five bytes -- there is no imm8 form, so a short
- * encoding would silently swallow the next instruction.
- *
- * lgdt [disp32] in 64-bit mode must go through SIB: modrm 0x14 (mod=00,
- * reg=/2, rm=100) with SIB 0x25 (no index, base=101 -> disp32), i.e.
- * 0f 01 14 25 <disp32>.  With modrm 0x15 the operand is RIP-relative.
+ * Offsets below are relative to PROGRAM_PC.  Three encoding details matter
+ * here: EFER.LME is bit 8 (the value written is 0x100, not 1), `mov r32,
+ * imm32` is always five bytes -- there is no imm8 form, so a short encoding
+ * would silently swallow the next instruction -- and `lgdt [disp32]` in
+ * 64-bit mode must go through SIB (modrm 0x14, SIB 0x25); with modrm 0x15 the
+ * operand is RIP-relative.
  *
  * The three stores build a valid 4-level table set: PML4[0] -> PDPT[0] -> PD,
- * and PD[0] is a 2 MiB leaf (PS set at the PD level, which is where the
- * manual puts it) mapping the first 2 MiB of guest physical memory.  CR4.PAE
- * is set before CR3, as long mode requires.
+ * with PD[0] a 2 MiB leaf.  It starts read-only (0x81) and CR0.WP is set, so
+ * the store at +0x6b takes a real #PF; the driver acts as the guest's kernel,
+ * makes the leaf writable and resumes at the store.
  *
  *    *   +0x00: b9 80 00 00 c0                       mov  ecx, 0xc0000080     ; EFER
  *   +0x05: b8 00 01 00 00                       mov  eax, 0x100          ; LME
@@ -196,7 +198,7 @@ typedef void (*TbEntry)(void *tb_code, void *env);
  *   +0x16: 0f 01 14 25 00 12 00 00              lgdt [0x1200]
  *   +0x1e: 48 c7 04 25 00 20 00 00 03 30 00 00  mov  qword [0x2000], 0x3003  ; PML4[0] -> PDPT
  *   +0x2a: 48 c7 04 25 00 30 00 00 03 40 00 00  mov  qword [0x3000], 0x4003  ; PDPT[0] -> PD
- *   +0x36: 48 c7 04 25 00 40 00 00 83 00 00 00  mov  qword [0x4000], 0x83    ; PD[0]: 2 MiB, P|RW|PS
+ *   +0x36: 48 c7 04 25 00 40 00 00 81 00 00 00  mov  qword [0x4000], 0x81    ; PD[0]: 2 MiB, read-only
  *   +0x42: b8 20 00 00 00                       mov  eax, 0x20           ; PAE
  *   +0x47: 0f 22 e0                             mov  cr4, eax
  *   +0x4a: 0f 20 e0                             mov  eax, cr4
@@ -205,24 +207,25 @@ typedef void (*TbEntry)(void *tb_code, void *env);
  *   +0x55: 0f 22 d8                             mov  cr3, eax
  *   +0x58: 0f 20 d8                             mov  eax, cr3
  *   +0x5b: 41 89 c4                             mov  r12d, eax           ; CR3 as read back
- *   +0x5e: b8 01 00 00 80                       mov  eax, 0x80000001     ; PG | PE
+ *   +0x5e: b8 01 00 01 80                       mov  eax, 0x80010001     ; PG | WP | PE
  *   +0x63: 0f 22 c0                             mov  cr0, eax
  *   +0x66: 0f 20 c0                             mov  eax, cr0
  *   +0x69: 89 c7                                mov  edi, eax            ; CR0 as read back
- *   +0x6b: ba fd 03 00 00                       mov  edx, 0x3fd
- *   +0x70: ec                                   in   al, dx
- *   +0x71: 0f b6 c0                             movzx eax, al
- *   +0x74: 89 c5                                mov  ebp, eax            ; LSR as read back
- *   +0x76: be 00 00 00 00                       mov  esi, <str>          ; patched
- *   +0x7b: 8a 06                                mov  al, [rsi]
- *   +0x7d: 84 c0                                test al, al
- *   +0x7f: 74 0c                                jz   +0x0c
- *   +0x81: ba f8 03 00 00                       mov  edx, 0x3f8
- *   +0x86: ee                                   out  dx, al
- *   +0x87: 48 ff c6                             inc  rsi
- *   +0x8a: eb ef                                jmp  -0x11
- *   +0x8c: 90                                   nop
- *   +0x8d: eb fe                                jmp  $
+ *   +0x6b: c6 04 25 00 15 00 00 01              mov  byte [0x1500], 1    ; #PF: leaf is read-only
+ *   +0x73: ba fd 03 00 00                       mov  edx, 0x3fd
+ *   +0x78: ec                                   in   al, dx
+ *   +0x79: 0f b6 c0                             movzx eax, al
+ *   +0x7c: 89 c5                                mov  ebp, eax            ; LSR as read back
+ *   +0x7e: be 00 00 00 00                       mov  esi, <str>          ; patched to 0x6000
+ *   +0x83: 8a 06                                mov  al, [rsi]
+ *   +0x85: 84 c0                                test al, al
+ *   +0x87: 74 0c                                jz   +0x0c
+ *   +0x89: ba f8 03 00 00                       mov  edx, 0x3f8
+ *   +0x8e: ee                                   out  dx, al
+ *   +0x8f: 48 ff c6                             inc  rsi
+ *   +0x92: eb ef                                jmp  -0x11
+ *   +0x94: 90                                   nop
+ *   +0x95: eb fe                                jmp  $
  */
 static const uint8_t program[] = {
     0xb9, 0x80, 0x00, 0x00, 0xc0, 0xb8, 0x00, 0x01,
@@ -232,20 +235,19 @@ static const uint8_t program[] = {
     0x04, 0x25, 0x00, 0x20, 0x00, 0x00, 0x03, 0x30,
     0x00, 0x00, 0x48, 0xc7, 0x04, 0x25, 0x00, 0x30,
     0x00, 0x00, 0x03, 0x40, 0x00, 0x00, 0x48, 0xc7,
-    0x04, 0x25, 0x00, 0x40, 0x00, 0x00, 0x83, 0x00,
+    0x04, 0x25, 0x00, 0x40, 0x00, 0x00, 0x81, 0x00,
     0x00, 0x00, 0xb8, 0x20, 0x00, 0x00, 0x00, 0x0f,
     0x22, 0xe0, 0x0f, 0x20, 0xe0, 0x41, 0x89, 0xc5,
     0xb8, 0x00, 0x20, 0x00, 0x00, 0x0f, 0x22, 0xd8,
     0x0f, 0x20, 0xd8, 0x41, 0x89, 0xc4, 0xb8, 0x01,
-    0x00, 0x00, 0x80, 0x0f, 0x22, 0xc0, 0x0f, 0x20,
-    0xc0, 0x89, 0xc7, 0xba, 0xfd, 0x03, 0x00, 0x00,
+    0x00, 0x01, 0x80, 0x0f, 0x22, 0xc0, 0x0f, 0x20,
+    0xc0, 0x89, 0xc7, 0xc6, 0x04, 0x25, 0x00, 0x15,
+    0x00, 0x00, 0x01, 0xba, 0xfd, 0x03, 0x00, 0x00,
     0xec, 0x0f, 0xb6, 0xc0, 0x89, 0xc5, 0xbe, 0x00,
     0x00, 0x00, 0x00, 0x8a, 0x06, 0x84, 0xc0, 0x74,
     0x0c, 0xba, 0xf8, 0x03, 0x00, 0x00, 0xee, 0x48,
     0xff, 0xc6, 0xeb, 0xef, 0x90, 0xeb, 0xfe,
 };
-
-static uint8_t gdt_image[16] __attribute__((aligned(16)));
 
 /* NUL terminated; the guest walks it and writes it out port by port. */
 static const char banner[] = "loongemu: long mode\n";
@@ -254,7 +256,7 @@ static const uint8_t gdt_descriptor[] = {
     0x1f, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
-#define HALT_PC (PROGRAM_PC + 0x8d)
+#define HALT_PC (PROGRAM_PC + 0x95)
 #define EFER_LME (1u << 8)
 #define EFER_LMA (1u << 10)
 
@@ -263,6 +265,9 @@ void kmain(void)
     uint64_t pc;
     int steps = 0;
     int translated = 0;
+    int faults = 0;
+    uint64_t fault_cr2 = 0;
+    uint32_t fault_ec = 0;
     uint32_t hflags;
 
     latx_bare_uart_puts("tb-sys: start\n");
@@ -279,22 +284,21 @@ void kmain(void)
         lbt_emu_install();
     }
 
-    memset(gdt_image, 0, sizeof(gdt_image));
-    memcpy(gdt_image, gdt_descriptor, sizeof(gdt_descriptor));
     memcpy(guest_ram + (PROGRAM_PC - GUEST_BASE), program, sizeof(program));
 
     /*
-     * lgdt m16&64 names its operand with an absolute disp32 at
-     * program offset 0x1a; point it at the descriptor image's host address,
-     * which is the only address the direct-mapped data path can reach.
+     * With the page-table check enabled, everything the guest reads must be
+     * inside the range its own tables map -- host addresses below 2 MiB, the
+     * 2 MiB leaf the guest builds.  So the descriptor and the banner are
+     * placed in that range at the addresses the program names, instead of in
+     * this image's .bss.
      */
+    memcpy((void *)(uintptr_t)GDT_PC, gdt_descriptor, sizeof(gdt_descriptor));
+    memcpy((void *)(uintptr_t)STR_PC, banner, sizeof(banner));
     {
-        uint32_t desc_addr = (uint32_t)(uintptr_t)gdt_image;
-        uint32_t str_addr = (uint32_t)(uintptr_t)banner;
+        uint32_t str_addr = STR_PC;
 
-        memcpy(guest_ram + (PROGRAM_PC - GUEST_BASE) + 0x1a, &desc_addr,
-               sizeof(desc_addr));
-        memcpy(guest_ram + (PROGRAM_PC - GUEST_BASE) + 0x77, &str_addr,
+        memcpy(guest_ram + (PROGRAM_PC - GUEST_BASE) + 0x7f, &str_addr,
                sizeof(str_addr));
     }
 
@@ -331,6 +335,8 @@ void kmain(void)
     latx_runtime_init();
     /* EFER.LME is only writable when CPUID advertises long mode. */
     latx_x86_env_init_features(&env);
+    /* Consult the guest's page tables for every data access. */
+    option_guest_paging = 1;
 
     latx_gen_epilogue(epi_buf);
     latx_gen_prologue(pro_buf);
@@ -375,6 +381,33 @@ void kmain(void)
 
         ((TbEntry)(void *)(uintptr_t)pro_buf)((void *)(uintptr_t)e->code,
                                               &env);
+
+        if (env.exception_index != 0) {
+            faults++;
+            fault_cr2 = env.cr[2];
+            fault_ec = (uint32_t)env.error_code;
+            latx_bare_uart_puts("  #PF at ");
+            puthex(pc);
+            latx_bare_uart_puts(" cr2=");
+            puthex(fault_cr2);
+            latx_bare_uart_puts(" ec=");
+            puthex(fault_ec);
+            latx_bare_uart_puts("\n");
+
+            /*
+             * Act as the guest's kernel: the store hit a read-only leaf, so
+             * make it writable, invalidate and resume at the instruction the
+             * fault stub left in eip.  Anything else is a harness failure.
+             */
+            if (env.exception_index != EXCP0E_PAGE || fault_cr2 != STORE_PC ||
+                faults != 1) {
+                check(0, "unexpected guest fault");
+                break;
+            }
+            *(volatile uint64_t *)0x4000 = 0x83;
+            helper_invlpg(&env, STORE_PC);
+            env.exception_index = 0;
+        }
     }
 
     latx_bare_uart_puts("tb-sys: steps=");
@@ -415,8 +448,14 @@ void kmain(void)
     check(env.cr[3] == 0x2000, "mov cr3 stored");
     check(env.regs[R_R12] == 0x2000, "mov r, cr3 reads it back");
     /* mov cr0 plus the read back */
-    check(env.cr[0] == 0x80000001u, "mov cr0 stored");
-    check(env.regs[R_EDI] == 0x80000001u, "mov r, cr0 reads it back");
+    check(env.cr[0] == 0x80010001u, "mov cr0 stored (PG|WP|PE)");
+    check(env.regs[R_EDI] == 0x80010001u, "mov r, cr0 reads it back");
+    /* the fault the checked store took, and the resume afterwards */
+    check(faults == 1, "read-only leaf raised exactly one #PF");
+    check(fault_cr2 == STORE_PC, "CR2 holds the faulting store address");
+    check(fault_ec == 0x3u, "error code is P|W (supervisor write)");
+    check(*(volatile uint8_t *)(uintptr_t)STORE_PC == 1,
+          "the store executed after the PTE was fixed");
     /*
      * The same tables, translated by the runtime's walker: 2 MiB leaf at the
      * PD level, identity mapped, writable, supervisor only.
@@ -447,8 +486,12 @@ void kmain(void)
         /*
          * Read-only leaf.  CR0.WP decides whether a supervisor write faults,
          * so both sides of that switch are checked; a user write always
-         * faults.
+         * faults.  The guest leaves WP set, so clear it for the first case
+         * and restore the guest's value at the end.
          */
+        uint64_t saved_cr0 = env.cr[0];
+
+        env.cr[0] &= ~(uint64_t)CR0_WP_MASK;
         *(volatile uint64_t *)0x4000 = 0x81;
         r = latx_x86_walk(&env, 0x1000, LATX_X86_ACCESS_WRITE, &t);
         check(r == LATX_X86_WALK_OK,
@@ -464,9 +507,9 @@ void kmain(void)
               latx_x86_fault_error_code(
                   &env, r, LATX_X86_ACCESS_WRITE | LATX_X86_ACCESS_USER) == 0x7,
               "user write to supervisor leaf faults (P|W|U error)");
-        env.cr[0] &= ~(uint64_t)CR0_WP_MASK;
         r = latx_x86_walk(&env, 0x1000, LATX_X86_ACCESS_READ, &t);
         check(r == LATX_X86_WALK_OK, "read-only leaf still readable");
+        env.cr[0] = saved_cr0;
 
         /* NX on the leaf, with EFER.NXE enabled, blocks fetch only. */
         env.efer |= MSR_EFER_NXE;

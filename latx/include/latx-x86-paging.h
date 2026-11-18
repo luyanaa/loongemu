@@ -83,6 +83,18 @@ LatxX86WalkResult latx_x86_walk_cached(const struct CPUX86State *env,
                                        LatxX86Translation *out);
 
 /*
+ * Validate one guest access.  `gva` is the first byte, `size_bits` the access
+ * width; every page the access touches is checked, so a store crossing a
+ * page boundary is not approved on the strength of its first page.
+ *
+ * Returns 0 when the access may proceed.  Otherwise it records the fault the
+ * guest should take -- CR2, exception_index and the error code -- and returns
+ * non-zero, leaving the caller to leave the block so the instruction restarts.
+ */
+int latx_x86_check_guest_access(struct CPUX86State *env, uint64_t gva,
+                                uint32_t access, uint32_t size_bits);
+
+/*
  * Physical-memory read used for the tables themselves.  Weak default reads
  * the identity mapping; a board overrides it when guest RAM lives elsewhere.
  */

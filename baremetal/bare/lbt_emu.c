@@ -93,6 +93,8 @@ void lbt_handle(uint64_t *regs)
         puthex(era);
         latx_bare_uart_puts(" badv=");
         puthex(badv);
+        latx_bare_uart_puts(" insn=");
+        puthex(*(const volatile uint32_t *)(uintptr_t)era);
         latx_bare_uart_puts("\n");
         for (;;) {
         }
