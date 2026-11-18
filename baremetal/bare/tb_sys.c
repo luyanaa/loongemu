@@ -478,6 +478,37 @@ void kmain(void)
         r = latx_x86_walk(&env, 0x1000, LATX_X86_ACCESS_READ, &t);
         check(r == LATX_X86_WALK_OK, "NX leaf still readable");
 
+        /*
+         * Cached walks.  The cache must agree with the walker, must go stale
+         * when only the PTE changes (that is the guest's job to invalidate),
+         * and must be dropped by INVLPG and by a CR3 write.
+         */
+        latx_x86_tlb_flush_all();
+        *(volatile uint64_t *)0x4000 = 0x81;      /* read-only leaf */
+        r = latx_x86_walk_cached(&env, 0x1000, LATX_X86_ACCESS_READ, &t);
+        check(r == LATX_X86_WALK_OK && t.gpa == 0x1000, "cached walk fills");
+        env.cr[0] |= CR0_WP_MASK;
+        r = latx_x86_walk_cached(&env, 0x1000, LATX_X86_ACCESS_WRITE, &t);
+        check(r == LATX_X86_WALK_PROTECTION,
+              "cached leaf permissions are re-checked without a walk");
+        /* Back to writable in the table, but the cache still says read-only. */
+        *(volatile uint64_t *)0x4000 = 0x83;
+        r = latx_x86_walk_cached(&env, 0x1000, LATX_X86_ACCESS_WRITE, &t);
+        check(r == LATX_X86_WALK_PROTECTION, "no invalidation keeps the old leaf");
+        /* INVLPG goes through helper_invlpg -> tlb_flush_page. */
+        helper_invlpg(&env, 0x1000);
+        r = latx_x86_walk_cached(&env, 0x1000, LATX_X86_ACCESS_WRITE, &t);
+        check(r == LATX_X86_WALK_OK, "INVLPG drops the stale leaf");
+        env.cr[0] &= ~(uint64_t)CR0_WP_MASK;
+        /* A CR3 write drops everything, as a real address-space switch must. */
+        *(volatile uint64_t *)0x4000 = 0x81;
+        r = latx_x86_walk_cached(&env, 0x1000, LATX_X86_ACCESS_READ, &t);
+        check(r == LATX_X86_WALK_OK, "cache refilled after INVLPG");
+        *(volatile uint64_t *)0x4000 = 0x83;
+        cpu_x86_update_cr3(&env, env.cr[3]);
+        r = latx_x86_walk_cached(&env, 0x1000, LATX_X86_ACCESS_WRITE, &t);
+        check(r == LATX_X86_WALK_OK, "CR3 write drops the cache");
+
         /* PS at the PML4 level is a reserved encoding, not a 512 GiB page. */
         *(volatile uint64_t *)0x4000 = 0x83;
         *(volatile uint64_t *)0x2000 = 0x3003 | 0x80;

@@ -154,6 +154,96 @@ LatxX86WalkResult latx_x86_walk(const CPUX86State *env, uint64_t va,
     return LATX_X86_WALK_OK;
 }
 
+/* ---------------- cached walks ---------------- */
+
+typedef struct LatxX86TlbEntry {
+    uint64_t cr3;
+    uint64_t tag;        /* va >> page_bits */
+    uint64_t gpa_base;   /* leaf base */
+    uint32_t page_bits;
+    uint32_t perm;
+    bool valid;
+} LatxX86TlbEntry;
+
+static LatxX86TlbEntry latx_x86_tlb[LATX_X86_TLB_ENTRIES];
+
+void latx_x86_tlb_flush_all(void)
+{
+    memset(latx_x86_tlb, 0, sizeof(latx_x86_tlb));
+}
+
+void latx_x86_tlb_flush_page(uint64_t va)
+{
+    for (unsigned i = 0; i < LATX_X86_TLB_ENTRIES; i++) {
+        LatxX86TlbEntry *e = &latx_x86_tlb[i];
+
+        /*
+         * An entry answers every address inside its leaf, so a flush for any
+         * address in that leaf invalidates it.  Entries for smaller pages are
+         * separate slots and are matched by their own page size.
+         */
+        if (e->valid && (va >> e->page_bits) == e->tag) {
+            e->valid = false;
+        }
+    }
+}
+
+LatxX86WalkResult latx_x86_walk_cached(const CPUX86State *env, uint64_t va,
+                                       uint32_t access,
+                                       LatxX86Translation *out)
+{
+    uint64_t cr3 = env->cr[3] & PTE_PHYS_MASK;
+    LatxX86TlbEntry *e = &latx_x86_tlb[(va >> 12) & (LATX_X86_TLB_ENTRIES - 1)];
+    LatxX86WalkResult r;
+
+    /* Paging off, or no long-mode paging at all: no cache to consult. */
+    if (!(env->cr[0] & CR0_PG_MASK) || !(env->cr[4] & CR4_PAE_MASK)) {
+        return latx_x86_walk(env, va, access, out);
+    }
+
+    if (e->valid && e->cr3 == cr3 && (va >> e->page_bits) == e->tag) {
+        memset(out, 0, sizeof(*out));
+        out->page_bits = e->page_bits;
+        out->gpa = e->gpa_base | (va & ((UINT64_C(1) << e->page_bits) - 1));
+        out->perm = e->perm;
+        out->pte = 0;            /* not kept: the cache may outlive an A/D bump */
+
+        if ((access & LATX_X86_ACCESS_USER) && !(e->perm & LATX_X86_ACCESS_USER)) {
+            return LATX_X86_WALK_PROTECTION;
+        }
+        if ((access & LATX_X86_ACCESS_WRITE) &&
+            !(e->perm & LATX_X86_ACCESS_WRITE)) {
+            bool user = (access & LATX_X86_ACCESS_USER) != 0;
+
+            if (user || (env->cr[0] & CR0_WP_MASK)) {
+                return LATX_X86_WALK_PROTECTION;
+            }
+        }
+        if ((access & LATX_X86_ACCESS_EXEC) &&
+            !(e->perm & LATX_X86_ACCESS_EXEC)) {
+            return LATX_X86_WALK_PROTECTION;
+        }
+        return LATX_X86_WALK_OK;
+    }
+
+    r = latx_x86_walk(env, va, access, out);
+    if (r != LATX_X86_WALK_OK && r != LATX_X86_WALK_PROTECTION) {
+        /*
+         * A not-present or malformed entry is never cached: the guest may be
+         * about to fix it, and a negative entry would then need its own
+         * invalidation protocol.
+         */
+        return r;
+    }
+    e->cr3 = cr3;
+    e->page_bits = out->page_bits;
+    e->tag = va >> out->page_bits;
+    e->gpa_base = out->gpa & ~((UINT64_C(1) << out->page_bits) - 1);
+    e->perm = out->perm;
+    e->valid = true;
+    return r;
+}
+
 uint32_t latx_x86_fault_error_code(const CPUX86State *env,
                                    LatxX86WalkResult result, uint32_t access)
 {

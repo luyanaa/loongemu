@@ -66,6 +66,23 @@ uint32_t latx_x86_fault_error_code(const struct CPUX86State *env,
                                    LatxX86WalkResult result, uint32_t access);
 
 /*
+ * Cached walks.
+ *
+ * A page-granular cache keyed by (cr3, leaf index) is what makes a per-access
+ * check affordable.  It is direct mapped and small: a miss simply walks, and
+ * correctness does not depend on the cache at all, only on the flushes below
+ * being called.  A large leaf is stored with its own size, so an entry for a
+ * 2 MiB page answers every address inside it.
+ */
+#define LATX_X86_TLB_ENTRIES 64
+
+void latx_x86_tlb_flush_all(void);
+void latx_x86_tlb_flush_page(uint64_t va);
+LatxX86WalkResult latx_x86_walk_cached(const struct CPUX86State *env,
+                                       uint64_t va, uint32_t access,
+                                       LatxX86Translation *out);
+
+/*
  * Physical-memory read used for the tables themselves.  Weak default reads
  * the identity mapping; a board overrides it when guest RAM lives elsewhere.
  */

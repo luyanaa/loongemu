@@ -14,6 +14,7 @@
 #include "cpu.h"
 #include "latx-options.h"
 #include "latx-smc.h"
+#include "latx-x86-paging.h"
 
 /* ---------------- platform hooks (weak defaults) ---------------- */
 __attribute__((weak)) uint64_t latx_platform_io_read(uint32_t port, int size)
@@ -211,6 +212,11 @@ void cpu_x86_update_cr0(CPUX86State *env, uint32_t new_cr0)
 void cpu_x86_update_cr3(CPUX86State *env, target_ulong new_cr3)
 {
     env->cr[3] = new_cr3;
+    /*
+     * A new address space invalidates every cached guest translation.  The
+     * TB cache is keyed on cr3 separately, but a walk result is not.
+     */
+    latx_x86_tlb_flush_all();
     tlb_flush_page(0, 0);
 }
 
@@ -313,15 +319,24 @@ void cpu_svm_check_intercept_param(CPUX86State *env, uint32_t type,
     (void)retaddr;
 }
 
+/*
+ * The QEMU helpers express their invalidation through these two functions --
+ * helper_invlpg() calls tlb_flush_page(), a TLB-wide flush calls tlb_flush().
+ * Routing them into the guest translation cache is what makes INVLPG visible
+ * here: a guest that edits a PTE and invalidates gets the new answer on the
+ * next walk, and one that edits without invalidating keeps the old one, which
+ * is exactly the architecture's contract.
+ */
 void tlb_flush(CPUState *cpu)
 {
     (void)cpu;
+    latx_x86_tlb_flush_all();
 }
 
 void tlb_flush_page(CPUState *cpu, uint64_t addr)
 {
     (void)cpu;
-    (void)addr;
+    latx_x86_tlb_flush_page(addr);
 }
 
 int qemu_guest_getrandom(void *buf, size_t len, void **errp)
