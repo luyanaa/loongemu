@@ -55,9 +55,11 @@
  *     lbt_x86sub_w immediately before each lbt_x86setj.
  *   - A call pushes the return address, so the guest needs a stack; ESP was
  *     left at zero and the push faulted.
- *   - Past that point the harness hits a decoder abort on `call rel32`, the
- *     same class as the earlier one on `dec r32` (ir1_disasm exits when
- *     la_disa_v1 reports more than one instruction).
+ *   - Past that point the translator requests a single 8.9 MiB allocation
+ *     from a 4 MiB arena and aborts.  Arena occupancy at that moment is only
+ *     40 KiB, so it is one oversized request rather than exhaustion: some
+ *     size computation inside translation is being fed a value far larger
+ *     than any structure it should need.
  *   - The exit is a self-looping link slot only the runtime linker fills.
  *     Routing the block through a patched slot (turning `b 0` into a nop so
  *     it falls into the epilogue jump) makes the block return.  tb_loop now

@@ -396,7 +396,9 @@ ADDRX ir1_disasm(IR1_INST *ir1, uint8_t *addr, ADDRX t_pc, int ir1_num,
     }
 
     if (count != 1) {
-        fprintf(stderr, "ERROR : disasm, ADDR : 0x%" PRIx64 "\n", (uint64_t)t_pc);
+        fprintf(stderr, "ERROR : disasm, ADDR : 0x%" PRIx64
+                " count=%d bytes=%02x %02x %02x %02x\n",
+                (uint64_t)t_pc, count, addr[0], addr[1], addr[2], addr[3]);
         exit(-1);
     }
 
