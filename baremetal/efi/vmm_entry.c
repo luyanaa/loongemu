@@ -21,6 +21,14 @@
  *
  * Everything here runs on real hardware (or QEMU) at PLV0; the table
  * arithmetic itself is unit tested on the host via loongarch_paging.c.
+ *
+ * STATUS: the same sequence is verified end to end by baremetal/bare/
+ * paging_smoke.c (make test-p0): a PLV3 load faults, the PLV0 handler walks
+ * the table, TLBFILLs, and the load completes with the right value.  This
+ * UEFI entry reaches its allocations, GetMemoryMap and the PWCL/PWCH/STLBPS
+ * programming, but ExitBootServices does not return on this firmware in the
+ * current build, so the probe below is not executed and the UEFI path is
+ * NOT verified.  See the note at the ExitBootServices call.
  */
 
 #include <stdint.h>
