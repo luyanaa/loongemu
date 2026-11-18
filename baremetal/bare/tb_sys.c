@@ -177,7 +177,8 @@ int latx_platform_apic_mmio(uint64_t gpa, int is_write, uint64_t *value)
 
 /* ---------------- guest memory ---------------- */
 
-#define GUEST_RAM_SIZE (64 * 1024)
+/* Guest-visible RAM: the whole area below the VMM's load base. */
+#define GUEST_RAM_SIZE (64 * 1024 * 1024)
 #define GUEST_BASE     0x0
 #define PROGRAM_PC     0x0ffe
 #define GDT_PC         0x1200
@@ -623,7 +624,17 @@ static int is_plv0_helper_entry(uint64_t addr)
 {
     /* Any address inside the VMM .text segment (0x200000..0x395260) that is
      * not in the guest RAM (< 0x10000) or the PLV3 code cache is a VMM helper. */
-    return addr >= 0x200000ULL && addr < 0x3a0000ULL && !is_host_vmm_va(addr);
+    /*
+     * Any address from the VMM's load base upward that is not one of its own
+     * mapped buffers is a helper entry point.  The base comes from the symbol
+     * rather than a literal, so moving the VMM (as the linker script does to
+     * free the low 64 MiB for the guest) does not silently break this test.
+     */
+    {
+        uint64_t vmm_base = (uint64_t)(uintptr_t)&env & ~UINT64_C(0x3fffff);
+
+        return addr >= vmm_base && !is_host_vmm_va(addr);
+    }
 }
 
 static void fill_hw_tlb_pair(uint64_t badv, int is_refill)
@@ -2158,6 +2169,23 @@ void kmain(void)
         latx_bare_uart_puts("tb-sys: kernel_entry_bytes=");
         puthex((uint64_t)emitted);
         latx_bare_uart_puts("\n");
+    }
+
+    /*
+     * The low 64 MiB belongs to the guest and the VMM starts above it.  A
+     * translation at the top of that window must succeed and must not be
+     * rejected by the fetch guard, which is what bounds a guest image.
+     */
+    {
+        uint64_t probe = GUEST_RAM_SIZE - 0x1000;
+        int emitted;
+
+        memset((void *)(uintptr_t)probe, 0x90, 256);   /* nop sled */
+        emitted = tb_harness_translate_at(probe,
+                                          (uint8_t *)(uintptr_t)(CODE_SCRATCH),
+                                          1024);
+        check(emitted > 0, "guest RAM reaches 64 MiB");
+        check(g_bad_fetch == 0, "no fetch outside guest RAM");
     }
 
     latx_bare_uart_puts("tb-sys: checks=");
