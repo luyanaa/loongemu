@@ -305,6 +305,10 @@ static uint64_t g_guest_isr_addr;            /* IDT[vector].offset        */
 static uint32_t g_guest_ticks;               /* incremented by the stub   */
 static uint32_t g_timer_vector = 0x20;       /* PIC default vector        */
 
+/* A copy of the real kernel entry point, and scratch for its translation. */
+#define KERNEL_ENTRY_PC  0x0000a000
+#define CODE_SCRATCH     0x0008c000
+
 /* Local APIC window, as a guest physical range. */
 #define APIC_MMIO_BASE  0xfee00000ULL
 #define APIC_MMIO_SIZE  0x00100000ULL
@@ -1684,6 +1688,37 @@ void kmain(void)
         }
 
         (void)delivered_before;
+    }
+
+    /*
+     * (6) A real kernel entry decodes and translates.
+     *
+     * These are the first bytes of Linux's 64-bit entry point, taken verbatim
+     * from an x86-64 vmlinux (`_text` + 0x90): mov rdi,rsi ; lea rsp,[rip+..] ;
+     * lea rdi,[rip+..] ; mov ecx,.. ; lea rdx,.. ; mov eax,.. ; wrmsr ; call.
+     * Translating them proves the dispatch table covers the sequence a kernel
+     * executes before it has a stack of its own -- the part that cannot be
+     * skipped by starting the guest somewhere more convenient.
+     */
+    {
+        static const uint8_t kernel_entry[] = {
+            0x49, 0x89, 0xf7, 0x48, 0x8d, 0x25, 0xbe, 0x3e,
+            0x80, 0x01, 0x48, 0x8d, 0x3d, 0x5f, 0xff, 0xff,
+            0xff, 0xb9, 0x01, 0x01, 0x00, 0xc0, 0x48, 0x8d,
+            0x15, 0x53, 0xef, 0xd5, 0x01, 0x89, 0xd0, 0x48,
+            0xc1, 0xea, 0x20, 0x0f, 0x30, 0xe8, 0xa6, 0x05,
+        };
+        uint64_t pc = KERNEL_ENTRY_PC;
+        int emitted;
+
+        memcpy((void *)(uintptr_t)pc, kernel_entry, sizeof(kernel_entry));
+
+        emitted = tb_harness_translate_at(pc, (uint8_t *)(uintptr_t)
+                                          (CODE_SCRATCH), 4096);
+        check(emitted > 0, "kernel entry block translates");
+        latx_bare_uart_puts("tb-sys: kernel_entry_bytes=");
+        puthex((uint64_t)emitted);
+        latx_bare_uart_puts("\n");
     }
 
     latx_bare_uart_puts("tb-sys: checks=");
