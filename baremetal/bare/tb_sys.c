@@ -2246,6 +2246,66 @@ void kmain(void)
     }
 
     /*
+     * A kernel runs from the negative half of the address space:
+     * 0xffffffff81000000 in the real image.  Build the four levels that map
+     * one such page onto physical memory and check the walker resolves it,
+     * because everything after this -- fetching the entry point, pushing a
+     * stack, following a call -- goes through that translation.
+     */
+    {
+        /*
+         * Well clear of the guest image (which occupies 0x0-0x10000) and of
+         * the test structures below it.
+         */
+        uint64_t pml4 = 0x200000, pdpt = 0x201000, pd = 0x202000, pt = 0x203000;
+        uint64_t gva = 0xffffffff81000000ULL;
+        uint64_t gpa = 0x1000000ULL;        /* where the kernel would live */
+        LatxX86Translation t;
+        uint64_t saved_cr3 = env.cr[3];
+        uint64_t saved_cr0 = env.cr[0];
+
+        memset((void *)(uintptr_t)pml4, 0, 0x4000);
+        /* PML4[511] -> PDPT, PDPT[510] -> PD, PD[0] -> PT, PT[0] -> 16 MiB */
+        *(volatile uint64_t *)(uintptr_t)(pml4 + 511 * 8) = pdpt | 0x3;
+        *(volatile uint64_t *)(uintptr_t)(pdpt + 510 * 8) = pd | 0x3;
+        /*
+         * Index arithmetic for 0xffffffff81000000: PML4[511], PDPT[510],
+         * PD[8], PT[0].  The PD index is 8, not 0 -- 0x81000000 has a non-zero
+         * bit 21, and using index 0 was why the walk reported NOT_PRESENT
+         * with otherwise correct tables.
+         */
+        *(volatile uint64_t *)(uintptr_t)(pd + 8 * 8) = pt | 0x3;
+        *(volatile uint64_t *)(uintptr_t)(pt + 0 * 8) =
+            (gpa & ~UINT64_C(0xfff)) | 0x3;
+
+        /*
+         * Long mode is PAE paging, always: the walker refuses to walk without
+         * CR4.PAE, which is what it means for this to be long mode rather
+         * than a 32-bit page directory.
+         */
+        {
+            uint64_t saved_cr4 = env.cr[4];
+
+            env.cr[4] = saved_cr4 | CR4_PAE_MASK;
+            env.cr[3] = pml4;
+            env.cr[0] = saved_cr0 | 0x80000000u;    /* CR0.PG */
+            latx_x86_tlb_flush_all();
+
+        check(latx_x86_walk(&env, gva, LATX_X86_ACCESS_READ, &t) ==
+              LATX_X86_WALK_OK, "kernel GVA 0xffffffff81000000 walks");
+        check(t.gpa == gpa, "kernel GVA resolves to the physical load base");
+        latx_bare_uart_puts("tb-sys: kernel_gpa=");
+        puthex(t.gpa);
+        latx_bare_uart_puts("\n");
+
+            env.cr[3] = saved_cr3;
+            env.cr[0] = saved_cr0;
+            env.cr[4] = saved_cr4;
+            latx_x86_tlb_flush_all();
+        }
+    }
+
+    /*
      * The low 64 MiB belongs to the guest and the VMM starts above it.  A
      * translation at the top of that window must succeed and must not be
      * rejected by the fetch guard, which is what bounds a guest image.
