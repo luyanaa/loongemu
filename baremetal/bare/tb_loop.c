@@ -18,15 +18,25 @@
  * spins; the assertions check the loop ran, the call returned, and the
  * translator produced more than one block.
  *
- * STATUS: the harness is complete and builds, but it does not pass yet.  The
- * single-block smoke in main.c -- which this reuses, unchanged in substance --
- * already ends with rax=1, rbx=0, eip=0 on this tree, i.e. the translated
- * block runs without updating the guest state; the same failure reproduces
- * with the version of main.c from the previous commit, so it is a pre-existing
- * defect in the bare-metal execution path rather than something this harness
- * introduced.  Until that is fixed, neither harness can demonstrate real
- * execution: this one additionally trips the arena assert inside ir1_disasm
- * while decoding the second block.
+ * STATUS: the harness builds and translates, but execution does not return.
+ * What the bring-up established, and what is still wrong:
+ *
+ *   - qemu_loglevel_mask() in latx/compat/qemu/log.h was hardcoded to return
+ *     0, so CPU_LOG_TB_NOCHAIN could never take effect and every block exit
+ *     went to a link the harness never built.  It now reads qemu_loglevel.
+ *   - Entry uses the generated prologue/epilogue pair instead of the hand
+ *     rolled frame, because that pair is a matched call/return: it saves the
+ *     callee-saved set at fixed sp offsets, loads the guest registers, and
+ *     returns through $ra.  The old harness saved the same registers at the
+ *     same offsets but never loaded the guest state the block reads.
+ *   - ir1_disasm() exits the process on `dec r32` (0xff /1) in this build:
+ *     replacing `ff c9` with the equivalent `83 e9 01` moved the failure
+ *     from decode to execution.  That is a decoder defect, independent of
+ *     this harness.
+ *   - With the prologue installed, the first block is entered at its code
+ *     address and never returns; with a zeroed prologue the same block ran
+ *     (its LBT instructions trapped) and returned.  So the block itself
+ *     executes, and the remaining fault is in the entry/exit convention.
  */
 #include "qemu/osdep.h"
 #include "exec/exec-all.h"
@@ -38,6 +48,9 @@
 
 #include "loongemu/tb_cache.h"
 #include "lbt_emu.h"
+
+size_t latx_bare_arena_used(void);
+size_t latx_bare_arena_size(void);
 
 #define UART0_THR ((volatile unsigned char *)0x1fe001e0)
 
@@ -114,6 +127,7 @@ static uint8_t jmp_cache[4096] __attribute__((aligned(16)));
 #define CODE_CACHE_SIZE (256 * 1024)
 static uint8_t code_cache[CODE_CACHE_SIZE] __attribute__((aligned(16)));
 static uint8_t epi_buf[4096] __attribute__((aligned(16)));
+static uint8_t pro_buf[4096] __attribute__((aligned(16)));
 
 static uint64_t code_used;
 
@@ -128,20 +142,16 @@ void kmain(void);
 __asm__(".text\n.globl _start\n_start:\n  la $sp, kstack\n  lu12i.w $t0, 16\n"
         "  add.d $sp, $sp, $t0\n  bl kmain\n1:\n  b 1b\n");
 
-extern uint64_t latx_run_body(void *tb, void *env, void *epi);
-
-__asm__(
-".text\n.globl latx_run_body\nlatx_run_body:\n"
-"  addi.d $sp,$sp,-256\n"
-"  st.d $ra,$sp,120\n  st.d $fp,$sp,112\n"
-"  st.d $s0,$sp,40\n  st.d $s1,$sp,48\n  st.d $s2,$sp,56\n  st.d $s3,$sp,64\n"
-"  st.d $s4,$sp,72\n  st.d $s5,$sp,80\n  st.d $s6,$sp,88\n  st.d $s7,$sp,96\n"
-"  st.d $s8,$sp,104\n"
-"  move $s8,$a1\n"
-"  move $t4,$a2\n"
-"  ld.d $s0,$a1,0\n  ld.d $s3,$a1,24\n"
-"  jirl $zero,$a0,0\n"
-);
+/*
+ * Entry into translated code is the generated prologue, not a hand-written
+ * frame: prologue and epilogue are a matched pair that save the callee-saved
+ * set at fixed sp offsets, load the guest registers from env, and return
+ * through $ra.  With CPU_LOG_TB_NOCHAIN set the block's own exit jumps to the
+ * epilogue instead of a link slot, so one call runs exactly one block and
+ * comes back here.
+ */
+extern int latx_gen_prologue(void *code_buf);
+typedef void (*TbEntry)(void *tb_code, void *env);
 
 /* ---------------- guest program ---------------- */
 
@@ -158,10 +168,11 @@ __asm__(
  *   ret
  */
 static const uint8_t program[] = {
-    0xb8, 0x00, 0x00, 0x00, 0x00,             /* mov eax, 0     */
+    0x48, 0x89, 0xd8,                         /* mov rax, rbx (probe) */
+    0x31, 0xc0,                               /* xor eax, eax   */
     0xb9, 0x05, 0x00, 0x00, 0x00,             /* mov ecx, 5     */
     0x83, 0xc0, 0x02,                         /* add eax, 2     */
-    0xff, 0xc9,                               /* dec ecx        */
+    0x83, 0xe9, 0x01,                         /* sub ecx, 1     */
     0x75, 0xf9,                               /* jnz -7         */
     0xe8, 0x0a, 0x00, 0x00, 0x00,             /* call f         */
     0x89, 0xc3,                               /* mov ebx, eax   */
@@ -171,8 +182,8 @@ static const uint8_t program[] = {
 };
 
 /* Byte offsets in program[]: the self-jump is at +0x18, the function at +0x1a. */
-#define HALT_PC (PROGRAM_PC + 0x18)
-#define FUNC_PC (PROGRAM_PC + 0x1a)
+#define HALT_PC (PROGRAM_PC + 0x1b)
+#define FUNC_PC (PROGRAM_PC + 0x1d)
 
 /* ---------------- per-PC translation ---------------- */
 
@@ -199,9 +210,9 @@ static int is_control_flow(const IR1_INST *ir1)
 
 /*
  * Translate the block starting at pc into the code cache and return the
- * number of bytes emitted.  The exit is rewritten to jump through $t4, which
- * latx_run_body fills with the epilogue address; that makes every block
- * return to the C loop instead of following a link the harness never built.
+ * number of bytes emitted.  No exit patch is needed: with NOCHAIN set the
+ * translator itself emits the jump to the epilogue, which is the entry the
+ * harness calls through.
  */
 static int translate_at(uint64_t pc, uint8_t *code, uint64_t limit)
 {
@@ -213,8 +224,22 @@ static int translate_at(uint64_t pc, uint8_t *code, uint64_t limit)
     memset(ir1_list, 0, sizeof(ir1_list));
     memset(&ir1_sd, 0, sizeof(ir1_sd));
 
+    {
+        /*
+         * Decode from a local 32-byte copy, matching what the single-block
+         * harness does: ir1_disasm copies a maximum instruction (15 bytes)
+         * plus lookahead, and handing it a pointer into the guest image
+         * makes the bounds of that read depend on where in the image the
+         * block sits.
+         */
+        uint8_t insn_bytes[32] = { 0 };
+
+        for (unsigned b = 0; b < sizeof(insn_bytes); b++) {
+            insn_bytes[b] = latx_bare_ldub_code(pc + b);
+        }
+
     while (off < 32 && n < 8) {
-        ADDRX next = ir1_disasm(&ir1_list[n], guest_ram + (pc - GUEST_BASE) + off,
+        ADDRX next = ir1_disasm(&ir1_list[n], insn_bytes + off,
                                 (ADDRX)(pc + off), n, ir1_dt_area);
 
         if (next <= (ADDRX)(pc + off)) {
@@ -225,6 +250,7 @@ static int translate_at(uint64_t pc, uint8_t *code, uint64_t limit)
         if (is_control_flow(&ir1_list[n - 1])) {
             break;
         }
+    }
     }
     if (n == 0) {
         return -1;
@@ -240,13 +266,9 @@ static int translate_at(uint64_t pc, uint8_t *code, uint64_t limit)
     tb.s_data = &ir1_sd;
 
     rc = tr_translate_tb(&tb);
-    if (rc < 20 || (uint64_t)rc > limit) {
+    if (rc <= 0 || (uint64_t)rc > limit) {
         return -1;
     }
-    /* Replace the block's own exit with `jr $t4`. */
-    ((uint32_t *)code)[2] = 0x4c000200u;
-    ((uint32_t *)code)[3] = 0x03400000u;
-    ((uint32_t *)code)[4] = 0x03400000u;
     return rc;
 }
 
@@ -300,6 +322,9 @@ void kmain(void)
     latx_runtime_init();
 
     latx_gen_epilogue(epi_buf);
+    latx_gen_prologue(pro_buf);
+    /* Make every block exit to the epilogue rather than a link slot. */
+    qemu_loglevel |= CPU_LOG_TB_NOCHAIN;
 
 
     check(tbc_init(&tb_cache, tb_entries, tb_buckets, TB_TABLE_CAP) == 1,
@@ -345,7 +370,9 @@ void kmain(void)
             translated++;
         }
 
-        (void)latx_run_body((void *)(uintptr_t)e->code, &env, epi_buf);
+        ((TbEntry)(void *)(uintptr_t)pro_buf)((void *)(uintptr_t)e->code,
+                                              &env);
+
     }
 
     latx_bare_uart_puts("tb-loop: steps=");

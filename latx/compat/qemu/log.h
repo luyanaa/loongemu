@@ -19,9 +19,14 @@
 extern int qemu_loglevel;
 void qemu_log(const char *fmt, ...);
 
+/*
+ * The bare harnesses need CPU_LOG_TB_NOCHAIN to make translated blocks exit
+ * to the epilogue instead of chasing a link the harness never built, so this
+ * has to read the real level rather than answering "nothing enabled".
+ */
 static inline int qemu_loglevel_mask(int mask)
 {
-    return 0;
+    return qemu_loglevel & mask;
 }
 #define qemu_log_mask(mask, ...) do { (void)(mask); } while (0)
 #define qemu_log_mask_and_addr(mask, addr, ...) do { (void)(mask); } while (0)

@@ -29,7 +29,19 @@ __attribute__((weak)) void latx_bare_uart_puts(const char *s)
 #endif
 
 static unsigned char g_arena[LATX_BARE_ARENA_SIZE] __attribute__((aligned(16)));
+
+int qemu_loglevel;
 static size_t g_arena_used;
+
+size_t latx_bare_arena_used(void)
+{
+    return g_arena_used;
+}
+
+size_t latx_bare_arena_size(void)
+{
+    return LATX_BARE_ARENA_SIZE;
+}
 
 void *latx_bare_arena_base(void)
 {
