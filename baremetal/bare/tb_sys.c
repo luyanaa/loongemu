@@ -32,6 +32,8 @@
 #include "ir2.h"
 #include "translate.h"
 
+#include "latx-x86-paging.h"
+
 #include "loongemu/tb_cache.h"
 #include "lbt_emu.h"
 #include "tb_harness.h"
@@ -178,12 +180,12 @@ typedef void (*TbEntry)(void *tb_code, void *env);
  * reg=/2, rm=100) with SIB 0x25 (no index, base=101 -> disp32), i.e.
  * 0f 01 14 25 <disp32>.  With modrm 0x15 the operand is RIP-relative.
  *
- * The four stores build a 4-level table set: PML4[0] -> PDPT -> PD -> PT,
- * and PT[0] maps the first 2 MiB with PS set, which covers the code, the
- * stack and the string.  CR3 is loaded with the PML4 physical address and PG
- * is then set in CR0.
+ * The three stores build a valid 4-level table set: PML4[0] -> PDPT[0] -> PD,
+ * and PD[0] is a 2 MiB leaf (PS set at the PD level, which is where the
+ * manual puts it) mapping the first 2 MiB of guest physical memory.  CR4.PAE
+ * is set before CR3, as long mode requires.
  *
-  *   +0x00: b9 80 00 00 c0                       mov  ecx, 0xc0000080     ; EFER
+ *    *   +0x00: b9 80 00 00 c0                       mov  ecx, 0xc0000080     ; EFER
  *   +0x05: b8 00 01 00 00                       mov  eax, 0x100          ; LME
  *   +0x0a: 31 d2                                xor  edx, edx
  *   +0x0c: 0f 30                                wrmsr
@@ -192,32 +194,35 @@ typedef void (*TbEntry)(void *tb_code, void *env);
  *   +0x12: 0f 32                                rdmsr
  *   +0x14: 89 c3                                mov  ebx, eax            ; EFER as read back
  *   +0x16: 0f 01 14 25 00 12 00 00              lgdt [0x1200]
- *   +0x1e: 48 c7 04 25 00 20 00 00 03 30 00 00  mov  qword [0x2000], 0x3003  ; PML4 -> PDPT
- *   +0x2a: 48 c7 04 25 00 30 00 00 03 40 00 00  mov  qword [0x3000], 0x4003  ; PDPT -> PD
- *   +0x36: 48 c7 04 25 00 40 00 00 03 50 00 00  mov  qword [0x4000], 0x5003  ; PD   -> PT
- *   +0x42: 48 c7 04 25 00 50 00 00 83 00 00 00  mov  qword [0x5000], 0x83    ; PT: first 2 MiB
- *   +0x4e: b8 00 20 00 00                       mov  eax, 0x2000
- *   +0x53: 0f 22 d8                             mov  cr3, eax
- *   +0x56: 0f 20 d8                             mov  eax, cr3
- *   +0x59: 41 89 c4                             mov  r12d, eax           ; CR3 as read back
- *   +0x5c: b8 01 00 00 80                       mov  eax, 0x80000001     ; PG | PE
- *   +0x61: 0f 22 c0                             mov  cr0, eax
- *   +0x64: 0f 20 c0                             mov  eax, cr0
- *   +0x67: 89 c7                                mov  edi, eax            ; CR0 as read back
- *   +0x69: ba fd 03 00 00                       mov  edx, 0x3fd
- *   +0x6e: ec                                   in   al, dx
- *   +0x6f: 0f b6 c0                             movzx eax, al
- *   +0x72: 89 c5                                mov  ebp, eax            ; LSR as read back
- *   +0x74: be 00 00 00 00                       mov  esi, <str>          ; patched
- *   +0x79: 8a 06                                mov  al, [rsi]
- *   +0x7b: 84 c0                                test al, al
- *   +0x7d: 74 0c                                jz   +0x0c
- *   +0x7f: ba f8 03 00 00                       mov  edx, 0x3f8
- *   +0x84: ee                                   out  dx, al
- *   +0x85: 48 ff c6                             inc  rsi
- *   +0x88: eb ef                                jmp  -0x11
- *   +0x8a: 90                                   nop
- *   +0x8b: eb fe                                jmp  $
+ *   +0x1e: 48 c7 04 25 00 20 00 00 03 30 00 00  mov  qword [0x2000], 0x3003  ; PML4[0] -> PDPT
+ *   +0x2a: 48 c7 04 25 00 30 00 00 03 40 00 00  mov  qword [0x3000], 0x4003  ; PDPT[0] -> PD
+ *   +0x36: 48 c7 04 25 00 40 00 00 83 00 00 00  mov  qword [0x4000], 0x83    ; PD[0]: 2 MiB, P|RW|PS
+ *   +0x42: b8 20 00 00 00                       mov  eax, 0x20           ; PAE
+ *   +0x47: 0f 22 e0                             mov  cr4, eax
+ *   +0x4a: 0f 20 e0                             mov  eax, cr4
+ *   +0x4d: 41 89 c5                             mov  r13d, eax           ; CR4 as read back
+ *   +0x50: b8 00 20 00 00                       mov  eax, 0x2000
+ *   +0x55: 0f 22 d8                             mov  cr3, eax
+ *   +0x58: 0f 20 d8                             mov  eax, cr3
+ *   +0x5b: 41 89 c4                             mov  r12d, eax           ; CR3 as read back
+ *   +0x5e: b8 01 00 00 80                       mov  eax, 0x80000001     ; PG | PE
+ *   +0x63: 0f 22 c0                             mov  cr0, eax
+ *   +0x66: 0f 20 c0                             mov  eax, cr0
+ *   +0x69: 89 c7                                mov  edi, eax            ; CR0 as read back
+ *   +0x6b: ba fd 03 00 00                       mov  edx, 0x3fd
+ *   +0x70: ec                                   in   al, dx
+ *   +0x71: 0f b6 c0                             movzx eax, al
+ *   +0x74: 89 c5                                mov  ebp, eax            ; LSR as read back
+ *   +0x76: be 00 00 00 00                       mov  esi, <str>          ; patched
+ *   +0x7b: 8a 06                                mov  al, [rsi]
+ *   +0x7d: 84 c0                                test al, al
+ *   +0x7f: 74 0c                                jz   +0x0c
+ *   +0x81: ba f8 03 00 00                       mov  edx, 0x3f8
+ *   +0x86: ee                                   out  dx, al
+ *   +0x87: 48 ff c6                             inc  rsi
+ *   +0x8a: eb ef                                jmp  -0x11
+ *   +0x8c: 90                                   nop
+ *   +0x8d: eb fe                                jmp  $
  */
 static const uint8_t program[] = {
     0xb9, 0x80, 0x00, 0x00, 0xc0, 0xb8, 0x00, 0x01,
@@ -227,17 +232,17 @@ static const uint8_t program[] = {
     0x04, 0x25, 0x00, 0x20, 0x00, 0x00, 0x03, 0x30,
     0x00, 0x00, 0x48, 0xc7, 0x04, 0x25, 0x00, 0x30,
     0x00, 0x00, 0x03, 0x40, 0x00, 0x00, 0x48, 0xc7,
-    0x04, 0x25, 0x00, 0x40, 0x00, 0x00, 0x03, 0x50,
-    0x00, 0x00, 0x48, 0xc7, 0x04, 0x25, 0x00, 0x50,
-    0x00, 0x00, 0x83, 0x00, 0x00, 0x00, 0xb8, 0x00,
-    0x20, 0x00, 0x00, 0x0f, 0x22, 0xd8, 0x0f, 0x20,
-    0xd8, 0x41, 0x89, 0xc4, 0xb8, 0x01, 0x00, 0x00,
-    0x80, 0x0f, 0x22, 0xc0, 0x0f, 0x20, 0xc0, 0x89,
-    0xc7, 0xba, 0xfd, 0x03, 0x00, 0x00, 0xec, 0x0f,
-    0xb6, 0xc0, 0x89, 0xc5, 0xbe, 0x00, 0x00, 0x00,
-    0x00, 0x8a, 0x06, 0x84, 0xc0, 0x74, 0x0c, 0xba,
-    0xf8, 0x03, 0x00, 0x00, 0xee, 0x48, 0xff, 0xc6,
-    0xeb, 0xef, 0x90, 0xeb, 0xfe,
+    0x04, 0x25, 0x00, 0x40, 0x00, 0x00, 0x83, 0x00,
+    0x00, 0x00, 0xb8, 0x20, 0x00, 0x00, 0x00, 0x0f,
+    0x22, 0xe0, 0x0f, 0x20, 0xe0, 0x41, 0x89, 0xc5,
+    0xb8, 0x00, 0x20, 0x00, 0x00, 0x0f, 0x22, 0xd8,
+    0x0f, 0x20, 0xd8, 0x41, 0x89, 0xc4, 0xb8, 0x01,
+    0x00, 0x00, 0x80, 0x0f, 0x22, 0xc0, 0x0f, 0x20,
+    0xc0, 0x89, 0xc7, 0xba, 0xfd, 0x03, 0x00, 0x00,
+    0xec, 0x0f, 0xb6, 0xc0, 0x89, 0xc5, 0xbe, 0x00,
+    0x00, 0x00, 0x00, 0x8a, 0x06, 0x84, 0xc0, 0x74,
+    0x0c, 0xba, 0xf8, 0x03, 0x00, 0x00, 0xee, 0x48,
+    0xff, 0xc6, 0xeb, 0xef, 0x90, 0xeb, 0xfe,
 };
 
 static uint8_t gdt_image[16] __attribute__((aligned(16)));
@@ -249,7 +254,7 @@ static const uint8_t gdt_descriptor[] = {
     0x1f, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
-#define HALT_PC (PROGRAM_PC + 0x8b)
+#define HALT_PC (PROGRAM_PC + 0x8d)
 #define EFER_LME (1u << 8)
 #define EFER_LMA (1u << 10)
 
@@ -289,7 +294,7 @@ void kmain(void)
 
         memcpy(guest_ram + (PROGRAM_PC - GUEST_BASE) + 0x1a, &desc_addr,
                sizeof(desc_addr));
-        memcpy(guest_ram + (PROGRAM_PC - GUEST_BASE) + 0x75, &str_addr,
+        memcpy(guest_ram + (PROGRAM_PC - GUEST_BASE) + 0x77, &str_addr,
                sizeof(str_addr));
     }
 
@@ -412,11 +417,79 @@ void kmain(void)
     /* mov cr0 plus the read back */
     check(env.cr[0] == 0x80000001u, "mov cr0 stored");
     check(env.regs[R_EDI] == 0x80000001u, "mov r, cr0 reads it back");
+    /*
+     * The same tables, translated by the runtime's walker: 2 MiB leaf at the
+     * PD level, identity mapped, writable, supervisor only.
+     */
+    {
+        LatxX86Translation t;
+        LatxX86WalkResult r;
+
+        r = latx_x86_walk(&env, 0x1000, LATX_X86_ACCESS_READ, &t);
+        check(r == LATX_X86_WALK_OK && t.gpa == 0x1000 && t.page_bits == 21,
+              "walk maps 0x1000 with a 2 MiB leaf");
+        check((t.perm & LATX_X86_ACCESS_WRITE) != 0, "walk reports writable");
+
+        r = latx_x86_walk(&env, 0x1ff123, LATX_X86_ACCESS_READ, &t);
+        check(r == LATX_X86_WALK_OK && t.gpa == 0x1ff123,
+              "walk keeps the offset inside the leaf");
+
+        r = latx_x86_walk(&env, 0x200000, LATX_X86_ACCESS_READ, &t);
+        check(r == LATX_X86_WALK_NOT_PRESENT, "walk faults past the leaf");
+
+        r = latx_x86_walk(&env, 0x1000, LATX_X86_ACCESS_READ | LATX_X86_ACCESS_USER,
+                          &t);
+        check(r == LATX_X86_WALK_PROTECTION &&
+              latx_x86_fault_error_code(&env, r,
+                                        LATX_X86_ACCESS_READ | LATX_X86_ACCESS_USER) == 0x5,
+              "supervisor leaf faults for a user access (U/S error)");
+
+        /*
+         * Read-only leaf.  CR0.WP decides whether a supervisor write faults,
+         * so both sides of that switch are checked; a user write always
+         * faults.
+         */
+        *(volatile uint64_t *)0x4000 = 0x81;
+        r = latx_x86_walk(&env, 0x1000, LATX_X86_ACCESS_WRITE, &t);
+        check(r == LATX_X86_WALK_OK,
+              "WP clear: supervisor may write a read-only leaf");
+        env.cr[0] |= CR0_WP_MASK;
+        r = latx_x86_walk(&env, 0x1000, LATX_X86_ACCESS_WRITE, &t);
+        check(r == LATX_X86_WALK_PROTECTION &&
+              latx_x86_fault_error_code(&env, r, LATX_X86_ACCESS_WRITE) == 0x3,
+              "WP set: supervisor write faults (P|W error)");
+        r = latx_x86_walk(&env, 0x1000,
+                          LATX_X86_ACCESS_WRITE | LATX_X86_ACCESS_USER, &t);
+        check(r == LATX_X86_WALK_PROTECTION &&
+              latx_x86_fault_error_code(
+                  &env, r, LATX_X86_ACCESS_WRITE | LATX_X86_ACCESS_USER) == 0x7,
+              "user write to supervisor leaf faults (P|W|U error)");
+        env.cr[0] &= ~(uint64_t)CR0_WP_MASK;
+        r = latx_x86_walk(&env, 0x1000, LATX_X86_ACCESS_READ, &t);
+        check(r == LATX_X86_WALK_OK, "read-only leaf still readable");
+
+        /* NX on the leaf, with EFER.NXE enabled, blocks fetch only. */
+        env.efer |= MSR_EFER_NXE;
+        *(volatile uint64_t *)0x4000 = 0x8000000000000083ull;
+        r = latx_x86_walk(&env, 0x1000, LATX_X86_ACCESS_EXEC, &t);
+        check(r == LATX_X86_WALK_PROTECTION &&
+              latx_x86_fault_error_code(&env, r, LATX_X86_ACCESS_EXEC) == 0x11,
+              "NX leaf faults on fetch (P|I-D error)");
+        r = latx_x86_walk(&env, 0x1000, LATX_X86_ACCESS_READ, &t);
+        check(r == LATX_X86_WALK_OK, "NX leaf still readable");
+
+        /* PS at the PML4 level is a reserved encoding, not a 512 GiB page. */
+        *(volatile uint64_t *)0x4000 = 0x83;
+        *(volatile uint64_t *)0x2000 = 0x3003 | 0x80;
+        r = latx_x86_walk(&env, 0x1000, LATX_X86_ACCESS_READ, &t);
+        check(r == LATX_X86_WALK_RESERVED, "PS at the PML4 level is reserved");
+        *(volatile uint64_t *)0x2000 = 0x3003;
+    }
+
     /* the 4-level tables the guest built, read back through the data path */
     check(*(volatile uint64_t *)0x2000 == 0x3003u, "PML4 entry");
     check(*(volatile uint64_t *)0x3000 == 0x4003u, "PDPT entry");
-    check(*(volatile uint64_t *)0x4000 == 0x5003u, "PD entry");
-    check(*(volatile uint64_t *)0x5000 == 0x83u, "PT entry (2 MiB page)");
+    check(*(volatile uint64_t *)0x4000 == 0x83u, "PD entry (2 MiB leaf)");
     /* every byte of the banner came out of the guest's loop */
     check(uart_tx_count == (int)sizeof(banner) - 1 &&
           memcmp(uart_tx, banner, sizeof(banner) - 1) == 0,

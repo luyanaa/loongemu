@@ -44,6 +44,9 @@ static int is_control_flow(const IR1_INST *ir1)
  * below: with CPU_LOG_TB_NOCHAIN set the translator itself emits the jump to
  * the epilogue, which is the entry the harness calls through.
  */
+#define TB_DECODE_MAX_INSNS 8
+#define TB_MAX_X86_INSN_LEN 15
+
 int tb_harness_translate_at(uint64_t pc, uint8_t *code, uint64_t limit)
 {
     TranslationBlock tb;
@@ -56,18 +59,27 @@ int tb_harness_translate_at(uint64_t pc, uint8_t *code, uint64_t limit)
 
     {
         /*
-         * Decode from a local 32-byte copy: ir1_disasm copies a maximum
-         * instruction (15 bytes) plus lookahead, and handing it a pointer
-         * into the guest image makes the bounds of that read depend on
-         * where in the image the block sits.
+         * Decode from a local copy: ir1_disasm reads a maximum instruction
+         * (15 bytes) plus lookahead, and handing it a pointer into the guest
+         * image makes the bounds of that read depend on where in the image
+         * the block sits.
+         *
+         * The copy has to be big enough that every instruction it may decode
+         * has all 15 of its bytes present.  With a 32-byte copy, a block whose
+         * seventh instruction starts at offset 31 decodes that instruction
+         * from a zero-filled tail -- silently, as a different instruction with
+         * a different length -- and the rest of the block is shifted.  That is
+         * how `mov cr3, eax` became a one-operand instruction and stopped
+         * writing CR3.
          */
-        uint8_t insn_bytes[32] = { 0 };
+        uint8_t insn_bytes[TB_MAX_X86_INSN_LEN * TB_DECODE_MAX_INSNS] = { 0 };
 
         for (unsigned b = 0; b < sizeof(insn_bytes); b++) {
             insn_bytes[b] = latx_bare_ldub_code(pc + b);
         }
 
-        while (off < 32 && n < 8) {
+        while (n < TB_DECODE_MAX_INSNS &&
+               off + TB_MAX_X86_INSN_LEN <= (int)sizeof(insn_bytes)) {
             ADDRX next = ir1_disasm(&ir1_list[n], insn_bytes + off,
                                     (ADDRX)(pc + off), n, ir1_dt_area);
 
