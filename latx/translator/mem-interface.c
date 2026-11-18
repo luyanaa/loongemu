@@ -10,6 +10,8 @@
  * @brief Add some mem-opnd covert functions
  */
 #include "translate.h"
+#include "latx-x86-paging.h"
+#include "ir1.h"
 #include "reg-alloc.h"
 #include "aot.h"
 #include "latx-options.h"
@@ -617,8 +619,34 @@ IR2_OPND convert_mem_no_offset(IR1_OPND *opnd1)
     return convert_mem_helper(opnd1, NULL, 0, NULL);
 }
 
+/*
+ * With the page-table check enabled, the instruction body must dereference
+ * the address the checker approved, not the guest virtual address.  The check
+ * publishes that host address, so a dereference reads it here instead of
+ * recomputing the guest address.  Address-only uses (LEA) never reach this
+ * path: the checked wrapper does not set the flag for them.
+ */
+/*
+ * The translator sets this to the operand whose address it just validated;
+ * that operand's dereference then reads the address the checker published at
+ * run time.  Operand identity is decided while translating, the address is
+ * produced by the instruction's own check, so the two cannot drift apart.
+ */
+IR1_OPND *latx_x86_checked_operand;
+IR2_OPND latx_x86_checked_addr;
+
 IR2_OPND convert_mem(IR1_OPND *opnd1, int *host_off)
 {
+    if (opnd1 == latx_x86_checked_operand) {
+        /*
+         * The checker returned this address and the block is holding it in a
+         * host register that nothing else writes.  Dereference that.
+         */
+        if (host_off) {
+            *host_off = 0;
+        }
+        return latx_x86_checked_addr;
+    }
     return convert_mem_helper(opnd1, NULL, 0, host_off);
 }
 

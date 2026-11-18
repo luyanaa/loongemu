@@ -18,6 +18,7 @@
 #include "tu.h"
 #include "hbr.h"
 #include "jrra-translator.h"
+#include "latx-x86-paging.h"
 
 #if defined(CONFIG_LATX_KZT)
 #include "wrapper.h"
@@ -461,13 +462,37 @@ bool translate_wrmsr(IR1_INST *pir1)
  * splits displacements that do not fit the 12-bit immediate -- which a guest
  * address like 0x1200 does not.
  */
+/*
+ * Read one word of a descriptor-table operand.  The address is materialized
+ * with li_d and the load is emitted directly, rather than going through the
+ * memory-operand path: that path splits a displacement that does not fit the
+ * 12-bit immediate by adding it to a base register, and a base of riz gives it
+ * nothing to add to -- which produced a load through an uninitialized
+ * register.  A descriptor operand is always an absolute address, so there is
+ * nothing to fold.
+ */
 static IR2_OPND load_desc_word(uint32_t addr, int size_bits)
 {
-    IR1_OPND mem;
+    IR2_OPND base = ra_alloc_itemp();
+    IR2_OPND value = ra_alloc_itemp();
 
-    ir1_opnd_build_mem(&mem, size_bits, dt_X86_REG_RIZ, (int64_t)addr);
-    return load_ireg_from_ir1(&mem, UNKNOWN_EXTENSION, false);
+    li_d(base, addr);
+    switch (size_bits) {
+    case 16:
+        la_ld_hu(value, base, 0);
+        break;
+    case 32:
+        la_ld_wu(value, base, 0);
+        break;
+    default:
+        la_ld_d(value, base, 0);
+        break;
+    }
+    ra_free_temp(base);
+    return value;
 }
+
+/* Bring-up record: what the descriptor-table translation was handed. */
 
 static bool translate_descriptor_table(IR1_INST *pir1, bool is_gdt)
 {
@@ -479,6 +504,7 @@ static bool translate_descriptor_table(IR1_INST *pir1, bool is_gdt)
                            : lsenv_offset_of_idt_limit(lsenv);
     uint32_t addr = (uint32_t)ir1_opnd_simm(mem);
     IR2_OPND tmp, base, limit;
+
 
     if (size != 6 && size != 10) {
         return false;
@@ -1044,6 +1070,12 @@ bool translate_iretq(IR1_INST *pir1)
     IR2_OPND tmp_opnd = ra_alloc_itemp();
     IR2_OPND return_addr_opnd = ra_alloc_dbt_arg2();
 
+    /*
+     * Long-mode order from the top of the frame: RIP, CS, RFLAGS, RSP, SS.
+     * An exception that pushed an error code leaves it above RIP, which the
+     * handler removes before executing IRET; that is the handler's business,
+     * not this instruction's.
+     */
     la_ld_d(return_addr_opnd, esp_opnd, 0);
     /* cs */
     la_ld_d(tmp_opnd, esp_opnd, 8);
@@ -1052,7 +1084,7 @@ bool translate_iretq(IR1_INST *pir1)
     /* eflags */
     la_ld_d(eflags_opnd, esp_opnd, 16);
     la_x86mtflag(eflags_opnd, 0x3f);
-    /* esp */
+    /* rsp */
     la_ld_d(esp_tmp, esp_opnd, 24);
     /* ss */
     la_ld_d(tmp_opnd, esp_opnd, 32);
@@ -1063,6 +1095,12 @@ bool translate_iretq(IR1_INST *pir1)
     la_or(esp_opnd, esp_tmp, zero_ir2_opnd);
     ra_free_temp(esp_tmp);
 
+    /*
+     * The epilogue's first instruction stores its dbt-arg register into
+     * env.eip, so the popped RIP belongs there -- it is the register the
+     * exit path reads, and writing env directly would be overwritten by it.
+     * return_addr_opnd *is* that register.
+     */
     tr_generate_exit_tb(pir1, 0);
 
     return true;

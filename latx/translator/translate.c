@@ -3102,9 +3102,6 @@ static void tr_generate_single_step_exit(IR2_OPND next_pc)
 
 /* ---------------- guest page-table checked accesses ---------------- */
 
-#define LATX_ACCESS_PACK(mask, size_bits) \
-    ((uint32_t)(mask) | ((uint32_t)(size_bits) << 8))
-
 /*
  * The instruction's memory operands tell us how the access is used.  Capstone
  * reports READ/WRITE per operand; an operand that reports neither (an engine
@@ -3146,35 +3143,70 @@ static bool ir1_has_guest_mem_operand(IR1_INST *ir1)
  * guest registers are spilled first because the call is ordinary C and
  * r8..r15 live in caller-saved host registers.
  */
-static void tr_generate_access_check(IR1_INST *ir1, IR1_OPND *mem,
-                                     IR2_OPND fault_label)
+static IR2_OPND tr_generate_access_check(IR1_INST *ir1, IR1_OPND *mem,
+                                        IR2_OPND fault_label)
 {
     uint32_t user = ((CPUX86State *)lsenv->cpu_state)->hflags & HF_CPL_MASK
                         ? LATX_X86_ACCESS_USER : 0;
-    uint32_t packed = LATX_ACCESS_PACK(ir1_mem_access_mask(mem) | user,
-                                       ir1_opnd_size(mem));
+    uint32_t mask = ir1_mem_access_mask(mem) | user;
+    uint32_t size_bits = (uint32_t)ir1_opnd_size(mem);
     int imm = 0;
-    IR2_OPND base, addr, fn;
+    IR2_OPND base, addr, fn, hpa;
 
-    base = convert_mem(mem, &imm);
+    /*
+     * The checker needs the guest virtual address.  An absolute operand is
+     * materialized directly; anything else goes through the memory path.
+     */
     addr = ra_alloc_itemp();
-    if (imm) {
-        la_addi_d(addr, base, imm);
+    if (mem->type == dt_X86_OP_MEM && !ir1_opnd_has_base(mem) &&
+        !ir1_opnd_has_index(mem)) {
+        li_d(addr, (uint64_t)ir1_opnd_simm(mem));
     } else {
-        la_or(addr, base, zero_ir2_opnd);
+        base = convert_mem(mem, &imm);
+        if (imm) {
+            la_addi_d(addr, base, imm);
+        } else {
+            la_or(addr, base, zero_ir2_opnd);
+        }
     }
 
-    tr_save_guest_regs_for_helper();
-    fn = ra_alloc_dbt_arg2();
+    /*
+     * No guest register is saved: the checker only reads the environment and
+     * writes CR2/exception state on refusal, and it is compiled with the same
+     * call ABI as the other helpers (guest s0..s7 are callee-saved).  Saving
+     * and restoring anything would clobber values this block already computed.
+     */
+    fn = ra_alloc_itemp();
     aot_load_host_addr(fn, (ADDR)latx_x86_check_guest_access,
                        LOAD_HELPER_CHECK_ACCESS, 0);
     la_mov64(a0_ir2_opnd, env_ir2_opnd);
     la_mov64(a1_ir2_opnd, addr);
-    li_d(a2_ir2_opnd, packed);
+    li_d(a2_ir2_opnd, mask);
+    li_d(a3_ir2_opnd, size_bits);
+    li_d(a4_ir2_opnd, ir1_addr(ir1));
     la_jirl(ra_ir2_opnd, fn, 0);
-    tr_load_guest_regs_after_helper();
-    la_bnez(a0_ir2_opnd, fault_label);
+    ra_free_temp(fn);
+
+    /*
+     * The address comes back in a0.  A refusal has the high bit set and no
+     * valid host address does, so one branch covers both the test and the
+     * fault path.
+     */
+    hpa = ra_alloc_itemp();
+    la_or(hpa, a0_ir2_opnd, zero_ir2_opnd);
+    {
+        IR2_OPND ok = ra_alloc_label();
+        IR2_OPND faulted = ra_alloc_label();
+
+        la_srai_d(a0_ir2_opnd, a0_ir2_opnd, 63);
+        la_beqz(a0_ir2_opnd, ok);
+        la_b(faulted);
+        la_label(faulted);
+        la_b(fault_label);
+        la_label(ok);
+    }
     ra_free_temp(addr);
+    return hpa;
 }
 
 /*
@@ -3185,13 +3217,66 @@ static void tr_generate_access_check(IR1_INST *ir1, IR1_OPND *mem,
  */
 static void tr_generate_guest_fault_exit(IR1_INST *pir1)
 {
-    IR2_OPND eip_opnd = ra_alloc_dbt_arg2();
+    IR2_OPND eip_opnd = ra_alloc_dbt_arg2();   /* the epilogue's eip source */
     IR2_OPND base = ra_alloc_data();
     IR2_OPND target = ra_alloc_data();
+    IR2_OPND fn;
+    IR2_OPND restart = ra_alloc_label();
+    IR2_OPND done = ra_alloc_label();
 
+    tr_save_registers_to_env(0xff, 0xff, option_save_xmm, options_to_save());
+
+    /*
+     * The interrupted RIP has to be in the environment before the delivery
+     * runs: that is what the helper pushes into the frame.  A successful
+     * delivery overwrites it with the handler's RIP; a failed one leaves it,
+     * which is exactly the restart address the driver needs.
+     */
     li_d(eip_opnd, ir1_addr(pir1));
     la_store_addrx(eip_opnd, env_ir2_opnd, lsenv_offset_of_eip(lsenv));
-    tr_save_registers_to_env(0xff, 0xff, option_save_xmm, options_to_save());
+
+    /*
+     * Deliver through the guest's own IDT#14 when it has one.  The helper
+     * installs the handler's RIP, CS and RSP in the environment and returns 0;
+     * it returns non-zero when there is no usable gate, and then the fault
+     * stays with the driver.
+     *
+     * A plain itemp, never the dbt-arg register: the epilogue reads that
+     * register, so borrowing it here would change where the block returns.
+     */
+    fn = ra_alloc_itemp();
+    aot_load_host_addr(fn, (ADDR)latx_x86_deliver_fault,
+                       LOAD_HELPER_DELIVER_FAULT, 0);
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    li_d(a1_ir2_opnd, 14);                       /* #PF */
+    la_jirl(ra_ir2_opnd, fn, 0);
+    ra_free_temp(fn);
+
+    la_bnez(a0_ir2_opnd, restart);
+
+    /*
+     * A handler was entered.  The helper rewrote RIP, CS and RSP in the
+     * environment, but the host registers still hold the interrupted values
+     * and the epilogue saves them back -- which would undo the delivery.  So
+     * the environment is the source of truth here: reload the guest register
+     * file from it before leaving, exactly as any helper that edits the
+     * environment requires.
+     */
+    la_ld_d(eip_opnd, env_ir2_opnd, lsenv_offset_of_eip(lsenv));
+    tr_load_registers_from_env(0xff, 0xff, option_save_xmm, options_to_save());
+#ifdef TARGET_X86_64
+    tr_load_x64_8_registers_from_env(0xff, option_save_xmm);
+#endif
+    la_b(done);
+
+    /*
+     * No gate: leave the fault with the driver, which resumes the faulting
+     * instruction once the mapping is fixed.
+     */
+    la_label(restart);
+    /* eip already holds the faulting instruction: nothing to restore. */
+
+    la_label(done);
     la_data_li(base,
                (ADDR)((TranslationBlock *)lsenv->tr_data->curr_tb)->tc.ptr);
     la_data_li(target, context_switch_native_to_bt_ret_0);
@@ -3209,17 +3294,35 @@ static bool tr_translate_checked(IR1_INST *pir1)
     IR2_OPND fault_label = ra_alloc_label();
     IR2_OPND done_label = ra_alloc_label();
     int n = ir1_opnd_num(pir1);
+    int mem_operands = 0;
+    IR1_OPND *checked_operand = NULL;
     bool ok;
+
+    IR2_OPND last_hpa;
 
     for (int i = 0; i < n; i++) {
         IR1_OPND *opnd = ir1_get_opnd(pir1, i);
 
         if (ir1_opnd_is_mem(opnd)) {
-            tr_generate_access_check(pir1, opnd, fault_label);
+            mem_operands++;
+            checked_operand = opnd;
+            last_hpa = tr_generate_access_check(pir1, opnd, fault_label);
         }
     }
 
+    /*
+     * The checker published the address it approved; a store path that asks
+     * for exactly that address gets the translated one.  Nothing else does,
+     * so an instruction with two memory operands simply keeps using guest
+     * addresses for the second one -- correct for identity mappings, and
+     * refused by the checker for anything else.
+     */
+    latx_x86_checked_operand = (mem_operands == 1) ? checked_operand : NULL;
+    if (mem_operands == 1) {
+        latx_x86_checked_addr = last_hpa;
+    }
     ok = ir1_translate(pir1);
+    latx_x86_checked_operand = NULL;
     if (!ok) {
         return false;
     }

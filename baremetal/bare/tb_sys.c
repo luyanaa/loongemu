@@ -35,6 +35,7 @@
 #include "latx-options.h"
 #include "latx-x86-paging.h"
 
+
 #include "loongemu/tb_cache.h"
 #include "lbt_emu.h"
 #include "tb_harness.h"
@@ -54,7 +55,6 @@ static void puthex(uint64_t v)
     static const char d[] = "0123456789abcdef";
     int sh;
 
-    latx_bare_uart_puts("0x");
     for (sh = 60; sh >= 0; sh -= 4) {
         latx_bare_uart_putc(d[(v >> sh) & 0xf]);
     }
@@ -122,7 +122,12 @@ void latx_platform_io_write(uint32_t port, int size, uint64_t value)
 #define PROGRAM_PC     0x0ffe
 #define GDT_PC         0x1200
 #define STR_PC         0x6000
-#define STORE_PC       0x1500
+#define ALIAS_VA       0x202000u
+#define ALIAS_PA       0x100000
+#define RO_PC          0x201000u
+#define STORE_PC       (PROGRAM_PC + 0xc3)   /* the faulting store */
+#define IDT_DESC_PC    0x1400
+#define IDT_TABLE_PC   0x14e0
 
 static uint8_t guest_ram[GUEST_RAM_SIZE] __attribute__((aligned(4096)));
 
@@ -175,78 +180,118 @@ typedef void (*TbEntry)(void *tb_code, void *env);
  * at 0x0ffe, so its immediate straddles the 4 KiB boundary at 0x1000 and
  * instruction fetch has to cross a page to decode it.
  *
- * Offsets below are relative to PROGRAM_PC.  Three encoding details matter
- * here: EFER.LME is bit 8 (the value written is 0x100, not 1), `mov r32,
- * imm32` is always five bytes -- there is no imm8 form, so a short encoding
- * would silently swallow the next instruction -- and `lgdt [disp32]` in
- * 64-bit mode must go through SIB (modrm 0x14, SIB 0x25); with modrm 0x15 the
- * operand is RIP-relative.
+ * The tables this guest builds:
  *
- * The three stores build a valid 4-level table set: PML4[0] -> PDPT[0] -> PD,
- * with PD[0] a 2 MiB leaf.  It starts read-only (0x81) and CR0.WP is set, so
- * the store at +0x6b takes a real #PF; the driver acts as the guest's kernel,
- * makes the leaf writable and resumes at the store.
+ *   PML4[0] -> PDPT @0x3000
+ *   PDPT[0] -> PD   @0x4000
+ *   PD[0] = 0x83              2 MiB identity, writable (code, tables, data)
+ *   PD[1] -> PT   @0x5000
+ *   PT[1] = 0x00201001        VA 0x201000 -> PA 0x201000, read-only      <- the faulting page
+ *   PT[2] = 0x100003          VA 0x202000 -> PA 0x100000 <- non-identity
  *
- *    *   +0x00: b9 80 00 00 c0                       mov  ecx, 0xc0000080     ; EFER
- *   +0x05: b8 00 01 00 00                       mov  eax, 0x100          ; LME
- *   +0x0a: 31 d2                                xor  edx, edx
- *   +0x0c: 0f 30                                wrmsr
- *   +0x0e: 31 c0                                xor  eax, eax
- *   +0x10: 31 d2                                xor  edx, edx
- *   +0x12: 0f 32                                rdmsr
- *   +0x14: 89 c3                                mov  ebx, eax            ; EFER as read back
- *   +0x16: 0f 01 14 25 00 12 00 00              lgdt [0x1200]
- *   +0x1e: 48 c7 04 25 00 20 00 00 03 30 00 00  mov  qword [0x2000], 0x3003  ; PML4[0] -> PDPT
- *   +0x2a: 48 c7 04 25 00 30 00 00 03 40 00 00  mov  qword [0x3000], 0x4003  ; PDPT[0] -> PD
- *   +0x36: 48 c7 04 25 00 40 00 00 81 00 00 00  mov  qword [0x4000], 0x81    ; PD[0]: 2 MiB, read-only
- *   +0x42: b8 20 00 00 00                       mov  eax, 0x20           ; PAE
- *   +0x47: 0f 22 e0                             mov  cr4, eax
- *   +0x4a: 0f 20 e0                             mov  eax, cr4
- *   +0x4d: 41 89 c5                             mov  r13d, eax           ; CR4 as read back
- *   +0x50: b8 00 20 00 00                       mov  eax, 0x2000
- *   +0x55: 0f 22 d8                             mov  cr3, eax
- *   +0x58: 0f 20 d8                             mov  eax, cr3
- *   +0x5b: 41 89 c4                             mov  r12d, eax           ; CR3 as read back
- *   +0x5e: b8 01 00 01 80                       mov  eax, 0x80010001     ; PG | WP | PE
- *   +0x63: 0f 22 c0                             mov  cr0, eax
- *   +0x66: 0f 20 c0                             mov  eax, cr0
- *   +0x69: 89 c7                                mov  edi, eax            ; CR0 as read back
- *   +0x6b: c6 04 25 00 15 00 00 01              mov  byte [0x1500], 1    ; #PF: leaf is read-only
- *   +0x73: ba fd 03 00 00                       mov  edx, 0x3fd
- *   +0x78: ec                                   in   al, dx
- *   +0x79: 0f b6 c0                             movzx eax, al
- *   +0x7c: 89 c5                                mov  ebp, eax            ; LSR as read back
- *   +0x7e: be 00 00 00 00                       mov  esi, <str>          ; patched to 0x6000
- *   +0x83: 8a 06                                mov  al, [rsi]
- *   +0x85: 84 c0                                test al, al
- *   +0x87: 74 0c                                jz   +0x0c
- *   +0x89: ba f8 03 00 00                       mov  edx, 0x3f8
- *   +0x8e: ee                                   out  dx, al
- *   +0x8f: 48 ff c6                             inc  rsi
- *   +0x92: eb ef                                jmp  -0x11
- *   +0x94: 90                                   nop
- *   +0x95: eb fe                                jmp  $
+ * The guest stores to 0x201000 (refused: leaf is read-only), the runtime
+ * delivers #PF through IDT[14] to the handler at the end of this image, the
+ * handler records CR2/error-code/frame-RIP and makes the leaf writable, and
+ * IRETs.  The store is then retried and succeeds, and a store through the
+ * non-identity alias must appear at PA 0x100000.
+ *
+ * Offsets are relative to PROGRAM_PC.  EFER.LME is bit 8 (value 0x100);
+ * `mov r32, imm32` is always five bytes; `lgdt/lidt [disp32]` need the SIB
+ * form (modrm 0x14, SIB 0x25), since modrm 0x15 is RIP-relative.
+ *
+ *    *   +0x00: b9 80 00 00 c0                         mov  ecx, 0xc0000080
+ *   +0x05: b8 00 01 00 00                         mov  eax, 0x100
+ *   +0x0a: 31 d2                                  xor  edx, edx
+ *   +0x0c: 0f 30                                  wrmsr
+ *   +0x0e: 0f 01 14 25 00 12 00 00                lgdt [0x1200]
+ *   +0x16: c7 04 25 c0 15 00 00 e7 10 08 00       mov  dword [0x15c0], offset|selector
+ *   +0x21: c7 04 25 c4 15 00 00 00 8e 00 00       mov  dword [0x15c4], type_attr
+ *   +0x2c: c7 04 25 c8 15 00 00 00 00 00 00       mov  dword [0x15c8], 0
+ *   +0x37: c7 04 25 cc 15 00 00 00 00 00 00       mov  dword [0x15cc], 0
+ *   +0x42: 0f 01 1c 25 00 14 00 00                lidt [0x1400]
+ *   +0x4a: 48 c7 04 25 00 20 00 00 03 30 00 00    mov qword [0x2000], 0x3003
+ *   +0x56: 48 c7 04 25 00 30 00 00 03 40 00 00    mov qword [0x3000], 0x4003
+ *   +0x62: 48 c7 04 25 00 40 00 00 83 00 00 00    mov qword [0x4000], 0x83
+ *   +0x6e: 48 c7 04 25 08 40 00 00 03 50 00 00    mov qword [0x4008], 0x5003
+ *   +0x7a: 48 c7 04 25 08 50 00 00 81 00 00 00    mov qword [0x5008], 0x81
+ *   +0x86: 48 c7 04 25 10 50 00 00 03 00 10 00    mov qword [0x5010], 0x100003
+ *   +0x92: b8 20 00 00 00                         mov  eax, 0x20
+ *   +0x97: 0f 22 e0                               mov  cr4, eax
+ *   +0x9a: b8 00 20 00 00                         mov  eax, 0x2000
+ *   +0x9f: 0f 22 d8                               mov  cr3, eax
+ *   +0xa2: b8 01 00 01 80                         mov  eax, 0x80010001
+ *   +0xa7: 0f 22 c0                               mov  cr0, eax
+ *   +0xaa: c6 04 25 00 10 20 00 01                mov  byte [0x201000], 1   ; #PF
+ *   +0xb2: c6 04 25 00 10 20 00 02                mov  byte [0x201000], 2   ; after the handler
+ *   +0xba: 48 c7 04 25 00 20 20 00 11 22 33 44    mov  qword [0x202000], 0x44332211
+ *   +0xc6: 48 8b 04 25 00 20 20 00                mov  rax, [0x202000]
+ *   +0xce: 41 89 c6                               mov  r14d, eax
+ *   +0xd1: be 00 00 00 00                         mov  esi, <str>
+ *   +0xd6: 8a 06                                  mov  al, [rsi]
+ *   +0xd8: 84 c0                                  test al, al
+ *   +0xda: 74 0c                                  jz   +0x0c
+ *   +0xdc: ba f8 03 00 00                         mov  edx, 0x3f8
+ *   +0xe1: ee                                     out  dx, al
+ *   +0xe2: 48 ff c6                               inc  rsi
+ *   +0xe5: eb ef                                  jmp  -0x11
+ *   +0xe7: 90                                     nop
+ *   +0xe8: eb fe                                  jmp  $
+ * Handler for IDT[14]; the gate at +0x16 points at +0xea (0x10e8).
+ *   +0xea: 48 89 24 25 18 16 00 00                mov  qword [0x1618], rsp   ; frame pointer
+ *   +0xf2: 0f 20 d2                               mov  rdx, cr2
+ *   +0xf5: 48 89 14 25 00 16 00 00                mov  qword [0x1600], rdx   ; CR2
+ *   +0xfd: 48 8b 4c 24 08                         mov  rcx, [rsp+8]          ; frame RIP
+ *   +0x102: 48 89 0c 25 10 16 00 00                mov  qword [0x1610], rcx
+ *   +0x10a: 8b 0c 24                               mov  ecx, [rsp]            ; error code
+ *   +0x10d: 89 0c 25 04 16 00 00                   mov  dword [0x1620], ecx
+ *   +0x114: ff 04 25 08 16 00 00                   inc  dword [0x1628]        ; runs
+ *   +0x11b: 48 c7 04 25 08 50 00 00 83 00 00 00    mov  qword [0x5008], 0x03   ; fix the PTE
+ *   +0x127: 48 83 c4 08                            add  rsp, 8                ; drop the error code
+ *   +0x12b: 48 cf                                  iretq
  */
 static const uint8_t program[] = {
     0xb9, 0x80, 0x00, 0x00, 0xc0, 0xb8, 0x00, 0x01,
-    0x00, 0x00, 0x31, 0xd2, 0x0f, 0x30, 0x31, 0xc0,
-    0x31, 0xd2, 0x0f, 0x32, 0x89, 0xc3, 0x0f, 0x01,
-    0x14, 0x25, 0x00, 0x12, 0x00, 0x00, 0x48, 0xc7,
-    0x04, 0x25, 0x00, 0x20, 0x00, 0x00, 0x03, 0x30,
-    0x00, 0x00, 0x48, 0xc7, 0x04, 0x25, 0x00, 0x30,
-    0x00, 0x00, 0x03, 0x40, 0x00, 0x00, 0x48, 0xc7,
-    0x04, 0x25, 0x00, 0x40, 0x00, 0x00, 0x81, 0x00,
-    0x00, 0x00, 0xb8, 0x20, 0x00, 0x00, 0x00, 0x0f,
+    0x00, 0x00, 0x31, 0xd2, 0x0f, 0x30, 0x0f, 0x01,
+    0x14, 0x25, 0x00, 0x12, 0x00, 0x00, 0xc7, 0x04,
+    0x25, 0xc0, 0x15, 0x00, 0x00, 0x0c, 0x11, 0x08,
+    0x00, 0xc7, 0x04, 0x25, 0xc4, 0x15, 0x00, 0x00,
+    0x00, 0x8e, 0x00, 0x00, 0xc7, 0x04, 0x25, 0xc8,
+    0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc7,
+    0x04, 0x25, 0xcc, 0x15, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x0f, 0x01, 0x1c, 0x25, 0x00, 0x14,
+    0x00, 0x00, 0x48, 0xc7, 0x04, 0x25, 0x00, 0x20,
+    0x00, 0x00, 0x03, 0x30, 0x00, 0x00, 0x48, 0xc7,
+    0x04, 0x25, 0x00, 0x30, 0x00, 0x00, 0x03, 0x40,
+    0x00, 0x00, 0x48, 0xc7, 0x04, 0x25, 0x00, 0x40,
+    0x00, 0x00, 0x83, 0x00, 0x00, 0x00, 0x48, 0xc7,
+    0x04, 0x25, 0x08, 0x40, 0x00, 0x00, 0x03, 0x50,
+    0x00, 0x00, 0x48, 0xc7, 0x04, 0x25, 0x08, 0x50,
+    0x00, 0x00, 0x01, 0x10, 0x20, 0x00, 0x48, 0xc7,
+    0x04, 0x25, 0x10, 0x50, 0x00, 0x00, 0x03, 0x00,
+    0x10, 0x00, 0x31, 0xc0, 0x31, 0xd2, 0x0f, 0x32,
+    0x89, 0xc3, 0xb8, 0x20, 0x00, 0x00, 0x00, 0x0f,
     0x22, 0xe0, 0x0f, 0x20, 0xe0, 0x41, 0x89, 0xc5,
     0xb8, 0x00, 0x20, 0x00, 0x00, 0x0f, 0x22, 0xd8,
     0x0f, 0x20, 0xd8, 0x41, 0x89, 0xc4, 0xb8, 0x01,
     0x00, 0x01, 0x80, 0x0f, 0x22, 0xc0, 0x0f, 0x20,
-    0xc0, 0x89, 0xc7, 0xc6, 0x04, 0x25, 0x00, 0x15,
-    0x00, 0x00, 0x01, 0xba, 0xfd, 0x03, 0x00, 0x00,
-    0xec, 0x0f, 0xb6, 0xc0, 0x89, 0xc5, 0xbe, 0x00,
-    0x00, 0x00, 0x00, 0x8a, 0x06, 0x84, 0xc0, 0x74,
-    0x0c, 0xba, 0xf8, 0x03, 0x00, 0x00, 0xee, 0x48,
-    0xff, 0xc6, 0xeb, 0xef, 0x90, 0xeb, 0xfe,
+    0xc0, 0x89, 0xc7, 0xc6, 0x04, 0x25, 0x00, 0x10,
+    0x20, 0x00, 0x01, 0xc6, 0x04, 0x25, 0x00, 0x10,
+    0x20, 0x00, 0x02, 0x48, 0xc7, 0x04, 0x25, 0x00,
+    0x20, 0x20, 0x00, 0x11, 0x22, 0x33, 0x44, 0x48,
+    0x8b, 0x04, 0x25, 0x00, 0x20, 0x20, 0x00, 0x41,
+    0x89, 0xc6, 0xba, 0xfd, 0x03, 0x00, 0x00, 0xec,
+    0x0f, 0xb6, 0xc0, 0x89, 0xc5, 0xbe, 0x00, 0x00,
+    0x00, 0x00, 0x8a, 0x06, 0x84, 0xc0, 0x74, 0x0c,
+    0xba, 0xf8, 0x03, 0x00, 0x00, 0xee, 0x48, 0xff,
+    0xc6, 0xeb, 0xef, 0x90, 0xeb, 0xfe, 0x0f, 0x20,
+    0xd2, 0x48, 0x89, 0x14, 0x25, 0x00, 0x16, 0x00,
+    0x00, 0x48, 0x8b, 0x4c, 0x24, 0x08, 0x48, 0x89,
+    0x0c, 0x25, 0x10, 0x16, 0x00, 0x00, 0x8b, 0x0c,
+    0x24, 0x89, 0x0c, 0x25, 0x20, 0x16, 0x00, 0x00,
+    0xff, 0x04, 0x25, 0x28, 0x16, 0x00, 0x00, 0x48,
+    0xc7, 0x04, 0x25, 0x08, 0x50, 0x00, 0x00, 0x03,
+    0x10, 0x20, 0x00, 0x48, 0x83, 0xc4, 0x08, 0x48,
+    0xcf,
 };
 
 /* NUL terminated; the guest walks it and writes it out port by port. */
@@ -256,7 +301,7 @@ static const uint8_t gdt_descriptor[] = {
     0x1f, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
-#define HALT_PC (PROGRAM_PC + 0x95)
+#define HALT_PC (PROGRAM_PC + 0x10c)
 #define EFER_LME (1u << 8)
 #define EFER_LMA (1u << 10)
 
@@ -294,11 +339,24 @@ void kmain(void)
      * this image's .bss.
      */
     memcpy((void *)(uintptr_t)GDT_PC, gdt_descriptor, sizeof(gdt_descriptor));
+    /* IDT descriptor for lidt: 16-bit limit, 64-bit base of the table. */
+    {
+        static const uint8_t idt_descriptor[10] = {
+            0xff, 0x00,                     /* limit 0xff (16 gates)  */
+            0xe0, 0x14, 0x00, 0x00,         /* base 0x14e0             */
+            0x00, 0x00, 0x00, 0x00,
+        };
+
+        memcpy((void *)(uintptr_t)IDT_DESC_PC, idt_descriptor,
+               sizeof(idt_descriptor));
+    }
     memcpy((void *)(uintptr_t)STR_PC, banner, sizeof(banner));
+    /* The non-identity target starts clear so the guest's store is visible. */
+    *(volatile uint64_t *)(uintptr_t)ALIAS_PA = 0;
     {
         uint32_t str_addr = STR_PC;
 
-        memcpy(guest_ram + (PROGRAM_PC - GUEST_BASE) + 0x7f, &str_addr,
+        memcpy(guest_ram + (PROGRAM_PC - GUEST_BASE) + 0xf6, &str_addr,
                sizeof(str_addr));
     }
 
@@ -336,6 +394,7 @@ void kmain(void)
     /* EFER.LME is only writable when CPUID advertises long mode. */
     latx_x86_env_init_features(&env);
     /* Consult the guest's page tables for every data access. */
+    /* Consult the guest's page tables for every data access. */
     option_guest_paging = 1;
 
     latx_gen_epilogue(epi_buf);
@@ -368,8 +427,6 @@ void kmain(void)
             rc = tb_harness_translate_at(pc, code, CODE_CACHE_SIZE - code_used);
             if (rc < 0) {
                 latx_bare_uart_puts("tb-sys: translate failed at ");
-                puthex(pc);
-                latx_bare_uart_puts("\n");
                 check(0, "translate");
                 break;
             }
@@ -381,18 +438,12 @@ void kmain(void)
 
         ((TbEntry)(void *)(uintptr_t)pro_buf)((void *)(uintptr_t)e->code,
                                               &env);
-
         if (env.exception_index != 0) {
             faults++;
             fault_cr2 = env.cr[2];
             fault_ec = (uint32_t)env.error_code;
-            latx_bare_uart_puts("  #PF at ");
-            puthex(pc);
-            latx_bare_uart_puts(" cr2=");
-            puthex(fault_cr2);
-            latx_bare_uart_puts(" ec=");
-            puthex(fault_ec);
-            latx_bare_uart_puts("\n");
+            puthex(env.idt.base);
+            puthex(env.idt.limit);
 
             /*
              * Act as the guest's kernel: the store hit a read-only leaf, so
@@ -422,14 +473,17 @@ void kmain(void)
     latx_bare_uart_puts(" cr3=");
     puthex(env.cr[3]);
     latx_bare_uart_puts("\n");
-    latx_bare_uart_puts("tb-sys: ebx=");
-    puthex(env.regs[R_EBX]);
-    latx_bare_uart_puts(" esi=");
-    puthex(env.regs[R_ESI]);
-    latx_bare_uart_puts(" edi=");
-    puthex(env.regs[R_EDI]);
-    latx_bare_uart_puts(" ebp=");
-    puthex(env.regs[R_EBP]);
+    latx_bare_uart_puts("tb-sys: handler runs=");
+    puthex(*(volatile uint32_t *)(uintptr_t)0x1628);
+    latx_bare_uart_puts(" cr2=");
+    puthex(*(volatile uint64_t *)(uintptr_t)0x1600);
+    latx_bare_uart_puts(" ec=");
+    puthex(*(volatile uint32_t *)(uintptr_t)0x1620);
+    latx_bare_uart_puts("\n");
+    latx_bare_uart_puts("tb-sys: alias r14=");
+    puthex(env.regs[R_R14]);
+    latx_bare_uart_puts(" pa100000=");
+    puthex(*(volatile uint64_t *)(uintptr_t)ALIAS_PA);
     latx_bare_uart_puts("\n");
     latx_bare_uart_puts("tb-sys: gdt.base=");
     puthex(env.gdt.base);
@@ -450,12 +504,29 @@ void kmain(void)
     /* mov cr0 plus the read back */
     check(env.cr[0] == 0x80010001u, "mov cr0 stored (PG|WP|PE)");
     check(env.regs[R_EDI] == 0x80010001u, "mov r, cr0 reads it back");
-    /* the fault the checked store took, and the resume afterwards */
-    check(faults == 1, "read-only leaf raised exactly one #PF");
-    check(fault_cr2 == STORE_PC, "CR2 holds the faulting store address");
-    check(fault_ec == 0x3u, "error code is P|W (supervisor write)");
-    check(*(volatile uint8_t *)(uintptr_t)STORE_PC == 1,
-          "the store executed after the PTE was fixed");
+    /*
+     * The fault was delivered to the guest's own IDT[14] handler, which
+     * recorded what it saw.  No driver-side fault is expected: the guest owns
+     * the exception now.
+     */
+    check(faults == 0, "no fault escaped to the driver");
+    check(*(volatile uint32_t *)(uintptr_t)0x1628 == 1,
+          "the #PF handler ran exactly once");
+    check(*(volatile uint64_t *)(uintptr_t)0x1600 == RO_PC,
+          "handler saw CR2 = the faulting store address");
+    check(*(volatile uint64_t *)(uintptr_t)0x1610 == STORE_PC,
+          "the frame RIP is the faulting instruction");
+    check(*(volatile uint32_t *)(uintptr_t)0x1620 == 0x3u,
+          "error code is P|W (supervisor write)");
+    check(*(volatile uint64_t *)(uintptr_t)0x5008 == 0x00201003u,
+          "the handler made the leaf writable");
+    /*
+     * The first store faults and is retried; the retry is the second store,
+     * which writes 2.  Seeing 2 also proves the handler's IRET returned to the
+     * faulting instruction rather than past it.
+     */
+    check(*(volatile uint8_t *)(uintptr_t)RO_PC == 2,
+          "the retried store landed after the PTE was fixed");
     /*
      * The same tables, translated by the runtime's walker: 2 MiB leaf at the
      * PD level, identity mapped, writable, supervisor only.
@@ -463,6 +534,7 @@ void kmain(void)
     {
         LatxX86Translation t;
         LatxX86WalkResult r;
+        LatxX86Translation probe;
 
         r = latx_x86_walk(&env, 0x1000, LATX_X86_ACCESS_READ, &t);
         check(r == LATX_X86_WALK_OK && t.gpa == 0x1000 && t.page_bits == 21,
@@ -559,6 +631,24 @@ void kmain(void)
         check(r == LATX_X86_WALK_RESERVED, "PS at the PML4 level is reserved");
         *(volatile uint64_t *)0x2000 = 0x3003;
     }
+
+    /*
+     * Non-identity mapping: the guest stored 0x44332211 through VA
+     * 0x40000000, which PDPT[1]/PD2 translate to PA 0x100000.  The harness
+     * reads that physical page directly -- the translator cannot help here --
+     * and the value the guest read back into r14d must agree.
+     */
+    {
+        LatxX86Translation probe;
+
+        check(latx_x86_walk(&env, ALIAS_VA, LATX_X86_ACCESS_READ, &probe) ==
+              LATX_X86_WALK_OK && probe.gpa == ALIAS_PA &&
+              probe.page_bits == 12,
+              "walk maps the aliased VA to PA 0x100000");
+    }
+    check(*(volatile uint64_t *)(uintptr_t)ALIAS_PA == 0x44332211ull,
+          "store through the aliased VA reached PA 0x100000");
+    check(env.regs[R_R14] == 0x44332211u, "read through the aliased VA agrees");
 
     /* the 4-level tables the guest built, read back through the data path */
     check(*(volatile uint64_t *)0x2000 == 0x3003u, "PML4 entry");

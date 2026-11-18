@@ -91,8 +91,81 @@ LatxX86WalkResult latx_x86_walk_cached(const struct CPUX86State *env,
  * guest should take -- CR2, exception_index and the error code -- and returns
  * non-zero, leaving the caller to leave the block so the instruction restarts.
  */
-int latx_x86_check_guest_access(struct CPUX86State *env, uint64_t gva,
-                                uint32_t access, uint32_t size_bits);
+/*
+ * Validate one guest access and return the host address to use for it.
+ *
+ * The translated address is the return value, not a side channel: that keeps
+ * it scoped to the instruction that asked, and a refusal is unambiguous
+ * because a valid host address never has the high bit set.  On refusal the
+ * fault is recorded in the environment (CR2, exception index, error code) and
+ * the caller leaves the block.
+ */
+#define LATX_X86_ACCESS_FAULTED UINT64_C(0x8000000000000000)
+
+uint64_t latx_x86_check_guest_access(struct CPUX86State *env, uint64_t gva,
+                                     uint32_t access, uint32_t size_bits,
+                                     uint64_t insn_pc);
+
+/*
+ * The host address of the last approved access, returned through a slot the
+ * caller owns.
+ *
+ * A checked access is emitted as: validate, then dereference the translated
+ * address instead of the guest virtual one.  The address is written to the
+ * caller's slot rather than to a global, because a global survives the
+ * instruction: the handler's own stores would then dereference whatever the
+ * previous access published.  The slot lives in this translator's scratch
+ * space, one per emitted check, and is dead once the instruction is done.
+ */
+extern uint64_t latx_x86_access_hpa;
+
+/*
+ * Set by the translator to the operand it just validated, cleared right
+ * after.  Translation-time identity, run-time address: the dereference of
+ * exactly this operand reads latx_x86_access_hpa.
+ */
+struct dt_cs_x86_op;
+extern struct dt_cs_x86_op *latx_x86_checked_operand;
+
+/* The host register holding the translated address of that operand. */
+struct IR2_OPND;
+extern struct IR2_OPND latx_x86_checked_addr;
+
+/*
+ * The guest virtual address of the access that was just approved, or -1.
+ *
+ * The shared load/store paths substitute the published host address when the
+ * operand they are asked to convert resolves to exactly this address.  An
+ * address comparison rather than an operand pointer is what keeps this honest:
+ * the translator builds several IR1 operands for one instruction (a descriptor
+ * fetched at operand+2, the stack slot a push synthesizes), and only the one
+ * whose address was validated may be redirected.
+ */
+extern uint64_t latx_x86_access_hpa;
+
+/*
+ * Set by the translator to the operand it just validated, cleared right
+ * after.  Translation-time identity, run-time address: the dereference of
+ * exactly this operand reads latx_x86_access_hpa.
+ */
+struct dt_cs_x86_op;
+extern struct dt_cs_x86_op *latx_x86_checked_operand;
+
+/* The host register holding the translated address of that operand. */
+struct IR2_OPND;
+extern struct IR2_OPND latx_x86_checked_addr;
+
+/*
+ * Deliver the fault the last check recorded to the guest's own #PF handler.
+ *
+ * The frame is built the way the architecture describes it -- the faulting
+ * RIP, the interrupted CS, RFLAGS and the error code on the guest stack, with
+ * CS:RIP taken from IDT[14] -- and CS base stays zero because long mode
+ * ignores segment bases.  Returns 0 when a handler was entered, non-zero when
+ * the IDT has no usable gate for vector 14 (a triple fault for the caller to
+ * report).
+ */
+int latx_x86_deliver_fault(struct CPUX86State *env, uint32_t vector);
 
 /*
  * Physical-memory read used for the tables themselves.  Weak default reads

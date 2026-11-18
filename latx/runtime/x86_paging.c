@@ -24,6 +24,25 @@
 #define PTE_PHYS_MASK UINT64_C(0x000ffffffffff000)
 #define LAPG_SIZE      UINT64_C(4096)
 
+__attribute__((weak)) void latx_platform_phys_write(uint64_t pa, int size,
+                                                   uint64_t value)
+{
+    switch (size) {
+    case 1:
+        *(volatile uint8_t *)(uintptr_t)pa = (uint8_t)value;
+        break;
+    case 2:
+        *(volatile uint16_t *)(uintptr_t)pa = (uint16_t)value;
+        break;
+    case 4:
+        *(volatile uint32_t *)(uintptr_t)pa = (uint32_t)value;
+        break;
+    default:
+        *(volatile uint64_t *)(uintptr_t)pa = value;
+        break;
+    }
+}
+
 __attribute__((weak)) uint64_t latx_platform_phys_read(uint64_t pa, int size)
 {
     switch (size) {
@@ -246,26 +265,120 @@ LatxX86WalkResult latx_x86_walk_cached(const CPUX86State *env, uint64_t va,
     return r;
 }
 
-int latx_x86_check_guest_access(CPUX86State *env, uint64_t gva,
-                                uint32_t access, uint32_t size_bits)
+uint64_t latx_x86_access_hpa;
+/* latx_x86_checked_operand lives in mem-interface.c: it is translation-time. */
+
+uint64_t latx_x86_check_guest_access(CPUX86State *env, uint64_t gva,
+                                     uint32_t access, uint32_t size_bits,
+                                     uint64_t insn_pc)
 {
     uint64_t bytes = size_bits ? (size_bits + 7) / 8 : 1;
     uint64_t page = gva & ~(LAPG_SIZE - 1);
+    uint64_t hpa = 0;
+    uint64_t delta = 0;
+    bool have_delta = false;
+
+    (void)insn_pc;
+
     for (;;) {
         LatxX86Translation t;
         LatxX86WalkResult r = latx_x86_walk_cached(env, page, access, &t);
 
         if (r != LATX_X86_WALK_OK && r != LATX_X86_WALK_PAGING_OFF) {
+            /*
+             * Whatever produced this refusal must not be reused: a guest
+             * handler exists precisely because the mapping is about to
+             * change, and a cached leaf would make the retry fault forever.
+             */
+            latx_x86_tlb_flush_page(gva);
             env->cr[2] = gva;
             env->exception_index = EXCP0E_PAGE;
             env->error_code = (int)latx_x86_fault_error_code(env, r, access);
-            return 1;
+            return LATX_X86_ACCESS_FAULTED;
+        }
+        {
+            uint64_t d = t.gpa - page;
+
+            if (!have_delta) {
+                delta = d;
+                have_delta = true;
+                hpa = gva + delta;
+            } else if (d != delta) {
+                /*
+                 * The access spans pages with different translations.  The
+                 * emitted code can only carry one host address, so refuse
+                 * rather than write half of it to the wrong place.
+                 */
+                env->cr[2] = gva;
+                env->exception_index = EXCP0E_PAGE;
+                env->error_code = 1 | 8;        /* protection, RSVD */
+                return LATX_X86_ACCESS_FAULTED;
+            }
         }
         if (page + LAPG_SIZE >= gva + bytes) {
-            return 0;
+            break;
         }
         page += LAPG_SIZE;
     }
+
+    return hpa;
+}
+
+int latx_x86_deliver_fault(CPUX86State *env, uint32_t vector)
+{
+    uint64_t gate_phys = env->idt.base + (uint64_t)vector * 16;
+    uint64_t lo, hi, off, selector, rsp;
+
+    if ((uint64_t)vector * 16 + 15 > env->idt.limit + 1) {
+        return 1;                       /* no such gate */
+    }
+    lo = latx_platform_phys_read(gate_phys, 8);
+    hi = latx_platform_phys_read(gate_phys + 8, 8);
+
+    {
+        uint8_t type_attr = (uint8_t)(lo >> 40);
+
+        /* Present, and an interrupt (0xE) or trap (0xF) gate. */
+        if (!(type_attr & 0x80) || (type_attr & 0x1f) < 0x0e) {
+            return 1;
+        }
+    }
+    selector = (lo >> 16) & 0xffff;
+    off = (lo & 0xffff) | (hi & 0xffff0000u) | (hi << 32);
+
+    rsp = env->regs[R_ESP];
+    /*
+     * Long-mode frame, top first: error code, RIP, CS, RFLAGS, RSP, SS.
+     * RSP and SS belong to the privilege-change form; they are pushed
+     * unconditionally because the translator's IRETQ pops them regardless,
+     * and SS selector 0 is what long mode uses.
+     */
+#define PUSH64(v)                                                             \
+    do {                                                                      \
+        latx_platform_phys_write(rsp - 8, 8, (uint64_t)(v));                   \
+        rsp -= 8;                                                             \
+    } while (0)
+
+    PUSH64(env->segs[R_SS].selector);
+    PUSH64(env->regs[R_ESP]);
+    PUSH64(env->eflags & ~(UINT64_C(1) << 8));   /* TF clear in the handler */
+    PUSH64(env->segs[R_CS].selector);
+    PUSH64(env->eip);
+    PUSH64((uint64_t)(uint32_t)env->error_code);
+#undef PUSH64
+
+    /*
+     * A handler runs because a mapping or a permission is about to change,
+     * and nothing here can know which, so every cached walk is suspect.
+     */
+    latx_x86_tlb_flush_all();
+
+    env->regs[R_ESP] = rsp;
+    env->eip = off;
+    env->segs[R_CS].selector = (uint32_t)selector;
+    env->segs[R_CS].base = 0;                    /* ignored in long mode */
+    env->exception_index = 0;                    /* the guest now owns it */
+    return 0;
 }
 
 uint32_t latx_x86_fault_error_code(const CPUX86State *env,
