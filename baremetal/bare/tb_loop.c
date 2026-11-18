@@ -45,6 +45,19 @@
  *   - No LBT trap fires while the prologue runs, because this QEMU tree
  *     implements the LBT instructions natively, so the emulation path is
  *     not involved.
+ *   - Flags: the decoder leaves _eflag_def zero because the flag-reduction
+ *     pass is what normally fills it.  Without it ir1_need_calculate_any_flag
+ *     answers "no" for every instruction, arithmetic is emitted as plain
+ *     add_d/sub_d with no LBT flag update, and the following
+ *     lbt_x86setj/bne reads stale flags -- a conditional branch then never
+ *     terminates its loop.  Calling flag_gen() per decoded instruction fixes
+ *     it: the emitted code now contains lbt_x86xor_w / lbt_x86add_w /
+ *     lbt_x86sub_w immediately before each lbt_x86setj.
+ *   - A call pushes the return address, so the guest needs a stack; ESP was
+ *     left at zero and the push faulted.
+ *   - Past that point the harness hits a decoder abort on `call rel32`, the
+ *     same class as the earlier one on `dec r32` (ir1_disasm exits when
+ *     la_disa_v1 reports more than one instruction).
  *   - The exit is a self-looping link slot only the runtime linker fills.
  *     Routing the block through a patched slot (turning `b 0` into a nop so
  *     it falls into the epilogue jump) makes the block return.  tb_loop now
@@ -64,6 +77,7 @@
 #include "ir1.h"
 #include "ir2.h"
 #include "translate.h"
+#include "flag-reduction.h"
 
 #include "loongemu/tb_cache.h"
 #include "lbt_emu.h"
@@ -300,6 +314,14 @@ static int translate_at(uint64_t pc, uint8_t *code, uint64_t limit)
             break;
         }
         off = (int)(next - pc);
+        /*
+         * Fill each instruction's eflag use/def bitmap.  Normally the flag
+         * reduction pass does this over the whole TB; without it every
+         * _eflag_def is zero, ir1_need_calculate_any_flag() answers "no"
+         * for every instruction, no arithmetic updates the LBT flag state,
+         * and a following conditional branch reads stale flags.
+         */
+        flag_gen(&ir1_list[n]);
         n++;
         if (is_control_flow(&ir1_list[n - 1])) {
             break;
@@ -393,6 +415,11 @@ void kmain(void)
     env.efer = UINT64_C(1) << 10;       /* LMA     */
     env.tb_jmp_cache_ptr = jmp_cache;
     env.eip = PROGRAM_PC;
+    /*
+     * A call pushes the return address, so the guest needs a stack inside
+     * the image.  0x8000 is well past the code and inside the 64 KiB RAM.
+     */
+    env.regs[R_ESP] = 0x8000;
     env.cr[3] = 0;                 /* one address space for this program */
     lsenv_storage.cpu_state = &env;
     lsenv_storage.tr_data = &tr;
@@ -451,7 +478,12 @@ void kmain(void)
             }
             e->code = (uint64_t)(uintptr_t)code;
             e->code_size = (uint32_t)rc;
-            code_used += ((uint64_t)rc + 15) & ~UINT64_C(15);
+            /*
+             * Space blocks out generously: a block also owns literal and
+             * jump-slot words written by la_data_li/la_data_st, and a tight
+             * stride risks the next block landing on them.
+             */
+            code_used += (((uint64_t)rc + 255) & ~UINT64_C(255));
             translated++;
         }
 
