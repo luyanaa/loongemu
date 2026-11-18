@@ -6,7 +6,7 @@ LBT_SRC := src/loongbt_semantics.c src/loongbt_cpu.c src/loongbt_hw.c src/loongb
 CLANG   ?= /opt/homebrew/Cellar/llvm/23.1.5_1/bin/clang
 OBJDUMP ?= /opt/homebrew/Cellar/llvm/23.1.5_1/bin/llvm-objdump
 
-.PHONY: all test test-cpu test-lapaging test-p0 vmm-efi vmm-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot clean
+.PHONY: all test test-cpu test-lapaging test-tbc test-p0 vmm-efi vmm-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot clean
 
 all: test
 
@@ -14,10 +14,19 @@ build/test_loongbt: tests/test_loongbt.c $(LBT_SRC) include/loongemu/loongbt.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Ibaremetal/gen/latx/include tests/test_loongbt.c $(LBT_SRC) -o $@
 
-test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging
+build/test_tb_cache: tests/test_tb_cache.c src/tb_cache.c include/loongemu/tb_cache.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) src/tb_cache.c tests/test_tb_cache.c -o $@
+
+test-tbc: build/test_tb_cache
+	./build/test_tb_cache
+
+test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging \
+      build/test_tb_cache
 	./build/test_loongbt
 	./build/test_loongbt_cpu
 	./build/test_loongarch_paging
+	./build/test_tb_cache
 
 # Back-end selection and the EFLAGS pack/unpack bridge.  Kept separate from
 # test_loongbt so a failure points at the glue rather than the semantics.
@@ -338,13 +347,41 @@ BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
                -isystem $(shell $(CLANG) -print-resource-dir)/include \
                -include latx/compat/latx_bare_prelude.h
 
-build/bare_main.o: baremetal/bare/main.c
+build/bare_main.o: baremetal/bare/main.c baremetal/bare/lbt_emu.h
 	@mkdir -p build
-	$(CLANG) $(BARE_CFLAGS) -c $< -o $@
+	$(CLANG) $(BARE_CFLAGS) -Ibaremetal/bare -c $< -o $@
 
-build/bare_latx.elf: build/bare_main.o baremetal/build/liblatx_core.a baremetal/bare/bare.lds
+build/bare_latx.elf: build/bare_main.o build/lbt_emu.o baremetal/build/liblatx_core.a baremetal/bare/bare.lds
 	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T baremetal/bare/bare.lds -e _start \
-	   build/bare_main.o baremetal/build/liblatx_core.a -o $@
+	   build/bare_main.o build/lbt_emu.o baremetal/build/liblatx_core.a -o $@
+
+# ---- P1: multi-TB dynamic execution loop ----
+build/tb_loop.o: baremetal/bare/tb_loop.c include/loongemu/tb_cache.h baremetal/bare/lbt_emu.h
+	@mkdir -p build
+	$(CLANG) $(BARE_CFLAGS) -Iinclude -Ibaremetal/bare -c $< -o $@
+
+build/lbt_emu.o: baremetal/bare/lbt_emu.c baremetal/bare/lbt_emu.h
+	@mkdir -p build
+	$(CLANG) $(BARE_CFLAGS) -Iinclude -Ibaremetal/bare -c $< -o $@
+
+build/tb_cache_bare.o: src/tb_cache.c include/loongemu/tb_cache.h
+	@mkdir -p build
+	$(CLANG) $(BARE_CFLAGS) -Iinclude -c $< -o $@
+
+build/tb_loop.elf: build/tb_loop.o build/tb_cache_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a baremetal/bare/bare.lds
+	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	   build/tb_loop.o build/tb_cache_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a -o $@
+
+tb-loop-image: build/tb_loop.elf
+
+tb-loop-run: build/tb_loop.elf
+	@rm -f build/tb_loop.log
+	@timeout 15 $(QLVZ) -M virt -cpu max -m 512M -kernel build/tb_loop.elf \
+	     -display none -monitor none -serial file:build/tb_loop.log -no-reboot 2>/dev/null || true
+	@grep -a 'tb-loop:' build/tb_loop.log | tail -8
+	@grep -qa 'tb-loop: done' build/tb_loop.log
+	@grep -qa 'fails=0' build/tb_loop.log
+
 
 lata-all:
 	$(MAKE) -C lata all
