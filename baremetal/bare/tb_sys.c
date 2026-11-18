@@ -179,6 +179,9 @@ int latx_platform_apic_mmio(uint64_t gpa, int is_write, uint64_t *value)
 
 /* Guest-visible RAM: the whole area below the VMM's load base. */
 #define GUEST_RAM_SIZE (64 * 1024 * 1024)
+
+/* Must match the linker script's load address (baremetal/bare/bare.lds). */
+#define VMM_IMAGE_BASE  0x4000000ULL
 #define GUEST_BASE     0x0
 #define PROGRAM_PC     0x0ffe
 #define GDT_PC         0x1200
@@ -453,6 +456,28 @@ static void rebuild_host_mappings(void)
         return;
     }
     lapg_zero_page((void *)(uintptr_t)g_root);
+
+    /*
+     * The VMM's own image.
+     *
+     * Its code, read-only data and bss all live above the guest's window and
+     * must be reachable at PLV0 once paging is on: the trap handler runs from
+     * here, pushes onto this stack, and touches the pool and every global in
+     * this file.  Mapping the whole linked span keeps the linker script the
+     * single place the guest/VMM split is decided, instead of a list of
+     * globals that silently goes stale when the image moves.
+     */
+    {
+        extern char _end[];
+        uint64_t img_start = VMM_IMAGE_BASE;
+        uint64_t img_end = (uint64_t)(uintptr_t)_end;
+
+        if (img_end > img_start) {
+            map_host_range(img_start, img_end - img_start,
+                           LAPG_PERM_READ | LAPG_PERM_WRITE |
+                           LAPG_PERM_EXEC | LAPG_PERM_USER);
+        }
+    }
 
     map_host_range((uint64_t)(uintptr_t)code_cache, CODE_CACHE_SIZE,
                    LAPG_PERM_READ | LAPG_PERM_WRITE |
