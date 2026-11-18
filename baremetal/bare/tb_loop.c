@@ -33,10 +33,20 @@
  *     replacing `ff c9` with the equivalent `83 e9 01` moved the failure
  *     from decode to execution.  That is a decoder defect, independent of
  *     this harness.
- *   - With the prologue installed, the first block is entered at its code
- *     address and never returns; with a zeroed prologue the same block ran
- *     (its LBT instructions trapped) and returned.  So the block itself
- *     executes, and the remaining fault is in the entry/exit convention.
+ *   - With the prologue installed, the first block is entered and never
+ *     returns; with a zeroed prologue the same block ran and returned.  So
+ *     translation and fetch are fine and the remaining fault is in the
+ *     entry/exit convention.
+ *   - The generated prologue and epilogue were disassembled and are a
+ *     correct pair: sp-=256, s0..s8/fp/ra saved at 40..120, env and the jump
+ *     target taken from a0/a1, closing with jr through S_UD1.  QEMU reports
+ *     the entry points the harness expects (ret_0 == epi_buf,
+ *     bt_to_native == pro_buf).
+ *   - No LBT trap fires while the prologue runs, because this QEMU tree
+ *     implements the LBT instructions natively, so the emulation path is
+ *     not involved.
+ *   The failure is therefore inside the prologue's register-load sequence,
+ *   which was not localised further.
  */
 #include "qemu/osdep.h"
 #include "exec/exec-all.h"
@@ -167,23 +177,58 @@ typedef void (*TbEntry)(void *tb_code, void *env);
  * f:add  eax, 1
  *   ret
  */
+/*
+ * Layout (offsets matter: the jnz and call displacements are hand-assembled):
+ *
+ *   00: 31 c0                 xor eax, eax
+ *   02: b9 05 00 00 00        mov ecx, 5
+ *   07: 83 c0 02              add eax, 2        <- loop target
+ *   0a: 83 e9 01              sub ecx, 1
+ *   0d: 75 f8                 jnz 07            (next=0x0f, 0x07-0x0f = -8)
+ *   0f: e8 06 00 00 00        call 18           (next=0x14, 0x18-0x14 = 4+... )
+ *   14: 89 c3                 mov ebx, eax
+ *   16: eb fe                 jmp 16            <- halt
+ *   18: 83 c0 01              add eax, 1
+ *   1b: c3                    ret
+ *
+ * Every displacement is computed from the next PC, so the probe bytes that
+ * were here earlier (which shifted the layout without fixing the jnz) are
+ * gone -- that misalignment sent the loop into the middle of an instruction.
+ */
+/*
+ * Layout (offsets matter: the jnz and call displacements are hand-assembled):
+ *
+ *   00: 31 c0                 xor eax, eax
+ *   02: b9 05 00 00 00        mov ecx, 5
+ *   07: 83 c0 02              add eax, 2        <- loop target
+ *   0a: 83 e9 01              sub ecx, 1
+ *   0d: 75 f8                 jnz 07            (next=0x0f, 0x07-0x0f = -8)
+ *   0f: e8 06 00 00 00        call 18           (next=0x14, 0x18-0x14 = 4+... )
+ *   14: 89 c3                 mov ebx, eax
+ *   16: eb fe                 jmp 16            <- halt
+ *   18: 83 c0 01              add eax, 1
+ *   1b: c3                    ret
+ *
+ * Every displacement is computed from the next PC, so the probe bytes that
+ * were here earlier (which shifted the layout without fixing the jnz) are
+ * gone -- that misalignment sent the loop into the middle of an instruction.
+ */
 static const uint8_t program[] = {
-    0x48, 0x89, 0xd8,                         /* mov rax, rbx (probe) */
     0x31, 0xc0,                               /* xor eax, eax   */
     0xb9, 0x05, 0x00, 0x00, 0x00,             /* mov ecx, 5     */
     0x83, 0xc0, 0x02,                         /* add eax, 2     */
     0x83, 0xe9, 0x01,                         /* sub ecx, 1     */
-    0x75, 0xf9,                               /* jnz -7         */
-    0xe8, 0x0a, 0x00, 0x00, 0x00,             /* call f         */
+    0x75, 0xf8,                               /* jnz -8         */
+    0xe8, 0x04, 0x00, 0x00, 0x00,             /* call +4        */
     0x89, 0xc3,                               /* mov ebx, eax   */
     0xeb, 0xfe,                               /* jmp $          */
     0x83, 0xc0, 0x01,                         /* add eax, 1     */
     0xc3,                                     /* ret            */
 };
 
-/* Byte offsets in program[]: the self-jump is at +0x18, the function at +0x1a. */
-#define HALT_PC (PROGRAM_PC + 0x1b)
-#define FUNC_PC (PROGRAM_PC + 0x1d)
+/* Byte offsets in program[]: the self-jump is at +0x16, the function at +0x18. */
+#define HALT_PC (PROGRAM_PC + 0x16)
+#define FUNC_PC (PROGRAM_PC + 0x18)
 
 /* ---------------- per-PC translation ---------------- */
 
@@ -325,8 +370,6 @@ void kmain(void)
     latx_gen_prologue(pro_buf);
     /* Make every block exit to the epilogue rather than a link slot. */
     qemu_loglevel |= CPU_LOG_TB_NOCHAIN;
-
-
     check(tbc_init(&tb_cache, tb_entries, tb_buckets, TB_TABLE_CAP) == 1,
           "tb cache init");
 
