@@ -6,7 +6,7 @@ LBT_SRC := src/loongbt_semantics.c src/loongbt_cpu.c src/loongbt_hw.c src/loongb
 CLANG   ?= /opt/homebrew/Cellar/llvm/23.1.5_1/bin/clang
 OBJDUMP ?= /opt/homebrew/Cellar/llvm/23.1.5_1/bin/llvm-objdump
 
-.PHONY: all test test-cpu test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot clean
+.PHONY: all test test-cpu test-lapaging test-p0 vmm-efi vmm-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot clean
 
 all: test
 
@@ -14,9 +14,10 @@ build/test_loongbt: tests/test_loongbt.c $(LBT_SRC) include/loongemu/loongbt.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Ibaremetal/gen/latx/include tests/test_loongbt.c $(LBT_SRC) -o $@
 
-test: build/test_loongbt build/test_loongbt_cpu
+test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging
 	./build/test_loongbt
 	./build/test_loongbt_cpu
+	./build/test_loongarch_paging
 
 # Back-end selection and the EFLAGS pack/unpack bridge.  Kept separate from
 # test_loongbt so a failure points at the glue rather than the semantics.
@@ -26,6 +27,40 @@ build/test_loongbt_cpu: tests/test_loongbt_cpu.c $(LBT_SRC) include/loongemu/loo
 
 test-cpu: build/test_loongbt_cpu
 	./build/test_loongbt_cpu
+
+# LoongArch 4 KiB hardware page tables: pool, PTE encoding, map/walk.
+build/test_loongarch_paging: tests/test_loongarch_paging.c src/loongarch_paging.c \
+                             include/loongemu/loongarch_paging.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) src/loongarch_paging.c tests/test_loongarch_paging.c -o $@
+
+test-lapaging: build/test_loongarch_paging
+	./build/test_loongarch_paging
+
+# ---- P0: 4 KiB paging, PLV3 page fault, PLV0 walk + TLBFILL, resume ----
+P0_SRC := baremetal/bare/paging_smoke.c src/loongarch_paging.c
+
+build/p0_paging.elf: $(P0_SRC) include/loongemu/loongarch_paging.h
+	@mkdir -p build
+	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
+	         -fno-builtin -O1 -mno-lsx -mno-lasx -Iinclude \
+	         -c baremetal/bare/paging_smoke.c -o build/p0_paging.o
+	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
+	         -fno-builtin -O1 -mno-lsx -mno-lasx -Iinclude \
+	         -c src/loongarch_paging.c -o build/p0_loongarch_paging.o
+	/opt/homebrew/opt/lld/bin/ld.lld -T baremetal/bare/bare.lds -e _start \
+	   build/p0_paging.o build/p0_loongarch_paging.o -o $@
+
+test-p0: build/p0_paging.elf
+	@rm -f build/p0.log
+	@timeout 20 qemu-system-loongarch64 -M virt -cpu max -m 512M \
+	   -kernel build/p0_paging.elf -display none -monitor none \
+	   -serial file:build/p0.log -no-reboot >/dev/null 2>&1 || true
+	@cat build/p0.log
+	@grep -q 'p0: P0-OK' build/p0.log && echo "  P0: page fault serviced, execution resumed" || \
+	  { echo "P0 REGRESSION"; exit 1; }
+	@grep -q 'value=0x1234abcd5678ef90' build/p0.log || \
+	  { echo "P0 WRONG DATA"; exit 1; }
 
 build/test_x86_64_paging: tests/test_x86_64_paging.c src/x86_64_paging.c include/loongemu/x86_64_paging.h
 	@mkdir -p build
@@ -329,3 +364,39 @@ bare-run: bare-image
 	   echo $$! > build/qemu_bare.pid )
 	@sleep 12; kill $$(cat build/qemu_bare.pid) 2>/dev/null; true
 	@grep -aE 'bare:|lbt|FAIL' build/bare_run.log | head -30
+
+# ---- P0 UEFI entry: ExitBootServices handoff and the 4 KiB bring-up ----
+VMM_SRC := baremetal/efi/vmm_entry.c src/loongarch_paging.c
+VMM_INC := -Iinclude -Ibaremetal/efi
+
+build/vmm_entry.o: $(VMM_SRC) include/loongemu/loongarch_paging.h baremetal/efi/efi_min.h
+	@mkdir -p build
+	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
+	         -fno-builtin -O2 -mno-lsx -mno-lasx -fno-vectorize -fno-slp-vectorize \
+	         $(VMM_INC) -c baremetal/efi/vmm_entry.c -o $@
+	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
+	         -fno-builtin -O2 -mno-lsx -mno-lasx -fno-vectorize -fno-slp-vectorize \
+	         $(VMM_INC) -c src/loongarch_paging.c -o build/vmm_loongarch_paging.o
+
+build/vmm_entry.elf: build/vmm_entry.o build/vmm_loongarch_paging.o
+	@printf 'ENTRY(efi_main)\nSECTIONS { . = 0x1000; .text : { *(.text*) } .rodata : { *(.rodata*) } .data : { *(.data*) } .bss : { *(.bss*) *(COMMON) } }\n' > build/vmm.lds
+	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T build/vmm.lds -e efi_main \
+	   build/vmm_entry.o build/vmm_loongarch_paging.o -o $@
+
+build/vmm_entry.efi: build/vmm_entry.elf
+	$(GENFW) -o $@ -e UEFI_APPLICATION $<
+
+vmm-efi: build/vmm_entry.efi
+
+vmm-boot: vmm-efi
+	@rm -rf build/esp_vmm && mkdir -p build/esp_vmm/EFI/BOOT
+	@cp build/vmm_entry.efi build/esp_vmm/EFI/BOOT/BOOTLOONGARCH64.EFI
+	@rm -f build/vmm-serial.log
+	@( qemu-system-loongarch64 -M virt -cpu la464 -m 2G \
+	     -bios firmware/QEMU_EFI.fd \
+	     -drive id=esp,file=fat:rw:build/esp_vmm,format=raw,if=none \
+	     -device virtio-blk-pci,drive=esp \
+	     -display none -monitor none -serial file:build/vmm-serial.log -no-reboot & \
+	   echo $$! > build/qemu_vmm.pid )
+	@sleep 40; kill $$(cat build/qemu_vmm.pid) 2>/dev/null; true
+	@grep -aE 'vmm:' build/vmm-serial.log | head -30
