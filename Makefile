@@ -368,11 +368,33 @@ build/tb_cache_bare.o: src/tb_cache.c include/loongemu/tb_cache.h
 	@mkdir -p build
 	$(CLANG) $(BARE_CFLAGS) -Iinclude -c $< -o $@
 
-build/tb_loop.elf: build/tb_loop.o build/tb_cache_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a baremetal/bare/bare.lds
+build/tb_harness.o: baremetal/bare/tb_harness.c baremetal/bare/tb_harness.h
+	@mkdir -p build
+	$(CLANG) $(BARE_CFLAGS) -Iinclude -Ibaremetal/bare -c $< -o $@
+
+build/tb_loop.elf: build/tb_loop.o build/tb_harness.o build/tb_cache_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a baremetal/bare/bare.lds
 	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T baremetal/bare/bare.lds -e _start \
-	   build/tb_loop.o build/tb_cache_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a -o $@
+	   build/tb_loop.o build/tb_harness.o build/tb_cache_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a -o $@
 
 tb-loop-image: build/tb_loop.elf
+
+build/tb_sys.o: baremetal/bare/tb_sys.c include/loongemu/tb_cache.h baremetal/bare/lbt_emu.h baremetal/bare/tb_harness.h
+	@mkdir -p build
+	$(CLANG) $(BARE_CFLAGS) -Iinclude -Ibaremetal/bare -c $< -o $@
+
+build/tb_sys.elf: build/tb_sys.o build/tb_harness.o build/tb_cache_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a baremetal/bare/bare.lds
+	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	   build/tb_sys.o build/tb_harness.o build/tb_cache_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a -o $@
+
+tb-sys-image: build/tb_sys.elf
+
+tb-sys-run: build/tb_sys.elf
+	@rm -f build/tb_sys.log
+	@timeout 15 $(QLVZ) -M virt -cpu max -m 512M -kernel build/tb_sys.elf \
+	     -display none -monitor none -serial file:build/tb_sys.log -no-reboot 2>/dev/null || true
+	@grep -a 'tb-sys:' build/tb_sys.log | tail -8
+	@grep -qa 'tb-sys: done' build/tb_sys.log
+	@grep -qa 'fails=0' build/tb_sys.log
 
 tb-loop-run: build/tb_loop.elf
 	@rm -f build/tb_loop.log

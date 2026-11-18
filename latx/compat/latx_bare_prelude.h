@@ -106,6 +106,12 @@ enum aot_rel_kind {
     LOAD_HELPER_RAISE_INTO,
     LOAD_HELPER_RAISE_BOUND,
     LOAD_HELPER_RAISE_SYSCALL,
+    LOAD_HELPER_WRITE_CR,
+    LOAD_HELPER_READ_CR,
+    LOAD_HELPER_RDMSR,
+    LOAD_HELPER_WRMSR,
+    LOAD_HELPER_IN,
+    LOAD_HELPER_OUT,
     LOAD_HELPER_XGETBV,
     LOAD_HELPER_EFLAGTF,
     LOAD_HELPER_SMC_ST,
@@ -211,6 +217,13 @@ void update_mxcsr_status(CPUX86State *env);
 
 
 void latx_runtime_init(void);
+/*
+ * Fill CPUX86State.features[] from what cpu_x86_cpuid() advertises.  The MSR
+ * helpers mask writes with those words (EFER.LME is only writable when long
+ * mode is advertised), so an environment that was merely zeroed silently
+ * swallows wrmsr.
+ */
+void latx_x86_env_init_features(CPUX86State *env);
 int latx_gen_prologue(void *code_buf);
 int latx_gen_epilogue(void *code_buf);
 extern ADDR context_switch_bt_to_native;

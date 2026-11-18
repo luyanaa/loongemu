@@ -316,36 +316,198 @@ bool translate_int_3(IR1_INST *pir1)
     return true;
 }
 
+/*
+ * Port I/O.  The instruction carries the port either as an imm8 or in DX, and
+ * the width comes from the AL/AX/EAX operand.  In a system build all three go
+ * through QEMU's system helpers, which reach the board layer through
+ * address_space_io -> latx_platform_io_read/write, so a harness supplies the
+ * device and this file stays free of platform knowledge.  Under
+ * CONFIG_USER_ONLY there is no I/O space at all -- the process cannot be
+ * granted iopl() -- so the instruction keeps raising #GP, which is what the
+ * user-mode signal model turns into the guest's fault.
+ */
+static ADDR io_helper_addr(int size, bool is_in)
+{
+    if (is_in) {
+        return (ADDR)(size == 1 ? helper_inb : size == 2 ? helper_inw
+                                                         : helper_inl);
+    }
+    return (ADDR)(size == 1 ? helper_outb : size == 2 ? helper_outw
+                                                      : helper_outl);
+}
+
+static IR2_OPND io_port_opnd(IR1_OPND *port, bool *allocated)
+{
+    *allocated = false;
+    if (ir1_opnd_type(port) == dt_X86_OP_IMM) {
+        IR2_OPND op = ra_alloc_itemp_internal();
+
+        li_d(op, ir1_opnd_simm(port));
+        *allocated = true;
+        return op;
+    }
+    /* IN/OUT take the port from DX only; DX maps onto the edx guest slot. */
+    return ra_alloc_gpr(edx_index);
+}
+
+#ifdef CONFIG_USER_ONLY
 bool translate_in(IR1_INST *pir1)
 {
-    /* raise GPF */
-    IR2_OPND tmp_opnd = ra_alloc_itemp();
-    IR2_OPND eip_opnd = ra_alloc_dbt_arg2();
-    li_d(eip_opnd, ir1_addr(pir1));
-    la_store_addrx(eip_opnd, env_ir2_opnd,
-                    lsenv_offset_of_eip(lsenv));
-    tr_save_registers_to_env(0xff, 0xff, option_save_xmm, options_to_save());
-    aot_load_host_addr(tmp_opnd, (ADDR)helper_raise_gpf,
-        LOAD_HELPER_RAISE_GPF, 0);
-    la_jirl(zero_ir2_opnd, tmp_opnd, 0);
-    ra_free_temp(tmp_opnd);
+    tr_generate_raise_gpf(pir1);
     return true;
 }
 
 bool translate_out(IR1_INST *pir1)
 {
-    /* raise GPF */
-    IR2_OPND tmp_opnd = ra_alloc_itemp();
-    IR2_OPND eip_opnd = ra_alloc_dbt_arg2();
-    li_d(eip_opnd, ir1_addr(pir1));
-    la_store_addrx(eip_opnd, env_ir2_opnd,
-                    lsenv_offset_of_eip(lsenv));
-    tr_save_registers_to_env(0xff, 0xff, option_save_xmm, options_to_save());
-    aot_load_host_addr(tmp_opnd, (ADDR)helper_raise_gpf,
-        LOAD_HELPER_RAISE_GPF, 0);
-    la_jirl(zero_ir2_opnd, tmp_opnd, 0);
-    ra_free_temp(tmp_opnd);
+    tr_generate_raise_gpf(pir1);
     return true;
+}
+#else
+bool translate_in(IR1_INST *pir1)
+{
+    IR1_OPND *dst = ir1_get_opnd(pir1, 0);
+    IR1_OPND *port = ir1_get_opnd(pir1, 1);
+    int size = ir1_opnd_size(dst) >> 3;
+    bool allocated;
+    IR2_OPND port_op, fn;
+
+    if (size != 1 && size != 2 && size != 4) {
+        return false;
+    }
+    port_op = io_port_opnd(port, &allocated);
+    tr_save_guest_regs_for_helper();
+    fn = ra_alloc_dbt_arg2();
+    aot_load_host_addr(fn, io_helper_addr(size, true), LOAD_HELPER_IN, 0);
+    la_mov64(a1_ir2_opnd, port_op);
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    la_jirl(ra_ir2_opnd, fn, 0);
+    tr_load_guest_regs_after_helper();
+    store_ireg_to_ir1(a0_ir2_opnd, dst, false);
+    if (allocated) {
+        ra_free_temp(port_op);
+    }
+    return true;
+}
+
+bool translate_out(IR1_INST *pir1)
+{
+    IR1_OPND *port = ir1_get_opnd(pir1, 0);
+    IR1_OPND *src = ir1_get_opnd(pir1, 1);
+    int size = ir1_opnd_size(src) >> 3;
+    bool allocated;
+    IR2_OPND port_op, val, fn;
+
+    if (size != 1 && size != 2 && size != 4) {
+        return false;
+    }
+    port_op = io_port_opnd(port, &allocated);
+    tr_save_guest_regs_for_helper();
+    val = load_ireg_from_ir1(src, UNKNOWN_EXTENSION, false);
+    fn = ra_alloc_dbt_arg2();
+    aot_load_host_addr(fn, io_helper_addr(size, false), LOAD_HELPER_OUT, 0);
+    la_mov64(a2_ir2_opnd, val);
+    la_mov64(a1_ir2_opnd, port_op);
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    la_jirl(ra_ir2_opnd, fn, 0);
+    tr_load_guest_regs_after_helper();
+    if (allocated) {
+        ra_free_temp(port_op);
+    }
+    return true;
+}
+#endif /* CONFIG_USER_ONLY */
+
+/*
+ * RDMSR/WRMSR: ECX selects the MSR, EDX:EAX carries the value.  The helper
+ * works on the environment, so the guest registers are flushed first and
+ * reloaded afterwards -- that also delivers the helper's EDX:EAX result.
+ */
+static bool translate_msr(IR1_INST *pir1, bool is_write)
+{
+    IR2_OPND fn;
+
+    tr_save_guest_regs_for_helper();
+    fn = ra_alloc_dbt_arg2();
+    if (is_write) {
+        aot_load_host_addr(fn, (ADDR)helper_wrmsr, LOAD_HELPER_WRMSR, 0);
+    } else {
+        aot_load_host_addr(fn, (ADDR)helper_rdmsr, LOAD_HELPER_RDMSR, 0);
+    }
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    la_jirl(ra_ir2_opnd, fn, 0);
+    tr_load_guest_regs_after_helper();
+    return true;
+}
+
+bool translate_rdmsr(IR1_INST *pir1)
+{
+    return translate_msr(pir1, false);
+}
+
+bool translate_wrmsr(IR1_INST *pir1)
+{
+    return translate_msr(pir1, true);
+}
+
+/*
+ * LGDT/LIDT read a 6-byte (32-bit operand) or 10-byte (64-bit operand)
+ * descriptor from memory: a 16-bit limit followed by a 32/64-bit base.  The
+ * environment keeps only base and limit, which is all a translator needs --
+ * segment loads resolve through env->gdt/ldt, and the shadow-table contents
+ * stay in guest memory where the guest put them.
+ *
+ * The operand is rebuilt as [riz + addr] rather than handed to convert_mem:
+ * an absolute address is a displacement, and the normal load path already
+ * splits displacements that do not fit the 12-bit immediate -- which a guest
+ * address like 0x1200 does not.
+ */
+static IR2_OPND load_desc_word(uint32_t addr, int size_bits)
+{
+    IR1_OPND mem;
+
+    ir1_opnd_build_mem(&mem, size_bits, dt_X86_REG_RIZ, (int64_t)addr);
+    return load_ireg_from_ir1(&mem, UNKNOWN_EXTENSION, false);
+}
+
+static bool translate_descriptor_table(IR1_INST *pir1, bool is_gdt)
+{
+    IR1_OPND *mem = ir1_get_opnd(pir1, 0);
+    int size = ir1_opnd_size(mem) >> 3;
+    int base_off = is_gdt ? lsenv_offset_of_gdt_base(lsenv)
+                          : lsenv_offset_of_idt_base(lsenv);
+    int limit_off = is_gdt ? lsenv_offset_of_gdt_limit(lsenv)
+                           : lsenv_offset_of_idt_limit(lsenv);
+    uint32_t addr = (uint32_t)ir1_opnd_simm(mem);
+    IR2_OPND tmp, base, limit;
+
+    if (size != 6 && size != 10) {
+        return false;
+    }
+
+    limit = load_desc_word(addr, 16);
+    la_st_w(limit, env_ir2_opnd, limit_off);
+
+    base = load_desc_word(addr + 2, 32);
+    if (size == 10) {
+        tmp = load_desc_word(addr + 8, 32);
+        la_slli_d(tmp, tmp, 32);
+        la_or(base, base, tmp);
+        ra_free_temp(tmp);
+    }
+    la_st_d(base, env_ir2_opnd, base_off);
+    ra_free_temp(limit);
+    ra_free_temp(base);
+    return true;
+}
+
+bool translate_lgdt(IR1_INST *pir1)
+{
+    return translate_descriptor_table(pir1, true);
+}
+
+bool translate_lidt(IR1_INST *pir1)
+{
+    return translate_descriptor_table(pir1, false);
 }
 
 bool translate_into(IR1_INST *pir1)

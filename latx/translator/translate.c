@@ -814,6 +814,10 @@ static bool (*translate_functions[])(IR1_INST *) = {
     TRANS_FUNC_GEN(XORPD, xorpd),
     TRANS_FUNC_GEN(XORPS, xorps),
     TRANS_FUNC_GEN(HLT, hlt),
+    TRANS_FUNC_GEN(RDMSR, rdmsr),
+    TRANS_FUNC_GEN(WRMSR, wrmsr),
+    TRANS_FUNC_GEN(LGDT, lgdt),
+    TRANS_FUNC_GEN(LIDT, lidt),
     TRANS_FUNC_GEN(IDIV, idiv),
     TRANS_FUNC_GEN(IMUL, imul),
     TRANS_FUNC_GEN(IN, in),
@@ -2696,6 +2700,18 @@ int tr_ir2_generate(struct TranslationBlock *tb)
         pir1++;
     }
     /*
+     * With chaining enabled a TB that ends on an ordinary instruction just
+     * falls into the successor's link slot, which is why no exit is emitted
+     * here.  With CPU_LOG_TB_NOCHAIN there is no slot to fall into -- the
+     * block returns to whoever called it -- so the exit has to be explicit.
+     * Without it the generated code runs off the end of the block into
+     * whatever follows in the code cache.
+     */
+    if (qemu_loglevel_mask(CPU_LOG_TB_NOCHAIN) && ir1_nr > 0 &&
+        !ir1_is_tb_ending(tb_ir1_inst(tb, ir1_nr - 1))) {
+        tr_generate_exit_tb_to_next(tb_ir1_inst(tb, ir1_nr - 1));
+    }
+    /*
      * AOT can split overlapping TBs after an ordinary instruction. Such a
      * TB falls through without translating a branch or generating an exit,
      * but the next TB starts with an empty pending mask. Materialize the
@@ -3066,6 +3082,26 @@ static void tr_generate_single_step_exit(IR2_OPND next_pc)
                        LOAD_HELPER_RAISE_TRAPOP, 0);
     la_jirl(zero_ir2_opnd, helper_addr, 0);
     ra_free_temp(helper_addr);
+}
+
+/*
+ * Emit a #GP for an instruction this translator refuses to emulate.  The
+ * restart address is the instruction itself, and the guest registers are
+ * flushed because the fault handler is ordinary C and will read the
+ * environment.
+ */
+void tr_generate_raise_gpf(IR1_INST *pir1)
+{
+    IR2_OPND tmp_opnd = ra_alloc_itemp();
+    IR2_OPND eip_opnd = ra_alloc_dbt_arg2();
+
+    li_d(eip_opnd, ir1_addr(pir1));
+    la_store_addrx(eip_opnd, env_ir2_opnd, lsenv_offset_of_eip(lsenv));
+    tr_save_registers_to_env(0xff, 0xff, option_save_xmm, options_to_save());
+    aot_load_host_addr(tmp_opnd, (ADDR)helper_raise_gpf,
+                       LOAD_HELPER_RAISE_GPF, 0);
+    la_jirl(zero_ir2_opnd, tmp_opnd, 0);
+    ra_free_temp(tmp_opnd);
 }
 
 void tr_generate_exit_tb_to_next(IR1_INST *ir1)
@@ -4235,6 +4271,28 @@ void tr_load_ymm_high_from_env(uint16 ymm_to_load)
         ra_free_temp(address);
         ra_free_temp(high);
     }
+}
+
+/*
+ * Guest registers r8..r15 live in caller-saved host registers (a2..a5,
+ * t5..t8), so a call into C has to spill them first.  The callee may also
+ * rewrite the environment (CR/MSR helpers do), hence the unconditional
+ * reload.  Both halves are deliberately the same masks.
+ */
+void tr_save_guest_regs_for_helper(void)
+{
+    tr_save_registers_to_env(0xff, 0, 0, options_to_save());
+#ifdef TARGET_X86_64
+    tr_save_x64_8_registers_to_env(0xff, 0);
+#endif
+}
+
+void tr_load_guest_regs_after_helper(void)
+{
+    tr_load_registers_from_env(0xff, 0, 0, options_to_save());
+#ifdef TARGET_X86_64
+    tr_load_x64_8_registers_from_env(0xff, 0);
+#endif
 }
 
 void tr_save_registers_to_env(uint8 gpr_to_save, uint8 fpr_to_save,

@@ -396,10 +396,89 @@ static void translate_mov_from_mem(IR1_OPND *opnd0, IR1_OPND *opnd1)
     ra_free_temp(temp);
 }
 
+/*
+ * MOV CRn, r64  /  MOV r64, CRn
+ *
+ * CPUX86State.cr[] holds cr0..cr4; CR8 lives in the APIC TPR and is reached
+ * through the CR helpers.  x86-64 has no other control registers, so any
+ * other number raises #GP, as it does on hardware.
+ *
+ * Writes go through helper_write_crN because that is what owns the
+ * mode-dependent hflags (PE/PG/LME/LMA, SMAP/OSFXSR) and the page-table
+ * invalidation; duplicating it here would drift from the system emulator.
+ */
+#define LATX_CR_STORED 5
+
+static bool cr_has_storage(int cr)
+{
+    return cr >= 0 && cr < LATX_CR_STORED;
+}
+
+bool translate_mov_cr(IR1_INST *pir1)
+{
+    IR1_OPND *opnd0 = ir1_get_opnd(pir1, 0);
+    IR1_OPND *opnd1 = ir1_get_opnd(pir1, 1);
+
+    if (ir1_opnd_is_creg(opnd1)) {
+        /* MOV r32/r64, CRn */
+        int cr = ir1_opnd_creg_num(opnd1);
+        IR2_OPND tmp, fn;
+
+        if (cr_has_storage(cr)) {
+            tmp = ra_alloc_itemp_internal();
+            la_ld_d(tmp, env_ir2_opnd, offsetof(CPUX86State, cr[0]) + cr * 8);
+            store_ireg_to_ir1(tmp, opnd0, false);
+            ra_free_temp(tmp);
+            return true;
+        }
+        if (cr != 8) {
+            tr_generate_raise_gpf(pir1);
+            return true;
+        }
+        tr_save_guest_regs_for_helper();
+        fn = ra_alloc_dbt_arg2();
+        aot_load_host_addr(fn, (ADDR)helper_read_crN, LOAD_HELPER_READ_CR, 0);
+        la_mov64(a0_ir2_opnd, env_ir2_opnd);
+        li_d(a1_ir2_opnd, cr);
+        la_jirl(ra_ir2_opnd, fn, 0);
+        tr_load_guest_regs_after_helper();
+        store_ireg_to_ir1(a0_ir2_opnd, opnd0, false);
+        return true;
+    }
+
+    if (ir1_opnd_is_creg(opnd0)) {
+        /* MOV CRn, r32/r64 */
+        int cr = ir1_opnd_creg_num(opnd0);
+        IR2_OPND val, fn;
+
+        if (!cr_has_storage(cr) && cr != 8) {
+            tr_generate_raise_gpf(pir1);
+            return true;
+        }
+        tr_save_guest_regs_for_helper();
+        val = load_ireg_from_ir1(opnd1, UNKNOWN_EXTENSION, false);
+        fn = ra_alloc_dbt_arg2();
+        aot_load_host_addr(fn, (ADDR)helper_write_crN, LOAD_HELPER_WRITE_CR, 0);
+        la_mov64(a2_ir2_opnd, val);
+        la_mov64(a0_ir2_opnd, env_ir2_opnd);
+        li_d(a1_ir2_opnd, cr);
+        la_jirl(ra_ir2_opnd, fn, 0);
+        tr_load_guest_regs_after_helper();
+        return true;
+    }
+
+    return false;
+}
+
 bool translate_mov(IR1_INST *pir1)
 {
     IR1_OPND *opnd0 = ir1_get_opnd(pir1, 0);
     IR1_OPND *opnd1 = ir1_get_opnd(pir1, 1);
+
+    /* MOV to/from a control register is a different instruction shape. */
+    if (ir1_opnd_is_creg(opnd0) || ir1_opnd_is_creg(opnd1)) {
+        return translate_mov_cr(pir1);
+    }
 
     switch (ir1_opnd_type(opnd1)) {
     case dt_X86_OP_IMM:

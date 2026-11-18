@@ -154,7 +154,15 @@ bool translate_##function##_wrap(IR1_INST *pir1)    \
 
 #include "insts-pattern.h"
 
+/* Spill/reload the guest register file around a call into C. */
+void tr_save_guest_regs_for_helper(void);
+void tr_load_guest_regs_after_helper(void);
+
 TRANS_FUNC_DEF(invalid);
+TRANS_FUNC_DEF(rdmsr);
+TRANS_FUNC_DEF(wrmsr);
+TRANS_FUNC_DEF(lgdt);
+TRANS_FUNC_DEF(lidt);
 TRANS_FUNC_DEF(add);
 TRANS_FUNC_DEF(lock_add);
 TRANS_FUNC_DEF(lock_add_fast_atomic);
@@ -1728,6 +1736,7 @@ void generate_xcomisx(IR2_OPND, IR2_OPND, bool, bool, uint8_t);
 
 void tr_generate_exit_tb(IR1_INST *branch, int succ_id);
 void tr_generate_exit_tb_to_next(IR1_INST *ir1);
+void tr_generate_raise_gpf(IR1_INST *pir1);
 #ifdef CONFIG_LATX_XCOMISX_OPT
 void tr_generate_exit_stub_tb(IR1_INST *branch, int succ_id, void *func, IR1_INST *stub);
 #endif

@@ -232,6 +232,34 @@ void cpu_sync_bndcs_hflags(CPUX86State *env)
     (void)env;
 }
 
+/*
+ * The feature words the MSR helpers consult.  They are derived from CPUID
+ * rather than hand-written so the two can never disagree: a wrmsr of EFER.LME
+ * is accepted exactly when CPUID.8000_0001:EDX advertises long mode.
+ */
+void latx_x86_env_init_features(CPUX86State *env)
+{
+    uint32_t eax, ebx, ecx, edx;
+
+    memset(env->features, 0, sizeof(env->features));
+
+    cpu_x86_cpuid(env, 0x1, 0, &eax, &ebx, &ecx, &edx);
+    env->features[FEAT_1_EDX] = edx;
+    env->features[FEAT_1_ECX] = ecx;
+
+    cpu_x86_cpuid(env, 0x7, 0, &eax, &ebx, &ecx, &edx);
+    env->features[FEAT_7_0_EBX] = ebx;
+    env->features[FEAT_7_0_ECX] = ecx;
+    env->features[FEAT_7_0_EDX] = edx;
+
+    cpu_x86_cpuid(env, 0x80000001u, 0, &eax, &ebx, &ecx, &edx);
+    env->features[FEAT_8000_0001_EDX] = edx;
+    env->features[FEAT_8000_0001_ECX] = ecx;
+
+    cpu_x86_cpuid(env, 0x80000008u, 0, &eax, &ebx, &ecx, &edx);
+    env->features[FEAT_8000_0008_EBX] = ebx;
+}
+
 /* ---------------- model registers ---------------- */
 uint64_t cpu_get_tsc(CPUX86State *env)
 {

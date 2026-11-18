@@ -305,6 +305,8 @@ int ir1_opnd_is_reg(const IR1_OPND *opnd);
 int ir1_opnd_is_gpr(const IR1_OPND *opnd);
 int ir1_opnd_is_fpr(const IR1_OPND *opnd);
 int ir1_opnd_is_seg(const IR1_OPND *opnd);
+int ir1_opnd_is_creg(const IR1_OPND *opnd);
+int ir1_opnd_creg_num(const IR1_OPND *opnd);
 int ir1_opnd_is_mmx(const IR1_OPND *opnd);
 int ir1_opnd_is_xmm(const IR1_OPND *opnd);
 int ir1_opnd_is_ymm(const IR1_OPND *opnd);

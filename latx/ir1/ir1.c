@@ -1482,6 +1482,22 @@ int ir1_opnd_is_fpr(const IR1_OPND *opnd)
     }
 }
 
+/*
+ * Control registers are reg operands whose capstone id is X86_REG_CRn.  They
+ * are contiguous, so the number in the name is the index into
+ * CPUX86State.cr[] (cr0..cr4 are the ones the state actually stores).
+ */
+int ir1_opnd_is_creg(const IR1_OPND *opnd)
+{
+    return opnd->type == dt_X86_OP_REG && opnd->reg >= dt_X86_REG_CR0 &&
+           opnd->reg <= dt_X86_REG_CR15;
+}
+
+int ir1_opnd_creg_num(const IR1_OPND *opnd)
+{
+    return ir1_opnd_is_creg(opnd) ? (int)opnd->reg - (int)dt_X86_REG_CR0 : -1;
+}
+
 int ir1_opnd_is_seg(const IR1_OPND *opnd)
 {
     if (opnd->type != dt_X86_OP_REG) {

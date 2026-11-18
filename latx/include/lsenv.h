@@ -206,6 +206,18 @@ static inline int lsenv_offset_of_gdt_limit(ENV *lsenv)
     return (int)((ADDR)(&cpu->gdt.limit) - (ADDR)lsenv->cpu_state);
 }
 
+static inline int lsenv_offset_of_idt_base(ENV *lsenv)
+{
+    CPUX86State *cpu = (CPUX86State *)lsenv->cpu_state;
+    return (int)((ADDR)(&cpu->idt.base) - (ADDR)lsenv->cpu_state);
+}
+
+static inline int lsenv_offset_of_idt_limit(ENV *lsenv)
+{
+    CPUX86State *cpu = (CPUX86State *)lsenv->cpu_state;
+    return (int)((ADDR)(&cpu->idt.limit) - (ADDR)lsenv->cpu_state);
+}
+
 /* func to access ENV's interrupt/exception attributes */
 static inline int lsenv_offset_exception_index(ENV *lsenv)
 {
