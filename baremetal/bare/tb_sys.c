@@ -1,16 +1,22 @@
 /*
- * System-instruction smoke test (P1).
+ * Long-mode bring-up test (P1).
  *
- * The guest program is a 64-bit snippet that performs the moves a firmware or
- * a kernel does before it can run anything else, and the harness checks the
- * resulting machine state instead of output:
+ * The guest is a 64-bit snippet that does what a firmware or a kernel does
+ * before it can run anything else, and the harness checks the resulting
+ * machine state rather than trusting the guest to report:
  *
  *   wrmsr  0xc0000080 (EFER) = LME     -> env->efer
- *   rdmsr  0xc0000080                  -> ebx (round trip through helper)
+ *   rdmsr  0xc0000080                  -> ebx (round trip through the helper)
  *   lgdt   [0x1200]                    -> env->gdt.base / limit
- *   mov    cr3, 0x2000                 -> env->cr[3] and a read back
+ *   4 stores                           -> a PML4/PDPT/PD/PT set in guest RAM
+ *   mov    cr3, 0x2000                 -> env->cr[3], read back into r12d
  *   mov    cr0, PE|PG                  -> env->cr[0], LMA follows LME+PG
- *   out    0x3f8, 'K' / in 0x3fd       -> the platform port hooks
+ *   in     0x3fd                       -> ebp (line status, transmitter empty)
+ *   loop   over a NUL-terminated string -> every byte out port 0x3f8
+ *
+ * The last part is the acceptance criterion: the banner arrives complete,
+ * which means a backward branch, a data load, a port write and the halt all
+ * survive translation in long mode.
  *
  * The port hooks are the weak latx_platform_io_read/write symbols the
  * translator's address_space_io plumbing calls, so this also proves that the
@@ -70,7 +76,7 @@ static void check(int cond, const char *what)
 #define COM1_LSR 0x3fd
 #define LSR_THRE_TEMT 0x60
 
-static uint8_t uart_tx[8];
+static uint8_t uart_tx[64];
 static int uart_tx_count;
 
 uint64_t latx_platform_io_read(uint32_t port, int size)
@@ -172,68 +178,78 @@ typedef void (*TbEntry)(void *tb_code, void *env);
  * reg=/2, rm=100) with SIB 0x25 (no index, base=101 -> disp32), i.e.
  * 0f 01 14 25 <disp32>.  With modrm 0x15 the operand is RIP-relative.
  *
- *   +0x00: b9 80 00 00 c0        mov  ecx, 0xc0000080     ; EFER
- *   +0x05: b8 00 01 00 00        mov  eax, 0x100          ; LME
- *   +0x0a: 31 d2                 xor  edx, edx
- *   +0x0c: 0f 30                 wrmsr
- *   +0x0e: 31 c0                 xor  eax, eax
- *   +0x10: 31 d2                 xor  edx, edx
- *   +0x12: 0f 32                 rdmsr
- *   +0x14: 89 c3                 mov  ebx, eax            ; EFER as read back
- *   +0x16: 0f 01 14 25 00 12 00 00  lgdt [0x1200]
- *   +0x1e: b8 00 20 00 00        mov  eax, 0x2000
- *   +0x23: 0f 22 d8              mov  cr3, eax
- *   +0x26: 0f 20 d8              mov  eax, cr3
- *   +0x29: 89 c6                 mov  esi, eax
- *   +0x2b: b8 01 00 00 80        mov  eax, 0x80000001     ; PG | PE
- *   +0x30: 0f 22 c0              mov  cr0, eax
- *   +0x33: 0f 20 c0              mov  eax, cr0
- *   +0x36: 89 c7                 mov  edi, eax
- *   +0x38: ba f8 03 00 00        mov  edx, 0x3f8
- *   +0x3d: b0 4b                 mov  al, 'K'
- *   +0x3f: ee                    out  dx, al
- *   +0x40: ba fd 03 00 00        mov  edx, 0x3fd
- *   +0x45: ec                    in   al, dx
- *   +0x46: 0f b6 c0              movzx eax, al
- *   +0x49: 89 c5                 mov  ebp, eax
- *   +0x4b: eb fe                 jmp  +0x4b
+ * The four stores build a 4-level table set: PML4[0] -> PDPT -> PD -> PT,
+ * and PT[0] maps the first 2 MiB with PS set, which covers the code, the
+ * stack and the string.  CR3 is loaded with the PML4 physical address and PG
+ * is then set in CR0.
+ *
+  *   +0x00: b9 80 00 00 c0                       mov  ecx, 0xc0000080     ; EFER
+ *   +0x05: b8 00 01 00 00                       mov  eax, 0x100          ; LME
+ *   +0x0a: 31 d2                                xor  edx, edx
+ *   +0x0c: 0f 30                                wrmsr
+ *   +0x0e: 31 c0                                xor  eax, eax
+ *   +0x10: 31 d2                                xor  edx, edx
+ *   +0x12: 0f 32                                rdmsr
+ *   +0x14: 89 c3                                mov  ebx, eax            ; EFER as read back
+ *   +0x16: 0f 01 14 25 00 12 00 00              lgdt [0x1200]
+ *   +0x1e: 48 c7 04 25 00 20 00 00 03 30 00 00  mov  qword [0x2000], 0x3003  ; PML4 -> PDPT
+ *   +0x2a: 48 c7 04 25 00 30 00 00 03 40 00 00  mov  qword [0x3000], 0x4003  ; PDPT -> PD
+ *   +0x36: 48 c7 04 25 00 40 00 00 03 50 00 00  mov  qword [0x4000], 0x5003  ; PD   -> PT
+ *   +0x42: 48 c7 04 25 00 50 00 00 83 00 00 00  mov  qword [0x5000], 0x83    ; PT: first 2 MiB
+ *   +0x4e: b8 00 20 00 00                       mov  eax, 0x2000
+ *   +0x53: 0f 22 d8                             mov  cr3, eax
+ *   +0x56: 0f 20 d8                             mov  eax, cr3
+ *   +0x59: 41 89 c4                             mov  r12d, eax           ; CR3 as read back
+ *   +0x5c: b8 01 00 00 80                       mov  eax, 0x80000001     ; PG | PE
+ *   +0x61: 0f 22 c0                             mov  cr0, eax
+ *   +0x64: 0f 20 c0                             mov  eax, cr0
+ *   +0x67: 89 c7                                mov  edi, eax            ; CR0 as read back
+ *   +0x69: ba fd 03 00 00                       mov  edx, 0x3fd
+ *   +0x6e: ec                                   in   al, dx
+ *   +0x6f: 0f b6 c0                             movzx eax, al
+ *   +0x72: 89 c5                                mov  ebp, eax            ; LSR as read back
+ *   +0x74: be 00 00 00 00                       mov  esi, <str>          ; patched
+ *   +0x79: 8a 06                                mov  al, [rsi]
+ *   +0x7b: 84 c0                                test al, al
+ *   +0x7d: 74 0c                                jz   +0x0c
+ *   +0x7f: ba f8 03 00 00                       mov  edx, 0x3f8
+ *   +0x84: ee                                   out  dx, al
+ *   +0x85: 48 ff c6                             inc  rsi
+ *   +0x88: eb ef                                jmp  -0x11
+ *   +0x8a: 90                                   nop
+ *   +0x8b: eb fe                                jmp  $
  */
 static const uint8_t program[] = {
-    0xb9, 0x80, 0x00, 0x00, 0xc0,
-    0xb8, 0x00, 0x01, 0x00, 0x00,
-    0x31, 0xd2,
-    0x0f, 0x30,
-    0x31, 0xc0,
-    0x31, 0xd2,
-    0x0f, 0x32,
-    0x89, 0xc3,
-    0x0f, 0x01, 0x14, 0x25, 0x00, 0x12, 0x00, 0x00,
-    0xb8, 0x00, 0x20, 0x00, 0x00,
-    0x0f, 0x22, 0xd8,
-    0x0f, 0x20, 0xd8,
-    0x89, 0xc6,
-    0xb8, 0x01, 0x00, 0x00, 0x80,
-    0x0f, 0x22, 0xc0,
-    0x0f, 0x20, 0xc0,
-    0x89, 0xc7,
-    0xba, 0xf8, 0x03, 0x00, 0x00,
-    0xb0, 0x4b,
-    0xee,
-    0xba, 0xfd, 0x03, 0x00, 0x00,
-    0xec,
-    0x0f, 0xb6, 0xc0,
-    0x89, 0xc5,
-    0xeb, 0xfe,
+    0xb9, 0x80, 0x00, 0x00, 0xc0, 0xb8, 0x00, 0x01,
+    0x00, 0x00, 0x31, 0xd2, 0x0f, 0x30, 0x31, 0xc0,
+    0x31, 0xd2, 0x0f, 0x32, 0x89, 0xc3, 0x0f, 0x01,
+    0x14, 0x25, 0x00, 0x12, 0x00, 0x00, 0x48, 0xc7,
+    0x04, 0x25, 0x00, 0x20, 0x00, 0x00, 0x03, 0x30,
+    0x00, 0x00, 0x48, 0xc7, 0x04, 0x25, 0x00, 0x30,
+    0x00, 0x00, 0x03, 0x40, 0x00, 0x00, 0x48, 0xc7,
+    0x04, 0x25, 0x00, 0x40, 0x00, 0x00, 0x03, 0x50,
+    0x00, 0x00, 0x48, 0xc7, 0x04, 0x25, 0x00, 0x50,
+    0x00, 0x00, 0x83, 0x00, 0x00, 0x00, 0xb8, 0x00,
+    0x20, 0x00, 0x00, 0x0f, 0x22, 0xd8, 0x0f, 0x20,
+    0xd8, 0x41, 0x89, 0xc4, 0xb8, 0x01, 0x00, 0x00,
+    0x80, 0x0f, 0x22, 0xc0, 0x0f, 0x20, 0xc0, 0x89,
+    0xc7, 0xba, 0xfd, 0x03, 0x00, 0x00, 0xec, 0x0f,
+    0xb6, 0xc0, 0x89, 0xc5, 0xbe, 0x00, 0x00, 0x00,
+    0x00, 0x8a, 0x06, 0x84, 0xc0, 0x74, 0x0c, 0xba,
+    0xf8, 0x03, 0x00, 0x00, 0xee, 0x48, 0xff, 0xc6,
+    0xeb, 0xef, 0x90, 0xeb, 0xfe,
 };
 
-/* limit 0x1f, base 0x1000 -- the shape a 64-bit lgdt operand must have. */
 static uint8_t gdt_image[16] __attribute__((aligned(16)));
+
+/* NUL terminated; the guest walks it and writes it out port by port. */
+static const char banner[] = "loongemu: long mode\n";
 
 static const uint8_t gdt_descriptor[] = {
     0x1f, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
-#define HALT_PC (PROGRAM_PC + 0x4b)
+#define HALT_PC (PROGRAM_PC + 0x8b)
 #define EFER_LME (1u << 8)
 #define EFER_LMA (1u << 10)
 
@@ -269,9 +285,12 @@ void kmain(void)
      */
     {
         uint32_t desc_addr = (uint32_t)(uintptr_t)gdt_image;
+        uint32_t str_addr = (uint32_t)(uintptr_t)banner;
 
         memcpy(guest_ram + (PROGRAM_PC - GUEST_BASE) + 0x1a, &desc_addr,
                sizeof(desc_addr));
+        memcpy(guest_ram + (PROGRAM_PC - GUEST_BASE) + 0x75, &str_addr,
+               sizeof(str_addr));
     }
 
     memset(&env, 0, sizeof(env));
@@ -389,12 +408,19 @@ void kmain(void)
     check(env.gdt.limit == 0x1f, "lgdt limit");
     /* mov cr3 plus the read back */
     check(env.cr[3] == 0x2000, "mov cr3 stored");
-    check(env.regs[R_ESI] == 0x2000, "mov r, cr3 reads it back");
+    check(env.regs[R_R12] == 0x2000, "mov r, cr3 reads it back");
     /* mov cr0 plus the read back */
     check(env.cr[0] == 0x80000001u, "mov cr0 stored");
     check(env.regs[R_EDI] == 0x80000001u, "mov r, cr0 reads it back");
-    /* port I/O reached the device layer */
-    check(uart_tx_count == 1 && uart_tx[0] == 'K', "out 0x3f8 sent 'K'");
+    /* the 4-level tables the guest built, read back through the data path */
+    check(*(volatile uint64_t *)0x2000 == 0x3003u, "PML4 entry");
+    check(*(volatile uint64_t *)0x3000 == 0x4003u, "PDPT entry");
+    check(*(volatile uint64_t *)0x4000 == 0x5003u, "PD entry");
+    check(*(volatile uint64_t *)0x5000 == 0x83u, "PT entry (2 MiB page)");
+    /* every byte of the banner came out of the guest's loop */
+    check(uart_tx_count == (int)sizeof(banner) - 1 &&
+          memcmp(uart_tx, banner, sizeof(banner) - 1) == 0,
+          "out 0x3f8 printed the banner");
     check(env.regs[R_EBP] == LSR_THRE_TEMT, "in 0x3fd read the LSR");
     check(env.eip == HALT_PC, "reached the halt block");
     check(g_bad_fetch == 0, "no out-of-image fetch");

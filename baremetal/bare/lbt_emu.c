@@ -81,10 +81,18 @@ void lbt_handle(uint64_t *regs)
     __asm__ volatile("csrrd %0, 0x6" : "=r"(era));
     __asm__ volatile("csrrd %0, 0x5" : "=r"(estat));
     if (((estat >> 16) & 0x3f) != 0x0d) {
-        latx_bare_uart_puts("trap is=");
+        uint64_t badv;
+
+        /* BADV names the address a load/store fault was about. */
+        __asm__ volatile("csrrd %0, 0x7" : "=r"(badv));
+        latx_bare_uart_puts("trap ecode=");
         puthex((estat >> 16) & 0x3f);
+        latx_bare_uart_puts(" estat=");
         puthex(estat);
+        latx_bare_uart_puts(" era=");
         puthex(era);
+        latx_bare_uart_puts(" badv=");
+        puthex(badv);
         latx_bare_uart_puts("\n");
         for (;;) {
         }
