@@ -309,14 +309,21 @@ static uint32_t g_timer_vector = 0x20;       /* PIC default vector        */
  * End-to-end tick test.  Its own code page, IDT, stack and counter, so it
  * cannot perturb (or be perturbed by) the image the earlier checks built.
  */
+/*
+ * Layout for the timer tests.  These must not overlap: the IDT occupies
+ * idt_base + vector*16, so an idt_base of 0xb400 with vector 0x20 puts the
+ * gate itself at 0xb600.  Placing the counter there made the ISR's
+ * `inc dword [0xb600]` rewrite the gate's offset[15:0] -- the handler address
+ * it returned to became 0xb001, and every read of the "counter" was really
+ * reading a gate field.
+ */
 #define TICK_ISR_PC       0x0000b000   /* guest ISR: inc dword [counter]; iretq */
-#define TICK_SPIN_PC      0x0000b100   /* guest body: install gate, sti, spin */
-#define TICK_STUB_PC      0x0000b200   /* cli / sti stubs used by the body  */
-#define TICK_IDT_PC       0x0000b400
-#define TICK_STACK_PC     0x0000bc00   /* grows down; keep clear of 0xb600  */
-#define TICK_COUNTER_PC   0x0000b600   /* far below the stack pointer       */
+#define TICK_COUNTER_PC   0x0000b100   /* the dword the ISR increments       */
+#define TICK_IDT_PC       0x0000b400   /* gates live at +vector*16 = 0xb600  */
+#define TICK_SPIN_PC      0x0000c000   /* guest body: jmp $                  */
+#define TICK_STACK_PC     0x0000d000   /* grows down; clear of everything    */
 #define TICK_VECTOR       0x20
-#define HLT_PC_TEST       0x0000be00   /* one `hlt`, for the halt check      */
+#define HLT_PC_TEST       0x0000e000   /* one `hlt`, for the halt check      */
 
 
 
@@ -780,6 +787,98 @@ static int deliver_tick_to_guest(void)
  * must not move.
  */
 /*
+ * A real dispatch loop over translated blocks, with HLT as an idle state.
+ *
+ * Unlike run_halted_guest_rounds(), which models the hand-off, this executes
+ * the guest's own bytes through the translator: the HLT block stops with RIP
+ * on itself, the driver injects a tick, the handler block runs `inc`/`iretq`
+ * for real, and iretq brings RIP back to the HLT.  Each round therefore covers
+ * translation, PLV3 execution, injection, the handler's own instructions and
+ * the return -- the whole path a kernel's idle loop takes.
+ *
+ * Returns the number of completed halt/wake rounds, or a negative value if a
+ * block failed to translate or RIP did not behave.
+ */
+static int run_guest_idle_loop(int rounds)
+{
+    uint64_t code_addr = CODE_SCRATCH + 0x1c000;
+    int i;
+    int woke = 0;
+
+    *(volatile uint8_t *)(uintptr_t)HLT_PC_TEST = 0xf4;
+    *(volatile uint32_t *)(uintptr_t)TICK_COUNTER_PC = 0;
+
+    /* The ISR must be in place: this test is about the loop, not the gate. */
+    {
+        static const uint8_t isr_code[] = {
+            0xff, 0x04, 0x25, 0x00, 0xb1, 0x00, 0x00,  /* inc dword [0xb100] */
+            0x48, 0xcf,                                 /* iretq             */
+        };
+        uint64_t gate_lo, gate_hi;
+
+        memcpy((void *)(uintptr_t)TICK_ISR_PC, isr_code, sizeof(isr_code));
+        gate_lo = ((uint64_t)TICK_ISR_PC & 0xffffULL) |
+                  ((uint64_t)0x08 << 16) |
+                  ((uint64_t)0x8e << 40) |
+                  (((((uint64_t)TICK_ISR_PC) >> 16) & 0xffffULL) << 48);
+        gate_hi = ((uint64_t)TICK_ISR_PC >> 32) & 0xffffffffULL;
+        *(volatile uint64_t *)(uintptr_t)(TICK_IDT_PC + TICK_VECTOR * 16) =
+            gate_lo;
+        *(volatile uint64_t *)(uintptr_t)(TICK_IDT_PC +
+                                          TICK_VECTOR * 16 + 8) = gate_hi;
+    }
+
+    env.idt.base = TICK_IDT_PC;
+    env.idt.limit = 0xffff;
+    env.segs[R_CS].selector = 0x08;
+    env.segs[R_SS].selector = 0x10;
+    env.regs[R_ESP] = TICK_STACK_PC;
+    env.eip = HLT_PC_TEST;
+    env.eflags = IF_MASK | 0x2;
+    latx_x86_tlb_flush_all();
+
+    for (i = 0; i < rounds; i++) {
+        int rc;
+
+        /* 1. Run the halt.  RIP must not advance past it. */
+        rc = tb_harness_translate_at(env.eip, (uint8_t *)(uintptr_t)code_addr,
+                                     2048);
+        if (rc <= 0) {
+            return -1;
+        }
+        tb_sys_run_plv3((void *)(uintptr_t)pro_buf,
+                        (void *)(uintptr_t)code_addr, &env);
+        if (env.eip != HLT_PC_TEST) {
+            return -2;
+        }
+
+        /* 2. The tick arrives; the driver enters the guest's handler. */
+        if (!deliver_tick_to_guest()) {
+            return -3;
+        }
+        if (env.eip != TICK_ISR_PC) {
+            return -4;
+        }
+
+        /* 3. Run the handler for real: inc dword [counter] ; iretq. */
+        rc = tb_harness_translate_at(env.eip, (uint8_t *)(uintptr_t)code_addr,
+                                     2048);
+        if (rc <= 0) {
+            return -5;
+        }
+        tb_sys_run_plv3((void *)(uintptr_t)pro_buf,
+                        (void *)(uintptr_t)code_addr, &env);
+
+        /* 4. iretq must have landed back on the halt. */
+        if (env.eip != HLT_PC_TEST) {
+            return -6;
+        }
+        woke++;
+    }
+    return woke;
+}
+
+/*
  * Drive a halted guest the way the vCPU loop does: while RIP sits on an HLT,
  * inject a tick; the handler runs, iretq's back to the HLT, and the next round
  * halts again.  This is the idle loop with a periodic timer, and the count it
@@ -828,7 +927,7 @@ static int run_halted_guest_rounds(int rounds)
 static uint32_t run_guest_tick_case(int enable_ticks, int injections)
 {
     static const uint8_t isr_code[] = {
-        0xff, 0x04, 0x25, 0x00, 0xb6, 0x00, 0x00,  /* inc dword [0xb600] */
+        0xff, 0x04, 0x25, 0x00, 0xb1, 0x00, 0x00,  /* inc dword [0xb100] */
         0x48, 0xcf,                                 /* iretq             */
     };
     uint64_t gate_lo, gate_hi;
@@ -1948,6 +2047,25 @@ void kmain(void)
                 check(woke == 4, "halted guest woke four times on four ticks");
                 latx_bare_uart_puts("tb-sys: halt_wakes=");
                 puthex((uint64_t)woke);
+                latx_bare_uart_puts("\n");
+            }
+
+            /*
+             * The same sequence executed for real: the guest's own HLT block
+             * and the handler's own inc/iretq run at PLV3, and iretq is what
+             * brings RIP back.  This is the path a kernel's idle loop takes.
+             */
+            {
+                int idle = run_guest_idle_loop(4);
+
+                check(idle == 4,
+                      "idle loop: 4 halt/wake rounds executed end to end");
+                check(*(volatile uint32_t *)(uintptr_t)TICK_COUNTER_PC == 4,
+                      "idle loop: the handler's own inc ran four times");
+                latx_bare_uart_puts("tb-sys: idle_rounds=");
+                puthex((uint64_t)(idle < 0 ? 0 : idle));
+                latx_bare_uart_puts(" idle_count=");
+                puthex(*(volatile uint32_t *)(uintptr_t)TICK_COUNTER_PC);
                 latx_bare_uart_puts("\n");
             }
         }
