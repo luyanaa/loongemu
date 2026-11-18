@@ -45,8 +45,17 @@
  *   - No LBT trap fires while the prologue runs, because this QEMU tree
  *     implements the LBT instructions natively, so the emulation path is
  *     not involved.
- *   The failure is therefore inside the prologue's register-load sequence,
- *   which was not localised further.
+ *   - The exit is a self-looping link slot only the runtime linker fills.
+ *     Routing the block through a patched slot (turning `b 0` into a nop so
+ *     it falls into the epilogue jump) makes the block return.  tb_loop now
+ *     does that.
+ *   - Once it returns, the guest registers are saved correctly (eax=2,
+ *     ecx=4 after one pass of the loop body) but env.eip is never written:
+ *     a sentinel placed there survives the call unchanged.  The exit lands
+ *     on context_switch_native_to_bt_ret_id_0 (epilogue+28), which by
+ *     construction skips the eip store at epilogue+0 and assumes the block
+ *     stored it; this build's direct-branch path does not.  Propagating the
+ *     successor PC is the remaining work.
  */
 #include "qemu/osdep.h"
 #include "exec/exec-all.h"
@@ -309,10 +318,33 @@ static int translate_at(uint64_t pc, uint8_t *code, uint64_t limit)
     tb.icount = (uint16_t)n;
     tb.tc.ptr = code;
     tb.s_data = &ir1_sd;
+    /*
+     * Never link: there is no runtime TB linker here, and the translator's
+     * goto_tb stub is a nop followed by a link slot that only the linker
+     * would fill.  With both successors marked unlinkable the exit goes to
+     * the epilogue instead.
+     */
+    tb.canlink[0] = 0;
+    tb.canlink[1] = 0;
 
     rc = tr_translate_tb(&tb);
     if (rc <= 0 || (uint64_t)rc > limit) {
         return -1;
+    }
+
+    /*
+     * A direct branch emits a link slot -- `b 0` -- that only the runtime TB
+     * linker ever fills, followed by the epilogue jump.  There is no linker
+     * here, so the slot is turned into a nop and execution falls through to
+     * the epilogue instead of spinning on itself.  jmp_target_arg holds the
+     * slot's byte offset once assembly has resolved the label.
+     */
+    for (int i = 0; i < 2; i++) {
+        uint64_t off = tb.jmp_target_arg[i];
+
+        if (off != 0 && off + 4 <= (uint64_t)rc) {
+            *(uint32_t *)(code + off) = 0x03400000u;   /* andi r0, r0, 0 */
+        }
     }
     return rc;
 }
@@ -349,6 +381,16 @@ void kmain(void)
     memset(epi_buf, 0, sizeof(epi_buf));
 
     env.sys.codemode = 1;
+    /*
+     * 64-bit long mode.  hflags is what the translator consults to decide the
+     * code segment width and how condition codes are evaluated; leaving it at
+     * zero describes a 32-bit segment while the decoder is fed the 64-bit
+     * instruction stream, and a conditional branch then never takes.
+     */
+    env.hflags = HF_LMA_MASK | HF_CS64_MASK;
+    env.cr[0] = UINT64_C(0x80000001);   /* PE | PG */
+    env.cr[4] = UINT64_C(0x20);         /* PAE     */
+    env.efer = UINT64_C(1) << 10;       /* LMA     */
     env.tb_jmp_cache_ptr = jmp_cache;
     env.eip = PROGRAM_PC;
     env.cr[3] = 0;                 /* one address space for this program */
