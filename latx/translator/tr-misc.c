@@ -1601,9 +1601,31 @@ bool translate_syscall(IR1_INST *pir1)
 }
 #endif
 
+/*
+ * HLT stops the CPU until an interrupt arrives.
+ *
+ * It used to be a nop, which is invisible until a guest actually idles: the
+ * kernel's idle loop becomes a busy spin instead of a place where the tick can
+ * wake it.  The architecture's contract is that RIP stays on the HLT, so the
+ * block exits with the guest address of this instruction rather than the next
+ * one -- the driver sees the same PC and knows the CPU is halted, and a
+ * pending interrupt re-enters at the handler with the HLT still there to be
+ * resumed afterwards.
+ */
 bool translate_hlt(IR1_INST *pir1)
 {
-    la_andi(zero_ir2_opnd, zero_ir2_opnd, 0);
+    TranslationBlock *tb = lsenv->tr_data->curr_tb;
+    IR2_OPND halt_pc = ra_alloc_dbt_arg2();
+    IR2_OPND base = ra_alloc_data();
+    IR2_OPND target = ra_alloc_data();
+    target_ulong call_offset = aot_get_call_offset(ir1_addr(pir1));
+
+    emit_ymmh_zeros();
+    aot_load_guest_addr(halt_pc, ir1_addr(pir1), LOAD_CALL_TARGET,
+                        call_offset);
+    la_data_li(base, (ADDR)tb->tc.ptr);
+    la_data_li(target, context_switch_native_to_bt_ret_0);
+    aot_la_append_ir2_jmp_far(target, base, B_EPILOGUE_RET_0, 0);
     return true;
 }
 

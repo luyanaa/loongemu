@@ -316,6 +316,7 @@ static uint32_t g_timer_vector = 0x20;       /* PIC default vector        */
 #define TICK_STACK_PC     0x0000bc00   /* grows down; keep clear of 0xb600  */
 #define TICK_COUNTER_PC   0x0000b600   /* far below the stack pointer       */
 #define TICK_VECTOR       0x20
+#define HLT_PC_TEST       0x0000be00   /* one `hlt`, for the halt check      */
 
 
 
@@ -1807,6 +1808,72 @@ void kmain(void)
         latx_bare_uart_puts("tb-sys: tick_isr_count=");
         puthex((uint64_t)with_if);
         latx_bare_uart_puts("\n");
+
+        /*
+         * HLT must leave RIP on itself.  If the translator advanced it (or
+         * treated the instruction as a nop, which is what it used to do), a
+         * guest idle loop becomes a busy spin and the address seen by the
+         * driver is the instruction after the halt.
+         */
+        {
+            uint64_t code_addr = CODE_SCRATCH + 0x18000;
+            int rc;
+
+            *(volatile uint8_t *)(uintptr_t)HLT_PC_TEST = 0xf4;  /* hlt */
+            env.eip = HLT_PC_TEST;
+            env.regs[R_ESP] = TICK_STACK_PC;
+            env.eflags = IF_MASK | 0x2;
+            latx_x86_tlb_flush_all();
+
+            rc = tb_harness_translate_at(env.eip,
+                                         (uint8_t *)(uintptr_t)code_addr,
+                                         2048);
+            check(rc > 0, "hlt block translates");
+            if (rc > 0) {
+                tb_sys_run_plv3((void *)(uintptr_t)pro_buf,
+                                (void *)(uintptr_t)code_addr, &env);
+            }
+            check(env.eip == HLT_PC_TEST, "hlt leaves RIP on itself");
+            latx_bare_uart_puts("tb-sys: hlt_eip=");
+            puthex(env.eip);
+            latx_bare_uart_puts("\n");
+        }
+
+        /*
+         * HLT + tick: the halt must be a place an interrupt can wake the CPU
+         * from.  Inject a tick while RIP sits on the HLT; delivery redirects
+         * to the gate target, so the pair behaves like a real idle loop --
+         * halted until the timer, then in the handler.
+         */
+        {
+            uint64_t gate_lo, gate_hi, before;
+
+            *(volatile uint8_t *)(uintptr_t)HLT_PC_TEST = 0xf4;
+            gate_lo = ((uint64_t)TICK_ISR_PC & 0xffffULL) |
+                      ((uint64_t)0x08 << 16) |
+                      ((uint64_t)0x8e << 40) |
+                      (((((uint64_t)TICK_ISR_PC) >> 16) & 0xffffULL) << 48);
+            gate_hi = ((uint64_t)TICK_ISR_PC >> 32) & 0xffffffffULL;
+            *(volatile uint64_t *)(uintptr_t)(TICK_IDT_PC + TICK_VECTOR * 16) =
+                gate_lo;
+            *(volatile uint64_t *)(uintptr_t)(TICK_IDT_PC +
+                                              TICK_VECTOR * 16 + 8) = gate_hi;
+
+            env.idt.base = TICK_IDT_PC;
+            env.idt.limit = 0xffff;
+            env.segs[R_CS].selector = 0x08;
+            env.segs[R_SS].selector = 0x10;
+            env.eip = HLT_PC_TEST;
+            env.regs[R_ESP] = TICK_STACK_PC;
+            env.eflags = IF_MASK | 0x2;
+            g_timer_vector = TICK_VECTOR;
+            latx_x86_tlb_flush_all();
+
+            before = env.eip;
+            check(deliver_tick_to_guest() == 1, "tick accepted while halted");
+            check(env.eip == TICK_ISR_PC && env.eip != before,
+                  "a halted CPU is woken into its own handler");
+        }
 
         without_if = run_guest_tick_case(0, 5);
         check(without_if == 0, "cli: guest ISR counted nothing");
