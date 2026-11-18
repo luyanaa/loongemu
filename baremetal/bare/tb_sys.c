@@ -1715,6 +1715,21 @@ void kmain(void)
         check(t1 != t0, "clock advances between back-to-back reads");
         check((t2 - t1) > (t1 - t0), "clock gap grows with elapsed work");
 
+        /*
+         * One clock, not two.  cpu_get_tsc() is what helpers see; RDTSC is
+         * what the guest sees.  A synthetic env->tsc++ would make these
+         * diverge by an arbitrary amount, so they must agree to within the
+         * time the two reads themselves take.
+         */
+        {
+            uint64_t via_helper = cpu_get_tsc(&env);
+            uint64_t via_hw;
+
+            __asm__ volatile("rdtime.d %0, $zero" : "=r"(via_hw) :: "memory");
+            check(via_hw >= via_helper && (via_hw - via_helper) < 100000,
+                  "cpu_get_tsc agrees with rdtime.d");
+        }
+
         /* (2) A tick is delivered when the guest has IF set. */
         idt_save_base = env.idt.base;
         eip_save = env.eip;

@@ -266,9 +266,23 @@ void latx_x86_env_init_features(CPUX86State *env)
 }
 
 /* ---------------- model registers ---------------- */
+/*
+ * The timestamp counter is the hardware's, not this file's.
+ *
+ * RDTSC translates to rdtime.d, so a guest that reads the counter and a
+ * helper that reads it through here must see the same number; `env->tsc++`
+ * was a second clock running at one tick per call, which made the two
+ * disagree the moment anything actually measured elapsed time.  The
+ * environment field stays as the guest-visible shadow for state save and
+ * restore, updated from the same source.
+ */
 uint64_t cpu_get_tsc(CPUX86State *env)
 {
-    return env->tsc++;
+    uint64_t now;
+
+    __asm__ volatile("rdtime.d %0, $zero" : "=r"(now) :: "memory");
+    env->tsc = now;
+    return now;
 }
 
 void cpu_set_fpuc(CPUX86State *env, uint16_t fpuc)
