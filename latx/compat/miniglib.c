@@ -25,7 +25,12 @@ __attribute__((weak)) void latx_bare_uart_puts(const char *s)
 }
 
 #ifndef LATX_BARE_ARENA_SIZE
-#define LATX_BARE_ARENA_SIZE (4u * 1024u * 1024u)
+/*
+ * 4 MiB was too small: translating a block with a call needs a single ~8.9 MiB
+ * allocation, so translation aborted with an assert that looked like
+ * exhaustion but was one oversized request.  32 MiB covers it with headroom.
+ */
+#define LATX_BARE_ARENA_SIZE (32u * 1024u * 1024u)
 #endif
 
 static unsigned char g_arena[LATX_BARE_ARENA_SIZE] __attribute__((aligned(16)));

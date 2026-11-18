@@ -18,59 +18,41 @@
  * spins; the assertions check the loop ran, the call returned, and the
  * translator produced more than one block.
  *
- * STATUS: the harness builds and translates, but execution does not return.
- * What the bring-up established, and what is still wrong:
+ * STATUS: passing.  Five blocks are translated (loop head, loop body, call,
+ * callee, halt) and seven checks hold: eax == ebx == 11, ecx == 0,
+ * eip == HALT_PC, more than one block translated, and no out-of-image fetch.
+ *
+ * What the bring-up established:
  *
  *   - qemu_loglevel_mask() in latx/compat/qemu/log.h was hardcoded to return
  *     0, so CPU_LOG_TB_NOCHAIN could never take effect and every block exit
  *     went to a link the harness never built.  It now reads qemu_loglevel.
- *   - Entry uses the generated prologue/epilogue pair instead of the hand
+ *   - Entry uses the generated prologue/epilogue pair rather than a hand
  *     rolled frame, because that pair is a matched call/return: it saves the
  *     callee-saved set at fixed sp offsets, loads the guest registers, and
- *     returns through $ra.  The old harness saved the same registers at the
- *     same offsets but never loaded the guest state the block reads.
- *   - ir1_disasm() exits the process on `dec r32` (0xff /1) in this build:
- *     replacing `ff c9` with the equivalent `83 e9 01` moved the failure
- *     from decode to execution.  That is a decoder defect, independent of
- *     this harness.
- *   - With the prologue installed, the first block is entered and never
- *     returns; with a zeroed prologue the same block ran and returned.  So
- *     translation and fetch are fine and the remaining fault is in the
- *     entry/exit convention.
- *   - The generated prologue and epilogue were disassembled and are a
- *     correct pair: sp-=256, s0..s8/fp/ra saved at 40..120, env and the jump
- *     target taken from a0/a1, closing with jr through S_UD1.  QEMU reports
- *     the entry points the harness expects (ret_0 == epi_buf,
- *     bt_to_native == pro_buf).
- *   - No LBT trap fires while the prologue runs, because this QEMU tree
- *     implements the LBT instructions natively, so the emulation path is
- *     not involved.
+ *     returns through $ra.
+ *   - ir1_disasm() exits the process on `dec r32` (0xff /1) in this build, so
+ *     the loop decrements with the equivalent `83 e9 01`.  That is a decoder
+ *     defect, independent of this harness.
  *   - Flags: the decoder leaves _eflag_def zero because the flag-reduction
- *     pass is what normally fills it.  Without it ir1_need_calculate_any_flag
- *     answers "no" for every instruction, arithmetic is emitted as plain
- *     add_d/sub_d with no LBT flag update, and the following
- *     lbt_x86setj/bne reads stale flags -- a conditional branch then never
- *     terminates its loop.  Calling flag_gen() per decoded instruction fixes
- *     it: the emitted code now contains lbt_x86xor_w / lbt_x86add_w /
- *     lbt_x86sub_w immediately before each lbt_x86setj.
- *   - A call pushes the return address, so the guest needs a stack; ESP was
- *     left at zero and the push faulted.
- *   - Past that point the translator requests a single 8.9 MiB allocation
- *     from a 4 MiB arena and aborts.  Arena occupancy at that moment is only
- *     40 KiB, so it is one oversized request rather than exhaustion: some
- *     size computation inside translation is being fed a value far larger
- *     than any structure it should need.
- *   - The exit is a self-looping link slot only the runtime linker fills.
- *     Routing the block through a patched slot (turning `b 0` into a nop so
- *     it falls into the epilogue jump) makes the block return.  tb_loop now
- *     does that.
- *   - Once it returns, the guest registers are saved correctly (eax=2,
- *     ecx=4 after one pass of the loop body) but env.eip is never written:
- *     a sentinel placed there survives the call unchanged.  The exit lands
- *     on context_switch_native_to_bt_ret_id_0 (epilogue+28), which by
- *     construction skips the eip store at epilogue+0 and assumes the block
- *     stored it; this build's direct-branch path does not.  Propagating the
- *     successor PC is the remaining work.
+ *     pass normally fills it.  Calling flag_gen() per decoded instruction
+ *     gives the emitted code its lbt_x86xor_w / lbt_x86add_w / lbt_x86sub_w
+ *     before each lbt_x86setj, without which a conditional branch reads stale
+ *     flags and never leaves its loop.
+ *   - Translation needs one ~8.9 MiB allocation for a block with a call, so
+ *     the bare arena is 32 MiB (see LATX_BARE_ARENA_SIZE).
+ *   - The exit is a self-looping link slot that only the runtime linker
+ *     fills; the harness patches each `b 0` slot to a nop so control falls
+ *     into the epilogue jump instead.  The patch must be bounds checked with
+ *     a *signed* offset: a block with one successor leaves the second
+ *     successor's label undisposed, label_dispose stores -1, and `-1 + 4 <=
+ *     size` is true in unsigned arithmetic -- an unchecked write lands one
+ *     byte before the block, rewrites the high byte of its first instruction,
+ *     and the call's return address is then built from garbage.  The write is
+ *     also gated on the slot actually decoding as `b 0`.
+ *   - A guest call pushes through $s4 (the mapped esp) and the callee's ret
+ *     pops into the indirect-jump path, which under NOCHAIN exits to the
+ *     epilogue with env.eip already written; no runtime TB linker is needed.
  */
 #include "qemu/osdep.h"
 #include "exec/exec-all.h"
@@ -362,13 +344,26 @@ static int translate_at(uint64_t pc, uint8_t *code, uint64_t limit)
      * here, so the slot is turned into a nop and execution falls through to
      * the epilogue instead of spinning on itself.  jmp_target_arg holds the
      * slot's byte offset once assembly has resolved the label.
+     *
+     * A successor that this block does not have -- the call block exits
+     * through one path only -- leaves the label undisposed, and label_dispose
+     * stores -1.  As unsigned, `-1 + 4 <= rc` holds, so an unchecked write
+     * lands one byte before the block and rewrites the high byte of its first
+     * instruction: the call's return address then materialises from garbage,
+     * `ret` pops it, and execution continues at an address nothing was
+     * translated for.  Both the signed bound and the `b 0` check below keep
+     * the patch inside the block and on the slot it is meant for.
      */
     for (int i = 0; i < 2; i++) {
-        uint64_t off = tb.jmp_target_arg[i];
+        int64_t off = (int64_t)tb.jmp_target_arg[i];
 
-        if (off != 0 && off + 4 <= (uint64_t)rc) {
-            *(uint32_t *)(code + off) = 0x03400000u;   /* andi r0, r0, 0 */
+        if (off < 0 || off + 4 > (int64_t)rc) {
+            continue;
         }
+        if (*(uint32_t *)(code + off) != 0x50000000u) {   /* b 0 */
+            continue;
+        }
+        *(uint32_t *)(code + off) = 0x03400000u;           /* andi r0, r0, 0 */
     }
     return rc;
 }
@@ -491,7 +486,6 @@ void kmain(void)
 
         ((TbEntry)(void *)(uintptr_t)pro_buf)((void *)(uintptr_t)e->code,
                                               &env);
-
     }
 
     latx_bare_uart_puts("tb-loop: steps=");

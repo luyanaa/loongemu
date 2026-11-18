@@ -129,6 +129,11 @@ static void test_format(void)
     CMP("%08x", 0x1234u);
     CMP("%5d", 42);
     CMP("%p", (void *)0x1234);
+    /* ir2_dump renders mnemonics with a left justified field */
+    CMP("%-8s|", "abc");
+    CMP("%-6d|", 42);
+    CMP("%-6d|", -42);
+    CMP("%-7x|", 0x12u);
 #undef CMP
 
     CHECK(latx_snprintf(ours, 4, "abcdef") == 6);

@@ -226,13 +226,23 @@ static void out_unsigned(Out *o, unsigned long long v, unsigned base, int upper,
 {
     char tmp[24];
     int n = 0;
+    int digits;
 
     do {
         unsigned d = (unsigned)(v % base);
         tmp[n++] = (char)(d < 10 ? '0' + d : (upper ? 'A' : 'a') + (d - 10));
         v /= base;
     } while (v != 0);
-    out_pad(o, pad, width - n);
+    digits = n;
+    if (width < 0) {
+        /* a negative width is how the callers ask for left justification */
+        while (n--) {
+            out_ch(o, tmp[n]);
+        }
+        out_pad(o, ' ', -width - digits);
+        return;
+    }
+    out_pad(o, pad, width - digits);
     while (n--) {
         out_ch(o, tmp[n]);
     }
@@ -244,6 +254,7 @@ int vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap)
 
     while (*fmt) {
         int width = 0;
+        int left = 0;
         char pad = ' ';
         int lng = 0;
         char spec;
@@ -257,6 +268,11 @@ int vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap)
             out_ch(&o, '%');
             fmt++;
             continue;
+        }
+        if (*fmt == '-') {
+            /* left justify: ir2_dump prints "%-8s", so flags must parse */
+            left = 1;
+            fmt++;
         }
         if (*fmt == '0') {
             pad = '0';
@@ -278,7 +294,21 @@ int vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap)
         switch (spec) {
         case 's': {
             const char *s = va_arg(ap, const char *);
-            out_str(&o, s ? s : "(null)");
+            int len;
+
+            s = s ? s : "(null)";
+            len = (int)strlen(s);
+            if (!left) {
+                for (int i = len; i < width; i++) {
+                    out_ch(&o, ' ');
+                }
+            }
+            out_str(&o, s);
+            if (left) {
+                for (int i = len; i < width; i++) {
+                    out_ch(&o, ' ');
+                }
+            }
             break;
         }
         case 'c':
@@ -296,7 +326,8 @@ int vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap)
             if (neg) {
                 out_ch(&o, '-');
             }
-            out_unsigned(&o, uv, 10, 0, width - (neg ? 1 : 0), pad);
+            out_unsigned(&o, uv, 10, 0,
+                         (left ? -1 : 1) * (width - (neg ? 1 : 0)), pad);
             break;
         }
         case 'u':
@@ -305,13 +336,14 @@ int vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap)
             unsigned long long v = (lng >= 2) ? va_arg(ap, unsigned long long)
                                                : (unsigned long long)va_arg(ap, unsigned);
             unsigned base = (spec == 'u') ? 10u : 16u;
-            out_unsigned(&o, v, base, spec == 'X', width, pad);
+            out_unsigned(&o, v, base, spec == 'X', left ? -width : width,
+                         pad);
             break;
         }
         case 'p':
             out_str(&o, "0x");
             out_unsigned(&o, (unsigned long long)(uintptr_t)va_arg(ap, void *),
-                         16, 0, width, pad);
+                         16, 0, left ? -width : width, pad);
             break;
         case '\0':
             out_ch(&o, '%');
