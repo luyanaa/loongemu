@@ -3196,6 +3196,24 @@ direct_jmp:
          */
         la_code_accl(base, 2, 0x03400000);
 
+        /*
+         * Record the successor PC before emitting the link slot.
+         *
+         * A linked jump goes straight to the next block, so nothing
+         * downstream would store it; and the epilogue entries this path uses
+         * (ret_id_0/ret_id_1) start after the eip store by construction,
+         * assuming the block already wrote it.  Without this, a direct
+         * branch leaves env.eip holding whatever it had before the block.
+         */
+        {
+            IR2_OPND next_pc_opnd = ra_alloc_itemp();
+
+            li_d(next_pc_opnd, succ_x86_addr);
+            la_store_addrx(next_pc_opnd, env_ir2_opnd,
+                           lsenv_offset_of_eip(lsenv));
+            ra_free_temp(next_pc_opnd);
+        }
+
         if (!use_tu_jmp(tb)) {
 #ifdef CONFIG_LATX_XCOMISX_OPT
             set_jmp_reset_offset(tb, func, stub, succ_id);
