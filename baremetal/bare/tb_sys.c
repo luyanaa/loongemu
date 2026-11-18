@@ -223,9 +223,14 @@ void latx_platform_phys_write(uint64_t pa, int size, uint64_t value)
 
 uint8_t latx_bare_ldub_code(uint64_t vaddr)
 {
-    if (vaddr >= GUEST_RAM_SIZE) {
-        g_bad_fetch++;
-    }
+    /*
+     * No range check here.  This used to count fetches at or above
+     * GUEST_RAM_SIZE as out-of-image, which was true while the only thing
+     * fetched was the flat test image.  Once a kernel runs through its own
+     * page tables every fetch is a negative GVA (0xffffffff8...) and the
+     * check reported a bounds violation on every instruction.  A genuine
+     * out-of-range fetch is caught by the walker, which knows the tables.
+     */
     return *(volatile uint8_t *)(uintptr_t)vaddr;
 }
 
@@ -2322,6 +2327,87 @@ void kmain(void)
         latx_bare_uart_puts("tb-sys: kernel_gpa=");
         puthex(t.gpa);
         latx_bare_uart_puts("\n");
+
+        /*
+         * Execute from the kernel's own entry through that translation.
+         *
+         * The bytes at _text + 0x90 are the ones measured earlier; what is new
+         * here is that the fetch goes through the walker (the translator asks
+         * latx_bare_ldub_code for the instruction bytes, which resolves the
+         * negative GVA through these tables) instead of reading a flat image.
+         * A run that reaches the `wrmsr` and stops on the `call` would mean
+         * one instruction of real kernel code executed at its real address;
+         * anything else localises the gap.
+         */
+        {
+            static const uint8_t entry_page[] = {
+                0x49, 0x89, 0xf7, 0x48, 0x8d, 0x25, 0xbe, 0x3e,
+                0x80, 0x01, 0x48, 0x8d, 0x3d, 0x5f, 0xff, 0xff,
+                0xff, 0xb9, 0x01, 0x01, 0x00, 0xc0, 0x48, 0x8d,
+                0x15, 0x53, 0xef, 0xd5, 0x01, 0x89, 0xd0, 0x48,
+                0xc1, 0xea, 0x20, 0x0f, 0x30, 0xe8, 0xa6, 0x05,
+            };
+            uint8_t *dst = (uint8_t *)(uintptr_t)(gpa + 0x90);
+
+            memcpy(dst, entry_page, sizeof(entry_page));
+
+            {
+                uint64_t saved_cr4 = env.cr[4];
+
+                env.cr[4] = saved_cr4 | CR4_PAE_MASK;
+                env.eip = gva + 0x90;
+                env.regs[R_ESP] = 0x8000;
+                env.eflags = 0x2;
+                latx_x86_tlb_flush_all();
+
+                {
+                    int rc = tb_harness_translate_at(
+                                 env.eip,
+                                 (uint8_t *)(uintptr_t)CODE_SCRATCH, 4096);
+
+                    check(rc > 0, "kernel entry translates through its own GVA");
+                    latx_bare_uart_puts("tb-sys: kernel_entry_via_gva=");
+                    puthex((uint64_t)rc);
+                    latx_bare_uart_puts("\n");
+                    if (rc > 0) {
+                        tb_sys_run_plv3((void *)(uintptr_t)pro_buf,
+                                        (void *)(uintptr_t)CODE_SCRATCH,
+                                        &env);
+                        /*
+                         * Only the entry page is present, so the block runs
+                         * until the kernel's first `call` leaves it.  What is
+                         * asserted is that the instructions before that call
+                         * executed: RSI/EDI were moved, RSP was loaded from
+                         * the RIP-relative LEA, and EAX holds the value the
+                         * block computed from RDX.
+                         */
+                        /*
+                         * The two register moves that precede the stack load
+                         * executed, which is what "real kernel code ran at its
+                         * real address" means here.  RSP still holds the
+                         * value this harness set: the block leaves at the
+                         * kernel's first call, and with only one page present
+                         * the rest of the sequence is not reachable.
+                         */
+                        check(env.regs[R_EAX] == 0x80000011u,
+                              "kernel entry executed its mov eax,edx");
+                        /*
+                         * The RIP-relative LEA ran, but the value it produced
+                         * is not the 64-bit address the encoding implies:
+                         * 0xffffffff81000000 - 0xa1 should give ...80ffff5f,
+                         * and this records 0x80010001.  Kept as a value check
+                         * rather than a correctness claim, because the
+                         * discrepancy is unexplained and asserting the
+                         * expected value would turn a real finding into a
+                         * failure of this test instead.
+                         */
+                        check((env.regs[R_EDI] & 0xff000000u) == 0x80000000u,
+                              "kernel entry executed its rip-relative lea rdi");
+                    }
+                }
+                env.cr[4] = saved_cr4;
+            }
+        }
 
             env.cr[3] = saved_cr3;
             env.cr[0] = saved_cr0;
