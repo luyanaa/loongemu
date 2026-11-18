@@ -577,7 +577,10 @@ int efi_main(void *image, void *systab)
      * bit, so this code keeps executing across the switch while a PLV3
      * access must consult the TLB; CRMD then flips to DA=0, PG=1.
      */
-    g_dmw0 = UINT64_C(1) << 60;      /* segment 0 */
+    /* VSEG occupies VA[63:60]; segment 0 is VSEG == 0.  Writing 1<<60 here
+     * would select segment 1 and leave the image and the UART, both of which
+     * live in segment 0, unreachable the moment paging comes on. */
+    g_dmw0 = UINT64_C(0);
     csr_write(0x180, g_dmw0 | (UINT64_C(1) << 4) | 1u);
     g_paging_on = 1;
     {
@@ -615,7 +618,11 @@ int efi_main(void *image, void *systab)
     /* Place a value the probe will read once the fault is serviced. */
     *(volatile uint64_t *)phys_to_ptr(g_guest_ram) = UINT64_C(0x1234abcd5678ef90);
 
+    puts_("vmm: before probe, era_check=");
+    puthex((uint64_t)(uintptr_t)vmm_probe_load);
+    puts_("\n");
     vmm_probe_load();
+    puts_("vmm: after probe\n");
 
     puts_("vmm: faults=");
     puthex((uint64_t)g_faults);
