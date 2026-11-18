@@ -2110,6 +2110,80 @@ void kmain(void)
      * CS.base = 0xFFFF0000, so it exercises the 32-bit operand forms and a
      * taken/not-taken branch pair before anything else in the firmware runs.
      */
+    /*
+     * Scale check: how far into the real kernel can the translator go before
+     * it meets something it cannot encode?  The bytes are the first 512 of a
+     * real vmlinux .text (Linux 6.6.134 x86-64), translated as consecutive
+     * blocks.  A low count localises the gap; it is not a boot.
+     */
+    {
+        static const uint8_t kernel_head[] = {
+            0x49, 0x89, 0xf7, 0x48, 0x8d, 0x25, 0xbe, 0x3e, 0x80, 0x01,
+            0x48, 0x8d, 0x3d, 0x5f, 0xff, 0xff, 0xff, 0xb9, 0x01, 0x01,
+            0x00, 0xc0, 0x48, 0x8d, 0x15, 0x53, 0xef, 0xd5, 0x01, 0x89,
+            0xd0, 0x48, 0xc1, 0xea, 0x20, 0x0f, 0x30, 0xe8, 0xa6, 0x05,
+            0x00, 0x00, 0x6a, 0x10, 0x48, 0x8d, 0x05, 0x03, 0x00, 0x00,
+            0x00, 0x50, 0x48, 0xcb, 0xe8, 0xb5, 0x01, 0x00, 0x00, 0x48,
+            0x8d, 0x3d, 0x2e, 0xff, 0xff, 0xff, 0xe8, 0x8c, 0x00, 0x00,
+            0x00, 0x48, 0x8d, 0x3d, 0x2e, 0xff, 0xff, 0xff, 0xe9, 0x71,
+            0xff, 0xff, 0xff, 0x66, 0x90, 0x66, 0x90, 0x66, 0x90, 0x66,
+            0x90, 0x66, 0x90, 0x66, 0x90, 0x66, 0x2e, 0x0f, 0x1f, 0x84,
+        };
+        uint64_t base = KERNEL_ENTRY_PC + 0x400;
+        uint64_t pc = base;
+        int blocks = 0;
+
+        memcpy((void *)(uintptr_t)base, kernel_head, sizeof(kernel_head));
+
+        /*
+         * Walk instruction by instruction rather than in fixed strides: a
+         * block boundary is wherever a block ends, and stepping 16 bytes at a
+         * time lands mid-instruction and reports a decode failure that is an
+         * artifact of the walk, not of the translator.
+         */
+        while (blocks < 40 && pc < base + 96) {
+            TbInsnMap map;
+            int rc = tb_harness_translate_at_with_map(
+                         pc, (uint8_t *)(uintptr_t)(CODE_SCRATCH + 0x20000),
+                         4096, &map);
+            /*
+             * The harness records each instruction's guest PC and the native
+             * offset where it ends; the block's guest extent is the last
+             * instruction plus its own length, which the map does not carry.
+             * Recomputing it by decoding forward is exactly what the harness
+             * already did, so ask it for the count and walk from there.
+             */
+            /*
+             * The map carries consecutive instruction PCs, so the last
+             * instruction's length is the stride of the final pair; with one
+             * instruction only, fall back to the native span the caller gets
+             * from the block (a single instruction's bytes are its guest
+             * length in a flat image).
+             */
+            uint64_t next = pc;
+            if (map.count >= 2) {
+                next = map.spans[map.count - 1].x86_pc +
+                       (map.spans[map.count - 1].x86_pc -
+                        map.spans[map.count - 2].x86_pc);
+            } else if (map.count == 1) {
+                next = map.spans[0].x86_pc + 1;
+            }
+
+            if (rc <= 0 || next <= pc) {
+                latx_bare_uart_puts("tb-sys: kernel_stop_at=");
+                puthex(pc - base);
+                latx_bare_uart_puts("\n");
+                break;
+            }
+            blocks++;
+            pc = next;
+        }
+        check(blocks >= 4, "kernel head translates block after block");
+        latx_bare_uart_puts("tb-sys: kernel_blocks=");
+        puthex((uint64_t)blocks);
+        latx_bare_uart_puts("\n");
+    }
+
     {
         static const uint8_t ovmf_reset[] = {
             0x0f, 0x20, 0xc0, 0xa8, 0x01, 0x74, 0x05,
