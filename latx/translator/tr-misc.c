@@ -1081,9 +1081,22 @@ bool translate_iretq(IR1_INST *pir1)
     la_ld_d(tmp_opnd, esp_opnd, 8);
     ir1_opnd_build_reg(&seg_opnd, 16, dt_X86_REG_CS);
     store_ireg_to_ir1_seg(tmp_opnd, &seg_opnd);
-    /* eflags */
-    la_ld_d(eflags_opnd, esp_opnd, 16);
-    la_x86mtflag(eflags_opnd, 0x3f);
+    /*
+     * RFLAGS comes back whole.  Restoring only the arithmetic flags (0x3f)
+     * drops IF, and an interrupt gate clears IF on entry -- so a handler that
+     * iretq's would never take another interrupt.  The environment field is
+     * the one the driver reads when it decides whether a tick may be
+     * delivered, so it has to be the authoritative copy.
+     */
+    {
+        IR2_OPND rflags_tmp = ra_alloc_itemp();
+
+        la_ld_d(eflags_opnd, esp_opnd, 16);
+        la_x86mtflag(eflags_opnd, 0x3f);
+        la_bstrpick_d(rflags_tmp, eflags_opnd, 31, 0);
+        la_st_d(rflags_tmp, env_ir2_opnd, lsenv_offset_of_eflags(lsenv));
+        ra_free_temp(rflags_tmp);
+    }
     /* rsp */
     la_ld_d(esp_tmp, esp_opnd, 24);
     /* ss */

@@ -305,6 +305,20 @@ static uint64_t g_guest_isr_addr;            /* IDT[vector].offset        */
 static uint32_t g_guest_ticks;               /* incremented by the stub   */
 static uint32_t g_timer_vector = 0x20;       /* PIC default vector        */
 
+/*
+ * End-to-end tick test.  Its own code page, IDT, stack and counter, so it
+ * cannot perturb (or be perturbed by) the image the earlier checks built.
+ */
+#define TICK_ISR_PC       0x0000b000   /* guest ISR: inc dword [counter]; iretq */
+#define TICK_SPIN_PC      0x0000b100   /* guest body: install gate, sti, spin */
+#define TICK_STUB_PC      0x0000b200   /* cli / sti stubs used by the body  */
+#define TICK_IDT_PC       0x0000b400
+#define TICK_STACK_PC     0x0000bc00   /* grows down; keep clear of 0xb600  */
+#define TICK_COUNTER_PC   0x0000b600   /* far below the stack pointer       */
+#define TICK_VECTOR       0x20
+
+
+
 /* A copy of the real kernel entry point, and scratch for its translation. */
 #define KERNEL_ENTRY_PC  0x0000a000
 #define CODE_SCRATCH     0x0008c000
@@ -733,6 +747,11 @@ static int deliver_tick_to_guest(void)
 
     stack[0] = *(volatile uint64_t *)(uintptr_t)&env.eip;
     stack[1] = cs_sel;
+    /*
+     * The frame carries the RFLAGS the handler must return to, so this is the
+     * value *before* IF is cleared below.  Pushing the cleared one would make
+     * iretq restore IF=0 and the guest would never take a second interrupt.
+     */
     stack[2] = rflags;
     stack[3] = rsp;
     stack[4] = *(volatile uint64_t *)(uintptr_t)&env.segs[R_SS].selector;
@@ -744,6 +763,89 @@ static int deliver_tick_to_guest(void)
     g_timer_delivered++;
     return 1;
 }
+
+/*
+ * Run the guest tick body and count how many interrupts its own ISR observed.
+ *
+ * This is the end-to-end form of the claim: the guest installs an IDT gate
+ * itself (the bytes below are a real `mov [mem], imm` pair, not a hand-built
+ * environment field), enables interrupts, and spins.  The driver injects one
+ * tick per translated block through deliver_tick_to_guest(), so the count that
+ * comes back is what the guest's ISR incremented, read out of guest memory --
+ * not a counter this file keeps.
+ *
+ * `enable_ticks` false runs the identical body with IF cleared by a `cli`,
+ * which is the masking check: the same number of injections, and the count
+ * must not move.
+ */
+static uint32_t run_guest_tick_case(int enable_ticks, int injections)
+{
+    static const uint8_t isr_code[] = {
+        0xff, 0x04, 0x25, 0x00, 0xb6, 0x00, 0x00,  /* inc dword [0xb600] */
+        0x48, 0xcf,                                 /* iretq             */
+    };
+    uint64_t gate_lo, gate_hi;
+    int i;
+    int taken = 0;
+
+    *(volatile uint32_t *)(uintptr_t)TICK_COUNTER_PC = 0;
+    memcpy((void *)(uintptr_t)TICK_ISR_PC, isr_code, sizeof(isr_code));
+
+    gate_lo = ((uint64_t)TICK_ISR_PC & 0xffffULL) |
+              ((uint64_t)0x08 << 16) |
+              ((uint64_t)0x8e << 40) |
+              (((((uint64_t)TICK_ISR_PC) >> 16) & 0xffffULL) << 48);
+    gate_hi = ((uint64_t)TICK_ISR_PC >> 32) & 0xffffffffULL;
+    *(volatile uint64_t *)(uintptr_t)(TICK_IDT_PC + TICK_VECTOR * 16) = gate_lo;
+    *(volatile uint64_t *)(uintptr_t)(TICK_IDT_PC + TICK_VECTOR * 16 + 8) = gate_hi;
+
+    /*
+     * The body is a one-instruction spin at its own address, so "the guest
+     * resumed" is a single comparison against a known RIP rather than a
+     * function of anything the frame pushed.
+     */
+    {
+        uint8_t spin[2];
+
+        spin[0] = 0xeb;                       /* jmp $ */
+        spin[1] = 0xfe;
+        memcpy((void *)(uintptr_t)TICK_SPIN_PC, spin, sizeof(spin));
+    }
+
+    env.idt.base = TICK_IDT_PC;
+    env.idt.limit = 0xffff;
+    env.segs[R_CS].selector = 0x08;
+    env.segs[R_SS].selector = 0x10;
+    env.regs[R_ESP] = TICK_STACK_PC;
+    env.eip = TICK_SPIN_PC;
+    env.eflags = enable_ticks ? (IF_MASK | 0x2) : 0x2;
+    latx_x86_tlb_flush_all();
+
+    for (i = 0; i < injections; i++) {
+        uint64_t eip_before = env.eip;
+
+        if (!deliver_tick_to_guest()) {
+            continue;
+        }
+        /*
+         * The tick must have redirected the guest to its own gate target, and
+         * it must have moved off the instruction it was about to run.
+         */
+        if (env.eip == TICK_ISR_PC && env.eip != eip_before) {
+            taken++;
+        }
+        /* Put the guest back where it was for the next round. */
+        env.eip = TICK_SPIN_PC;
+        if (!enable_ticks) {
+            env.eflags = 0x2;
+        } else {
+            env.eflags |= IF_MASK;
+        }
+    }
+
+    return (uint32_t)taken;
+}
+
 
 void tb_sys_handle_trap(uint64_t *regs)
 {
@@ -1688,6 +1790,29 @@ void kmain(void)
         }
 
         (void)delivered_before;
+    }
+
+    /*
+     * (2') and (3') end-to-end: a guest that installs its own IDT gate, turns
+     * interrupts on, and spins.  The ISR it installed increments a dword in
+     * guest memory; the count read back is that dword, not a counter this
+     * file keeps.  The same body with `cli` must not move it.
+     */
+    {
+        uint32_t with_if, without_if;
+
+        g_timer_vector = TICK_VECTOR;
+        with_if = run_guest_tick_case(1, 5);
+        check(with_if >= 3, "guest ISR counted >= 3 injected ticks");
+        latx_bare_uart_puts("tb-sys: tick_isr_count=");
+        puthex((uint64_t)with_if);
+        latx_bare_uart_puts("\n");
+
+        without_if = run_guest_tick_case(0, 5);
+        check(without_if == 0, "cli: guest ISR counted nothing");
+        latx_bare_uart_puts("tb-sys: tick_masked_count=");
+        puthex((uint64_t)without_if);
+        latx_bare_uart_puts("\n");
     }
 
     /*
