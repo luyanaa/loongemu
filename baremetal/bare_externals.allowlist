@@ -1,0 +1,2 @@
+# Symbols liblatx_core.a expects from its platform layer.
+# Empty: the archive is self-contained (no libc/glib/libm/compiler-rt).

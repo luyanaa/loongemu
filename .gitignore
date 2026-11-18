@@ -1,0 +1,18 @@
+# Host and cross build outputs
+/build/
+/baremetal/build/
+
+# Editor / tooling scratch
+.commandcode/
+
+# Build products anywhere
+*.o
+*.elf
+*.efi
+*.a
+*.log
+qemu.pid
+qemu_ir1.pid
+
+# firmware/ holds the EDK2 blobs the EFI targets boot; they are test assets
+# pinned by firmware/SHA256SUMS.txt, so they are tracked on purpose.

@@ -1,0 +1,40 @@
+#ifndef __CALLBACK_H__
+#define __CALLBACK_H__
+
+#include <stdint.h>
+
+uint64_t RunFunctionWithState(uintptr_t fnc, int nargs, ...);
+uint64_t RunFunctionWithStateInternal(uintptr_t fnc, int nargs, ...);
+uint64_t RunFunctionWithStateInternalNoRefresh(uintptr_t fnc, int nargs,
+                                               ...);
+uint64_t RunFunctionFmt(uintptr_t fnc, const char *fmt, ...);
+/*
+ * Return 0 only when the Guest call ran; preserve its value, including zero.
+ * On preparation failure return -1 and leave *result unchanged. Like
+ * RunFunctionFmt, this supports an existing Guest context with TLS disabled.
+ */
+int RunFunctionFmtChecked(uintptr_t fnc, uint64_t *result,
+                          const char *fmt, ...);
+/* Map preparation failure to a caller-selected value; preserve all Guest values. */
+uint64_t RunFunctionFmtOr(uintptr_t fnc, uint64_t failure_value,
+                          const char *fmt, ...);
+float RunFunctionFmtFloat(uintptr_t fnc, const char *fmt, ...);
+#define RunFunction RunFunctionWithState
+
+int latx_guest_internal_callback_active(void);
+
+int latx_run_guest_callback(uintptr_t entry, const long *gpr_args,
+                            int gpr_count, const long *xmm_args,
+                            int xmm_count, const long *stack_args,
+                            int stack_count, long *rax, long *rdx,
+                            long *xmm0, long *xmm1,
+                            unsigned __int128 *st0);
+
+int latx_run_guest_callback_with_libc(
+    uintptr_t entry, const long *gpr_args, int gpr_count,
+    const long *xmm_args, int xmm_count, const long *stack_args,
+    int stack_count, long *rax, long *rdx, long *xmm0, long *xmm1,
+    unsigned __int128 *st0);
+
+
+#endif //__CALLBACK_H__

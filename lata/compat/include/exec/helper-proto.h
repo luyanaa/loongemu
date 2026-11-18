@@ -1,0 +1,21 @@
+#ifndef LATA_HELPER_PROTO_H
+#define LATA_HELPER_PROTO_H
+#include "exec/exec-all.h"
+void helper_access_check_cp_reg();
+void helper_dc_zva();
+void helper_exception_with_syndrome();
+void helper_get_cp_reg64();
+void helper_lookup_cp_reg();
+void helper_neon_addl_saturate_s32();
+void helper_neon_addl_saturate_s64();
+void helper_set_cp_reg64();
+void helper_simd_tblx();
+void helper_vfp_tosld();
+void helper_vfp_tosls();
+void helper_vfp_tosqd();
+void helper_vfp_tosqs();
+void helper_vfp_tould();
+void helper_vfp_touls();
+void helper_vfp_touqd();
+void helper_vfp_touqs();
+#endif

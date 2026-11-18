@@ -1,0 +1,15 @@
+# libc surface supplied by the platform (minilibc / host libc)
+abort
+calloc
+fprintf
+free
+malloc
+memset
+printf
+realloc
+sprintf
+stderr
+strcat
+strcpy
+strlen
+qsort
