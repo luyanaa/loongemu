@@ -168,6 +168,21 @@ extern struct IR2_OPND latx_x86_checked_addr;
 int latx_x86_deliver_fault(struct CPUX86State *env, uint32_t vector);
 
 /*
+ * Instruction fetch.
+ *
+ * Decode and execution must agree on what a guest virtual address means, so
+ * this is the single place a fetched byte comes from: with paging enabled it
+ * walks the guest's tables with LATX_X86_ACCESS_EXEC and reads the translated
+ * physical byte; otherwise it reads the flat guest image.
+ *
+ * A refusal records the fault exactly as a data refusal does (CR2, exception
+ * index, error code) and returns 0xCC, so a caller that decodes the returned
+ * bytes sees an int3 rather than silently executing whatever happened to be
+ * behind an unmapped page.
+ */
+uint8_t latx_x86_fetch_byte(const struct CPUX86State *env, uint64_t gva);
+
+/*
  * Physical-memory read used for the tables themselves.  Weak default reads
  * the identity mapping; a board overrides it when guest RAM lives elsewhere.
  */

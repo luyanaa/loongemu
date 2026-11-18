@@ -12,6 +12,7 @@
 #include "cpu.h"
 
 #include "latx-x86-paging.h"
+#include "latx_bare.h"
 
 /* PTE bits we care about (Intel SDM 4.5). */
 #define PTE_P       (UINT64_C(1) << 0)
@@ -379,6 +380,35 @@ int latx_x86_deliver_fault(CPUX86State *env, uint32_t vector)
     env->segs[R_CS].base = 0;                    /* ignored in long mode */
     env->exception_index = 0;                    /* the guest now owns it */
     return 0;
+}
+
+uint8_t latx_x86_fetch_byte(const CPUX86State *env, uint64_t gva)
+{
+    LatxX86Translation t;
+    LatxX86WalkResult r;
+
+    /*
+     * Paging is only real once the guest has loaded a PML4.  A harness that
+     * sets CR0.PG with CR3 == 0 has no tables at all and means the flat layout,
+     * which is also how the translator treated it before fetch went through
+     * the walker.
+     */
+    if (!(env->cr[0] & CR0_PG_MASK) || !(env->cr[4] & CR4_PAE_MASK) ||
+        env->cr[3] == 0) {
+        return latx_bare_ldub_code(gva);
+    }
+
+    r = latx_x86_walk_cached(env, gva, LATX_X86_ACCESS_EXEC, &t);
+    if (r != LATX_X86_WALK_OK) {
+        CPUX86State *mutable = (CPUX86State *)(uintptr_t)env;
+
+        mutable->cr[2] = gva;
+        mutable->exception_index = EXCP0E_PAGE;
+        mutable->error_code = (int)latx_x86_fault_error_code(env, r,
+                                                            LATX_X86_ACCESS_EXEC);
+        return 0xcc;
+    }
+    return (uint8_t)latx_platform_phys_read(t.gpa, 1);
 }
 
 uint32_t latx_x86_fault_error_code(const CPUX86State *env,

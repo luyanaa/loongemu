@@ -10,6 +10,7 @@
 #include "ir2.h"
 #include "translate.h"
 #include "flag-reduction.h"
+#include "latx-x86-paging.h"
 
 #include "tb_harness.h"
 
@@ -74,6 +75,12 @@ int tb_harness_translate_at(uint64_t pc, uint8_t *code, uint64_t limit)
          */
         uint8_t insn_bytes[TB_MAX_X86_INSN_LEN * TB_DECODE_MAX_INSNS] = { 0 };
 
+        /*
+         * The harness decodes from the flat image directly.  With paging on,
+         * cpu_ldub_code() -- the translator's own fetch -- goes through the
+         * walker, and both agree because the harness maps the image into the
+         * same physical memory the guest's tables describe.
+         */
         for (unsigned b = 0; b < sizeof(insn_bytes); b++) {
             insn_bytes[b] = latx_bare_ldub_code(pc + b);
         }

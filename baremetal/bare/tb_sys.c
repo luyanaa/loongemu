@@ -40,6 +40,7 @@
 #include "lbt_emu.h"
 #include "tb_harness.h"
 
+
 #define UART0_THR ((volatile unsigned char *)0x1fe001e0)
 
 void latx_bare_uart_putc(int c) { *UART0_THR = (unsigned char)c; }
@@ -129,19 +130,44 @@ void latx_platform_io_write(uint32_t port, int size, uint64_t value)
 #define IDT_DESC_PC    0x1400
 #define IDT_TABLE_PC   0x14e0
 
-static uint8_t guest_ram[GUEST_RAM_SIZE] __attribute__((aligned(4096)));
-
 static int g_bad_fetch;
 
+/*
+ * Guest physical memory is the machine's low RAM, read and written through
+ * this hook so tables, code and data all live in one place: the image is
+ * copied into the machine's low RAM at physical address 0, which is what makes
+ * a page-table walk and a translated store refer to the same bytes.
+ */
+uint64_t latx_platform_phys_read(uint64_t pa, int size)
+{
+    uint64_t value = 0;
+
+    for (int i = size - 1; i >= 0; i--) {
+        value <<= 8;
+        value |= *(volatile uint8_t *)(uintptr_t)(pa + (uint64_t)i);
+    }
+    return value;
+}
+
+void latx_platform_phys_write(uint64_t pa, int size, uint64_t value)
+{
+    for (int i = 0; i < size; i++) {
+        *(volatile uint8_t *)(uintptr_t)(pa + (uint64_t)i) =
+            (uint8_t)(value >> (8 * i));
+    }
+}
+
+/*
+ * The physical fetch the walker ends up calling once paging is on.  It reads
+ * the same memory the guest writes, because guest physical memory *is* the
+ * machine's low RAM here.
+ */
 uint8_t latx_bare_ldub_code(uint64_t vaddr)
 {
-    uint64_t off = vaddr - GUEST_BASE;
-
-    if (off >= GUEST_RAM_SIZE) {
+    if (vaddr >= GUEST_RAM_SIZE) {
         g_bad_fetch++;
-        return 0xcc;
     }
-    return guest_ram[off];
+    return *(volatile uint8_t *)(uintptr_t)vaddr;
 }
 
 /* ---------------- translator state ---------------- */
@@ -253,7 +279,7 @@ static const uint8_t program[] = {
     0xb9, 0x80, 0x00, 0x00, 0xc0, 0xb8, 0x00, 0x01,
     0x00, 0x00, 0x31, 0xd2, 0x0f, 0x30, 0x0f, 0x01,
     0x14, 0x25, 0x00, 0x12, 0x00, 0x00, 0xc7, 0x04,
-    0x25, 0xc0, 0x15, 0x00, 0x00, 0x0c, 0x11, 0x08,
+    0x25, 0xc0, 0x15, 0x00, 0x00, 0x09, 0x11, 0x08,
     0x00, 0xc7, 0x04, 0x25, 0xc4, 0x15, 0x00, 0x00,
     0x00, 0x8e, 0x00, 0x00, 0xc7, 0x04, 0x25, 0xc8,
     0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc7,
@@ -281,17 +307,16 @@ static const uint8_t program[] = {
     0x8b, 0x04, 0x25, 0x00, 0x20, 0x20, 0x00, 0x41,
     0x89, 0xc6, 0xba, 0xfd, 0x03, 0x00, 0x00, 0xec,
     0x0f, 0xb6, 0xc0, 0x89, 0xc5, 0xbe, 0x00, 0x00,
-    0x00, 0x00, 0x8a, 0x06, 0x84, 0xc0, 0x74, 0x0c,
+    0x00, 0x00, 0x8a, 0x06, 0x84, 0xc0, 0x74, 0x46,
     0xba, 0xf8, 0x03, 0x00, 0x00, 0xee, 0x48, 0xff,
-    0xc6, 0xeb, 0xef, 0x90, 0xeb, 0xfe, 0x0f, 0x20,
-    0xd2, 0x48, 0x89, 0x14, 0x25, 0x00, 0x16, 0x00,
-    0x00, 0x48, 0x8b, 0x4c, 0x24, 0x08, 0x48, 0x89,
-    0x0c, 0x25, 0x10, 0x16, 0x00, 0x00, 0x8b, 0x0c,
-    0x24, 0x89, 0x0c, 0x25, 0x20, 0x16, 0x00, 0x00,
-    0xff, 0x04, 0x25, 0x28, 0x16, 0x00, 0x00, 0x48,
-    0xc7, 0x04, 0x25, 0x08, 0x50, 0x00, 0x00, 0x03,
-    0x10, 0x20, 0x00, 0x48, 0x83, 0xc4, 0x08, 0x48,
-    0xcf,
+    0xc6, 0xeb, 0xef, 0x0f, 0x20, 0xd2, 0x48, 0x89,
+    0x14, 0x25, 0x00, 0x16, 0x00, 0x00, 0x48, 0x8b,
+    0x4c, 0x24, 0x08, 0x48, 0x89, 0x0c, 0x25, 0x10,
+    0x16, 0x00, 0x00, 0x8b, 0x0c, 0x24, 0x89, 0x0c,
+    0x25, 0x20, 0x16, 0x00, 0x00, 0xff, 0x04, 0x25,
+    0x28, 0x16, 0x00, 0x00, 0x48, 0xc7, 0x04, 0x25,
+    0x08, 0x50, 0x00, 0x00, 0x03, 0x10, 0x20, 0x00,
+    0x48, 0x83, 0xc4, 0x08, 0x48, 0xcf, 0xeb, 0xfe,
 };
 
 /* NUL terminated; the guest walks it and writes it out port by port. */
@@ -301,7 +326,7 @@ static const uint8_t gdt_descriptor[] = {
     0x1f, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
-#define HALT_PC (PROGRAM_PC + 0x10c)
+#define HALT_PC (PROGRAM_PC + 0x146)
 #define EFER_LME (1u << 8)
 #define EFER_LMA (1u << 10)
 
@@ -329,7 +354,8 @@ void kmain(void)
         lbt_emu_install();
     }
 
-    memcpy(guest_ram + (PROGRAM_PC - GUEST_BASE), program, sizeof(program));
+    memset((void *)GUEST_BASE, 0, GUEST_RAM_SIZE);
+    memcpy((void *)(uintptr_t)PROGRAM_PC, program, sizeof(program));
 
     /*
      * With the page-table check enabled, everything the guest reads must be
@@ -356,7 +382,7 @@ void kmain(void)
     {
         uint32_t str_addr = STR_PC;
 
-        memcpy(guest_ram + (PROGRAM_PC - GUEST_BASE) + 0xf6, &str_addr,
+        memcpy((void *)(uintptr_t)(PROGRAM_PC + 0xf6), &str_addr,
                sizeof(str_addr));
     }
 
@@ -410,7 +436,12 @@ void kmain(void)
 
         hflags = env.hflags;
         pc = env.eip;
-        if (pc == HALT_PC) {
+        /*
+         * The halt block is `jmp $`.  Stopping once the guest is inside it --
+         * rather than only at its exact start -- keeps the harness from
+         * depending on how the translator materializes a self-jump.
+         */
+        if (pc >= HALT_PC && pc <= HALT_PC + 1) {
             break;
         }
 
@@ -659,6 +690,12 @@ void kmain(void)
           memcmp(uart_tx, banner, sizeof(banner) - 1) == 0,
           "out 0x3f8 printed the banner");
     check(env.regs[R_EBP] == LSR_THRE_TEMT, "in 0x3fd read the LSR");
+    /*
+     * The halt block is `jmp $` and its exit must leave eip pointing at that
+     * jmp: a direct jump stores ir1_target_addr(), and for `jmp $` the target
+     * is the instruction itself.  Anything else would step past it.
+     */
+    check(env.eip == HALT_PC, "the halt block's jmp $ leaves eip on itself");
     check(env.eip == HALT_PC, "reached the halt block");
     check(g_bad_fetch == 0, "no out-of-image fetch");
 

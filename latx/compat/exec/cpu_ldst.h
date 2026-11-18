@@ -1,10 +1,16 @@
 #ifndef LATX_BARE_CPU_LDST_H
 #define LATX_BARE_CPU_LDST_H
 #include "exec/exec-all.h"
+#include "latx-x86-paging.h"
+
+/*
+ * Instruction fetch.  Routing it through the guest's page tables is what
+ * makes decode agree with execution: a byte that the guest cannot execute is
+ * not silently decoded from whatever lies behind its address.
+ */
 static inline uint8_t cpu_ldub_code(CPUArchState *env, uint64_t addr)
 {
-    (void)env;
-    return latx_bare_ldub_code(addr);
+    return latx_x86_fetch_byte((const struct CPUX86State *)env, addr);
 }
 uint8_t  cpu_ldub_data_ra(CPUArchState *env, uint64_t addr, uintptr_t ra);
 uint16_t cpu_lduw_data_ra(CPUArchState *env, uint64_t addr, uintptr_t ra);
