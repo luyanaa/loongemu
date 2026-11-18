@@ -206,7 +206,7 @@ void cpu_x86_update_cr0(CPUX86State *env, uint32_t new_cr0)
         env->efer &= ~MSR_EFER_LMA;
         env->hflags &= ~HF_LMA_MASK;
     }
-    tlb_flush_page(0, 0);
+    tlb_flush(0);
 }
 
 void cpu_x86_update_cr3(CPUX86State *env, target_ulong new_cr3)
@@ -216,8 +216,7 @@ void cpu_x86_update_cr3(CPUX86State *env, target_ulong new_cr3)
      * A new address space invalidates every cached guest translation.  The
      * TB cache is keyed on cr3 separately, but a walk result is not.
      */
-    latx_x86_tlb_flush_all();
-    tlb_flush_page(0, 0);
+    tlb_flush(0);
 }
 
 void cpu_x86_update_cr4(CPUX86State *env, uint32_t new_cr4)
@@ -327,16 +326,27 @@ void cpu_svm_check_intercept_param(CPUX86State *env, uint32_t type,
  * next walk, and one that edits without invalidating keeps the old one, which
  * is exactly the architecture's contract.
  */
+__attribute__((weak)) void latx_platform_tlb_flush_all(void)
+{
+}
+
+__attribute__((weak)) void latx_platform_tlb_flush_page(uint64_t addr)
+{
+    (void)addr;
+}
+
 void tlb_flush(CPUState *cpu)
 {
     (void)cpu;
     latx_x86_tlb_flush_all();
+    latx_platform_tlb_flush_all();
 }
 
 void tlb_flush_page(CPUState *cpu, uint64_t addr)
 {
     (void)cpu;
     latx_x86_tlb_flush_page(addr);
+    latx_platform_tlb_flush_page(addr);
 }
 
 int qemu_guest_getrandom(void *buf, size_t len, void **errp)

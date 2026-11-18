@@ -378,13 +378,17 @@ build/tb_loop.elf: build/tb_loop.o build/tb_harness.o build/tb_cache_bare.o buil
 
 tb-loop-image: build/tb_loop.elf
 
-build/tb_sys.o: baremetal/bare/tb_sys.c include/loongemu/tb_cache.h baremetal/bare/lbt_emu.h baremetal/bare/tb_harness.h
+build/loongarch_paging_bare.o: src/loongarch_paging.c include/loongemu/loongarch_paging.h
+	@mkdir -p build
+	$(CLANG) $(BARE_CFLAGS) -Iinclude -c $< -o $@
+
+build/tb_sys.o: baremetal/bare/tb_sys.c include/loongemu/tb_cache.h include/loongemu/loongarch_paging.h baremetal/bare/lbt_emu.h baremetal/bare/tb_harness.h
 	@mkdir -p build
 	$(CLANG) $(BARE_CFLAGS) -Iinclude -Ibaremetal/bare -c $< -o $@
 
-build/tb_sys.elf: build/tb_sys.o build/tb_harness.o build/tb_cache_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a baremetal/bare/bare.lds
+build/tb_sys.elf: build/tb_sys.o build/tb_harness.o build/tb_cache_bare.o build/loongarch_paging_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a baremetal/bare/bare.lds
 	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T baremetal/bare/bare.lds -e _start \
-	   build/tb_sys.o build/tb_harness.o build/tb_cache_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a -o $@
+	   build/tb_sys.o build/tb_harness.o build/tb_cache_bare.o build/loongarch_paging_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a -o $@
 
 tb-sys-image: build/tb_sys.elf
 

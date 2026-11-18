@@ -300,13 +300,20 @@ IR2_INST *ir2_relocate(TRANSLATION_DATA *lat_ctx, IR2_INST *current, int *counte
         insn_offset  -= (*counter << 2) + data[ir2_opnd_val(&current->_opnd[1])];
         insn_offset >>= 2;
 
-        ptrdiff_t upper, lower;
-        lower = (int16_t)insn_offset;
-        upper = (insn_offset - lower) >> 16;
-        IR2_OPND tmp = ra_alloc_itemp();
-        ir2_insert_before(generate_pcaddu18i(tmp, upper), cur_id);
-        ir2_insert_before(generate_jirl(a0_ir2_opnd, tmp, lower), cur_id);
-        ra_free_temp(tmp);
+        if (insn_offset == sextract64(insn_offset, 0, 26)) {
+            IR2_OPND ir2_opnd_addr;
+            ir2_opnd_build(&ir2_opnd_addr, IR2_OPND_IMM, insn_offset - 1);
+            ir2_insert_before(generate_pcaddi(a0_ir2_opnd, 2), cur_id);
+            ir2_insert_before(generate_b(ir2_opnd_addr), cur_id);
+        } else {
+            ptrdiff_t upper, lower;
+            lower = (int16_t)insn_offset;
+            upper = (insn_offset - lower) >> 16;
+            IR2_OPND tmp = ra_alloc_itemp();
+            ir2_insert_before(generate_pcaddu18i(tmp, upper), cur_id);
+            ir2_insert_before(generate_jirl(a0_ir2_opnd, tmp, lower), cur_id);
+            ra_free_temp(tmp);
+        }
         (*counter) += 2;
         ir2_remove(cur_id);
 
