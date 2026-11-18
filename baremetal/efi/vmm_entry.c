@@ -33,15 +33,29 @@
 
 #define VMM_GUEST_RAM_PAGES  256      /* 1 MiB  */
 #define VMM_CODE_CACHE_PAGES 64       /* 256 KiB */
-#define VMM_POOL_PAGES       512      /* 2 MiB: tables for the image window */
+#define VMM_POOL_PAGES       0x1000   /* 16 MiB: tables for a 256 MiB window */
 
 /*
  * The image is identity mapped before paging comes on.  The firmware places
  * the application inside a larger loaded image, so the window is generous
  * rather than fitted to this object.
  */
-#define VMM_IMAGE_BASE       UINT64_C(0x0d000000)
-#define VMM_IMAGE_PAGES      0x200       /* 2 MiB covers the loaded image */
+/*
+ * Everything the VMM itself touches after the switch has to be mapped: its
+ * code, its stack, the page table pool, guest RAM and the code cache.  The
+ * firmware places the application, its stack and the pool in the same low
+ * physical region, so one window from the start of RAM covers them; 64 MiB
+ * is generous because unmapping any part of it turns into a fault inside
+ * the handler, which is very hard to see.
+ */
+/*
+ * Map from the bottom of physical memory: the firmware's own stack and the
+ * images it loaded all live below the application, and after the switch any
+ * of them can be touched -- including by the exception stub when it saves
+ * the interrupted $sp, which points into whatever stack the fault came from.
+ */
+#define VMM_IMAGE_BASE       UINT64_C(0x00000000)
+#define VMM_IMAGE_PAGES      0x10000     /* 256 MiB */
 
 /* Where the probe lands in the guest address space. */
 #define VMM_PROBE_VA         0x40000000ULL
