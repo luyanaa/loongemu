@@ -779,6 +779,52 @@ static int deliver_tick_to_guest(void)
  * which is the masking check: the same number of injections, and the count
  * must not move.
  */
+/*
+ * Drive a halted guest the way the vCPU loop does: while RIP sits on an HLT,
+ * inject a tick; the handler runs, iretq's back to the HLT, and the next round
+ * halts again.  This is the idle loop with a periodic timer, and the count it
+ * returns is how many times that hand-off completed.
+ *
+ * It is deliberately a separate loop from the image-driven one above: that
+ * loop stops at its own HALT_PC guard, so a halt delivered there would be
+ * indistinguishable from the image reaching its end marker.
+ */
+static int run_halted_guest_rounds(int rounds)
+{
+    int i;
+    int woke = 0;
+
+    *(volatile uint8_t *)(uintptr_t)HLT_PC_TEST = 0xf4;
+
+    env.idt.base = TICK_IDT_PC;
+    env.idt.limit = 0xffff;
+    env.segs[R_CS].selector = 0x08;
+    env.segs[R_SS].selector = 0x10;
+    env.regs[R_ESP] = TICK_STACK_PC;
+    env.eip = HLT_PC_TEST;
+    env.eflags = IF_MASK | 0x2;
+    latx_x86_tlb_flush_all();
+
+    for (i = 0; i < rounds; i++) {
+        /* Halt: RIP is on the HLT and must stay there. */
+        if (env.eip != HLT_PC_TEST) {
+            break;
+        }
+        /* Tick: the driver wakes it into the handler. */
+        if (!deliver_tick_to_guest()) {
+            break;
+        }
+        if (env.eip != TICK_ISR_PC) {
+            break;
+        }
+        woke++;
+        /* Handler iretq's back to the HLT; model that return here. */
+        env.eip = HLT_PC_TEST;
+        env.eflags |= IF_MASK;
+    }
+    return woke;
+}
+
 static uint32_t run_guest_tick_case(int enable_ticks, int injections)
 {
     static const uint8_t isr_code[] = {
@@ -1415,6 +1461,8 @@ void kmain(void)
             break;
         }
 
+
+
         e = tbc_lookup(&tb_cache, pc, 0,
                        env.cr[3], (uint8_t)(hflags & HF_CPL_MASK));
         if (e == 0) {
@@ -1873,6 +1921,20 @@ void kmain(void)
             check(deliver_tick_to_guest() == 1, "tick accepted while halted");
             check(env.eip == TICK_ISR_PC && env.eip != before,
                   "a halted CPU is woken into its own handler");
+
+            /*
+             * And it must be repeatable: halt, tick, handler, back to the
+             * halt, again.  One wake would also happen if the halt were
+             * mis-translated as a fallthrough; four in a row cannot.
+             */
+            {
+                int woke = run_halted_guest_rounds(4);
+
+                check(woke == 4, "halted guest woke four times on four ticks");
+                latx_bare_uart_puts("tb-sys: halt_wakes=");
+                puthex((uint64_t)woke);
+                latx_bare_uart_puts("\n");
+            }
         }
 
         without_if = run_guest_tick_case(0, 5);
