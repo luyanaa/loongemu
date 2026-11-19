@@ -112,6 +112,10 @@ LatxX86WalkResult latx_x86_walk(const CPUX86State *env, uint64_t va,
         return LATX_X86_WALK_RESERVED;
     }
 
+    uint64_t combined_rw = PTE_RW;
+    uint64_t combined_us = PTE_US;
+    uint64_t combined_nx = 0;
+
     table = env->cr[3] & PTE_PHYS_MASK;
     for (level = 4; level >= 1; level--) {
         unsigned shift = 12 + 9 * (level - 1);
@@ -124,6 +128,9 @@ LatxX86WalkResult latx_x86_walk(const CPUX86State *env, uint64_t va,
         if (!nx_enabled && (pte & PTE_NX)) {
             return LATX_X86_WALK_RESERVED;
         }
+        combined_rw &= pte;
+        combined_us &= pte;
+        combined_nx |= (pte & PTE_NX);
         if (pte & PTE_PS) {
             /* PS is legal only at the 1 GiB (level 3) and 2 MiB (level 2)
              * leaves; at the PML4 and PT levels the bit is reserved. */
@@ -145,22 +152,22 @@ LatxX86WalkResult latx_x86_walk(const CPUX86State *env, uint64_t va,
     out->page_bits = 12 + 9 * (uint32_t)(level - 1);
     out->gpa = (pte & PTE_PHYS_MASK & ~((UINT64_C(1) << out->page_bits) - 1)) |
                (va & ((UINT64_C(1) << out->page_bits) - 1));
-    if (pte & PTE_RW) {
+    if (combined_rw & PTE_RW) {
         perm |= LATX_X86_ACCESS_WRITE;
     }
-    if (pte & PTE_US) {
+    if (combined_us & PTE_US) {
         perm |= LATX_X86_ACCESS_USER;
     }
-    if (!(pte & PTE_NX)) {
+    if (!(combined_nx & PTE_NX)) {
         perm |= LATX_X86_ACCESS_EXEC;
     }
     out->pte = pte;
     out->perm = perm;
 
-    if (user && !(pte & PTE_US)) {
+    if (user && !(combined_us & PTE_US)) {
         return LATX_X86_WALK_PROTECTION;
     }
-    if (write && !(pte & PTE_RW)) {
+    if (write && !(combined_rw & PTE_RW)) {
         /*
          * CR0.WP decides whether a supervisor write to a read-only page
          * faults; a user write always does.  A kernel that clears WP is
@@ -170,7 +177,7 @@ LatxX86WalkResult latx_x86_walk(const CPUX86State *env, uint64_t va,
             return LATX_X86_WALK_PROTECTION;
         }
     }
-    if (exec && (pte & PTE_NX)) {
+    if (exec && (combined_nx & PTE_NX)) {
         return LATX_X86_WALK_PROTECTION;
     }
     return LATX_X86_WALK_OK;
@@ -341,7 +348,7 @@ static int walk_or_flat(const CPUX86State *env, uint64_t gva, uint32_t access,
 int latx_x86_get_tss_stack(const CPUX86State *env, uint32_t ist,
                            uint64_t *out_rsp)
 {
-    uint16_t tr_sel = (uint16_t)(env->segs[R_TR].selector & ~7u);
+    uint16_t tr_sel = (uint16_t)(env->tr.selector & ~7u);
     uint64_t desc_gva = env->gdt.base + (uint64_t)tr_sel;
     uint64_t lo_pa, hi_pa, lo, hi, tss_base, slot_gva, slot_pa, slot_hi_pa;
     uint64_t tss_off;
@@ -510,14 +517,15 @@ uint8_t latx_x86_fetch_byte(const CPUX86State *env, uint64_t gva)
         return latx_bare_ldub_code(gva);
     }
 
-    r = latx_x86_walk_cached(env, gva, LATX_X86_ACCESS_EXEC, &t);
+    uint32_t fetch_acc = LATX_X86_ACCESS_EXEC |
+                         ((env->hflags & HF_CPL_MASK) ? LATX_X86_ACCESS_USER : 0);
+    r = latx_x86_walk_cached(env, gva, fetch_acc, &t);
     if (r != LATX_X86_WALK_OK) {
         CPUX86State *mutable = (CPUX86State *)(uintptr_t)env;
 
         mutable->cr[2] = gva;
         mutable->exception_index = EXCP0E_PAGE;
-        mutable->error_code = (int)latx_x86_fault_error_code(env, r,
-                                                            LATX_X86_ACCESS_EXEC);
+        mutable->error_code = (int)latx_x86_fault_error_code(env, r, fetch_acc);
         return 0xcc;
     }
     return (uint8_t)latx_platform_phys_read(t.gpa, 1);

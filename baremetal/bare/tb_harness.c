@@ -19,12 +19,16 @@ static struct separated_data ir1_sd;
 static uint8_t ir1_dt_area[131072] __attribute__((aligned(16)));
 
 static const int control_flow_ops[] = {
-    dt_X86_INS_JMP, dt_X86_INS_CALL, dt_X86_INS_RET, dt_X86_INS_JAE,
-    dt_X86_INS_JA, dt_X86_INS_JBE, dt_X86_INS_JB, dt_X86_INS_JCXZ,
-    dt_X86_INS_JECXZ, dt_X86_INS_JE, dt_X86_INS_JGE, dt_X86_INS_JG,
-    dt_X86_INS_JLE, dt_X86_INS_JL, dt_X86_INS_JNE, dt_X86_INS_JNO,
-    dt_X86_INS_JNP, dt_X86_INS_JNS, dt_X86_INS_JO, dt_X86_INS_JP,
-    dt_X86_INS_JS,
+    dt_X86_INS_JMP, dt_X86_INS_CALL, dt_X86_INS_RET, dt_X86_INS_RETF,
+    dt_X86_INS_RETFQ, dt_X86_INS_SYSCALL, dt_X86_INS_SYSRET,
+    dt_X86_INS_IRET, dt_X86_INS_IRETD,
+    dt_X86_INS_IRETQ, dt_X86_INS_HLT, dt_X86_INS_INT, dt_X86_INS_INT3,
+    dt_X86_INS_UD2, dt_X86_INS_LOOP, dt_X86_INS_LOOPE, dt_X86_INS_LOOPNE,
+    dt_X86_INS_JAE, dt_X86_INS_JA, dt_X86_INS_JBE, dt_X86_INS_JB,
+    dt_X86_INS_JCXZ, dt_X86_INS_JECXZ, dt_X86_INS_JRCXZ, dt_X86_INS_JE,
+    dt_X86_INS_JGE, dt_X86_INS_JG, dt_X86_INS_JLE, dt_X86_INS_JL,
+    dt_X86_INS_JNE, dt_X86_INS_JNO, dt_X86_INS_JNP, dt_X86_INS_JNS,
+    dt_X86_INS_JO, dt_X86_INS_JP, dt_X86_INS_JS,
 };
 
 static int is_control_flow(const IR1_INST *ir1)
@@ -77,15 +81,45 @@ int tb_harness_translate_at_with_map(uint64_t pc, uint8_t *code,
          * how `mov cr3, eax` became a one-operand instruction and stopped
          * writing CR3.
          */
+        CPUX86State *xenv = (lsenv != 0) ? (CPUX86State *)lsenv->cpu_state : 0;
         uint8_t insn_bytes[TB_MAX_X86_INSN_LEN * TB_DECODE_MAX_INSNS];
         int fetched = 0;
 
         while (n < TB_DECODE_MAX_INSNS &&
                off + TB_MAX_X86_INSN_LEN <= (int)sizeof(insn_bytes)) {
             int need = off + TB_MAX_X86_INSN_LEN;
+            int valid_fetched = -1;
+            int faulted = 0;
             while (fetched < need) {
-                insn_bytes[fetched] = latx_bare_ldub_code(pc + (uint64_t)fetched);
+                if (xenv != 0) {
+                    xenv->exception_index = -1;
+                    insn_bytes[fetched] =
+                        latx_x86_fetch_byte(xenv, pc + (uint64_t)fetched);
+                    if (xenv->exception_index == EXCP0E_PAGE) {
+                        if (fetched == off) {
+                            if (n == 0) {
+                                return -1;
+                            }
+                            xenv->exception_index = -1;
+                            faulted = 1;
+                            break;
+                        }
+                        /* Lookahead hit an unmapped page; pad tail for disasm only. */
+                        xenv->exception_index = -1;
+                        valid_fetched = fetched;
+                        for (int p = fetched; p < need; p++) {
+                            insn_bytes[p] = 0x90;
+                        }
+                        break;
+                    }
+                } else {
+                    insn_bytes[fetched] =
+                        latx_bare_ldub_code(pc + (uint64_t)fetched);
+                }
                 fetched++;
+            }
+            if (faulted) {
+                break;
             }
             ADDRX next = ir1_disasm(&ir1_list[n], insn_bytes + off,
                                     (ADDRX)(pc + off), n, ir1_dt_area);
@@ -93,9 +127,19 @@ int tb_harness_translate_at_with_map(uint64_t pc, uint8_t *code,
             if (next <= (ADDRX)(pc + off)) {
                 break;
             }
+            if (valid_fetched >= 0 && (int)(next - pc) > valid_fetched) {
+                if (n == 0) {
+                    (void)latx_x86_fetch_byte(xenv, pc + (uint64_t)valid_fetched);
+                    return -1;
+                }
+                break;
+            }
             off = (int)(next - pc);
             n++;
             if (is_control_flow(&ir1_list[n - 1])) {
+                break;
+            }
+            if (valid_fetched >= 0 && off >= valid_fetched) {
                 break;
             }
         }

@@ -1176,6 +1176,7 @@ static void init_insn_tr()
     LA_X86_INSN_DEF(git_x86_insn_tr, X86_INS_, SYSENTER);
     LA_X86_INSN_DEF(git_x86_insn_tr, X86_INS_, SYSEXIT);
     LA_X86_INSN_DEF(git_x86_insn_tr, X86_INS_, SYSRET);
+    LA_X86_INSN_REDEF(git_x86_insn_tr, X86_INS_SYSRETQ, dt_X86_INS_SYSRET);
     LA_X86_INSN_DEF(git_x86_insn_tr, X86_INS_, T1MSKC);
     LA_X86_INSN_DEF(git_x86_insn_tr, X86_INS_, TEST);
     LA_X86_INSN_DEF(git_x86_insn_tr, X86_INS_, UD2);
