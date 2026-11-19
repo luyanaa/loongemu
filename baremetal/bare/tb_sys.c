@@ -861,7 +861,7 @@ static int deliver_tick_to_guest(void)
  */
 static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
 {
-    uint64_t code_addr = CODE_SCRATCH + 0x30000;
+    uint64_t code_addr = (uint64_t)(uintptr_t)code_cache + 0x2000;
     int ran = 0;
 
     env.eip = pc;
