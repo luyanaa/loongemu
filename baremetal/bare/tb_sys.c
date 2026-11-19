@@ -180,6 +180,9 @@ int latx_platform_apic_mmio(uint64_t gpa, int is_write, uint64_t *value)
 /* Guest-visible RAM: the whole area below the VMM's load base. */
 #define GUEST_RAM_SIZE (64 * 1024 * 1024)
 
+/* The kernel text the harness carries, linked for 0xffffffff81000000. */
+#define KERNEL_TEXT_SIZE 0x1619ea0ULL
+
 /* Must match the linker script's load address (baremetal/bare/bare.lds). */
 #define VMM_IMAGE_BASE  0x4000000ULL
 #define GUEST_BASE     0x0
@@ -848,6 +851,51 @@ static int deliver_tick_to_guest(void)
  * Returns the number of completed halt/wake rounds, or a negative value if a
  * block failed to translate or RIP did not behave.
  */
+/*
+ * Translate and execute consecutive blocks starting at `pc`.
+ *
+ * The image-driven loop stops at its own HALT_PC marker, so it cannot answer
+ * "how far does this code run".  This takes whatever RIP each block leaves,
+ * which is the shape a vCPU loop has, and bounds the run so a translation
+ * loop cannot spin.
+ */
+static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
+{
+    uint64_t code_addr = CODE_SCRATCH + 0x30000;
+    int ran = 0;
+
+    env.eip = pc;
+    latx_x86_tlb_flush_all();
+
+    while (ran < max_blocks) {
+        uint64_t before = env.eip;
+        TbInsnMap map;
+        int rc = tb_harness_translate_at_with_map(
+                     env.eip, (uint8_t *)(uintptr_t)code_addr, 4096, &map);
+
+        if (rc <= 0) {
+            break;
+        }
+        /* Publish this block before running it: the fault path resolves the
+         * faulting guest RIP through the current block's map. */
+        g_current_tb_code = (uint64_t)(uintptr_t)code_addr;
+        g_current_tb_pc = before;
+        g_current_tb_map = &map;
+
+        tb_sys_run_plv3((void *)(uintptr_t)pro_buf,
+                        (void *)(uintptr_t)code_addr, &env);
+        ran++;
+        if (env.eip == before) {
+            break;
+        }
+    }
+
+    if (end_pc) {
+        *end_pc = env.eip;
+    }
+    return ran;
+}
+
 static int run_guest_idle_loop(int rounds)
 {
     uint64_t code_addr = CODE_SCRATCH + 0x1c000;
@@ -2347,30 +2395,43 @@ void kmain(void)
          * anything else localises the gap.
          */
         {
-            static const uint8_t entry_page[] = {
-                0x49, 0x89, 0xf7, 0x48, 0x8d, 0x25, 0xbe, 0x3e,
-                0x80, 0x01, 0x48, 0x8d, 0x3d, 0x5f, 0xff, 0xff,
-                0xff, 0xb9, 0x01, 0x01, 0x00, 0xc0, 0x48, 0x8d,
-                0x15, 0x53, 0xef, 0xd5, 0x01, 0x89, 0xd0, 0x48,
-                0xc1, 0xea, 0x20, 0x0f, 0x30, 0xe8, 0xa6, 0x05,
-            };
-            uint8_t *dst = (uint8_t *)(uintptr_t)(gpa + 0x90);
+            /*
+             * The whole text segment, not a sample.  A kernel's first call
+             * targets code a few hundred bytes past the entry; with only a
+             * 38-byte copy that target is zeros -- `add [eax],al` repeated --
+             * so the run leaves the intended path at the first call.
+             */
+            {
+                extern const uint8_t _ktext_start[];
 
-            memcpy(dst, entry_page, sizeof(entry_page));
+                memcpy((void *)(uintptr_t)gpa, _ktext_start,
+                       KERNEL_TEXT_SIZE);
+            }
 
             {
                 uint64_t saved_cr4 = env.cr[4];
 
                 env.cr[4] = saved_cr4 | CR4_PAE_MASK;
+                env.regs[R_EAX] = 0xdeadbeefu;
+                env.regs[R_EDI] = 0xdeadbeefu;
+                env.regs[R_EDX] = 0xdeadbeefu;
                 env.eip = gva + 0x90;
                 env.regs[R_ESP] = 0x8000;
                 env.eflags = 0x2;
                 latx_x86_tlb_flush_all();
 
                 {
+                    /*
+                     * Translate into code_cache, which rebuild_host_mappings()
+                     * installs at PLV3-accessible permissions.  CODE_SCRATCH
+                     * is inside the guest's low window and therefore not
+                     * mapped by this harness -- a block placed there faults on
+                     * its first fetch and the run looks like "the block did
+                     * nothing".
+                     */
                     int rc = tb_harness_translate_at(
                                  env.eip,
-                                 (uint8_t *)(uintptr_t)CODE_SCRATCH, 4096);
+                                 (uint8_t *)(uintptr_t)code_cache, 4096);
 
                     check(rc > 0, "kernel entry translates through its own GVA");
                     latx_bare_uart_puts("tb-sys: kernel_entry_via_gva=");
@@ -2378,7 +2439,7 @@ void kmain(void)
                     latx_bare_uart_puts("\n");
                     if (rc > 0) {
                         tb_sys_run_plv3((void *)(uintptr_t)pro_buf,
-                                        (void *)(uintptr_t)CODE_SCRATCH,
+                                        (void *)(uintptr_t)code_cache,
                                         &env);
                         /*
                          * Only the entry page is present, so the block runs
@@ -2396,20 +2457,38 @@ void kmain(void)
                          * kernel's first call, and with only one page present
                          * the rest of the sequence is not reachable.
                          */
-                        check(env.regs[R_EAX] == 0x80000011u,
-                              "kernel entry executed its mov eax,edx");
                         /*
-                         * The RIP-relative LEA ran, but the value it produced
-                         * is not the 64-bit address the encoding implies:
-                         * 0xffffffff81000000 - 0xa1 should give ...80ffff5f,
-                         * and this records 0x80010001.  Kept as a value check
-                         * rather than a correctness claim, because the
-                         * discrepancy is unexplained and asserting the
-                         * expected value would turn a real finding into a
-                         * failure of this test instead.
-                         */
-                        check((env.regs[R_EDI] & 0xff000000u) == 0x80000000u,
-                              "kernel entry executed its rip-relative lea rdi");
+                     * Sentinel first.  EAX holding 0x80000011 after the block
+                     * is not evidence the block ran: the OVMF check above
+                     * leaves exactly that value in EAX (it is CR0).  Poisoning
+                     * it beforehand is what makes "the instruction executed"
+                     * distinguishable from "nothing happened".
+                     */
+                    /*
+                     * The block ran.  RDI is the decisive register: the
+                     * RIP-relative `lea rdi,[rip-0xa1]` must produce the full
+                     * 64-bit kernel address, and the sentinel set before the
+                     * run proves the value came from the block rather than
+                     * from whatever was there before.
+                     */
+                    check(env.regs[R_EDI] == 0xffffffff81000000u,
+                          "rip-relative lea produced the 64-bit kernel address");
+                    latx_bare_uart_puts("tb-sys: kexec_rdi=");
+                    puthex(env.regs[R_EDI]);
+                    latx_bare_uart_puts("\n");
+
+                        {
+                            uint64_t stop = 0;
+                            int ran = run_blocks_from(gva + 0x90, 16, &stop);
+
+                            latx_bare_uart_puts("tb-sys: kernel_blocks_run=");
+                            puthex((uint64_t)(ran < 0 ? 0 : ran));
+                            latx_bare_uart_puts(" stop=");
+                            puthex(stop);
+                            latx_bare_uart_puts("\n");
+                            check(ran >= 1,
+                                  "kernel entry runs at least one block");
+                        }
 
                     }
                 }
@@ -2441,18 +2520,6 @@ void kmain(void)
         check(g_bad_fetch == 0, "no fetch outside guest RAM");
     }
 
-    /*
-     * Keep the zero block referenced: an unreferenced .rodata section is
-     * dropped by the linker, so a measurement that links one and does not use
-     * it measures nothing.  This reads a byte without touching it.
-     */
-    {
-        extern const uint8_t _ktext_start[];
-
-        if (_ktext_start[0] == 0xa5) {
-            g_probe_touched = 1;
-        }
-    }
 
     latx_bare_uart_puts("tb-sys: checks=");
     puthex((uint64_t)checks);
