@@ -51,9 +51,16 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
     (void)addr;
 }
 
-void cpu_loop_exit(CPUState *cs)
+__attribute__((weak)) void latx_platform_cpu_loop_exit(CPUState *cs)
 {
     (void)cs;
+    for (;;) {
+    }
+}
+
+void cpu_loop_exit(CPUState *cs)
+{
+    latx_platform_cpu_loop_exit(cs);
     for (;;) {
     }
 }
@@ -62,6 +69,7 @@ void siglongjmp(sigjmp_buf env, int val)
 {
     (void)env;
     (void)val;
+    latx_platform_cpu_loop_exit(env_cpu((CPUX86State *)lsenv->cpu_state));
     for (;;) {
     }
 }

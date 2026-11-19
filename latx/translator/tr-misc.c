@@ -1162,6 +1162,17 @@ bool translate_iretq(IR1_INST *pir1)
     la_or(esp_opnd, esp_tmp, zero_ir2_opnd);
     ra_free_temp(esp_tmp);
 
+    /* Record the fallthrough PC of this iretq so the VMM can detect
+     * sync_core() (iretq returning directly to ir1_addr_next) and flush
+     * stale TBs without false positives. */
+    {
+        IR2_OPND iret_next = ra_alloc_itemp();
+
+        li_d(iret_next, ir1_addr_next(pir1));
+        la_st_d(iret_next, env_ir2_opnd, lsenv_offset_of_vreg(lsenv, 0));
+        ra_free_temp(iret_next);
+    }
+
     /*
      * The epilogue's first instruction stores its dbt-arg register into
      * env.eip, so the popped RIP belongs there -- it is the register the

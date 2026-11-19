@@ -326,6 +326,8 @@ static TbCacheEntry tb_entries[TB_TABLE_CAP];
 static uint32_t tb_buckets[TB_TABLE_CAP];
 static TbCache tb_cache;
 static TbInsnMap tb_insn_maps[TB_TABLE_CAP];
+static uint64_t tb_code_hash[TB_TABLE_CAP];
+static uint16_t tb_code_len[TB_TABLE_CAP];
 
 unsigned char kstack[65536] __attribute__((aligned(4096)));
 void kmain(void);
@@ -551,6 +553,8 @@ static void map_host_range(uint64_t start, uint64_t size, uint32_t perm)
     }
 }
 
+extern char pf_table[256];
+
 static int is_host_vmm_va(uint64_t va)
 {
     uint64_t page = va & LAPG_PAGE_MASK;
@@ -569,6 +573,9 @@ static int is_host_vmm_va(uint64_t va)
     uint64_t ks_start = (uint64_t)(uintptr_t)kstack & LAPG_PAGE_MASK;
     uint64_t ks_end = ((uint64_t)(uintptr_t)kstack + sizeof(kstack) +
                        LAPG_PAGE_SIZE - 1) & LAPG_PAGE_MASK;
+    uint64_t pf_start = (uint64_t)(uintptr_t)pf_table & LAPG_PAGE_MASK;
+    uint64_t pf_end = ((uint64_t)(uintptr_t)pf_table + sizeof(pf_table) +
+                       LAPG_PAGE_SIZE - 1) & LAPG_PAGE_MASK;
 
     if (page >= cc_start && page < cc_end) {
         return 1;
@@ -583,6 +590,9 @@ static int is_host_vmm_va(uint64_t va)
         return 1;
     }
     if (page >= ks_start && page < ks_end) {
+        return 1;
+    }
+    if (page >= pf_start && page < pf_end) {
         return 1;
     }
     return 0;
@@ -627,6 +637,8 @@ static void rebuild_host_mappings(void)
                    LAPG_PERM_READ | LAPG_PERM_WRITE | LAPG_PERM_USER);
     map_host_range((uint64_t)(uintptr_t)kstack, sizeof(kstack),
                    LAPG_PERM_READ | LAPG_PERM_WRITE | LAPG_PERM_USER);
+    map_host_range((uint64_t)(uintptr_t)pf_table, sizeof(pf_table),
+                   LAPG_PERM_READ | LAPG_PERM_USER);
 }
 
 /*
@@ -688,7 +700,12 @@ static uint32_t classify_fault_access(uint64_t pc, uint64_t badv,
         int is_store = 0;
 
         if (major == 0x0a) {
-            is_store = ((insn >> 25) & 1) != 0;
+            uint32_t op8 = (insn >> 24) & 0xffu;
+            if (op8 == 0x29u) {
+                is_store = 1; /* st.{b,h,w,d} */
+            } else if (op8 == 0x2bu) {
+                is_store = ((insn >> 22) & 1u) != 0; /* fst.{s,d} */
+            }
         } else if (major == 0x09) {
             is_store = ((insn >> 24) & 1) != 0;
         } else if (major == 0x0b) {
@@ -1093,6 +1110,34 @@ static uint64_t g_run_tb_hits;
 static uint64_t g_run_tb_misses;
 static uint64_t g_run_tb_flushes;
 static uint64_t g_run_tb_links;
+static uint64_t g_sync_core_calls;
+static uint64_t g_sync_core_flushes;
+
+static uint64_t hash_guest_code(uint64_t gva, uint16_t len)
+{
+    uint64_t h = UINT64_C(14695981039346656037);
+    uint16_t rem = len;
+    uint64_t cur = gva;
+
+    while (rem > 0) {
+        LatxX86Translation tr_g;
+        uint64_t page_rem = 4096u - (cur & 4095u);
+        uint16_t chunk = rem < page_rem ? rem : (uint16_t)page_rem;
+
+        if (latx_x86_walk_cached(&env, cur, LATX_X86_ACCESS_READ, &tr_g) >
+            LATX_X86_WALK_PAGING_OFF) {
+            return 0;
+        }
+        const volatile uint8_t *p = (const volatile uint8_t *)(uintptr_t)tr_g.gpa;
+        for (uint16_t i = 0; i < chunk; i++) {
+            h ^= (uint64_t)p[i];
+            h *= UINT64_C(1099511628211);
+        }
+        cur += chunk;
+        rem -= chunk;
+    }
+    return h ? h : 1;
+}
 
 static void try_link_tb_slot(uint32_t from_slot, uint32_t to_slot)
 {
@@ -1177,6 +1222,8 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
     g_run_tb_misses = 0;
     g_run_tb_flushes = 0;
     g_run_tb_links = 0;
+    g_sync_core_calls = 0;
+    g_sync_core_flushes = 0;
     tbc_flush_all(&tb_cache);
     memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
     code_used = 0x2000;
@@ -1252,6 +1299,22 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
             }
             e->code = (uint64_t)(uintptr_t)code;
             e->code_size = (uint32_t)rc;
+            {
+                uint16_t clen = 16;
+                const TbInsnMap *m = &tb_insn_maps[slot_idx];
+                if (m->count >= 16) {
+                    clen = 256;
+                } else if (m->count > 0) {
+                    uint64_t last_pc = m->spans[m->count - 1].x86_pc;
+                    if (last_pc >= before && (last_pc - before) < 240) {
+                        clen = (uint16_t)((last_pc - before) + 15);
+                    } else {
+                        clen = 256;
+                    }
+                }
+                tb_code_len[slot_idx] = clen;
+                tb_code_hash[slot_idx] = hash_guest_code(before, clen);
+            }
             code_used += (((uint64_t)rc + 255) & ~UINT64_C(255));
             __asm__ volatile("ibar 0" ::: "memory");
             link_new_tb(slot_idx);
@@ -1276,10 +1339,37 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
         tb_sys_run_plv3((void *)(uintptr_t)pro_buf,
                         (void *)(uintptr_t)e->code, &env);
         ran++;
-        if (g_plv3_exit.reason == PLV3_EXIT_NORMAL && g_timer_irq_pending) {
-            if (deliver_kernel_timer_tick(env.eip)) {
-                g_timer_irq_pending = 0;
-                timer_start(250000);
+        if (g_plv3_exit.reason == PLV3_EXIT_NORMAL) {
+            if (env.vregs[0] != 0) {
+                uint64_t iret_next = env.vregs[0];
+                env.vregs[0] = 0;
+                if (env.eip == iret_next) {
+                    int dirty = 0;
+                    g_sync_core_calls++;
+                    for (uint32_t i = 0; i < TB_TABLE_CAP; i++) {
+                        if (!tb_entries[i].used || tb_entries[i].cr3 != env.cr[3]) {
+                            continue;
+                        }
+                        if (hash_guest_code(tb_entries[i].pc, tb_code_len[i]) !=
+                            tb_code_hash[i]) {
+                            dirty = 1;
+                            break;
+                        }
+                    }
+                    if (dirty) {
+                        tbc_flush_all(&tb_cache);
+                        memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
+                        code_used = 0x2000;
+                        g_sync_core_flushes++;
+                        __asm__ volatile("ibar 0" ::: "memory");
+                    }
+                }
+            }
+            if (g_timer_irq_pending) {
+                if (deliver_kernel_timer_tick(env.eip)) {
+                    g_timer_irq_pending = 0;
+                    timer_start(250000);
+                }
             }
         }
         if (g_plv3_exit.reason != PLV3_EXIT_NORMAL &&
@@ -1295,10 +1385,10 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
          * rather than on RIP.
          */
         {
-            uint64_t fp = env.eip ^ (env.regs[R_EDX] << 1) ^
-                          (env.regs[R_EAX] << 2) ^ (env.regs[R_ESP] << 3) ^
-                          (env.regs[R_ECX] << 4) ^ (env.regs[R_EBX] << 5) ^
-                          (env.regs[R_EDI] << 6) ^ (env.regs[R_ESI] << 7);
+            uint64_t fp = env.eip;
+            for (int r = 0; r < 16; r++) {
+                fp ^= (env.regs[r] << (r & 15)) ^ (env.regs[r] >> (64 - ((r & 15) ? (r & 15) : 1)));
+            }
 
             if (fp == last_fp) {
                 if (++stuck >= 16) {
@@ -1517,6 +1607,164 @@ static uint32_t run_guest_tick_case(int enable_ticks, int injections)
 }
 
 
+static volatile uint64_t g_active_helper_fn;
+static volatile uint64_t g_active_helper_a1;
+static volatile uint64_t g_active_helper_a2;
+static volatile uint64_t g_active_helper_ra;
+
+uint64_t latx_platform_guest_read(uint64_t gva, int size)
+{
+    uint64_t val = 0;
+    uint32_t access = LATX_X86_ACCESS_READ |
+                      ((env.hflags & HF_CPL_MASK) ? LATX_X86_ACCESS_USER : 0);
+    for (int i = size - 1; i >= 0; i--) {
+        LatxX86Translation tr_g;
+        if (latx_x86_walk(&env, gva + (uint64_t)i, access, &tr_g) >
+            LATX_X86_WALK_PAGING_OFF) {
+            return 0;
+        }
+        val = (val << 8) | latx_platform_phys_read(tr_g.gpa, 1);
+    }
+    return val;
+}
+
+void latx_platform_guest_write(uint64_t gva, int size, uint64_t value)
+{
+    uint32_t access = LATX_X86_ACCESS_WRITE |
+                      ((env.hflags & HF_CPL_MASK) ? LATX_X86_ACCESS_USER : 0);
+    for (int i = 0; i < size; i++) {
+        LatxX86Translation tr_g;
+        if (latx_x86_walk(&env, gva + (uint64_t)i, access, &tr_g) >
+            LATX_X86_WALK_PAGING_OFF) {
+            return;
+        }
+        latx_platform_phys_write(tr_g.gpa, 1, (value >> (8 * i)) & 0xffu);
+    }
+}
+
+static int deliver_x86_exception(uint32_t vec, uint64_t push_rip,
+                                 uint32_t error_code, int has_err)
+{
+    uint64_t idt_base = env.idt.base;
+    LatxX86Translation tr_lo, tr_hi;
+    uint64_t lo, hi, handler;
+    uint16_t cs_sel;
+    uint8_t gate_type;
+    uint64_t old_rsp, new_rsp, rflags;
+    uint64_t stack_gpa[6];
+    uint64_t vals[6];
+    int nwords = has_err ? 6 : 5;
+    int idx = 0;
+
+    if (idt_base == 0 || (uint64_t)vec * 16 + 15 > (uint64_t)env.idt.limit + 1) {
+        return 0;
+    }
+    if (latx_x86_walk(&env, idt_base + (uint64_t)vec * 16,
+                      LATX_X86_ACCESS_READ, &tr_lo) > LATX_X86_WALK_PAGING_OFF ||
+        latx_x86_walk(&env, idt_base + (uint64_t)vec * 16 + 8,
+                      LATX_X86_ACCESS_READ, &tr_hi) > LATX_X86_WALK_PAGING_OFF) {
+        return 0;
+    }
+    lo = latx_platform_phys_read(tr_lo.gpa, 8);
+    hi = latx_platform_phys_read(tr_hi.gpa, 8);
+    if (((lo >> 47) & 1u) == 0) {
+        return 0;
+    }
+    gate_type = (uint8_t)((lo >> 40) & 0x1fu);
+    if (gate_type != 0x0eu && gate_type != 0x0fu) {
+        return 0;
+    }
+    handler = (lo & 0xffffULL) | (((lo >> 48) & 0xffffULL) << 16) |
+              ((hi & 0xffffffffULL) << 32);
+    if (handler == 0) {
+        return 0;
+    }
+    cs_sel = (uint16_t)((lo >> 16) & 0xffffu);
+    old_rsp = env.regs[R_ESP];
+    new_rsp = (old_rsp & ~UINT64_C(15)) - (uint64_t)nwords * 8;
+    rflags = env.eflags;
+
+    for (int i = 0; i < nwords; i++) {
+        LatxX86Translation tr_st;
+        if (latx_x86_walk(&env, new_rsp + (uint64_t)i * 8,
+                          LATX_X86_ACCESS_WRITE, &tr_st) >
+            LATX_X86_WALK_PAGING_OFF) {
+            return 0;
+        }
+        stack_gpa[i] = tr_st.gpa;
+    }
+
+    if (has_err) {
+        vals[idx++] = (uint64_t)error_code;
+    }
+    vals[idx++] = push_rip;
+    vals[idx++] = env.segs[R_CS].selector ? env.segs[R_CS].selector : cs_sel;
+    vals[idx++] = rflags;
+    vals[idx++] = old_rsp;
+    vals[idx++] = env.segs[R_SS].selector;
+
+    for (int i = 0; i < nwords; i++) {
+        latx_platform_phys_write(stack_gpa[i], 8, vals[i]);
+    }
+
+    env.regs[R_ESP] = new_rsp;
+    env.eip = handler;
+    env.segs[R_CS].selector = cs_sel;
+    env.eflags = (rflags & ~(UINT64_C(1) << 8));
+    if (gate_type == 0x0eu) {
+        env.eflags &= ~IF_MASK;
+    }
+    latx_x86_tlb_flush_all();
+    latx_platform_tlb_flush_all();
+    return 1;
+}
+
+void latx_platform_cpu_loop_exit(CPUState *cs)
+{
+    int vec = (cs != 0 && cs->exception_index > 0) ? cs->exception_index
+                                                   : env.exception_index;
+    int is_int = env.exception_is_int;
+    uint32_t err = (uint32_t)env.error_code;
+    uint64_t fault_rip = resolve_fault_x86_pc(g_active_helper_ra);
+    uint64_t push_rip = is_int ? env.exception_next_eip : fault_rip;
+    int has_err = !is_int &&
+                  (vec == 8 || vec == 10 || vec == 11 || vec == 12 ||
+                   vec == 13 || vec == 14 || vec == 17 || vec == 21);
+    uint64_t tlbrera = csrrd(0x8a);
+    int is_refill = (int)(tlbrera & 1u);
+
+    if (cs != 0) {
+        cs->exception_index = -1;
+    }
+    env.exception_index = -1;
+    env.exception_is_int = 0;
+    g_active_helper_fn = 0;
+
+    if (vec >= 0 && vec < 256 &&
+        deliver_x86_exception((uint32_t)vec, push_rip, err, has_err)) {
+        g_plv3_exit.reason = PLV3_EXIT_GUEST_PF;
+        g_plv3_exit.guest_rip = env.eip;
+    } else {
+        g_plv3_exit.reason = PLV3_EXIT_TRAP;
+        g_plv3_exit.ecode = (uint64_t)(uint32_t)vec;
+        g_plv3_exit.guest_rip = push_rip;
+    }
+
+    if (is_refill) {
+        csrwr(0x8f, 0);
+        csrwr(0x8a,
+              ((uint64_t)(uintptr_t)tb_sys_abort_plv0 & ~UINT64_C(3)) | 1u);
+    } else {
+        uint64_t prmd = csrrd(0x1) & ~UINT64_C(0x7);
+
+        csrwr(0x1, prmd);
+        csrwr(0x6, (uint64_t)(uintptr_t)tb_sys_abort_plv0);
+    }
+    __asm__ volatile("ertn" ::: "memory");
+    for (;;) {
+    }
+}
+
 void tb_sys_handle_trap(uint64_t *regs)
 {
     uint64_t estat = csrrd(0x5);
@@ -1638,8 +1886,13 @@ void tb_sys_handle_trap(uint64_t *regs)
     if ((is_refill || ecode == EXC_PIF || ecode == EXC_PPI || ecode == EXC_PNX) &&
         fault_pc == badv && is_plv0_helper_entry(badv)) {
         HelperFn fn = (HelperFn)(uintptr_t)badv;
+        g_active_helper_fn = badv;
+        g_active_helper_a1 = regs[la_a1];
+        g_active_helper_a2 = regs[la_a2];
+        g_active_helper_ra = regs[la_ra];
         uint64_t ret = fn(regs[la_a0], regs[la_a1], regs[la_a2],
                           regs[la_a3], regs[la_a4]);
+        g_active_helper_fn = 0;
 
         regs[la_a0] = ret;
         if (is_refill) {
@@ -3016,7 +3269,7 @@ void kmain(void)
                     uint64_t cmdline_gpa = 0x00020000ULL;
                     static const char cmdline[] =
                         "earlycon=uart,io,0x3f8,115200n8 console=ttyS0,115200 "
-                        "ignore_loglevel nokaslr";
+                        "ignore_loglevel nokaslr mitigations=off";
                     uint64_t e0_addr = 0x00000000ULL;
                     uint64_t e0_size = 0x0009fc00ULL;
                     uint32_t e0_type = 1u;
@@ -3137,7 +3390,7 @@ void kmain(void)
                              * checks.  The bound is where that happens, not a
                              * step budget.
                              */
-                            int ran = run_blocks_from(gva + 0x90, 200000, &stop);
+                            int ran = run_blocks_from(gva + 0x90, 1000000, &stop);
 
                             latx_bare_uart_puts("tb-sys: kernel_blocks_run=");
                             puthex((uint64_t)(ran < 0 ? 0 : ran));
@@ -3153,6 +3406,10 @@ void kmain(void)
                             puthex(g_run_tb_misses);
                             latx_bare_uart_puts(" links=");
                             puthex(g_run_tb_links);
+                            latx_bare_uart_puts(" sync=");
+                            puthex(g_sync_core_flushes);
+                            latx_bare_uart_puts("/");
+                            puthex(g_sync_core_calls);
                             latx_bare_uart_puts(" ticks=");
                             puthex(g_timer_delivered);
                             latx_bare_uart_puts(" irqs=");
