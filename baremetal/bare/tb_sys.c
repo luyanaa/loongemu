@@ -103,6 +103,12 @@ static volatile uint64_t g_apic_mmio_writes;
 static uint32_t g_apic_regs[256];
 static uint8_t g_apic_mmio_page[4096] __attribute__((aligned(4096)));
 static uint8_t g_mmio_dummy_page[4096] __attribute__((aligned(4096)));
+static uint8_t g_pic_imr[2] = { 0xffu, 0xffu };
+static uint8_t g_pic_icw_idx[2];
+static uint8_t g_pic_icw_rem[2];
+static uint32_t g_pic_irq0_vec = 0x30;
+volatile uint64_t g_plv3_timer_preempt __attribute__((used));
+static volatile int g_timer_irq_pending;
 
 uint64_t latx_platform_io_read(uint32_t port, int size)
 {
@@ -115,6 +121,15 @@ uint64_t latx_platform_io_read(uint32_t port, int size)
     }
     if (port >= 0x3f8 && port <= 0x3ff) {
         return 0;                    /* 16550 registers / no receiver */
+    }
+    if (port == 0x20 || port == 0xa0) {
+        return 0;                    /* 8259A IRR/ISR */
+    }
+    if (port == 0x21) {
+        return g_pic_imr[0];         /* 8259A master IMR */
+    }
+    if (port == 0xa1) {
+        return g_pic_imr[1];         /* 8259A slave IMR */
     }
     if (port >= 0x40 && port <= 0x43) {
         return 0x1234;               /* 8254: plausible counter value */
@@ -141,6 +156,27 @@ void latx_platform_io_write(uint32_t port, int size, uint64_t value)
         }
         uart_tx_count++;
         latx_bare_uart_putc((int)(uint8_t)value);
+        return;
+    }
+    if (port == 0x20 || port == 0xa0) {
+        int pic = (port == 0xa0) ? 1 : 0;
+        if ((value & 0x10u) != 0) {
+            g_pic_icw_idx[pic] = 1;
+            g_pic_icw_rem[pic] = (value & 0x01u) ? 3 : 2;
+        }
+        return;
+    }
+    if (port == 0x21 || port == 0xa1) {
+        int pic = (port == 0xa1) ? 1 : 0;
+        if (g_pic_icw_rem[pic] > 0) {
+            if (pic == 0 && g_pic_icw_idx[0] == 1) {
+                g_pic_irq0_vec = (uint32_t)(value & 0xf8u);
+            }
+            g_pic_icw_idx[pic]++;
+            g_pic_icw_rem[pic]--;
+        } else {
+            g_pic_imr[pic] = (uint8_t)value;
+        }
         return;
     }
     if (port >= 0x40 && port <= 0x43) {
@@ -700,7 +736,8 @@ static void sync_trap_regs_to_env(const uint64_t *regs)
         env.regs[i] = regs[la_reg];
     }
     {
-        uint32_t non_cc = (uint32_t)(regs[reg_statics_map[S_EFLAGS]] & 0x702u);
+        uint32_t non_cc = ((uint32_t)regs[reg_statics_map[S_EFLAGS]] & 0x502u) |
+                          (env.eflags & IF_MASK);
         uint32_t cc = 0;
 
         if (g_use_sw_lbt) {
@@ -916,6 +953,105 @@ static int deliver_tick_to_guest(void)
     return 1;
 }
 
+static int resolve_exact_insn_boundary_x86_pc(uint64_t fault_pc,
+                                              uint64_t *out_x86_pc)
+{
+    for (uint32_t i = 0; i < TB_TABLE_CAP; i++) {
+        if (!tb_entries[i].used) {
+            continue;
+        }
+        if (fault_pc < tb_entries[i].code ||
+            fault_pc >= tb_entries[i].code + (uint64_t)tb_entries[i].code_size) {
+            continue;
+        }
+        uint64_t off = fault_pc - tb_entries[i].code;
+        const TbInsnMap *map = &tb_insn_maps[i];
+        if (off == 0) {
+            *out_x86_pc = tb_entries[i].pc;
+            return 1;
+        }
+        for (uint32_t k = 0; k + 1 < map->count; k++) {
+            if (off == (uint64_t)map->spans[k].native_end_off) {
+                *out_x86_pc = map->spans[k + 1].x86_pc;
+                return 1;
+            }
+        }
+        return 0;
+    }
+    return 0;
+}
+
+static int deliver_kernel_timer_tick(uint64_t guest_rip)
+{
+    uint64_t rflags = env.eflags;
+    uint64_t idt_base = env.idt.base;
+    uint32_t vec = g_pic_irq0_vec;
+    uint32_t spiv = *(volatile uint32_t *)(g_apic_mmio_page + 0xf0);
+    uint32_t lvtt = *(volatile uint32_t *)(g_apic_mmio_page + 0x320);
+    LatxX86Translation tr_lo, tr_hi;
+    uint64_t lo, hi, handler;
+    uint16_t cs_sel;
+    uint64_t old_rsp, new_rsp;
+    uint64_t stack_gpa[5];
+    uint64_t vals[5];
+
+    if ((rflags & IF_MASK) == 0 || idt_base == 0) {
+        g_timer_masked++;
+        return 0;
+    }
+    if ((spiv & 0x100u) != 0 && (lvtt & 0x10000u) == 0 &&
+        (lvtt & 0xffu) >= 0x20u) {
+        vec = lvtt & 0xffu;
+    } else if ((g_pic_imr[0] & 0x01u) != 0) {
+        g_timer_masked++;
+        return 0;
+    }
+    if (latx_x86_walk(&env, idt_base + (uint64_t)vec * 16,
+                      LATX_X86_ACCESS_READ, &tr_lo) > LATX_X86_WALK_PAGING_OFF ||
+        latx_x86_walk(&env, idt_base + (uint64_t)vec * 16 + 8,
+                      LATX_X86_ACCESS_READ, &tr_hi) > LATX_X86_WALK_PAGING_OFF) {
+        return 0;
+    }
+    lo = latx_platform_phys_read(tr_lo.gpa, 8);
+    hi = latx_platform_phys_read(tr_hi.gpa, 8);
+    if (((lo >> 47) & 1u) == 0) {
+        return 0;
+    }
+    handler = (lo & 0xffffULL) | (((lo >> 48) & 0xffffULL) << 16) |
+              ((hi & 0xffffffffULL) << 32);
+    if (handler == 0) {
+        return 0;
+    }
+    cs_sel = (uint16_t)((lo >> 16) & 0xffffu);
+    old_rsp = env.regs[R_ESP];
+    new_rsp = (old_rsp & ~UINT64_C(15)) - 40;
+
+    for (int i = 0; i < 5; i++) {
+        LatxX86Translation tr_st;
+        if (latx_x86_walk(&env, new_rsp + (uint64_t)i * 8,
+                          LATX_X86_ACCESS_WRITE, &tr_st) > LATX_X86_WALK_PAGING_OFF) {
+            return 0;
+        }
+        stack_gpa[i] = tr_st.gpa;
+    }
+
+    vals[0] = guest_rip;
+    vals[1] = env.segs[R_CS].selector ? env.segs[R_CS].selector : cs_sel;
+    vals[2] = rflags;
+    vals[3] = old_rsp;
+    vals[4] = env.segs[R_SS].selector;
+    for (int i = 0; i < 5; i++) {
+        latx_platform_phys_write(stack_gpa[i], 8, vals[i]);
+    }
+
+    env.regs[R_ESP] = new_rsp;
+    env.eip = handler;
+    env.eflags = rflags & ~IF_MASK;
+    env.segs[R_CS].selector = cs_sel;
+    g_timer_delivered++;
+    return 1;
+}
+
 /*
  * Run the guest tick body and count how many interrupts its own ISR observed.
  *
@@ -1046,6 +1182,23 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
     code_used = 0x2000;
     __asm__ volatile("ibar 0" ::: "memory");
     latx_x86_tlb_flush_all();
+    env.idt.base = 0;
+    env.idt.limit = 0;
+    env.eflags = 0x2;
+    g_pic_imr[0] = 0xffu;
+    g_pic_imr[1] = 0xffu;
+    g_pic_icw_idx[0] = 0;
+    g_pic_icw_idx[1] = 0;
+    g_pic_icw_rem[0] = 0;
+    g_pic_icw_rem[1] = 0;
+    g_pic_irq0_vec = 0x30;
+    g_timer_delivered = 0;
+    g_timer_ticks = 0;
+    g_timer_masked = 0;
+    g_timer_irq_pending = 0;
+    g_plv3_timer_preempt = 1;
+    timer_ack();
+    timer_start(250000);
 
     while (ran < max_blocks) {
         uint64_t before = env.eip;
@@ -1123,6 +1276,12 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
         tb_sys_run_plv3((void *)(uintptr_t)pro_buf,
                         (void *)(uintptr_t)e->code, &env);
         ran++;
+        if (g_plv3_exit.reason == PLV3_EXIT_NORMAL && g_timer_irq_pending) {
+            if (deliver_kernel_timer_tick(env.eip)) {
+                g_timer_irq_pending = 0;
+                timer_start(250000);
+            }
+        }
         if (g_plv3_exit.reason != PLV3_EXIT_NORMAL &&
             g_plv3_exit.reason != PLV3_EXIT_GUEST_PF) {
             g_run_blocks_exit = RUN_EXIT_PLV3_TRAP;
@@ -1153,6 +1312,10 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
         }
     }
 
+    timer_stop();
+    timer_ack();
+    g_plv3_timer_preempt = 0;
+    g_timer_irq_pending = 0;
     env.tb_jmp_cache_ptr = 0;
     if (end_pc) {
         *end_pc = env.eip;
@@ -1380,6 +1543,47 @@ void tb_sys_handle_trap(uint64_t *regs)
         if (isr & (1u << IRQ_TIMER)) {
             timer_ack();
             g_timer_ticks++;
+            if (g_plv3_timer_preempt) {
+                uint64_t exact_rip = 0;
+                if ((env.eflags & IF_MASK) == 0 || env.idt.base == 0) {
+                    g_timer_masked++;
+                    g_timer_irq_pending = 0;
+                    timer_start(250000);
+                    return;
+                }
+                if (fault_pc == (uint64_t)(uintptr_t)pro_buf) {
+                    if (deliver_kernel_timer_tick(env.eip)) {
+                        g_timer_irq_pending = 0;
+                        timer_start(250000);
+                        g_plv3_exit.reason = PLV3_EXIT_NORMAL;
+                        g_plv3_exit.guest_rip = env.eip;
+                        csrwr(0x1, csrrd(0x1) & ~UINT64_C(0x7));
+                        csrwr(0x6, (uint64_t)(uintptr_t)tb_sys_abort_plv0);
+                        return;
+                    }
+                    g_timer_irq_pending = 0;
+                    timer_start(250000);
+                    return;
+                }
+                if (resolve_exact_insn_boundary_x86_pc(fault_pc, &exact_rip)) {
+                    sync_trap_regs_to_env(regs);
+                    if (deliver_kernel_timer_tick(exact_rip)) {
+                        g_timer_irq_pending = 0;
+                        timer_start(250000);
+                        g_plv3_exit.reason = PLV3_EXIT_NORMAL;
+                        g_plv3_exit.guest_rip = env.eip;
+                        csrwr(0x1, csrrd(0x1) & ~UINT64_C(0x7));
+                        csrwr(0x6, (uint64_t)(uintptr_t)tb_sys_abort_plv0);
+                        return;
+                    }
+                    g_timer_irq_pending = 0;
+                    timer_start(250000);
+                } else {
+                    g_timer_irq_pending = 1;
+                    timer_start(5003);
+                }
+                return;
+            }
             (void)deliver_tick_to_guest();
         }
         return;
@@ -1402,7 +1606,7 @@ void tb_sys_handle_trap(uint64_t *regs)
             csrwr(0x8a,
                   ((uint64_t)(uintptr_t)tb_sys_abort_plv0 & ~UINT64_C(3)) | 1u);
         } else {
-            uint64_t prmd = csrrd(0x1) & ~UINT64_C(0x3);
+            uint64_t prmd = csrrd(0x1) & ~UINT64_C(0x7);
 
             csrwr(0x1, prmd);
             csrwr(0x6, (uint64_t)(uintptr_t)tb_sys_abort_plv0);
@@ -1571,7 +1775,7 @@ void tb_sys_handle_trap(uint64_t *regs)
                       ((uint64_t)(uintptr_t)tb_sys_abort_plv0 & ~UINT64_C(3)) |
                       1u);
             } else {
-                uint64_t prmd = csrrd(0x1) & ~UINT64_C(0x3);
+                uint64_t prmd = csrrd(0x1) & ~UINT64_C(0x7);
 
                 csrwr(0x1, prmd);
                 csrwr(0x6, (uint64_t)(uintptr_t)tb_sys_abort_plv0);
@@ -1601,7 +1805,7 @@ void tb_sys_handle_trap(uint64_t *regs)
         csrwr(0x8a,
               ((uint64_t)(uintptr_t)tb_sys_abort_plv0 & ~UINT64_C(3)) | 1u);
     } else {
-        uint64_t prmd = csrrd(0x1) & ~UINT64_C(0x3);
+        uint64_t prmd = csrrd(0x1) & ~UINT64_C(0x7);
 
         csrwr(0x1, prmd);
         csrwr(0x6, (uint64_t)(uintptr_t)tb_sys_abort_plv0);
@@ -1715,9 +1919,15 @@ __asm__(
 /* Reset g_plv3_exit.reason = PLV3_EXIT_NONE before entering PLV3 */
 "  la   $t0, g_plv3_exit\n"
 "  st.d $zero, $t0, 0\n"
-/* Set PRMD.PPLV = 3 */
+/* Set PRMD.PPLV = 3, and PRMD.PIE = (g_plv3_timer_preempt != 0) */
 "  csrrd $t0, 0x1\n"
-"  ori   $t0, $t0, 0x3\n"
+"  ori   $t0, $t0, 0x7\n"
+"  xori  $t0, $t0, 0x4\n"
+"  la    $t1, g_plv3_timer_preempt\n"
+"  ld.d  $t1, $t1, 0\n"
+"  beqz  $t1, 2f\n"
+"  ori   $t0, $t0, 0x4\n"
+"2:\n"
 "  csrwr $t0, 0x1\n"
 /* Set ERA = a0 (pro_buf), and shift (a1, a2) -> (a0, a1) for pro_buf(tb, env) */
 "  csrwr $a0, 0x6\n"
@@ -2943,6 +3153,10 @@ void kmain(void)
                             puthex(g_run_tb_misses);
                             latx_bare_uart_puts(" links=");
                             puthex(g_run_tb_links);
+                            latx_bare_uart_puts(" ticks=");
+                            puthex(g_timer_delivered);
+                            latx_bare_uart_puts(" irqs=");
+                            puthex(g_timer_ticks);
                             latx_bare_uart_puts("\n");
                             if (g_plv3_exit.reason != PLV3_EXIT_NORMAL) {
                                 uint64_t n = g_recent_count < 8 ? g_recent_count : 8;

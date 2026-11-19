@@ -3365,17 +3365,23 @@ void tr_generate_exit_tb_to_next(IR1_INST *ir1)
 {
     TranslationBlock *tb = lsenv->tr_data->curr_tb;
     IR2_OPND next_pc = ra_alloc_dbt_arg2();
+    ADDR succ_x86_addr = ir1_addr_next(ir1);
     target_ulong call_offset __attribute__((unused)) =
-            aot_get_call_offset(ir1_addr_next(ir1));
+            aot_get_call_offset(succ_x86_addr);
 
     emit_ymmh_zeros();
-    aot_load_guest_addr(next_pc, ir1_addr_next(ir1), LOAD_CALL_TARGET,
+    aot_load_guest_addr(next_pc, succ_x86_addr, LOAD_CALL_TARGET,
                         call_offset);
 
     if (tb->flags & HF_TF_MASK) {
         tr_generate_single_step_exit(next_pc);
         return;
     }
+
+    la_store_addrx(next_pc, env_ir2_opnd, lsenv_offset_of_eip(lsenv));
+    set_jmp_reset_offset(tb, NULL, NULL, 0);
+    la_b(imm_zero_ir2_opnd);
+    tb->lazypc[0] = succ_x86_addr - tb->pc;
 
     IR2_OPND base = ra_alloc_data();
     IR2_OPND target = ra_alloc_data();

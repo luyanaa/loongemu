@@ -1731,15 +1731,18 @@ bool translate_rdtsc(IR1_INST *pir1)
  */
 static bool translate_if_flag(IR1_INST *pir1, bool enable)
 {
+    IR2_OPND eflags_reg = ra_alloc_eflags();
     IR2_OPND eflags = ra_alloc_itemp();
 
     la_ld_d(eflags, env_ir2_opnd, lsenv_offset_of_eflags(lsenv));
     if (enable) {
+        la_ori(eflags_reg, eflags_reg, IF_MASK);
         la_ori(eflags, eflags, IF_MASK);
     } else {
         IR2_OPND mask = ra_alloc_itemp();
 
         la_ori(mask, zero_ir2_opnd, IF_MASK);
+        la_andn(eflags_reg, eflags_reg, mask);
         la_andn(eflags, eflags, mask);
         ra_free_temp(mask);
     }
