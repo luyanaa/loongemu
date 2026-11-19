@@ -428,7 +428,14 @@ static bool translate_msr(IR1_INST *pir1, bool is_write)
     IR2_OPND fn;
 
     tr_save_guest_regs_for_helper();
-    fn = ra_alloc_dbt_arg2();
+    /*
+     * A temporary, not dbt_arg2.  S_UD1 ($r21) is what the exit stubs store
+     * into env.eip; loading a helper's code address into it makes a block
+     * containing rdmsr/wrmsr leave with a host address as the guest's next
+     * RIP.  The kernel writes several MSRs before it is running properly, so
+     * this is on its critical path.
+     */
+    fn = ra_alloc_itemp();
     if (is_write) {
         aot_load_host_addr(fn, (ADDR)helper_wrmsr, LOAD_HELPER_WRMSR, 0);
     } else {
@@ -436,6 +443,7 @@ static bool translate_msr(IR1_INST *pir1, bool is_write)
     }
     la_mov64(a0_ir2_opnd, env_ir2_opnd);
     la_jirl(ra_ir2_opnd, fn, 0);
+    ra_free_temp(fn);
     tr_load_guest_regs_after_helper();
     return true;
 }
