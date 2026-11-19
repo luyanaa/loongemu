@@ -390,7 +390,7 @@ build/vmlinux_text.o: baremetal/bare/vmlinux_text.S firmware/vmlinux-x86_64-text
 	@mkdir -p build
 	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib -c $< -o $@
 
-build/vmlinux_segs.o: baremetal/bare/vmlinux_segs.S firmware/vmlinux-x86_64-seg1.bin firmware/vmlinux-x86_64-seg3.bin
+build/vmlinux_segs.o: baremetal/bare/vmlinux_segs.S firmware/vmlinux-x86_64-seg1.bin firmware/vmlinux-x86_64-seg2.bin firmware/vmlinux-x86_64-seg3.bin
 	@mkdir -p build
 	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib -c $< -o $@
 

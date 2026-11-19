@@ -325,16 +325,34 @@ uint64_t latx_x86_check_guest_access(CPUX86State *env, uint64_t gva,
     return hpa;
 }
 
+static int walk_or_flat(const CPUX86State *env, uint64_t gva, uint32_t access,
+                        uint64_t *gpa_out)
+{
+    LatxX86Translation t;
+    LatxX86WalkResult r = latx_x86_walk(env, gva, access, &t);
+
+    if (r != LATX_X86_WALK_OK && r != LATX_X86_WALK_PAGING_OFF) {
+        return 0;
+    }
+    *gpa_out = t.gpa;
+    return 1;
+}
+
 int latx_x86_deliver_fault(CPUX86State *env, uint32_t vector)
 {
-    uint64_t gate_phys = env->idt.base + (uint64_t)vector * 16;
+    uint64_t gate_gva = env->idt.base + (uint64_t)vector * 16;
+    uint64_t gate_lo_pa, gate_hi_pa;
     uint64_t lo, hi, off, selector, rsp;
 
     if ((uint64_t)vector * 16 + 15 > env->idt.limit + 1) {
         return 1;                       /* no such gate */
     }
-    lo = latx_platform_phys_read(gate_phys, 8);
-    hi = latx_platform_phys_read(gate_phys + 8, 8);
+    if (!walk_or_flat(env, gate_gva, LATX_X86_ACCESS_READ, &gate_lo_pa) ||
+        !walk_or_flat(env, gate_gva + 8, LATX_X86_ACCESS_READ, &gate_hi_pa)) {
+        return 1;                       /* IDT gate not mapped */
+    }
+    lo = latx_platform_phys_read(gate_lo_pa, 8);
+    hi = latx_platform_phys_read(gate_hi_pa, 8);
 
     {
         uint8_t type_attr = (uint8_t)(lo >> 40);
@@ -345,7 +363,9 @@ int latx_x86_deliver_fault(CPUX86State *env, uint32_t vector)
         }
     }
     selector = (lo >> 16) & 0xffff;
-    off = (lo & 0xffff) | (hi & 0xffff0000u) | (hi << 32);
+    off = (lo & 0xffffULL) |
+          (((lo >> 48) & 0xffffULL) << 16) |
+          ((hi & 0xffffffffULL) << 32);
 
     rsp = env->regs[R_ESP];
     /*
@@ -356,7 +376,11 @@ int latx_x86_deliver_fault(CPUX86State *env, uint32_t vector)
      */
 #define PUSH64(v)                                                             \
     do {                                                                      \
-        latx_platform_phys_write(rsp - 8, 8, (uint64_t)(v));                   \
+        uint64_t _pa;                                                         \
+        if (!walk_or_flat(env, rsp - 8, LATX_X86_ACCESS_WRITE, &_pa)) {       \
+            return 1;                                                         \
+        }                                                                     \
+        latx_platform_phys_write(_pa, 8, (uint64_t)(v));                      \
         rsp -= 8;                                                             \
     } while (0)
 

@@ -367,6 +367,15 @@ void lbt_handle(uint64_t *regs)
     } else if (w == 0x00008029u) {
         sw_lbt.top = (sw_lbt.top - 1u) & 7u;
         handled = 1;
+    } else if ((w & 0xfffc0000u) == 0x00300000u) {
+        /* adc.{b,h,w,d} (bit17=0) / sbc.{b,h,w,d} (bit17=1) rd, rj, rk */
+        int is_sub = (int)((w >> 17) & 1u);
+        unsigned width = 8u << ((w >> 15) & 3u);
+        uint64_t cf = (sw_lbt.eflags & EF_CF) ? 1u : 0u;
+        uint64_t r = is_sub ? (regs[rj] - regs[rk] - cf)
+                            : (regs[rj] + regs[rk] + cf);
+        regs[rd] = (uint64_t)sext(r, width);
+        handled = 1;
     } else if ((w & 0xffffc000u) == 0x00368000u) {
         /* setx86j rd, condh */
         unsigned cond = (w >> 10) & 0xfu;
@@ -463,6 +472,20 @@ void lbt_handle(uint64_t *regs)
             lbt_rot(width, regs[rj], imm, 1, 1);
             handled = 1;
         }
+    } else if ((w & 0xffffe000u) == 0x004c2000u) {
+        /* rotri.b rd, rj, ui3 */
+        unsigned sh = (w >> 10) & 7u;
+        uint8_t v = (uint8_t)regs[rj];
+        uint8_t r = sh ? (uint8_t)((v >> sh) | (v << (8u - sh))) : v;
+        regs[rd] = (uint64_t)(int64_t)(int8_t)r;
+        handled = 1;
+    } else if ((w & 0xffffc000u) == 0x004c4000u) {
+        /* rotri.h rd, rj, ui4 */
+        unsigned sh = (w >> 10) & 0xfu;
+        uint16_t v = (uint16_t)regs[rj];
+        uint16_t r = sh ? (uint16_t)((v >> sh) | (v << (16u - sh))) : v;
+        regs[rd] = (uint64_t)(int64_t)(int16_t)r;
+        handled = 1;
     } else if ((w & 0xfffc03c0u) == 0x005c0000u) {
         /* x86mfflag / x86mtflag rd, imm_ui8 */
         uint32_t imm = (w >> 10) & 0x3fu;

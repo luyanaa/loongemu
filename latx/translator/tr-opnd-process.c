@@ -673,6 +673,17 @@ void store_ireg_to_ir1_seg(IR2_OPND seg_value_opnd, IR1_OPND *opnd1)
     }
 #endif
 
+    /*
+     * A NULL selector (index == 0, TI == 0; bits [15:2] == 0) must not
+     * dereference the GDT: clear the cached base and flags directly.
+     */
+    IR2_OPND label_null_seg = ra_alloc_label();
+    IR2_OPND label_seg_done = ra_alloc_label();
+    IR2_OPND null_check = ra_alloc_itemp_internal();
+    la_bstrpick_d(null_check, selector_opnd, 15, 2);
+    la_beqz(null_check, label_null_seg);
+    ra_free_temp(null_check);
+
     /* 2. update seg cache : read data in GDT and store into seg cache */
     /* TI = 0 : GDT, TI = 1 : LDT */
     IR2_OPND label_ldt = ra_alloc_label();
@@ -751,6 +762,18 @@ void store_ireg_to_ir1_seg(IR2_OPND seg_value_opnd, IR1_OPND *opnd1)
                       lsenv_offset_of_seg_limit(lsenv, seg_num));
     la_st_w(seg_flags, env_ir2_opnd,
                       lsenv_offset_of_seg_flags(lsenv, seg_num));
+    la_b(label_seg_done);
+
+    la_label(label_null_seg);
+    la_st_d(zero_ir2_opnd, env_ir2_opnd,
+                      lsenv_offset_of_seg_base(lsenv, seg_num));
+    li_wu(seg_limit, -1);
+    la_st_w(seg_limit, env_ir2_opnd,
+                      lsenv_offset_of_seg_limit(lsenv, seg_num));
+    la_st_w(zero_ir2_opnd, env_ir2_opnd,
+                      lsenv_offset_of_seg_flags(lsenv, seg_num));
+
+    la_label(label_seg_done);
     ra_free_temp(seg_limit);
     ra_free_temp(seg_base);
     ra_free_temp(seg_flags);

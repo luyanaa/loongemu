@@ -14,9 +14,9 @@
 
 #include "tb_harness.h"
 
-static IR1_INST ir1_list[16];
+static IR1_INST ir1_list[TB_HARNESS_MAX_INSNS];
 static struct separated_data ir1_sd;
-static uint8_t ir1_dt_area[8192] __attribute__((aligned(16)));
+static uint8_t ir1_dt_area[32768] __attribute__((aligned(16)));
 
 static const int control_flow_ops[] = {
     dt_X86_INS_JMP, dt_X86_INS_CALL, dt_X86_INS_RET, dt_X86_INS_JAE,
@@ -145,23 +145,18 @@ int tb_harness_translate_at_with_map(uint64_t pc, uint8_t *code,
             out_map->spans[i].x86_pc = (uint64_t)tcg_ctx->gen_insn_data[i * 2];
             out_map->spans[i].native_end_off = tcg_ctx->gen_insn_end_off[i];
         }
+        out_map->jmp_slot_off[0] = -1;
+        out_map->jmp_slot_off[1] = -1;
+        out_map->jmp_target_pc[0] = 0;
+        out_map->jmp_target_pc[1] = 0;
     }
 
     /*
-     * A direct branch emits a link slot -- `b 0` -- that only the runtime TB
-     * linker ever fills, followed by the epilogue jump.  There is no linker
-     * here, so the slot is turned into a nop and execution falls through to
-     * the epilogue instead of spinning on itself.  jmp_target_arg holds the
-     * slot's byte offset once assembly has resolved the label.
-     *
-     * A successor that this block does not have -- the call block exits
-     * through one path only -- leaves the label undisposed, and label_dispose
-     * stores -1.  As unsigned, `-1 + 4 <= rc` holds, so an unchecked write
-     * lands one byte before the block and rewrites the high byte of its first
-     * instruction: the call's return address then materialises from garbage,
-     * `ret` pops it, and execution continues at an address nothing was
-     * translated for.  Both the signed bound and the `b 0` check below keep
-     * the patch inside the block and on the slot it is meant for.
+     * A direct branch emits a link slot -- `b 0` -- followed by the epilogue
+     * jump.  We turn the slot into `nop` (`andi r0, r0, 0`) initially so an
+     * unlinked successor falls through to the epilogue, and record the slot
+     * offset and successor x86 PC in `out_map` so the runtime loop can patch
+     * it into a direct LoongArch `b offs26` once the target TB is translated.
      */
     for (int i = 0; i < 2; i++) {
         int64_t off = (int64_t)tb.jmp_target_arg[i];
@@ -171,6 +166,10 @@ int tb_harness_translate_at_with_map(uint64_t pc, uint8_t *code,
         }
         if (*(uint32_t *)(code + off) != 0x50000000u) {   /* b 0 */
             continue;
+        }
+        if (out_map != 0) {
+            out_map->jmp_slot_off[i] = (int32_t)off;
+            out_map->jmp_target_pc[i] = (uint64_t)((int64_t)tb.pc + tb.lazypc[i]);
         }
         *(uint32_t *)(code + off) = 0x03400000u;           /* andi r0, r0, 0 */
     }

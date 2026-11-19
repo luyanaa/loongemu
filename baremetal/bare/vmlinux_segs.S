@@ -16,6 +16,12 @@ _kseg1_start:
 .globl _kseg1_end
 _kseg1_end:
 .balign 4096
+.globl _kseg2_start
+_kseg2_start:
+.incbin "firmware/vmlinux-x86_64-seg2.bin"
+.globl _kseg2_end
+_kseg2_end:
+.balign 4096
 .globl _kseg3_start
 _kseg3_start:
 .incbin "firmware/vmlinux-x86_64-seg3.bin"

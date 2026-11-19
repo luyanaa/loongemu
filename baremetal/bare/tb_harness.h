@@ -17,7 +17,7 @@
  * fault handler to recover the exact faulting x86 RIP from CSR.ERA when
  * option_guest_paging = 0.
  */
-#define TB_HARNESS_MAX_INSNS 8
+#define TB_HARNESS_MAX_INSNS 16
 
 typedef struct TbInsnSpan {
     uint64_t x86_pc;
@@ -27,6 +27,9 @@ typedef struct TbInsnSpan {
 typedef struct TbInsnMap {
     uint16_t count;
     TbInsnSpan spans[TB_HARNESS_MAX_INSNS];
+    /* Direct-branch link slots (`b 0` patched to `nop` at translate time). */
+    int32_t jmp_slot_off[2];
+    uint64_t jmp_target_pc[2];
 } TbInsnMap;
 
 /*

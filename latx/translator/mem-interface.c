@@ -227,10 +227,14 @@ static IR2_OPND convert_mem_helper(IR1_OPND *opnd1, IR2_OPND *arg_dest_op,
          *    displacement to the RIP of the next instruction.
          */
         offset += ir1_addr_next(pir1);
+        has_seg = ir1_opnd_has_seg(opnd1);
 
 #ifdef CONFIG_LATX_IMM_REG
         int rip_cache_id = -1;
 
+        if (has_seg) {
+            cache_skip = true;
+        }
         if (dest_need_itmp) {
             if (!option_imm_reg || !option_imm_rip || cache_skip) {
                 dest_op = ra_alloc_itemp();
@@ -318,6 +322,14 @@ static IR2_OPND convert_mem_helper(IR1_OPND *opnd1, IR2_OPND *arg_dest_op,
                 aot_get_call_offset(base_offset);
         aot_load_guest_addr(dest_op, base_offset, LOAD_CALL_TARGET,
                             call_offset);
+        if (has_seg) {
+            int seg_idx = ir1_opnd_get_seg_index(opnd1);
+            seg_op = ra_alloc_itemp();
+            la_load_addrx(seg_op, env_ir2_opnd,
+                          offsetof(CPUX86State, segs[seg_idx].base));
+            la_add(dest_op, seg_op, dest_op);
+            ra_free_temp(seg_op);
+        }
         if (host_off) {
             *host_off = load_offset;
         }

@@ -93,6 +93,7 @@ static void check(int cond, const char *what)
 
 static uint8_t uart_tx[64];
 static int uart_tx_count;
+static uint8_t uart_lcr;
 
 /* Device stub counters, incremented by the port and MMIO hooks below. */
 static volatile uint64_t g_pit_port_writes;
@@ -100,6 +101,8 @@ static volatile uint64_t g_pci_config_writes;
 static volatile uint64_t g_apic_mmio_reads;
 static volatile uint64_t g_apic_mmio_writes;
 static uint32_t g_apic_regs[256];
+static uint8_t g_apic_mmio_page[4096] __attribute__((aligned(4096)));
+static uint8_t g_mmio_dummy_page[4096] __attribute__((aligned(4096)));
 
 uint64_t latx_platform_io_read(uint32_t port, int size)
 {
@@ -107,8 +110,11 @@ uint64_t latx_platform_io_read(uint32_t port, int size)
     if (port == COM1_LSR) {
         return LSR_THRE_TEMT;
     }
-    if (port == COM1_THR) {
-        return 0;                    /* no receiver attached */
+    if (port == 0x3fb) {
+        return uart_lcr;
+    }
+    if (port >= 0x3f8 && port <= 0x3ff) {
+        return 0;                    /* 16550 registers / no receiver */
     }
     if (port >= 0x40 && port <= 0x43) {
         return 0x1234;               /* 8254: plausible counter value */
@@ -122,7 +128,14 @@ uint64_t latx_platform_io_read(uint32_t port, int size)
 void latx_platform_io_write(uint32_t port, int size, uint64_t value)
 {
     (void)size;
+    if (port == 0x3fb) {
+        uart_lcr = (uint8_t)value;
+        return;
+    }
     if (port == COM1_THR) {
+        if ((uart_lcr & 0x80u) != 0) {
+            return;                  /* DLAB=1: divisor latch write */
+        }
         if (uart_tx_count < (int)sizeof(uart_tx)) {
             uart_tx[uart_tx_count] = (uint8_t)value;
         }
@@ -184,6 +197,8 @@ int latx_platform_apic_mmio(uint64_t gpa, int is_write, uint64_t *value)
 #define KERNEL_TEXT_SIZE 0x1619ea0ULL
 #define KERNEL_SEG1_REL  0x1800000ULL
 #define KERNEL_SEG1_SIZE 0x55f000ULL
+#define KERNEL_SEG2_REL  0x1d5f000ULL
+#define KERNEL_SEG2_SIZE 0x2f9a8ULL
 #define KERNEL_SEG3_REL  0x1d8f000ULL
 #define KERNEL_SEG3_SIZE 0x283000ULL
 
@@ -254,16 +269,23 @@ static CPUX86State env;
 static TCGContext tcg_storage;
 static TRANSLATION_DATA tr;
 static ENV lsenv_storage;
-static uint8_t jmp_cache[4096] __attribute__((aligned(16)));
+typedef struct FastJmpEntry {
+    uint64_t pc;
+    uint64_t code;
+} FastJmpEntry;
 
-#define CODE_CACHE_SIZE (64 * 1024)
+#define FAST_JMP_CACHE_SIZE (1u << TB_JMP_CACHE_BITS)
+static FastJmpEntry fast_jmp_cache[FAST_JMP_CACHE_SIZE]
+    __attribute__((aligned(4096)));
+
+#define CODE_CACHE_SIZE (2 * 1024 * 1024)
 static uint8_t epi_buf[4096] __attribute__((aligned(4096)));
 static uint8_t pro_buf[4096] __attribute__((aligned(4096)));
 static uint8_t code_cache[CODE_CACHE_SIZE] __attribute__((aligned(4096)));
 
 static uint64_t code_used;
 
-#define TB_TABLE_CAP 64
+#define TB_TABLE_CAP 1024
 static TbCacheEntry tb_entries[TB_TABLE_CAP];
 static uint32_t tb_buckets[TB_TABLE_CAP];
 static TbCache tb_cache;
@@ -281,6 +303,7 @@ extern int latx_gen_prologue(void *code_buf);
 /* ---------------- P0 4 KiB hardware paging state ---------------- */
 
 /* ESTAT.Ecode values. */
+#define EXC_INT  0x0
 #define EXC_PIL  0x1
 #define EXC_PIS  0x2
 #define EXC_PIF  0x3
@@ -288,10 +311,12 @@ extern int latx_gen_prologue(void *code_buf);
 #define EXC_PNR  0x5
 #define EXC_PNX  0x6
 #define EXC_PPI  0x7
+#define EXC_ADE  0x8
+#define EXC_ALE  0x9
+#define EXC_SYS  0x0b
+#define EXC_BRK  0x0c
 #define EXC_IPE  0x0d
 #define EXC_GSPR 0x0e
-#define EXC_HWI  0x0b
-#define EXC_TI   0x0c
 
 /* CSR numbers (LoongArch Reference Manual Vol 1, table 7-1). */
 #define CSR_TCFG   0x41
@@ -300,7 +325,7 @@ extern int latx_gen_prologue(void *code_buf);
 #define CSR_ESTAT_IS_MASK 0x1fffULL
 #define IRQ_TIMER  11
 
-#define LAPG_POOL_PAGES 512
+#define LAPG_POOL_PAGES 1024
 static uint64_t g_pool_mem[LAPG_POOL_PAGES * (LAPG_PAGE_SIZE / 8)]
     __attribute__((aligned(LAPG_PAGE_SIZE)));
 static LapgPagePool g_pool;
@@ -310,8 +335,62 @@ static volatile int g_probe_touched;
 static volatile uint64_t g_hw_tlb_fills;
 static volatile uint64_t g_hw_guest_pf;
 static volatile uint64_t g_current_tb_code;
+static volatile uint32_t g_current_tb_size;
 static volatile uint64_t g_current_tb_pc;
 static const TbInsnMap *g_current_tb_map;
+
+static uint64_t resolve_fault_x86_pc(uint64_t fault_pc)
+{
+    if (g_current_tb_map != 0 &&
+        fault_pc >= g_current_tb_code &&
+        fault_pc < g_current_tb_code + (uint64_t)g_current_tb_size) {
+        return tb_harness_resolve_x86_pc(g_current_tb_map,
+                                         g_current_tb_code,
+                                         fault_pc,
+                                         g_current_tb_pc);
+    }
+    for (uint32_t i = 0; i < TB_TABLE_CAP; i++) {
+        if (tb_entries[i].used &&
+            fault_pc >= tb_entries[i].code &&
+            fault_pc < tb_entries[i].code + (uint64_t)tb_entries[i].code_size) {
+            return tb_harness_resolve_x86_pc(&tb_insn_maps[i],
+                                             tb_entries[i].code,
+                                             fault_pc,
+                                             tb_entries[i].pc);
+        }
+    }
+    return tb_harness_resolve_x86_pc(g_current_tb_map,
+                                     g_current_tb_code,
+                                     fault_pc,
+                                     g_current_tb_pc);
+}
+
+typedef enum {
+    PLV3_EXIT_NONE     = 0,
+    PLV3_EXIT_NORMAL   = 1,
+    PLV3_EXIT_GUEST_PF = 2,
+    PLV3_EXIT_TRAP     = 3,
+} Plv3ExitReason;
+
+typedef enum {
+    RUN_EXIT_MAX_BLOCKS     = 0,
+    RUN_EXIT_TRANSLATE_FAIL = 1,
+    RUN_EXIT_STUCK          = 2,
+    RUN_EXIT_PLV3_TRAP      = 3,
+} RunBlocksExitKind;
+
+typedef struct {
+    uint64_t reason;
+    uint64_t ecode;
+    uint64_t esubcode;
+    uint64_t is_refill;
+    uint64_t era;
+    uint64_t badv;
+    uint64_t guest_rip;
+} Plv3ExitInfo;
+
+volatile Plv3ExitInfo g_plv3_exit __attribute__((used));
+static volatile uint64_t g_run_blocks_exit;
 
 /*
  * Interrupt injection state.
@@ -447,7 +526,10 @@ static int is_host_vmm_va(uint64_t va)
     uint64_t env_start = (uint64_t)(uintptr_t)&env & LAPG_PAGE_MASK;
     uint64_t env_end = ((uint64_t)(uintptr_t)&env + sizeof(env) +
                         LAPG_PAGE_SIZE - 1) & LAPG_PAGE_MASK;
-    uint64_t jc_page = (uint64_t)(uintptr_t)jmp_cache & LAPG_PAGE_MASK;
+    uint64_t jc_start = (uint64_t)(uintptr_t)fast_jmp_cache & LAPG_PAGE_MASK;
+    uint64_t jc_end = ((uint64_t)(uintptr_t)fast_jmp_cache +
+                       sizeof(fast_jmp_cache) + LAPG_PAGE_SIZE - 1) &
+                      LAPG_PAGE_MASK;
     uint64_t ks_start = (uint64_t)(uintptr_t)kstack & LAPG_PAGE_MASK;
     uint64_t ks_end = ((uint64_t)(uintptr_t)kstack + sizeof(kstack) +
                        LAPG_PAGE_SIZE - 1) & LAPG_PAGE_MASK;
@@ -455,7 +537,10 @@ static int is_host_vmm_va(uint64_t va)
     if (page >= cc_start && page < cc_end) {
         return 1;
     }
-    if (page == pro_page || page == epi_page || page == jc_page) {
+    if (page == pro_page || page == epi_page) {
+        return 1;
+    }
+    if (page >= jc_start && page < jc_end) {
         return 1;
     }
     if (page >= env_start && page < env_end) {
@@ -502,7 +587,7 @@ static void rebuild_host_mappings(void)
                    LAPG_PERM_EXEC | LAPG_PERM_USER);
     map_host_range((uint64_t)(uintptr_t)&env, sizeof(env),
                    LAPG_PERM_READ | LAPG_PERM_WRITE | LAPG_PERM_USER);
-    map_host_range((uint64_t)(uintptr_t)jmp_cache, sizeof(jmp_cache),
+    map_host_range((uint64_t)(uintptr_t)fast_jmp_cache, sizeof(fast_jmp_cache),
                    LAPG_PERM_READ | LAPG_PERM_WRITE | LAPG_PERM_USER);
     map_host_range((uint64_t)(uintptr_t)kstack, sizeof(kstack),
                    LAPG_PERM_READ | LAPG_PERM_WRITE | LAPG_PERM_USER);
@@ -515,14 +600,10 @@ static void rebuild_host_mappings(void)
 void latx_platform_tlb_flush_all(void)
 {
     /*
-     * Drop the hardware entries; do not rebuild the tables.
-     *
-     * rebuild_host_mappings() reinitialises the pool and allocates a new root,
-     * so calling it here threw away every mapping installed so far -- including
-     * the ones the caller is about to use -- and did so on every INVLPG and
-     * every CR3 write.  A TLB flush is exactly that and nothing more; the
-     * tables themselves are the caller's business.
+     * Drop the hardware entries and clear fast_jmp_cache so CR3/CR0 switches
+     * never jump directly to a TB translated under a different address space.
      */
+    memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
     __asm__ volatile("invtlb 0x0, $zero, $zero" ::: "memory");
 }
 
@@ -870,47 +951,183 @@ static int deliver_tick_to_guest(void)
  * which is the shape a vCPU loop has, and bounds the run so a translation
  * loop cannot spin.
  */
+static uint64_t g_recent_pcs[16];
+static uint64_t g_recent_count;
+static uint64_t g_run_tb_hits;
+static uint64_t g_run_tb_misses;
+static uint64_t g_run_tb_flushes;
+static uint64_t g_run_tb_links;
+
+static void try_link_tb_slot(uint32_t from_slot, uint32_t to_slot)
+{
+    TbCacheEntry *from_e = &tb_entries[from_slot];
+    TbCacheEntry *to_e = &tb_entries[to_slot];
+    TbInsnMap *map = &tb_insn_maps[from_slot];
+
+    if (!from_e->used || !to_e->used) {
+        return;
+    }
+    /* Avoid linking a 1-exit unconditional self-loop (`jmp $`) so the
+     * PLV0 stuck detector can still observe it. */
+    if (from_slot == to_slot &&
+        map->jmp_slot_off[0] >= 0 && map->jmp_slot_off[1] < 0) {
+        return;
+    }
+    for (int i = 0; i < 2; i++) {
+        int32_t slot_off = map->jmp_slot_off[i];
+        if (slot_off < 0 || map->jmp_target_pc[i] != to_e->pc) {
+            continue;
+        }
+        uint64_t slot_addr = from_e->code + (uint64_t)slot_off;
+        uint32_t *slot_ptr = (uint32_t *)(uintptr_t)slot_addr;
+        if (*slot_ptr != 0x03400000u) {
+            continue; /* already patched */
+        }
+        int64_t disp = ((int64_t)to_e->code - (int64_t)slot_addr) >> 2;
+        if (disp < -(1LL << 25) || disp >= (1LL << 25)) {
+            continue;
+        }
+        uint32_t insn = 0x50000000u |
+                        (((uint32_t)disp & 0xffffu) << 10) |
+                        (((uint32_t)disp >> 16) & 0x3ffu);
+        *slot_ptr = insn;
+        __asm__ volatile("ibar 0" ::: "memory");
+        g_run_tb_links++;
+    }
+}
+
+static void link_new_tb(uint32_t new_slot)
+{
+    TbCacheEntry *e = &tb_entries[new_slot];
+    TbInsnMap *map = &tb_insn_maps[new_slot];
+
+    /* 1. Outgoing edges from this newly translated TB to existing TBs. */
+    for (int i = 0; i < 2; i++) {
+        if (map->jmp_slot_off[i] >= 0) {
+            TbCacheEntry *dst = tbc_lookup(&tb_cache, map->jmp_target_pc[i],
+                                           0, e->cr3, e->cpl);
+            if (dst != 0) {
+                try_link_tb_slot(new_slot, (uint32_t)(dst - tb_entries));
+            }
+        }
+    }
+
+    /* 2. Incoming edges from existing TBs in the same (cr3, cpl) to this TB. */
+    for (uint32_t j = 0; j < TB_TABLE_CAP; j++) {
+        if (!tb_entries[j].used || j == new_slot) {
+            continue;
+        }
+        if (tb_entries[j].cr3 != e->cr3 || tb_entries[j].cpl != e->cpl) {
+            continue;
+        }
+        if (tb_insn_maps[j].jmp_target_pc[0] == e->pc ||
+            tb_insn_maps[j].jmp_target_pc[1] == e->pc) {
+            try_link_tb_slot(j, new_slot);
+        }
+    }
+}
+
 static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
 {
-    uint64_t code_addr = (uint64_t)(uintptr_t)code_cache + 0x2000;
     int ran = 0;
     int stuck = 0;
     uint64_t last_fp = 0;
 
     env.eip = pc;
+    env.tb_jmp_cache_ptr = fast_jmp_cache;
+    g_run_blocks_exit = RUN_EXIT_MAX_BLOCKS;
+    g_recent_count = 0;
+    g_run_tb_hits = 0;
+    g_run_tb_misses = 0;
+    g_run_tb_flushes = 0;
+    g_run_tb_links = 0;
+    tbc_flush_all(&tb_cache);
+    memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
+    code_used = 0x2000;
+    __asm__ volatile("ibar 0" ::: "memory");
     latx_x86_tlb_flush_all();
 
     while (ran < max_blocks) {
         uint64_t before = env.eip;
-        TbInsnMap map;
-        int rc = tb_harness_translate_at_with_map(
-                     env.eip, (uint8_t *)(uintptr_t)code_addr, 4096, &map);
+        uint64_t cur_cr3 = env.cr[3];
+        uint8_t cpl = (uint8_t)(env.hflags & HF_CPL_MASK);
+        TbCacheEntry *e;
+        uint32_t slot_idx;
 
-        if (rc <= 0) {
-            break;
+        g_recent_pcs[g_recent_count & 15] = before;
+        g_recent_count++;
+
+        e = tbc_lookup(&tb_cache, before, 0, cur_cr3, cpl);
+        if (e != 0) {
+            g_run_tb_hits++;
+        } else {
+            uint8_t *code;
+            int rc;
+
+            g_run_tb_misses++;
+            if (code_used + 16384 > CODE_CACHE_SIZE ||
+                tbc_count(&tb_cache) >= TB_TABLE_CAP - 1) {
+                tbc_flush_all(&tb_cache);
+                memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
+                code_used = 0x2000;
+                g_run_tb_flushes++;
+                __asm__ volatile("ibar 0" ::: "memory");
+            }
+            e = tbc_insert(&tb_cache, before, 0, cur_cr3, cpl);
+            if (e == 0) {
+                tbc_flush_all(&tb_cache);
+                memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
+                code_used = 0x2000;
+                g_run_tb_flushes++;
+                __asm__ volatile("ibar 0" ::: "memory");
+                e = tbc_insert(&tb_cache, before, 0, cur_cr3, cpl);
+            }
+            if (e == 0) {
+                g_run_blocks_exit = RUN_EXIT_TRANSLATE_FAIL;
+                break;
+            }
+            slot_idx = (uint32_t)(e - tb_entries);
+            code = code_cache + code_used;
+            rc = tb_harness_translate_at_with_map(
+                     before, code, CODE_CACHE_SIZE - code_used,
+                     &tb_insn_maps[slot_idx]);
+            if (rc <= 0) {
+                tbc_flush_all(&tb_cache);
+                memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
+                g_run_blocks_exit = RUN_EXIT_TRANSLATE_FAIL;
+                break;
+            }
+            e->code = (uint64_t)(uintptr_t)code;
+            e->code_size = (uint32_t)rc;
+            code_used += (((uint64_t)rc + 255) & ~UINT64_C(255));
+            __asm__ volatile("ibar 0" ::: "memory");
+            link_new_tb(slot_idx);
         }
-        /* Publish this block before running it: the fault path resolves the
-         * faulting guest RIP through the current block's map. */
-        g_current_tb_code = (uint64_t)(uintptr_t)code_addr;
-        g_current_tb_pc = before;
-        g_current_tb_map = &map;
 
         {
-            uint64_t pf0 = g_hw_guest_pf;
-            uint64_t tf0 = g_hw_tlb_fills;
-
-            tb_sys_run_plv3((void *)(void *)(uintptr_t)pro_buf,
-                            (void *)(uintptr_t)code_addr, &env);
-            (void)pf0;
-            (void)tf0;
+            uint32_t h = (uint32_t)(((before >> TB_JMP_CACHE_BITS) ^ before) &
+                                    (FAST_JMP_CACHE_SIZE - 1));
+            fast_jmp_cache[h].pc = before;
+            fast_jmp_cache[h].code = e->code;
         }
+
+        slot_idx = (uint32_t)(e - tb_entries);
+
+        /* Publish this block before running it: the fault path resolves the
+         * faulting guest RIP through the executing block's map. */
+        g_current_tb_code = e->code;
+        g_current_tb_size = e->code_size;
+        g_current_tb_pc = before;
+        g_current_tb_map = &tb_insn_maps[slot_idx];
+
+        tb_sys_run_plv3((void *)(uintptr_t)pro_buf,
+                        (void *)(uintptr_t)e->code, &env);
         ran++;
-        /*
-         * A loop that returns to the same PC is normal control flow -- the
-         * kernel's page-table clear does exactly that -- so "no progress" is
-         * counted, not inferred from a single step.  Only a run of identical
-         * PCs means the block asked for the same instruction forever.
-         */
+        if (g_plv3_exit.reason != PLV3_EXIT_NORMAL &&
+            g_plv3_exit.reason != PLV3_EXIT_GUEST_PF) {
+            g_run_blocks_exit = RUN_EXIT_PLV3_TRAP;
+            break;
+        }
         /*
          * A loop that returns to the same PC is normal control flow: the
          * kernel's page-table clear walks rdx upward and comes back to the
@@ -921,10 +1138,12 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
         {
             uint64_t fp = env.eip ^ (env.regs[R_EDX] << 1) ^
                           (env.regs[R_EAX] << 2) ^ (env.regs[R_ESP] << 3) ^
-                          (env.regs[R_ECX] << 4) ^ (env.regs[R_EBX] << 5);
+                          (env.regs[R_ECX] << 4) ^ (env.regs[R_EBX] << 5) ^
+                          (env.regs[R_EDI] << 6) ^ (env.regs[R_ESI] << 7);
 
             if (fp == last_fp) {
                 if (++stuck >= 16) {
+                    g_run_blocks_exit = RUN_EXIT_STUCK;
                     break;
                 }
             } else {
@@ -934,6 +1153,7 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
         }
     }
 
+    env.tb_jmp_cache_ptr = 0;
     if (end_pc) {
         *end_pc = env.eip;
     }
@@ -1148,34 +1368,16 @@ void tb_sys_handle_trap(uint64_t *regs)
         badv = csrrd(0x89);
     }
 
-    if (is_refill || ecode != EXC_IPE) {
-        static int dbg_traps;
-        if (dbg_traps < 80) {
-            dbg_traps++;
-            latx_bare_uart_puts("T rf=");
-            puthex((uint64_t)is_refill);
-            latx_bare_uart_puts(" ec=");
-            puthex(ecode);
-            latx_bare_uart_puts(" pc=");
-            puthex(fault_pc);
-            latx_bare_uart_puts(" bv=");
-            puthex(badv);
-            latx_bare_uart_puts(" ra=");
-            puthex(regs[la_ra]);
-            latx_bare_uart_puts("\n");
-        }
-    }
-
     /*
-     * 0. Timer / hardware interrupt.  The LoongArch core timer is the only
-     *    clock the guest can see, so acknowledging it here and injecting the
-     *    guest's own vector is what makes a guest tick exist at all.
+     * 0. Timer / hardware interrupt (LoongArch ESTAT.Ecode == 0x0).
+     *    The LoongArch core timer is the only clock the guest can see, so
+     *    acknowledging it here and injecting the guest's own vector is what
+     *    makes a guest tick exist at all.
      */
-    if (!is_refill && (ecode == EXC_TI || ecode == EXC_HWI)) {
-        uint64_t isr = (ecode == EXC_TI) ? (1u << (IRQ_TIMER - 8))
-                                         : (estat & CSR_ESTAT_IS_MASK);
+    if (!is_refill && ecode == EXC_INT && (estat & CSR_ESTAT_IS_MASK) != 0) {
+        uint64_t isr = estat & CSR_ESTAT_IS_MASK;
 
-        if (isr & (1u << (IRQ_TIMER - 8))) {
+        if (isr & (1u << IRQ_TIMER)) {
             timer_ack();
             g_timer_ticks++;
             (void)deliver_tick_to_guest();
@@ -1184,11 +1386,17 @@ void tb_sys_handle_trap(uint64_t *regs)
     }
 
     /*
-     * 1. Check if the epilogue returned to `tb_sys_plv3_done` (or executed a
-     *    privileged instruction) to exit PLV3 back to the PLV0 run loop.
+     * 1. Check if the epilogue returned to `tb_sys_plv3_done` to exit PLV3
+     *    normally back to the PLV0 run loop.
      */
-    if (fault_pc == (uint64_t)(uintptr_t)tb_sys_plv3_done ||
-        (!is_refill && ecode == EXC_GSPR)) {
+    if (fault_pc == (uint64_t)(uintptr_t)tb_sys_plv3_done) {
+        g_plv3_exit.reason = PLV3_EXIT_NORMAL;
+        g_plv3_exit.ecode = ecode;
+        g_plv3_exit.esubcode = (estat >> 22) & 0x1ffu;
+        g_plv3_exit.is_refill = (uint64_t)is_refill;
+        g_plv3_exit.era = fault_pc;
+        g_plv3_exit.badv = badv;
+        g_plv3_exit.guest_rip = env.eip;
         if (is_refill) {
             csrwr(0x8f, 0);
             csrwr(0x8a,
@@ -1284,6 +1492,13 @@ void tb_sys_handle_trap(uint64_t *regs)
                 uint64_t gpa_page = x86_tr.gpa & LAPG_PAGE_MASK;
                 uint32_t perm = LAPG_PERM_READ | LAPG_PERM_USER;
 
+                if (gpa_page >= APIC_MMIO_BASE &&
+                    gpa_page < APIC_MMIO_BASE + APIC_MMIO_SIZE) {
+                    gpa_page = (uint64_t)(uintptr_t)g_apic_mmio_page;
+                } else if (gpa_page >= UINT64_C(0x10000000)) {
+                    gpa_page = (uint64_t)(uintptr_t)g_mmio_dummy_page;
+                }
+
                 if (x86_r == LATX_X86_WALK_PAGING_OFF) {
                     perm |= LAPG_PERM_WRITE | LAPG_PERM_EXEC;
                 } else {
@@ -1329,16 +1544,22 @@ void tb_sys_handle_trap(uint64_t *regs)
              */
             g_hw_guest_pf++;
             sync_trap_regs_to_env(regs);
-            env.eip = tb_harness_resolve_x86_pc(g_current_tb_map,
-                                                g_current_tb_code,
-                                                fault_pc,
-                                                g_current_tb_pc);
+            env.eip = resolve_fault_x86_pc(fault_pc);
+            g_plv3_exit.reason = PLV3_EXIT_GUEST_PF;
+            g_plv3_exit.ecode = ecode;
+            g_plv3_exit.esubcode = (estat >> 22) & 0x1ffu;
+            g_plv3_exit.is_refill = (uint64_t)is_refill;
+            g_plv3_exit.era = fault_pc;
+            g_plv3_exit.badv = badv;
+            g_plv3_exit.guest_rip = env.eip;
             latx_x86_tlb_flush_page(badv);
             env.cr[2] = badv;
             env.exception_index = EXCP0E_PAGE;
             env.error_code = (int)latx_x86_fault_error_code(&env, x86_r,
                                                             x86_access);
-            (void)latx_x86_deliver_fault(&env, 14);
+            if (latx_x86_deliver_fault(&env, 14) != 0) {
+                g_plv3_exit.reason = PLV3_EXIT_TRAP;
+            }
             latx_platform_tlb_flush_all();
             sync_env_to_trap_regs(regs);
 
@@ -1359,14 +1580,31 @@ void tb_sys_handle_trap(uint64_t *regs)
         }
     }
 
-    latx_bare_uart_puts("tb-sys: unexpected trap ecode=");
-    puthex(ecode);
-    latx_bare_uart_puts(" era=");
-    puthex(era);
-    latx_bare_uart_puts(" badv=");
-    puthex(badv);
-    latx_bare_uart_puts("\n");
-    for (;;) {
+    /*
+     * 4. Unhandled PLV3 trap (e.g. EXC_ADE=0x8, EXC_ALE=0x9, EXC_SYS=0xb,
+     *    EXC_BRK=0xc, EXC_GSPR=0xe outside tb_sys_plv3_done): record full
+     *    diagnostic state and unwind cleanly to tb_sys_abort_plv0 so the PLV0
+     *    caller can inspect g_plv3_exit instead of spinning.
+     */
+    sync_trap_regs_to_env(regs);
+    env.eip = resolve_fault_x86_pc(fault_pc);
+    g_plv3_exit.reason = PLV3_EXIT_TRAP;
+    g_plv3_exit.ecode = ecode;
+    g_plv3_exit.esubcode = (estat >> 22) & 0x1ffu;
+    g_plv3_exit.is_refill = (uint64_t)is_refill;
+    g_plv3_exit.era = fault_pc;
+    g_plv3_exit.badv = badv;
+    g_plv3_exit.guest_rip = env.eip;
+
+    if (is_refill) {
+        csrwr(0x8f, 0);
+        csrwr(0x8a,
+              ((uint64_t)(uintptr_t)tb_sys_abort_plv0 & ~UINT64_C(3)) | 1u);
+    } else {
+        uint64_t prmd = csrrd(0x1) & ~UINT64_C(0x3);
+
+        csrwr(0x1, prmd);
+        csrwr(0x6, (uint64_t)(uintptr_t)tb_sys_abort_plv0);
     }
 }
 
@@ -1474,6 +1712,9 @@ __asm__(
 "  st.d $s8, $sp, 80\n"
 "  la   $t0, g_saved_plv0_sp\n"
 "  st.d $sp, $t0, 0\n"
+/* Reset g_plv3_exit.reason = PLV3_EXIT_NONE before entering PLV3 */
+"  la   $t0, g_plv3_exit\n"
+"  st.d $zero, $t0, 0\n"
 /* Set PRMD.PPLV = 3 */
 "  csrrd $t0, 0x1\n"
 "  ori   $t0, $t0, 0x3\n"
@@ -1493,6 +1734,23 @@ __asm__(
 "  csrrd $zero, 0x0\n"
 ".globl tb_sys_abort_plv0\n"
 "tb_sys_abort_plv0:\n"
+/* Fallback capture: if g_plv3_exit.reason is still 0, snapshot ESTAT/ERA/BADV */
+"  la   $t0, g_plv3_exit\n"
+"  ld.d $t1, $t0, 0\n"
+"  bnez $t1, 1f\n"
+"  ori  $t1, $zero, 3\n"
+"  st.d $t1, $t0, 0\n"
+"  csrrd $t1, 0x5\n"
+"  bstrpick.d $t2, $t1, 21, 16\n"
+"  st.d $t2, $t0, 8\n"
+"  bstrpick.d $t2, $t1, 30, 22\n"
+"  st.d $t2, $t0, 16\n"
+"  st.d $zero, $t0, 24\n"
+"  csrrd $t1, 0x6\n"
+"  st.d $t1, $t0, 32\n"
+"  csrrd $t1, 0x7\n"
+"  st.d $t1, $t0, 40\n"
+"1:\n"
 "  la   $t0, g_saved_plv0_sp\n"
 "  ld.d $sp, $t0, 0\n"
 "  ld.d $ra, $sp, 0\n"
@@ -1579,6 +1837,7 @@ void kmain(void)
 
     {
         uint64_t euen, crmd;
+        uint32_t cfg2 = 0;
 
         euen = csrrd(0x2);
         euen |= 0x1 | 0x2 | 0x40 | 0x80;
@@ -1586,6 +1845,10 @@ void kmain(void)
         crmd = csrrd(0x0);
         crmd &= ~(uint64_t)0x4;
         csrwr(0x0, crmd);
+        __asm__ volatile("cpucfg %0, %1" : "=r"(cfg2) : "r"(2));
+        if ((cfg2 & (1u << 18)) == 0) {
+            g_use_sw_lbt = 1;
+        }
     }
 
     memset((void *)GUEST_BASE, 0, GUEST_RAM_SIZE);
@@ -1614,10 +1877,16 @@ void kmain(void)
     memset(&tr, 0, sizeof(tr));
     memset(&lsenv_storage, 0, sizeof(lsenv_storage));
     memset(&tcg_storage, 0, sizeof(tcg_storage));
-    memset(jmp_cache, 0, sizeof(jmp_cache));
+    memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
     memset(code_cache, 0, sizeof(code_cache));
     memset(epi_buf, 0, sizeof(epi_buf));
     memset(pro_buf, 0, sizeof(pro_buf));
+    memset(g_apic_mmio_page, 0, sizeof(g_apic_mmio_page));
+    memset(g_mmio_dummy_page, 0, sizeof(g_mmio_dummy_page));
+    *(volatile uint32_t *)(g_apic_mmio_page + 0x20) = 0x00000000u; /* APIC_ID */
+    *(volatile uint32_t *)(g_apic_mmio_page + 0x30) = 0x00050014u; /* APIC_LVR */
+    *(volatile uint32_t *)(g_apic_mmio_page + 0xe0) = 0xffffffffu; /* APIC_DFR */
+    *(volatile uint32_t *)(g_apic_mmio_page + 0xf0) = 0x000001ffu; /* APIC_SPIV */
 
     env.sys.codemode = 1;
     env.hflags = HF_LMA_MASK | HF_CS64_MASK;
@@ -1730,6 +1999,7 @@ void kmain(void)
 
         slot_idx = (uint32_t)(e - tb_entries);
         g_current_tb_code = e->code;
+        g_current_tb_size = e->code_size;
         g_current_tb_pc = e->pc;
         g_current_tb_map = &tb_insn_maps[slot_idx];
 
@@ -2456,10 +2726,10 @@ void kmain(void)
              * what 0x81000000 needed under PML4[511]/PDPT[510], so only the
              * outer indices change.
              */
-            for (i = 0; i < 20; i++) {
-                uint64_t pa = gpa + (uint64_t)i * 0x200000ULL;
+            for (i = 0; i < 32; i++) {
+                uint64_t pa = (uint64_t)i * 0x200000ULL;
 
-                *(volatile uint64_t *)(uintptr_t)(pd + (8 + i) * 8) =
+                *(volatile uint64_t *)(uintptr_t)(pd + i * 8) =
                     (pa & ~UINT64_C(0x1fffff)) | 0x83;   /* P|RW|PS */
             }
             (void)pt;
@@ -2505,19 +2775,19 @@ void kmain(void)
              */
             {
                 extern const uint8_t _ktext_start[];
-                extern const uint8_t _kseg1_start[], _kseg3_start[];
+                extern const uint8_t _kseg1_start[], _kseg2_start[], _kseg3_start[];
 
                 /*
-                 * All of the image's PT_LOAD segments, at their offsets from
-                 * the load base.  Only the first was carried before, so the
-                 * kernel's page-table walk (which clears memory at rel
-                 * 0x1800000) ran off the end of what was mapped and control
-                 * left the image.
+                 * All four PT_LOAD segments, at their physical offsets from
+                 * the load base (including PT_LOAD #2 .data..percpu at rel
+                 * 0x1d5f000 so pcpu_hot.current_task resolves to init_task).
                  */
                 memcpy((void *)(uintptr_t)gpa, _ktext_start,
                        KERNEL_TEXT_SIZE);
                 memcpy((void *)(uintptr_t)(gpa + KERNEL_SEG1_REL),
                        _kseg1_start, KERNEL_SEG1_SIZE);
+                memcpy((void *)(uintptr_t)(gpa + KERNEL_SEG2_REL),
+                       _kseg2_start, KERNEL_SEG2_SIZE);
                 memcpy((void *)(uintptr_t)(gpa + KERNEL_SEG3_REL),
                        _kseg3_start, KERNEL_SEG3_SIZE);
             }
@@ -2527,12 +2797,44 @@ void kmain(void)
 
                 env.cr[4] = saved_cr4 | CR4_PAE_MASK;
                 /*
-                 * The boot protocol: RSI points at boot_params (the zero
-                 * page).  A kernel reads its memory map, command line and
-                 * loader type from there before it does anything else; leaving
-                 * RSI as whatever the harness last used makes it consume
-                 * garbage as if it were a real structure.
+                 * Populate a minimal Linux x86-64 boot_params at
+                 * BOOT_PARAMS_GPA (0x10000) with a 64 MiB e820 RAM map and
+                 * an earlyprintk serial command line at 0x20000.
                  */
+                {
+                    uint8_t *bp = (uint8_t *)(uintptr_t)BOOT_PARAMS_GPA;
+                    uint64_t cmdline_gpa = 0x00020000ULL;
+                    static const char cmdline[] =
+                        "earlycon=uart,io,0x3f8,115200n8 console=ttyS0,115200 "
+                        "ignore_loglevel nokaslr";
+                    uint64_t e0_addr = 0x00000000ULL;
+                    uint64_t e0_size = 0x0009fc00ULL;
+                    uint32_t e0_type = 1u;
+                    uint64_t e1_addr = 0x00100000ULL;
+                    uint64_t e1_size = 0x03f00000ULL;
+                    uint32_t e1_type = 1u;
+                    uint16_t boot_flag = 0xaa55u;
+                    uint32_t hdr_sig = 0x53726448u; /* "HdrS" */
+                    uint16_t hdr_ver = 0x020fu;
+                    uint32_t cmd_ptr = (uint32_t)cmdline_gpa;
+
+                    memset(bp, 0, 4096);
+                    memcpy((void *)(uintptr_t)cmdline_gpa, cmdline,
+                           sizeof(cmdline));
+                    bp[0x1e8] = 2; /* e820_entries */
+                    memcpy(bp + 0x1fe, &boot_flag, 2);
+                    memcpy(bp + 0x202, &hdr_sig, 4);
+                    memcpy(bp + 0x206, &hdr_ver, 2);
+                    bp[0x210] = 0xff; /* type_of_loader */
+                    bp[0x211] = 0x01; /* loadflags: LOADED_HIGH */
+                    memcpy(bp + 0x228, &cmd_ptr, 4);
+                    memcpy(bp + 0x2d0 + 0, &e0_addr, 8);
+                    memcpy(bp + 0x2d0 + 8, &e0_size, 8);
+                    memcpy(bp + 0x2d0 + 16, &e0_type, 4);
+                    memcpy(bp + 0x2d0 + 20, &e1_addr, 8);
+                    memcpy(bp + 0x2d0 + 28, &e1_size, 8);
+                    memcpy(bp + 0x2d0 + 36, &e1_type, 4);
+                }
                 env.regs[R_ESI] = (uint32_t)BOOT_PARAMS_GPA;
                 env.regs[R_EBP] = 0;
                 env.regs[R_EAX] = 0xdeadbeefu;
@@ -2625,13 +2927,50 @@ void kmain(void)
                              * checks.  The bound is where that happens, not a
                              * step budget.
                              */
-                            int ran = run_blocks_from(gva + 0x90, 4096, &stop);
+                            int ran = run_blocks_from(gva + 0x90, 200000, &stop);
 
                             latx_bare_uart_puts("tb-sys: kernel_blocks_run=");
                             puthex((uint64_t)(ran < 0 ? 0 : ran));
                             latx_bare_uart_puts(" stop=");
                             puthex(stop);
+                            latx_bare_uart_puts(" run_exit=");
+                            puthex(g_run_blocks_exit);
+                            latx_bare_uart_puts(" plv3_exit=");
+                            puthex(g_plv3_exit.reason);
+                            latx_bare_uart_puts(" hits=");
+                            puthex(g_run_tb_hits);
+                            latx_bare_uart_puts(" misses=");
+                            puthex(g_run_tb_misses);
+                            latx_bare_uart_puts(" links=");
+                            puthex(g_run_tb_links);
                             latx_bare_uart_puts("\n");
+                            if (g_plv3_exit.reason != PLV3_EXIT_NORMAL) {
+                                uint64_t n = g_recent_count < 8 ? g_recent_count : 8;
+                                uint64_t start = g_recent_count - n;
+                                latx_bare_uart_puts("tb-sys: plv3_abort ecode=");
+                                puthex(g_plv3_exit.ecode);
+                                latx_bare_uart_puts(" esub=");
+                                puthex(g_plv3_exit.esubcode);
+                                latx_bare_uart_puts(" rf=");
+                                puthex(g_plv3_exit.is_refill);
+                                latx_bare_uart_puts(" era=");
+                                puthex(g_plv3_exit.era);
+                                latx_bare_uart_puts(" badv=");
+                                puthex(g_plv3_exit.badv);
+                                latx_bare_uart_puts(" grip=");
+                                puthex(g_plv3_exit.guest_rip);
+                                latx_bare_uart_puts(" err=");
+                                puthex((uint64_t)(uint32_t)env.error_code);
+                                latx_bare_uart_puts(" gs_base=");
+                                puthex(env.segs[R_GS].base);
+                                latx_bare_uart_puts("\n");
+                                latx_bare_uart_puts("tb-sys: recent_pcs=");
+                                for (uint64_t idx = start; idx < g_recent_count; idx++) {
+                                    if (idx > start) latx_bare_uart_puts(" ");
+                                    puthex(g_recent_pcs[idx & 15]);
+                                }
+                                latx_bare_uart_puts("\n");
+                            }
                             check(ran >= 1,
                                   "kernel entry runs at least one block");
                         }

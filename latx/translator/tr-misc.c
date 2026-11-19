@@ -563,7 +563,7 @@ static bool translate_descriptor_table(IR1_INST *pir1, bool is_gdt)
 
     base = load_desc_word_opnd(addr_opnd, 2, 32);
     if (size == 10) {
-        tmp = load_desc_word_opnd(addr_opnd, 8, 32);
+        tmp = load_desc_word_opnd(addr_opnd, 6, 32);
         la_slli_d(tmp, tmp, 32);
         la_or(base, base, tmp);
         ra_free_temp(tmp);
@@ -1823,7 +1823,7 @@ static bool translate_store_descriptor_table(IR1_INST *pir1, bool is_gdt)
     la_st_w(base, addr, 2);
     if (size == 10) {
         la_srli_d(base, base, 32);
-        la_st_w(base, addr, 8);
+        la_st_w(base, addr, 6);
     }
 
     ra_free_temp(base);
