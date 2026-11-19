@@ -182,6 +182,10 @@ int latx_platform_apic_mmio(uint64_t gpa, int is_write, uint64_t *value)
 
 /* The kernel text the harness carries, linked for 0xffffffff81000000. */
 #define KERNEL_TEXT_SIZE 0x1619ea0ULL
+#define KERNEL_SEG1_REL  0x1800000ULL
+#define KERNEL_SEG1_SIZE 0x55f000ULL
+#define KERNEL_SEG3_REL  0x1d8f000ULL
+#define KERNEL_SEG3_SIZE 0x283000ULL
 
 /* Must match the linker script's load address (baremetal/bare/bare.lds). */
 #define VMM_IMAGE_BASE  0x4000000ULL
@@ -2382,8 +2386,14 @@ void kmain(void)
          * write to 0xffffffff82803f50 report NOT_PRESENT with tables that
          * looked correct.
          */
-        uint64_t pml4 = 0x3000000, pdpt = 0x3001000, pd = 0x3002000,
-                 pt = 0x3003000;
+        /*
+         * Above the whole loaded image: the segments span 0x1000000..0x322c000
+         * once all four PT_LOADs are placed, and the previous 0x3000000 base
+         * was inside segment 3 -- which silently wiped the page tables the
+         * moment the image was copied in.
+         */
+        uint64_t pml4 = 0x3800000, pdpt = 0x3801000, pd = 0x3802000,
+                 pt = 0x3803000;
         /*
          * A non-relocatable KERNEL_64 image refuses to run above 2^46: its
          * entry sequence computes `rdi >> 46` and jumps to a halt on a
@@ -2407,6 +2417,17 @@ void kmain(void)
          */
         *(volatile uint64_t *)(uintptr_t)(pml4 + 0 * 8) = pdpt | 0x3;
         *(volatile uint64_t *)(uintptr_t)(pdpt + 0 * 8) = pd | 0x3;
+
+        /*
+         * The kernel's own prologue loads RSP from a RIP-relative LEA that
+         * still points into the image's link-time half (0xffffffff8280xxxx),
+         * so the negative-half window has to resolve too -- mapped onto the
+         * same physical leaves.  Running at the load address satisfies the
+         * entry's `rdi >> 46` check; it does not change the addresses the
+         * image computes for itself.
+         */
+        *(volatile uint64_t *)(uintptr_t)(pml4 + 511 * 8) = pdpt | 0x3;
+        *(volatile uint64_t *)(uintptr_t)(pdpt + 510 * 8) = pd | 0x3;
         /*
          * Index arithmetic for 0xffffffff81000000: PML4[511], PDPT[510],
          * PD[8].  The PD index is 8, not 0 -- 0x81000000 has a non-zero bit
@@ -2427,7 +2448,7 @@ void kmain(void)
              * what 0x81000000 needed under PML4[511]/PDPT[510], so only the
              * outer indices change.
              */
-            for (i = 0; i < 16; i++) {
+            for (i = 0; i < 20; i++) {
                 uint64_t pa = gpa + (uint64_t)i * 0x200000ULL;
 
                 *(volatile uint64_t *)(uintptr_t)(pd + (8 + i) * 8) =
@@ -2476,9 +2497,21 @@ void kmain(void)
              */
             {
                 extern const uint8_t _ktext_start[];
+                extern const uint8_t _kseg1_start[], _kseg3_start[];
 
+                /*
+                 * All of the image's PT_LOAD segments, at their offsets from
+                 * the load base.  Only the first was carried before, so the
+                 * kernel's page-table walk (which clears memory at rel
+                 * 0x1800000) ran off the end of what was mapped and control
+                 * left the image.
+                 */
                 memcpy((void *)(uintptr_t)gpa, _ktext_start,
                        KERNEL_TEXT_SIZE);
+                memcpy((void *)(uintptr_t)(gpa + KERNEL_SEG1_REL),
+                       _kseg1_start, KERNEL_SEG1_SIZE);
+                memcpy((void *)(uintptr_t)(gpa + KERNEL_SEG3_REL),
+                       _kseg3_start, KERNEL_SEG3_SIZE);
             }
 
             {
@@ -2575,7 +2608,7 @@ void kmain(void)
                              * checks.  The bound is where that happens, not a
                              * step budget.
                              */
-                            int ran = run_blocks_from(gva + 0x90, 96, &stop);
+                            int ran = run_blocks_from(gva + 0x90, 4096, &stop);
 
                             latx_bare_uart_puts("tb-sys: kernel_blocks_run=");
                             puthex((uint64_t)(ran < 0 ? 0 : ran));

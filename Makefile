@@ -390,9 +390,13 @@ build/vmlinux_text.o: baremetal/bare/vmlinux_text.S firmware/vmlinux-x86_64-text
 	@mkdir -p build
 	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib -c $< -o $@
 
+build/vmlinux_segs.o: baremetal/bare/vmlinux_segs.S firmware/vmlinux-x86_64-seg1.bin firmware/vmlinux-x86_64-seg3.bin
+	@mkdir -p build
+	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib -c $< -o $@
+
 build/tb_sys.elf: build/tb_sys.o build/tb_harness.o build/tb_cache_bare.o build/loongarch_paging_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a baremetal/bare/bare.lds
 	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T baremetal/bare/bare.lds -e _start \
-	   build/tb_sys.o build/tb_harness.o build/tb_cache_bare.o build/loongarch_paging_bare.o build/lbt_emu.o build/vmlinux_text.o baremetal/build/liblatx_core.a -o $@
+	   build/tb_sys.o build/tb_harness.o build/tb_cache_bare.o build/loongarch_paging_bare.o build/lbt_emu.o build/vmlinux_text.o build/vmlinux_segs.o baremetal/build/liblatx_core.a -o $@
 
 tb-sys-image: build/tb_sys.elf
 
