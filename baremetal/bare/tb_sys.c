@@ -292,6 +292,7 @@ static uint64_t g_pool_mem[LAPG_POOL_PAGES * (LAPG_PAGE_SIZE / 8)]
 static LapgPagePool g_pool;
 static uint64_t g_root;
 
+static volatile int g_probe_touched;
 static volatile uint64_t g_hw_tlb_fills;
 static volatile uint64_t g_hw_guest_pf;
 static volatile uint64_t g_current_tb_code;
@@ -653,15 +654,23 @@ static int is_plv0_helper_entry(uint64_t addr)
     /* Any address inside the VMM .text segment (0x200000..0x395260) that is
      * not in the guest RAM (< 0x10000) or the PLV3 code cache is a VMM helper. */
     /*
-     * Any address from the VMM's load base upward that is not one of its own
-     * mapped buffers is a helper entry point.  The base comes from the symbol
-     * rather than a literal, so moving the VMM (as the linker script does to
-     * free the low 64 MiB for the guest) does not silently break this test.
+     * A helper entry is an address inside the VMM's own image that is not one
+     * of the buffers PLV3 is allowed to touch.
+     *
+     * The base comes from the linker script's load address, not from rounding
+     * a global down: `env` lives inside .bss, and rounding it to a 4 MiB
+     * boundary happens to produce the right answer only while the image is
+     * small enough that nothing crosses one.  Once .rodata grows, .bss starts
+     * at a different offset and the rounded value names the wrong window --
+     * which turned ordinary VMM addresses into "helper entries" and made a
+     * translated block jump to code that was never a call target.
      */
     {
-        uint64_t vmm_base = (uint64_t)(uintptr_t)&env & ~UINT64_C(0x3fffff);
+        extern char _end[];
+        uint64_t img_start = VMM_IMAGE_BASE;
+        uint64_t img_end = (uint64_t)(uintptr_t)_end;
 
-        return addr >= vmm_base && !is_host_vmm_va(addr);
+        return addr >= img_start && addr < img_end && !is_host_vmm_va(addr);
     }
 }
 
@@ -2430,6 +2439,19 @@ void kmain(void)
                                           1024);
         check(emitted > 0, "guest RAM reaches 64 MiB");
         check(g_bad_fetch == 0, "no fetch outside guest RAM");
+    }
+
+    /*
+     * Keep the zero block referenced: an unreferenced .rodata section is
+     * dropped by the linker, so a measurement that links one and does not use
+     * it measures nothing.  This reads a byte without touching it.
+     */
+    {
+        extern const uint8_t _ktext_start[];
+
+        if (_ktext_start[0] == 0xa5) {
+            g_probe_touched = 1;
+        }
     }
 
     latx_bare_uart_puts("tb-sys: checks=");
