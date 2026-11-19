@@ -1043,10 +1043,16 @@ bool translate_retf(IR1_INST *pir1)
     la_addi_addrx(esp_opnd, esp_opnd, 8);
 #else
     if (CODEIS64) {
-        /* pop rip */
-        la_ld_wu(return_addr_opnd, esp_opnd, 0);
+        /*
+         * A 64-bit far return pops a full 64-bit RIP, not a zero-extended
+         * 32-bit one.  `retfq` is how startup_64 leaves its identity-mapped
+         * stub, so a 32-bit load sent the kernel to 0x00000000810000cb -- the
+         * low half of the address it wanted -- and from there into
+         * secondary_startup_64, which is a different CPU's path entirely.
+         */
+        la_ld_d(return_addr_opnd, esp_opnd, 0);
         /* pop cs */
-        la_ld_w(cs_opnd, esp_opnd, 4);
+        la_ld_w(cs_opnd, esp_opnd, 8);
         /* 2. adjust esp */
         la_addi_addrx(esp_opnd, esp_opnd, 8);
     } else {
