@@ -507,9 +507,15 @@ static void rebuild_host_mappings(void)
  */
 void latx_platform_tlb_flush_all(void)
 {
-    if (g_root != 0) {
-        rebuild_host_mappings();
-    }
+    /*
+     * Drop the hardware entries; do not rebuild the tables.
+     *
+     * rebuild_host_mappings() reinitialises the pool and allocates a new root,
+     * so calling it here threw away every mapping installed so far -- including
+     * the ones the caller is about to use -- and did so on every INVLPG and
+     * every CR3 write.  A TLB flush is exactly that and nothing more; the
+     * tables themselves are the caller's business.
+     */
     __asm__ volatile("invtlb 0x0, $zero, $zero" ::: "memory");
 }
 
@@ -2403,6 +2409,7 @@ void kmain(void)
                          */
                         check((env.regs[R_EDI] & 0xff000000u) == 0x80000000u,
                               "kernel entry executed its rip-relative lea rdi");
+
                     }
                 }
                 env.cr[4] = saved_cr4;
