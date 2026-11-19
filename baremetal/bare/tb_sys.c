@@ -2552,17 +2552,15 @@ void kmain(void)
                      * value is simply that address minus the displacement.
                      */
                     /*
-                     * Recorded, not asserted.  The LEA produces the load base
-                     * (0x1000000) rather than base-0xa1, which is a real
-                     * discrepancy of 0xa1 in how the RIP-relative displacement
-                     * is applied; asserting either value would either hide it
-                     * or turn it into a failure of a test that is not about
-                     * displacement handling.  Execution itself is unaffected:
-                     * the kernel runs 49 blocks past this point.
+                     * The LEA is at entry+0xa, not entry, so its next
+                     * instruction is entry+0x11; subtracting the 0xa1
+                     * displacement from that lands exactly on the load base.
+                     * An earlier version of this check subtracted from
+                     * entry+7 and concluded the translator was off by 0xa --
+                     * the error was in the expectation, not the translation.
                      */
-                    latx_bare_uart_puts("tb-sys: lea=");
-                    puthex(env.regs[R_EDI]);
-                    latx_bare_uart_puts("\n");
+                    check(env.regs[R_EDI] == (uint32_t)(gva + 0x90 + 0x11 - 0xa1),
+                          "rip-relative lea resolves onto the load base");
                     latx_bare_uart_puts("tb-sys: kexec_rdi=");
                     puthex(env.regs[R_EDI]);
                     latx_bare_uart_puts("\n");
