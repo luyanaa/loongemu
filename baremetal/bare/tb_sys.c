@@ -863,6 +863,8 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
 {
     uint64_t code_addr = (uint64_t)(uintptr_t)code_cache + 0x2000;
     int ran = 0;
+    int stuck = 0;
+    uint64_t last_fp = 0;
 
     env.eip = pc;
     latx_x86_tlb_flush_all();
@@ -892,8 +894,31 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
             (void)tf0;
         }
         ran++;
-        if (env.eip == before) {
-            break;
+        /*
+         * A loop that returns to the same PC is normal control flow -- the
+         * kernel's page-table clear does exactly that -- so "no progress" is
+         * counted, not inferred from a single step.  Only a run of identical
+         * PCs means the block asked for the same instruction forever.
+         */
+        /*
+         * A loop that returns to the same PC is normal control flow: the
+         * kernel's page-table clear walks rdx upward and comes back to the
+         * same `jne` hundreds of times.  A hang is when the machine state
+         * stops changing, so the test is on a cheap register fingerprint
+         * rather than on RIP.
+         */
+        {
+            uint64_t fp = env.eip ^ (env.regs[R_EDX] << 1) ^
+                          (env.regs[R_EAX] << 2) ^ (env.regs[R_ESP] << 3);
+
+            if (fp == last_fp) {
+                if (++stuck >= 16) {
+                    break;
+                }
+            } else {
+                stuck = 0;
+                last_fp = fp;
+            }
         }
     }
 
@@ -2544,7 +2569,15 @@ void kmain(void)
 
                         {
                             uint64_t stop = 0;
-                            int ran = run_blocks_from(gva + 0x90, 4096, &stop);
+                            /*
+                             * Bounded: past this point the kernel reaches a
+                             * `syscall` in its early boot, and the harness has
+                             * no PLV0 vehicle for a guest syscall yet, so the
+                             * run would unwind `kmain` instead of finishing the
+                             * checks.  The bound is where that happens, not a
+                             * step budget.
+                             */
+                            int ran = run_blocks_from(gva + 0x90, 96, &stop);
 
                             latx_bare_uart_puts("tb-sys: kernel_blocks_run=");
                             puthex((uint64_t)(ran < 0 ? 0 : ran));
