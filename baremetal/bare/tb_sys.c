@@ -882,8 +882,15 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
         g_current_tb_pc = before;
         g_current_tb_map = &map;
 
-        tb_sys_run_plv3((void *)(uintptr_t)pro_buf,
-                        (void *)(uintptr_t)code_addr, &env);
+        {
+            uint64_t pf0 = g_hw_guest_pf;
+            uint64_t tf0 = g_hw_tlb_fills;
+
+            tb_sys_run_plv3((void *)(void *)(uintptr_t)pro_buf,
+                            (void *)(uintptr_t)code_addr, &env);
+            (void)pf0;
+            (void)tf0;
+        }
         ran++;
         if (env.eip == before) {
             break;
@@ -2342,7 +2349,16 @@ void kmain(void)
          * Well clear of the guest image (which occupies 0x0-0x10000) and of
          * the test structures below it.
          */
-        uint64_t pml4 = 0x200000, pdpt = 0x201000, pd = 0x202000, pt = 0x203000;
+        /*
+         * Clear of every other low-window user: the guest's own test
+         * structures live at 0x1000-0x5000 and 0x201000 (RO_PC), and the
+         * kernel text is copied from 0x1000000 for the next 22 MiB.  Putting
+         * pdpt at 0x201000 collided with RO_PC, which is what made a stack
+         * write to 0xffffffff82803f50 report NOT_PRESENT with tables that
+         * looked correct.
+         */
+        uint64_t pml4 = 0x3000000, pdpt = 0x3001000, pd = 0x3002000,
+                 pt = 0x3003000;
         uint64_t gva = 0xffffffff81000000ULL;
         uint64_t gpa = 0x1000000ULL;        /* where the kernel would live */
         LatxX86Translation t;
@@ -2355,13 +2371,27 @@ void kmain(void)
         *(volatile uint64_t *)(uintptr_t)(pdpt + 510 * 8) = pd | 0x3;
         /*
          * Index arithmetic for 0xffffffff81000000: PML4[511], PDPT[510],
-         * PD[8], PT[0].  The PD index is 8, not 0 -- 0x81000000 has a non-zero
-         * bit 21, and using index 0 was why the walk reported NOT_PRESENT
-         * with otherwise correct tables.
+         * PD[8].  The PD index is 8, not 0 -- 0x81000000 has a non-zero bit
+         * 21, and using index 0 was why an otherwise correct table reported
+         * NOT_PRESENT.
+         *
+         * The leaf is 2 MiB (PS at level 2), and there are sixteen of them,
+         * covering the 32 MiB the text spans.  A single 4 KiB leaf mapped
+         * only the entry page, so the kernel's very first stack push -- to
+         * 0xffffffff82803f50, PD index 20 -- was a #PF, and the run never
+         * got past its prologue.
          */
-        *(volatile uint64_t *)(uintptr_t)(pd + 8 * 8) = pt | 0x3;
-        *(volatile uint64_t *)(uintptr_t)(pt + 0 * 8) =
-            (gpa & ~UINT64_C(0xfff)) | 0x3;
+        {
+            int i;
+
+            for (i = 0; i < 16; i++) {
+                uint64_t pa = gpa + (uint64_t)i * 0x200000ULL;
+
+                *(volatile uint64_t *)(uintptr_t)(pd + (8 + i) * 8) =
+                    (pa & ~UINT64_C(0x1fffff)) | 0x83;   /* P|RW|PS */
+            }
+            (void)pt;
+        }
 
         /*
          * Long mode is PAE paging, always: the walker refuses to walk without
