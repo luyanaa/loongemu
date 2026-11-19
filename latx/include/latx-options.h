@@ -140,6 +140,7 @@ extern int option_mem_test;
  * permission check.  A system build turns it on for the guest's own sake.
  */
 extern int option_guest_paging;
+extern int option_lbt_jiscr;
 extern int option_minke_16k_page_check;
 extern int option_real_maps;
 extern int option_monitor_shared_mem;

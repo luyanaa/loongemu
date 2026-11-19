@@ -73,12 +73,14 @@ static int64_t sext(uint64_t v, unsigned w)
     return (int64_t)((v ^ sign) - sign);
 }
 
-static uint32_t parity_flag(uint64_t r)
+static inline uint32_t parity_flag(uint64_t r)
 {
-    return __builtin_parity((unsigned)(r & 0xff)) ? 0 : EF_PF;
+    uint32_t p = (uint32_t)r & 0xffu;
+    p ^= p >> 4;
+    return ((0x6996u >> (p & 0xfu)) & 1u) ? 0u : EF_PF;
 }
 
-static void set_szp_flags(unsigned w, uint64_t r, uint32_t extra)
+static inline void set_szp_flags(unsigned w, uint64_t r, uint32_t extra)
 {
     uint32_t f = extra & (EF_CF | EF_AF | EF_OF);
 
@@ -96,11 +98,15 @@ static void lbt_add_adc(unsigned w, uint64_t a, uint64_t b, int with_carry,
 {
     uint64_t m = zmask(w), x = a & m, y = b & m;
     uint64_t c = (with_carry && (sw_lbt.eflags & EF_CF)) ? 1u : 0u;
-    unsigned __int128 wide = (unsigned __int128)x + y + c;
-    uint64_t r = (uint64_t)wide & m;
+    uint64_t sum = x + y;
+    uint64_t r = (sum + c) & m;
     uint32_t f = 0;
 
-    if (wide > m) {
+    if (w == 64) {
+        if (sum < x || (c && r == 0)) {
+            f |= EF_CF;
+        }
+    } else if (((sum + c) >> w) != 0) {
         f |= EF_CF;
     }
     if ((x ^ y ^ r) & 0x10) {
@@ -118,10 +124,10 @@ static void lbt_sub_sbc(unsigned w, uint64_t a, uint64_t b, int with_borrow,
 {
     uint64_t m = zmask(w), x = a & m, y = b & m;
     uint64_t c = (with_borrow && (sw_lbt.eflags & EF_CF)) ? 1u : 0u;
-    uint64_t r = (x - (y + c)) & m;
+    uint64_t r = (x - y - c) & m;
     uint32_t f = 0;
 
-    if ((unsigned __int128)x < (unsigned __int128)y + c) {
+    if (x < y || (c && x == y)) {
         f |= EF_CF;
     }
     if ((x ^ y ^ r) & 0x10) {
@@ -291,19 +297,191 @@ static uint64_t eval_setx86j(uint32_t f, unsigned cond)
 
 extern void lbt_entry(void);
 
+void lbt_handle_fast(uint64_t *regs, uint64_t era)
+{
+    uint32_t w = *(const volatile uint32_t *)(uintptr_t)era;
+    uint32_t rd = w & 0x1fu;
+    uint32_t rj = (w >> 5) & 0x1fu;
+    uint32_t rk = (w >> 10) & 0x1fu;
+    uint64_t next_era = era + 4;
+    int handled = 1;
+
+    regs[0] = 0;
+
+    /* Hot-path dispatch ordered by dynamic frequency in Linux kernel TBs. */
+    if ((w & 0xffff8000u) == 0x003f0000u) {
+        /* x86add/sub/adc/sbc/sll/srl/sra rj, rk */
+        uint32_t sub = w & 0x1fu;
+        unsigned width = 8u << (sub & 3u);
+
+        if (sub >= 0x08u && sub <= 0x0bu) {
+            lbt_sub_sbc(width, regs[rj], regs[rk], 0, 0);
+        } else if (sub >= 0x04u && sub <= 0x07u) {
+            lbt_add_adc(width, regs[rj], regs[rk], 0, 0);
+        } else if (sub == 0x01u) {
+            lbt_add_adc(64, regs[rj], regs[rk], 0, 1);
+        } else if (sub == 0x03u) {
+            lbt_sub_sbc(64, regs[rj], regs[rk], 0, 1);
+        } else if (sub == 0x00u) {
+            lbt_add_adc(32, regs[rj], regs[rk], 0, 1);
+        } else if (sub == 0x02u) {
+            lbt_sub_sbc(32, regs[rj], regs[rk], 0, 1);
+        } else if (sub >= 0x0cu && sub <= 0x0fu) {
+            lbt_add_adc(width, regs[rj], regs[rk], 1, 0);
+        } else if (sub >= 0x10u && sub <= 0x13u) {
+            lbt_sub_sbc(width, regs[rj], regs[rk], 1, 0);
+        } else if (sub >= 0x14u && sub <= 0x17u) {
+            lbt_shift(width, regs[rj], regs[rk], 0);
+        } else if (sub >= 0x18u && sub <= 0x1bu) {
+            lbt_shift(width, regs[rj], regs[rk], 1);
+        } else {
+            lbt_shift(width, regs[rj], regs[rk], 2);
+        }
+    } else if ((w & 0xffff8000u) == 0x003f8000u) {
+        /* x86and/or/xor/rotr/rotl/rcr/rcl rj, rk */
+        uint32_t sub = w & 0x1fu;
+        unsigned width = 8u << (sub & 3u);
+
+        if (sub >= 0x10u && sub <= 0x13u) {
+            lbt_logic(width, regs[rj], regs[rk], 0);
+        } else if (sub >= 0x14u && sub <= 0x17u) {
+            lbt_logic(width, regs[rj], regs[rk], 1);
+        } else if (sub >= 0x18u && sub <= 0x1bu) {
+            lbt_logic(width, regs[rj], regs[rk], 2);
+        } else if (sub <= 0x03u) {
+            if (sub == 0x02u) width = 64;
+            else if (sub == 0x03u) width = 32;
+            lbt_rot(width, regs[rj], regs[rk], 0, 0);
+        } else if (sub >= 0x04u && sub <= 0x07u) {
+            lbt_rot(width, regs[rj], regs[rk], 1, 0);
+        } else if (sub >= 0x08u && sub <= 0x0bu) {
+            lbt_rot(width, regs[rj], regs[rk], 0, 1);
+        } else if (sub >= 0x0cu && sub <= 0x0fu) {
+            lbt_rot(width, regs[rj], regs[rk], 1, 1);
+        } else {
+            handled = 0;
+        }
+    } else if ((w & 0xffffc000u) == 0x00368000u) {
+        /* setx86j rd, condh */
+        regs[rd] = eval_setx86j(sw_lbt.eflags, (w >> 10) & 0xfu);
+    } else if ((w & 0xfffc03c0u) == 0x005c0000u) {
+        /* x86mfflag / x86mtflag rd, imm_ui8 */
+        uint32_t imm = (w >> 10) & 0x3fu;
+        if ((w & 0x20u) == 0) {
+            regs[rd] = pack_flags(sw_lbt.eflags, imm);
+        } else {
+            unpack_flags(&sw_lbt.eflags, regs[rd], imm);
+        }
+    } else if ((w & 0xfffffc18u) == 0x00008000u) {
+        /* x86inc.{b,h,w,d} / x86dec.{b,h,w,d} rj */
+        lbt_incdec(8u << (w & 3u), regs[rj], (int)((w >> 2) & 1u));
+    } else if ((w & 0xfffe0000u) == 0x00540000u) {
+        /* x86slli/srli/srai/rotri/rcri/rotli/rcli.{b,h,w,d} rj, imm */
+        uint32_t sub = w & 0x1fu;
+        uint32_t kind = sub >> 2;
+        unsigned width = 8u << (sub & 3u);
+        uint32_t imm_mask = (width == 8) ? 0x7u :
+                            (width == 16) ? 0xfu :
+                            (width == 32) ? 0x1fu : 0x3fu;
+        uint32_t imm = (w >> 10) & imm_mask;
+
+        if (kind <= 2u) {
+            lbt_shift(width, regs[rj], imm, (int)kind);
+        } else if (kind == 3u) {
+            lbt_rot(width, regs[rj], imm, 0, 0);
+        } else if (kind == 4u) {
+            lbt_rot(width, regs[rj], imm, 0, 1);
+        } else if (kind == 5u) {
+            lbt_rot(width, regs[rj], imm, 1, 0);
+        } else if (kind == 6u) {
+            lbt_rot(width, regs[rj], imm, 1, 1);
+        } else {
+            handled = 0;
+        }
+    } else if ((w & 0xfffffc00u) == 0x00000800u) {
+        /* gr2scr sd, rj */
+        sw_lbt.scr[w & 3u] = regs[rj];
+    } else if ((w & 0xfffffc00u) == 0x00000c00u) {
+        /* scr2gr rd, sj */
+        regs[rd] = sw_lbt.scr[(w >> 5) & 3u];
+    } else if ((w & 0xfc0003e0u) == 0x48000200u) {
+        /* jiscr0 imm_offl: jump to scr[0] + sign_ext(off21 << 2) */
+        uint32_t off21 = ((w & 0x1fu) << 16) | ((w >> 10) & 0xffffu);
+        int64_t disp = ((int64_t)(int32_t)(off21 << 11) >> 11) << 2;
+        next_era = sw_lbt.scr[0] + (uint64_t)disp;
+    } else if ((w & 0xfc0003e0u) == 0x48000300u) {
+        /* jiscr1 imm_offl: scr[0] = era; jump to scr[1] + sign_ext(off21 << 2) */
+        uint32_t off21 = ((w & 0x1fu) << 16) | ((w >> 10) & 0xffffu);
+        int64_t disp = ((int64_t)(int32_t)(off21 << 11) >> 11) << 2;
+        sw_lbt.scr[0] = era;
+        next_era = sw_lbt.scr[1] + (uint64_t)disp;
+    } else if ((w & 0xfffffc1fu) == 0x00007000u) {
+        /* x86mttop imm_ptr */
+        sw_lbt.top = (w >> 5) & 7u;
+    } else if ((w & 0xfffffc00u) == 0x00007400u) {
+        /* x86mftop rd */
+        regs[rd] = sw_lbt.top;
+    } else if ((w & 0xfffffc00u) == 0x00007800u) {
+        /* x86loope rd, rj */
+        regs[rd] = (regs[rj] != 0 && (sw_lbt.eflags & EF_ZF)) ? 1u : 0u;
+    } else if ((w & 0xfffffc00u) == 0x00007c00u) {
+        /* x86loopne rd, rj */
+        regs[rd] = (regs[rj] != 0 && !(sw_lbt.eflags & EF_ZF)) ? 1u : 0u;
+    } else if (w == 0x00008008u) {
+        sw_lbt.tm = 1;
+    } else if (w == 0x00008028u) {
+        sw_lbt.tm = 0;
+    } else if (w == 0x00008009u) {
+        sw_lbt.top = (sw_lbt.top + 1u) & 7u;
+    } else if (w == 0x00008029u) {
+        sw_lbt.top = (sw_lbt.top - 1u) & 7u;
+    } else if ((w & 0xfffc0000u) == 0x00300000u) {
+        /* adc.{b,h,w,d} (bit17=0) / sbc.{b,h,w,d} (bit17=1) rd, rj, rk */
+        int is_sub = (int)((w >> 17) & 1u);
+        unsigned width = 8u << ((w >> 15) & 3u);
+        uint64_t cf = (sw_lbt.eflags & EF_CF) ? 1u : 0u;
+        uint64_t r = is_sub ? (regs[rj] - regs[rk] - cf)
+                            : (regs[rj] + regs[rk] + cf);
+        regs[rd] = (uint64_t)sext(r, width);
+    } else if ((w & 0xffff8018u) == 0x003e8000u) {
+        /* x86mul.{b,h,w,d,bu,hu,wu,du} rj, rk */
+        lbt_mul(8u << (w & 3u), regs[rj], regs[rk], ((w & 4u) == 0));
+    } else if ((w & 0xffffe000u) == 0x004c2000u) {
+        /* rotri.b rd, rj, ui3 */
+        unsigned sh = (w >> 10) & 7u;
+        uint8_t v = (uint8_t)regs[rj];
+        uint8_t r = sh ? (uint8_t)((v >> sh) | (v << (8u - sh))) : v;
+        regs[rd] = (uint64_t)(int64_t)(int8_t)r;
+    } else if ((w & 0xffffc000u) == 0x004c4000u) {
+        /* rotri.h rd, rj, ui4 */
+        unsigned sh = (w >> 10) & 0xfu;
+        uint16_t v = (uint16_t)regs[rj];
+        uint16_t r = sh ? (uint16_t)((v >> sh) | (v << (16u - sh))) : v;
+        regs[rd] = (uint64_t)(int64_t)(int16_t)r;
+    } else {
+        handled = 0;
+    }
+
+    regs[0] = 0;
+    if (!handled) {
+        latx_bare_uart_puts("lbt unsupported era=");
+        puthex(era);
+        latx_bare_uart_puts(" w=");
+        puthex(w);
+        latx_bare_uart_puts("\n");
+    }
+    __asm__ volatile("csrwr %0, 0x6" :: "r"(next_era));
+}
+
 void lbt_handle(uint64_t *regs)
 {
     uint64_t era, estat;
-    uint32_t w, rd, rj, rk;
-    int handled = 0;
 
-    regs[0] = 0;
     __asm__ volatile("csrrd %0, 0x6" : "=r"(era));
     __asm__ volatile("csrrd %0, 0x5" : "=r"(estat));
     if (((estat >> 16) & 0x3f) != 0x0d) {
         uint64_t badv;
 
-        /* BADV names the address a load/store fault was about. */
         __asm__ volatile("csrrd %0, 0x7" : "=r"(badv));
         latx_bare_uart_puts("trap ecode=");
         puthex((estat >> 16) & 0x3f);
@@ -319,193 +497,7 @@ void lbt_handle(uint64_t *regs)
         for (;;) {
         }
     }
-
-    w = *(volatile uint32_t *)(uintptr_t)era;
-    rd = w & 0x1f;
-    rj = (w >> 5) & 0x1f;
-    rk = (w >> 10) & 0x1f;
-
-    if ((w & 0xfffffc00u) == 0x00000800u) {
-        /* gr2scr sd, rj */
-        sw_lbt.scr[w & 3u] = regs[rj];
-        handled = 1;
-    } else if ((w & 0xfffffc00u) == 0x00000c00u) {
-        /* scr2gr rd, sj */
-        regs[rd] = sw_lbt.scr[(w >> 5) & 3u];
-        handled = 1;
-    } else if ((w & 0xfffffc1fu) == 0x00007000u) {
-        /* x86mttop imm_ptr */
-        sw_lbt.top = (w >> 5) & 7u;
-        handled = 1;
-    } else if ((w & 0xfffffc00u) == 0x00007400u) {
-        /* x86mftop rd */
-        regs[rd] = sw_lbt.top;
-        handled = 1;
-    } else if ((w & 0xfffffc00u) == 0x00007800u) {
-        /* x86loope rd, rj */
-        regs[rd] = (regs[rj] != 0 && (sw_lbt.eflags & EF_ZF)) ? 1u : 0u;
-        handled = 1;
-    } else if ((w & 0xfffffc00u) == 0x00007c00u) {
-        /* x86loopne rd, rj */
-        regs[rd] = (regs[rj] != 0 && !(sw_lbt.eflags & EF_ZF)) ? 1u : 0u;
-        handled = 1;
-    } else if ((w & 0xfffffc18u) == 0x00008000u) {
-        /* x86inc.{b,h,w,d} / x86dec.{b,h,w,d} rj */
-        unsigned width = 8u << (w & 3u);
-        int is_dec = (int)((w >> 2) & 1u);
-        lbt_incdec(width, regs[rj], is_dec);
-        handled = 1;
-    } else if (w == 0x00008008u) {
-        sw_lbt.tm = 1;
-        handled = 1;
-    } else if (w == 0x00008028u) {
-        sw_lbt.tm = 0;
-        handled = 1;
-    } else if (w == 0x00008009u) {
-        sw_lbt.top = (sw_lbt.top + 1u) & 7u;
-        handled = 1;
-    } else if (w == 0x00008029u) {
-        sw_lbt.top = (sw_lbt.top - 1u) & 7u;
-        handled = 1;
-    } else if ((w & 0xfffc0000u) == 0x00300000u) {
-        /* adc.{b,h,w,d} (bit17=0) / sbc.{b,h,w,d} (bit17=1) rd, rj, rk */
-        int is_sub = (int)((w >> 17) & 1u);
-        unsigned width = 8u << ((w >> 15) & 3u);
-        uint64_t cf = (sw_lbt.eflags & EF_CF) ? 1u : 0u;
-        uint64_t r = is_sub ? (regs[rj] - regs[rk] - cf)
-                            : (regs[rj] + regs[rk] + cf);
-        regs[rd] = (uint64_t)sext(r, width);
-        handled = 1;
-    } else if ((w & 0xffffc000u) == 0x00368000u) {
-        /* setx86j rd, condh */
-        unsigned cond = (w >> 10) & 0xfu;
-        regs[rd] = eval_setx86j(sw_lbt.eflags, cond);
-        handled = 1;
-    } else if ((w & 0xffff8018u) == 0x003e8000u) {
-        /* x86mul.{b,h,w,d,bu,hu,wu,du} rj, rk */
-        unsigned width = 8u << (w & 3u);
-        int is_signed = ((w & 4u) == 0);
-        lbt_mul(width, regs[rj], regs[rk], is_signed);
-        handled = 1;
-    } else if ((w & 0xffff8000u) == 0x003f0000u) {
-        /* x86add/sub/adc/sbc/sll/srl/sra rj, rk */
-        uint32_t sub = w & 0x1fu;
-        unsigned width = 8u << (sub & 3u);
-
-        if (sub == 0x00u) {
-            lbt_add_adc(32, regs[rj], regs[rk], 0, 1);
-        } else if (sub == 0x01u) {
-            lbt_add_adc(64, regs[rj], regs[rk], 0, 1);
-        } else if (sub == 0x02u) {
-            lbt_sub_sbc(32, regs[rj], regs[rk], 0, 1);
-        } else if (sub == 0x03u) {
-            lbt_sub_sbc(64, regs[rj], regs[rk], 0, 1);
-        } else if (sub >= 0x04u && sub <= 0x07u) {
-            lbt_add_adc(width, regs[rj], regs[rk], 0, 0);
-        } else if (sub >= 0x08u && sub <= 0x0bu) {
-            lbt_sub_sbc(width, regs[rj], regs[rk], 0, 0);
-        } else if (sub >= 0x0cu && sub <= 0x0fu) {
-            lbt_add_adc(width, regs[rj], regs[rk], 1, 0);
-        } else if (sub >= 0x10u && sub <= 0x13u) {
-            lbt_sub_sbc(width, regs[rj], regs[rk], 1, 0);
-        } else if (sub >= 0x14u && sub <= 0x17u) {
-            lbt_shift(width, regs[rj], regs[rk], 0);
-        } else if (sub >= 0x18u && sub <= 0x1bu) {
-            lbt_shift(width, regs[rj], regs[rk], 1);
-        } else {
-            lbt_shift(width, regs[rj], regs[rk], 2);
-        }
-        handled = 1;
-    } else if ((w & 0xffff8000u) == 0x003f8000u) {
-        /* x86rotr/rotl/rcr/rcl/and/or/xor rj, rk */
-        uint32_t sub = w & 0x1fu;
-        unsigned width = 8u << (sub & 3u);
-
-        if (sub <= 0x03u) {
-            /* Note: format-table.h encodes ROTR.D=0x02, ROTR.W=0x03 */
-            if (sub == 0x02u) width = 64;
-            else if (sub == 0x03u) width = 32;
-            lbt_rot(width, regs[rj], regs[rk], 0, 0);
-            handled = 1;
-        } else if (sub >= 0x04u && sub <= 0x07u) {
-            lbt_rot(width, regs[rj], regs[rk], 1, 0);
-            handled = 1;
-        } else if (sub >= 0x08u && sub <= 0x0bu) {
-            lbt_rot(width, regs[rj], regs[rk], 0, 1);
-            handled = 1;
-        } else if (sub >= 0x0cu && sub <= 0x0fu) {
-            lbt_rot(width, regs[rj], regs[rk], 1, 1);
-            handled = 1;
-        } else if (sub >= 0x10u && sub <= 0x13u) {
-            lbt_logic(width, regs[rj], regs[rk], 0);
-            handled = 1;
-        } else if (sub >= 0x14u && sub <= 0x17u) {
-            lbt_logic(width, regs[rj], regs[rk], 1);
-            handled = 1;
-        } else if (sub >= 0x18u && sub <= 0x1bu) {
-            lbt_logic(width, regs[rj], regs[rk], 2);
-            handled = 1;
-        }
-    } else if ((w & 0xfffe0000u) == 0x00540000u) {
-        /* x86slli/srli/srai/rotri/rcri/rotli/rcli.{b,h,w,d} rj, imm */
-        uint32_t sub = w & 0x1fu;
-        uint32_t kind = sub >> 2;
-        unsigned width = 8u << (sub & 3u);
-        uint32_t imm_mask = (width == 8) ? 0x7u :
-                            (width == 16) ? 0xfu :
-                            (width == 32) ? 0x1fu : 0x3fu;
-        uint32_t imm = (w >> 10) & imm_mask;
-
-        if (kind <= 2u) {
-            lbt_shift(width, regs[rj], imm, (int)kind);
-            handled = 1;
-        } else if (kind == 3u) {
-            lbt_rot(width, regs[rj], imm, 0, 0);
-            handled = 1;
-        } else if (kind == 4u) {
-            lbt_rot(width, regs[rj], imm, 0, 1);
-            handled = 1;
-        } else if (kind == 5u) {
-            lbt_rot(width, regs[rj], imm, 1, 0);
-            handled = 1;
-        } else if (kind == 6u) {
-            lbt_rot(width, regs[rj], imm, 1, 1);
-            handled = 1;
-        }
-    } else if ((w & 0xffffe000u) == 0x004c2000u) {
-        /* rotri.b rd, rj, ui3 */
-        unsigned sh = (w >> 10) & 7u;
-        uint8_t v = (uint8_t)regs[rj];
-        uint8_t r = sh ? (uint8_t)((v >> sh) | (v << (8u - sh))) : v;
-        regs[rd] = (uint64_t)(int64_t)(int8_t)r;
-        handled = 1;
-    } else if ((w & 0xffffc000u) == 0x004c4000u) {
-        /* rotri.h rd, rj, ui4 */
-        unsigned sh = (w >> 10) & 0xfu;
-        uint16_t v = (uint16_t)regs[rj];
-        uint16_t r = sh ? (uint16_t)((v >> sh) | (v << (16u - sh))) : v;
-        regs[rd] = (uint64_t)(int64_t)(int16_t)r;
-        handled = 1;
-    } else if ((w & 0xfffc03c0u) == 0x005c0000u) {
-        /* x86mfflag / x86mtflag rd, imm_ui8 */
-        uint32_t imm = (w >> 10) & 0x3fu;
-        if ((w & 0x20u) == 0) {
-            regs[rd] = pack_flags(sw_lbt.eflags, imm);
-        } else {
-            unpack_flags(&sw_lbt.eflags, regs[rd], imm);
-        }
-        handled = 1;
-    }
-
-    regs[0] = 0;
-    if (!handled) {
-        latx_bare_uart_puts("lbt unsupported era=");
-        puthex(era);
-        latx_bare_uart_puts(" w=");
-        puthex(w);
-        latx_bare_uart_puts("\n");
-    }
-    __asm__ volatile("csrwr %0, 0x6" :: "r"(era + 4));
+    lbt_handle_fast(regs, era);
 }
 
 __asm__(

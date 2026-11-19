@@ -2981,14 +2981,20 @@ static void generate_indirect_goto(void *code_buf)
     la_masknez(next_tb, next_tb, jmp_entry);
     la_maskeqz(epi_addr, epi_addr, jmp_entry);
     la_or(next_tb, next_tb, epi_addr);
+    la_jirl(zero_ir2_opnd, next_tb, 0);
 #else
     la_alsl_d(next_tb, next_tb, jmp_cache_addr, 3);
     la_ld_d(jmp_entry, next_tb, 0);
     la_bne(jmp_entry, next_x86_addr, label_miss);
     la_ld_d(next_tb, next_tb, 8);
     la_beq(next_tb, zero_ir2_opnd, label_miss);
+    if (option_lbt_jiscr) {
+        la_gr2scr(scr0_ir2_opnd, next_tb);
+        la_jiscr0(0);
+    } else {
+        la_jirl(zero_ir2_opnd, next_tb, 0);
+    }
 #endif
-    la_jirl(zero_ir2_opnd, next_tb, 0);
 #else
     la_slli_d(next_tb, next_tb, 3);
     la_ldx_d(next_tb, next_tb, jmp_cache_addr);
@@ -3011,7 +3017,12 @@ static void generate_indirect_goto(void *code_buf)
             offsetof(struct tb_tc, ptr));
 
 /* hit: */
-    la_jirl(zero_ir2_opnd, jmp_entry, 0);
+    if (option_lbt_jiscr) {
+        la_gr2scr(scr0_ir2_opnd, jmp_entry);
+        la_jiscr0(0);
+    } else {
+        la_jirl(zero_ir2_opnd, jmp_entry, 0);
+    }
 
     ra_free_temp(jmp_entry);
 /* miss: */

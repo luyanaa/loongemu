@@ -26,4 +26,7 @@ extern SwLbt sw_lbt;
 /* Point CSR.EENTRY at the emulation stub. */
 void lbt_emu_install(void);
 
+/* Fast-path LBT emulator called directly from tb_sys_handle_trap on EXC_IPE. */
+void lbt_handle_fast(uint64_t *regs, uint64_t era);
+
 #endif

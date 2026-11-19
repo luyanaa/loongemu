@@ -16,7 +16,7 @@
 
 static IR1_INST ir1_list[TB_HARNESS_MAX_INSNS];
 static struct separated_data ir1_sd;
-static uint8_t ir1_dt_area[32768] __attribute__((aligned(16)));
+static uint8_t ir1_dt_area[131072] __attribute__((aligned(16)));
 
 static const int control_flow_ops[] = {
     dt_X86_INS_JMP, dt_X86_INS_CALL, dt_X86_INS_RET, dt_X86_INS_JAE,
@@ -77,20 +77,16 @@ int tb_harness_translate_at_with_map(uint64_t pc, uint8_t *code,
          * how `mov cr3, eax` became a one-operand instruction and stopped
          * writing CR3.
          */
-        uint8_t insn_bytes[TB_MAX_X86_INSN_LEN * TB_DECODE_MAX_INSNS] = { 0 };
-
-        /*
-         * The harness decodes from the flat image directly.  With paging on,
-         * cpu_ldub_code() -- the translator's own fetch -- goes through the
-         * walker, and both agree because the harness maps the image into the
-         * same physical memory the guest's tables describe.
-         */
-        for (unsigned b = 0; b < sizeof(insn_bytes); b++) {
-            insn_bytes[b] = latx_bare_ldub_code(pc + b);
-        }
+        uint8_t insn_bytes[TB_MAX_X86_INSN_LEN * TB_DECODE_MAX_INSNS];
+        int fetched = 0;
 
         while (n < TB_DECODE_MAX_INSNS &&
                off + TB_MAX_X86_INSN_LEN <= (int)sizeof(insn_bytes)) {
+            int need = off + TB_MAX_X86_INSN_LEN;
+            while (fetched < need) {
+                insn_bytes[fetched] = latx_bare_ldub_code(pc + (uint64_t)fetched);
+                fetched++;
+            }
             ADDRX next = ir1_disasm(&ir1_list[n], insn_bytes + off,
                                     (ADDRX)(pc + off), n, ir1_dt_area);
 
@@ -98,18 +94,15 @@ int tb_harness_translate_at_with_map(uint64_t pc, uint8_t *code,
                 break;
             }
             off = (int)(next - pc);
-            /*
-             * Fill each instruction's eflag use/def bitmap.  Normally the
-             * flag reduction pass does this over the whole TB; without it
-             * every _eflag_def is zero, ir1_need_calculate_any_flag()
-             * answers "no" for every instruction, no arithmetic updates the
-             * LBT flag state, and a following conditional branch reads stale
-             * flags.
-             */
-            flag_gen(&ir1_list[n]);
             n++;
             if (is_control_flow(&ir1_list[n - 1])) {
                 break;
+            }
+        }
+        {
+            uint8_t pending_use = __ALL_EFLAGS;
+            for (int i = n - 1; i >= 0; i--) {
+                flag_reduction(&ir1_list[i], &pending_use);
             }
         }
     }

@@ -17,7 +17,7 @@
  * fault handler to recover the exact faulting x86 RIP from CSR.ERA when
  * option_guest_paging = 0.
  */
-#define TB_HARNESS_MAX_INSNS 16
+#define TB_HARNESS_MAX_INSNS 64
 
 typedef struct TbInsnSpan {
     uint64_t x86_pc;

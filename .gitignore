@@ -1,3 +1,4 @@
+qemu-system-loongarch64
 # Host and cross build outputs
 /build/
 /baremetal/build/
