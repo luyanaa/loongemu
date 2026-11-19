@@ -17,3 +17,6 @@ qemu_ir1.pid
 
 # firmware/ holds the EDK2 blobs the EFI targets boot; they are test assets
 # pinned by firmware/SHA256SUMS.txt, so they are tracked on purpose.
+firmware/busybox
+firmware/initramfs.cpio.gz
+

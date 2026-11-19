@@ -148,6 +148,28 @@ typedef struct {
 } EFI_BOOT_SERVICES;
 
 typedef struct {
+    uint32_t Data1;
+    uint16_t Data2;
+    uint16_t Data3;
+    uint8_t  Data4[8];
+} EFI_GUID;
+
+typedef struct {
+    EFI_GUID VendorGuid;
+    void    *VendorTable;
+} EFI_CONFIGURATION_TABLE;
+
+/* ACPI 2.0 Table GUID: {8868e871-e4f1-11d3-bc22-0080c73c8881} */
+#define EFI_ACPI_20_TABLE_GUID \
+    { 0x8868e871u, 0xe4f1u, 0x11d3u, \
+      { 0xbcu, 0x22u, 0x00u, 0x80u, 0xc7u, 0x3cu, 0x88u, 0x81u } }
+
+/* ACPI 1.0 Table GUID: {eb9d2d30-2d88-11d3-9a16-0090273fc14d} */
+#define EFI_ACPI_TABLE_GUID \
+    { 0xeb9d2d30u, 0x2d88u, 0x11d3u, \
+      { 0x9au, 0x16u, 0x00u, 0x90u, 0x27u, 0x3fu, 0xc1u, 0x4du } }
+
+typedef struct {
     uint64_t Signature;
     uint32_t Revision;
     uint32_t HeaderSize;
@@ -165,7 +187,7 @@ typedef struct {
     void *RuntimeServices;
     EFI_BOOT_SERVICES *BootServices;
     UINTN NumberOfTableEntries;
-    void *ConfigurationTable;
+    EFI_CONFIGURATION_TABLE *ConfigurationTable;
 } EFI_SYSTEM_TABLE;
 
 #endif

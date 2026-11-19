@@ -166,6 +166,10 @@ extern struct IR2_OPND latx_x86_checked_addr;
  * report).
  */
 int latx_x86_deliver_fault(struct CPUX86State *env, uint32_t vector);
+int latx_x86_get_tss_stack(const struct CPUX86State *env, uint32_t ist,
+                           uint64_t *out_rsp);
+void helper_syscall_sys(struct CPUX86State *env, uint64_t next_rip);
+void helper_sysret_sys(struct CPUX86State *env);
 
 /*
  * Instruction fetch.

@@ -458,6 +458,25 @@ bool translate_wrmsr(IR1_INST *pir1)
     return translate_msr(pir1, true);
 }
 
+bool translate_invlpg(IR1_INST *pir1)
+{
+    IR1_OPND *opnd = ir1_get_opnd(pir1, 0);
+    IR2_OPND addr_opnd;
+    IR2_OPND fn;
+
+    tr_save_guest_regs_for_helper();
+    addr_opnd = convert_mem_no_offset(opnd);
+    la_mov64(a1_ir2_opnd, addr_opnd);
+    ra_free_temp(addr_opnd);
+    fn = ra_alloc_itemp();
+    li_d(fn, (ADDR)helper_invlpg);
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    la_jirl(ra_ir2_opnd, fn, 0);
+    ra_free_temp(fn);
+    tr_load_guest_regs_after_helper();
+    return true;
+}
+
 /*
  * LGDT/LIDT read a 6-byte (32-bit operand) or 10-byte (64-bit operand)
  * descriptor from memory: a 16-bit limit followed by a 32/64-bit base.  The
@@ -1630,6 +1649,7 @@ bool translate_syscall(IR1_INST *pir1)
 #else
 bool translate_syscall(IR1_INST *pir1)
 {
+#ifdef CONFIG_USER_ONLY
     tr_save_registers_to_env(0xff, 0xff, 0xff, options_to_save());
     tr_save_x64_8_registers_to_env(0xff, 0xff);
     tr_save_fcsr_to_env();
@@ -1642,7 +1662,6 @@ bool translate_syscall(IR1_INST *pir1)
 
     /* store next pc to CPUX86State */
     IR2_OPND next_pc = ra_alloc_itemp();
-    /* * li_guest_addr(next_pc, pir1->_inst_length + pir1->_addr); */
     target_ulong call_offset __attribute__((unused)) =
             aot_get_call_offset(ir1_addr_next(pir1));
     aot_load_guest_addr(next_pc, ir1_addr_next(pir1),
@@ -1663,6 +1682,32 @@ bool translate_syscall(IR1_INST *pir1)
     tr_load_x64_8_registers_from_env(0xf0, 0);
 
     return true;
+#else
+    TranslationBlock *tb = lsenv->tr_data->curr_tb;
+    IR2_OPND fn = ra_alloc_itemp();
+    IR2_OPND eip_opnd = ra_alloc_dbt_arg2();
+    IR2_OPND base = ra_alloc_data();
+    IR2_OPND target = ra_alloc_data();
+
+    emit_ymmh_zeros();
+    tr_save_registers_to_env(0xff, 0xff, option_save_xmm, options_to_save());
+    tr_save_x64_8_registers_to_env(0xff, option_save_xmm);
+
+    aot_load_host_addr(fn, (ADDR)helper_syscall_sys, LOAD_HELPER_RAISE_SYSCALL, 0);
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    li_d(a1_ir2_opnd, ir1_addr_next(pir1));
+    la_jirl(ra_ir2_opnd, fn, 0);
+    ra_free_temp(fn);
+
+    la_ld_d(eip_opnd, env_ir2_opnd, lsenv_offset_of_eip(lsenv));
+    tr_load_registers_from_env(0xff, 0xff, option_save_xmm, options_to_save());
+    tr_load_x64_8_registers_from_env(0xff, option_save_xmm);
+
+    la_data_li(base, (ADDR)tb->tc.ptr);
+    la_data_li(target, context_switch_native_to_bt_ret_0);
+    aot_la_append_ir2_jmp_far(target, base, B_EPILOGUE_RET_0, 0);
+    return true;
+#endif
 }
 #endif
 
@@ -1946,47 +1991,33 @@ bool translate_swapgs(IR1_INST *pir1)
  */
 bool translate_sysret(IR1_INST *pir1)
 {
-    IR2_OPND star;
+    TranslationBlock *tb = lsenv->tr_data->curr_tb;
+    IR2_OPND fn, eip_opnd, base, target;
 
     if (!CODEIS64) {
         return false;
     }
 
-    /*
-     * RIP comes from RCX, and it goes straight into the epilogue's eip source:
-     * that register is what the exit path stores, so writing the environment
-     * here would be overwritten on the way out.
-     */
-    {
-        IR2_OPND eip_opnd = ra_alloc_dbt_arg2();
+    emit_ymmh_zeros();
+    tr_save_registers_to_env(0xff, 0xff, option_save_xmm, options_to_save());
+    tr_save_x64_8_registers_to_env(0xff, option_save_xmm);
 
-        la_or(eip_opnd, ra_alloc_gpr(ecx_index), zero_ir2_opnd);
-    }
+    fn = ra_alloc_itemp();
+    aot_load_host_addr(fn, (ADDR)helper_sysret_sys, LOAD_HELPER_RAISE_SYSCALL, 0);
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    la_jirl(ra_ir2_opnd, fn, 0);
+    ra_free_temp(fn);
 
-    /* CS/SS selectors are STAR[63:48] + 16 / + 8. */
-    star = ra_alloc_itemp();
-    la_ld_d(star, env_ir2_opnd, (int)offsetof(CPUX86State, star));
-    la_srli_d(star, star, 48);
+    eip_opnd = ra_alloc_dbt_arg2();
+    la_ld_d(eip_opnd, env_ir2_opnd, lsenv_offset_of_eip(lsenv));
+    tr_load_registers_from_env(0xff, 0xff, option_save_xmm, options_to_save());
+    tr_load_x64_8_registers_from_env(0xff, option_save_xmm);
 
-    {
-        IR2_OPND cs = ra_alloc_itemp();
-        IR2_OPND ss = ra_alloc_itemp();
-
-        la_addi_d(cs, star, 16);
-        la_st_d(cs, env_ir2_opnd, lsenv_offset_of_seg_selector(lsenv, R_CS));
-        la_addi_d(ss, star, 8);
-        la_st_d(ss, env_ir2_opnd, lsenv_offset_of_seg_selector(lsenv, R_SS));
-        ra_free_temp(cs);
-        ra_free_temp(ss);
-    }
-    ra_free_temp(star);
-
-    /*
-     * The return to ring 3 is the driver's business: this translator runs one
-     * block at TB granularity and the loop re-reads CPL from hflags, so all
-     * that is left is to leave the block through the usual exit.
-     */
-    tr_generate_exit_tb(pir1, 0);
+    base = ra_alloc_data();
+    target = ra_alloc_data();
+    la_data_li(base, (ADDR)tb->tc.ptr);
+    la_data_li(target, context_switch_native_to_bt_ret_0);
+    aot_la_append_ir2_jmp_far(target, base, B_EPILOGUE_RET_0, 0);
     return true;
 }
 

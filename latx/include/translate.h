@@ -161,6 +161,7 @@ void tr_load_guest_regs_after_helper(void);
 TRANS_FUNC_DEF(invalid);
 TRANS_FUNC_DEF(rdmsr);
 TRANS_FUNC_DEF(wrmsr);
+TRANS_FUNC_DEF(invlpg);
 TRANS_FUNC_DEF(lgdt);
 TRANS_FUNC_DEF(lidt);
 TRANS_FUNC_DEF(sgdt);

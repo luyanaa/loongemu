@@ -27,4 +27,10 @@ _kseg3_start:
 .incbin "firmware/vmlinux-x86_64-seg3.bin"
 .globl _kseg3_end
 _kseg3_end:
+.balign 4096
+.globl _initramfs_start
+_initramfs_start:
+.incbin "firmware/initramfs.cpio.gz"
+.globl _initramfs_end
+_initramfs_end:
 .text

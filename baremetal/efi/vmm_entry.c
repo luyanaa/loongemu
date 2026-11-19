@@ -34,6 +34,7 @@
 #include <stdint.h>
 
 #include "loongemu/loongarch_paging.h"
+#include "loongemu/acpi_tables.h"
 #include "efi_min.h"
 
 /* The UART on the QEMU virt board; memory mapped, so it survives EBS. */
@@ -107,6 +108,42 @@ static EFI_PHYSICAL_ADDRESS g_guest_ram;
 static EFI_PHYSICAL_ADDRESS g_code_cache;
 static EFI_PHYSICAL_ADDRESS g_pool;
 static uint64_t g_map_key;
+static const void *g_host_acpi_rsdp;
+static LoongemuAcpiInfo g_guest_acpi_info;
+
+static int efi_guid_eq(const EFI_GUID *a, const EFI_GUID *b)
+{
+    if (a->Data1 != b->Data1 || a->Data2 != b->Data2 || a->Data3 != b->Data3) {
+        return 0;
+    }
+    for (int i = 0; i < 8; i++) {
+        if (a->Data4[i] != b->Data4[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static const void *uefi_find_acpi_rsdp(const EFI_SYSTEM_TABLE *st)
+{
+    static const EFI_GUID acpi20_guid = EFI_ACPI_20_TABLE_GUID;
+    static const EFI_GUID acpi10_guid = EFI_ACPI_TABLE_GUID;
+    const void *v1_fallback = 0;
+
+    if (st == 0 || st->ConfigurationTable == 0) {
+        return 0;
+    }
+    for (UINTN i = 0; i < st->NumberOfTableEntries; i++) {
+        const EFI_CONFIGURATION_TABLE *ent = &st->ConfigurationTable[i];
+        if (efi_guid_eq(&ent->VendorGuid, &acpi20_guid)) {
+            return ent->VendorTable;
+        }
+        if (efi_guid_eq(&ent->VendorGuid, &acpi10_guid)) {
+            v1_fallback = ent->VendorTable;
+        }
+    }
+    return v1_fallback;
+}
 
 static LapgPagePool g_lapg_pool;
 static uint64_t g_root_table;
@@ -464,6 +501,29 @@ int efi_main(void *image, void *systab)
         if (off != 232) {
             LOG("BootServices layout mismatch");
             return 1;
+        }
+    }
+
+    /*
+     * Phase 0: capture the host UEFI ACPI 2.0 RSDP from ConfigurationTable
+     * before ExitBootServices so we can propagate platform metadata into the
+     * synthesized x86-64 guest ACPI tables.
+     */
+    g_host_acpi_rsdp = uefi_find_acpi_rsdp(st);
+    if (g_host_acpi_rsdp != 0) {
+        uint8_t rev = 0;
+        uint64_t xsdt_pa = 0;
+        char oem[7];
+        if (loongemu_acpi_validate_rsdp(g_host_acpi_rsdp, &rev, &xsdt_pa, oem)) {
+            puts_("vmm: host UEFI ACPI RSDP=");
+            puthex((uint64_t)(uintptr_t)g_host_acpi_rsdp);
+            puts_(" rev=");
+            puthex(rev);
+            puts_(" xsdt=");
+            puthex(xsdt_pa);
+            puts_(" oem=");
+            puts_(oem);
+            puts_("\n");
         }
     }
 

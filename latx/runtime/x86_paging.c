@@ -338,11 +338,82 @@ static int walk_or_flat(const CPUX86State *env, uint64_t gva, uint32_t access,
     return 1;
 }
 
+int latx_x86_get_tss_stack(const CPUX86State *env, uint32_t ist,
+                           uint64_t *out_rsp)
+{
+    uint16_t tr_sel = (uint16_t)(env->segs[R_TR].selector & ~7u);
+    uint64_t desc_gva = env->gdt.base + (uint64_t)tr_sel;
+    uint64_t lo_pa, hi_pa, lo, hi, tss_base, slot_gva, slot_pa, slot_hi_pa;
+    uint64_t tss_off;
+
+    if (tr_sel == 0 || env->gdt.base == 0) {
+        return 0;
+    }
+    if (!walk_or_flat(env, desc_gva, LATX_X86_ACCESS_READ, &lo_pa) ||
+        !walk_or_flat(env, desc_gva + 8, LATX_X86_ACCESS_READ, &hi_pa)) {
+        return 0;
+    }
+    lo = latx_platform_phys_read(lo_pa, 8);
+    hi = latx_platform_phys_read(hi_pa, 8);
+    tss_base = ((lo >> 16) & 0xffffffULL) |
+               (((lo >> 56) & 0xffULL) << 24) |
+               ((hi & 0xffffffffULL) << 32);
+    if (tss_base == 0) {
+        return 0;
+    }
+    tss_off = (ist >= 1u && ist <= 7u) ? (36ULL + (uint64_t)(ist - 1u) * 8ULL)
+                                       : 4ULL; /* RSP0 */
+    slot_gva = tss_base + tss_off;
+    if (!walk_or_flat(env, slot_gva, LATX_X86_ACCESS_READ, &slot_pa) ||
+        !walk_or_flat(env, slot_gva + 4, LATX_X86_ACCESS_READ, &slot_hi_pa)) {
+        return 0;
+    }
+    *out_rsp = latx_platform_phys_read(slot_pa, 4) |
+               (latx_platform_phys_read(slot_hi_pa, 4) << 32);
+    return *out_rsp != 0;
+}
+
+void helper_syscall_sys(CPUX86State *env, uint64_t next_rip)
+{
+    uint64_t rflags = (env->eflags & 0x3c7fd7ULL) | 0x2ULL;
+    uint16_t cs_sel = (uint16_t)((env->star >> 32) & 0xfffcU);
+
+    env->regs[R_ECX] = next_rip;
+    env->regs[R_R11] = rflags;
+    env->eflags = (rflags & ~(env->fmask & 0x3c7fd7ULL)) | 0x2ULL;
+    env->segs[R_CS].selector = cs_sel;
+    env->segs[R_SS].selector = (uint16_t)(cs_sel + 8U);
+    env->hflags &= ~(uint32_t)HF_CPL_MASK;
+    env->eip = env->lstar;
+    latx_x86_tlb_flush_all();
+    latx_platform_tlb_flush_all();
+}
+
+void helper_sysret_sys(CPUX86State *env)
+{
+    uint16_t star_hi = (uint16_t)(env->star >> 48);
+    uint64_t rflags = (env->regs[R_R11] & 0x3c7fd7ULL) | 0x2ULL;
+
+    env->eip = env->regs[R_ECX];
+    env->eflags = rflags;
+    env->segs[R_CS].selector = (uint16_t)((star_hi + 16U) | 3U);
+    env->segs[R_SS].selector = (uint16_t)((star_hi + 8U) | 3U);
+    env->hflags = (env->hflags & ~(uint32_t)HF_CPL_MASK) | 3U;
+    latx_x86_tlb_flush_all();
+    latx_platform_tlb_flush_all();
+}
+
 int latx_x86_deliver_fault(CPUX86State *env, uint32_t vector)
 {
     uint64_t gate_gva = env->idt.base + (uint64_t)vector * 16;
     uint64_t gate_lo_pa, gate_hi_pa;
     uint64_t lo, hi, off, selector, rsp;
+    uint32_t ist;
+    uint8_t gate_type;
+    uint32_t old_cpl = (uint32_t)(env->hflags & HF_CPL_MASK);
+    uint64_t old_rsp = env->regs[R_ESP];
+    uint32_t old_ss = env->segs[R_SS].selector;
+    uint32_t old_cs = env->segs[R_CS].selector;
 
     if ((uint64_t)vector * 16 + 15 > env->idt.limit + 1) {
         return 1;                       /* no such gate */
@@ -361,13 +432,22 @@ int latx_x86_deliver_fault(CPUX86State *env, uint32_t vector)
         if (!(type_attr & 0x80) || (type_attr & 0x1f) < 0x0e) {
             return 1;
         }
+        gate_type = (uint8_t)(type_attr & 0x1fu);
     }
+    ist = (uint32_t)((lo >> 32) & 7u);
     selector = (lo >> 16) & 0xffff;
     off = (lo & 0xffffULL) |
           (((lo >> 48) & 0xffffULL) << 16) |
           ((hi & 0xffffffffULL) << 32);
 
-    rsp = env->regs[R_ESP];
+    rsp = old_rsp;
+    if (ist != 0 || old_cpl != 0) {
+        uint64_t tss_rsp = 0;
+        if (latx_x86_get_tss_stack(env, ist, &tss_rsp)) {
+            rsp = tss_rsp;
+        }
+    }
+    rsp &= ~UINT64_C(15);
     /*
      * Long-mode frame, top first: error code, RIP, CS, RFLAGS, RSP, SS.
      * RSP and SS belong to the privilege-change form; they are pushed
@@ -384,10 +464,10 @@ int latx_x86_deliver_fault(CPUX86State *env, uint32_t vector)
         rsp -= 8;                                                             \
     } while (0)
 
-    PUSH64(env->segs[R_SS].selector);
-    PUSH64(env->regs[R_ESP]);
+    PUSH64(old_ss);
+    PUSH64(old_rsp);
     PUSH64(env->eflags & ~(UINT64_C(1) << 8));   /* TF clear in the handler */
-    PUSH64(env->segs[R_CS].selector);
+    PUSH64(old_cs);
     PUSH64(env->eip);
     PUSH64((uint64_t)(uint32_t)env->error_code);
 #undef PUSH64
@@ -402,6 +482,14 @@ int latx_x86_deliver_fault(CPUX86State *env, uint32_t vector)
     env->eip = off;
     env->segs[R_CS].selector = (uint32_t)selector;
     env->segs[R_CS].base = 0;                    /* ignored in long mode */
+    if (old_cpl != 0) {
+        env->segs[R_SS].selector = 0;
+    }
+    env->hflags &= ~(uint32_t)HF_CPL_MASK;
+    env->eflags &= ~(UINT64_C(1) << 8);
+    if (gate_type == 0x0eu) {
+        env->eflags &= ~IF_MASK;
+    }
     env->exception_index = 0;                    /* the guest now owns it */
     return 0;
 }

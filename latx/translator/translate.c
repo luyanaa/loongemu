@@ -827,6 +827,7 @@ static bool (*translate_functions[])(IR1_INST *) = {
     TRANS_FUNC_GEN(LMSW, lmsw),
     TRANS_FUNC_GEN(RDMSR, rdmsr),
     TRANS_FUNC_GEN(WRMSR, wrmsr),
+    TRANS_FUNC_GEN(INVLPG, invlpg),
     TRANS_FUNC_GEN(LGDT, lgdt),
     TRANS_FUNC_GEN(LIDT, lidt),
     TRANS_FUNC_GEN(IDIV, idiv),

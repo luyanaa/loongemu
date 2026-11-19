@@ -221,10 +221,14 @@ void cpu_x86_update_cr3(CPUX86State *env, target_ulong new_cr3)
 
 void cpu_x86_update_cr4(CPUX86State *env, uint32_t new_cr4)
 {
+    uint32_t old_cr4 = (uint32_t)env->cr[4];
     env->cr[4] = new_cr4;
     env->hflags = (env->hflags & ~(HF_SMAP_MASK | HF_OSFXSR_MASK))
                   | ((new_cr4 & CR4_SMAP_MASK) ? HF_SMAP_MASK : 0)
                   | ((new_cr4 & CR4_OSFXSR_MASK) ? HF_OSFXSR_MASK : 0);
+    if ((old_cr4 ^ new_cr4) & (CR4_PGE_MASK | CR4_PSE_MASK | CR4_PAE_MASK | CR4_PCIDE_MASK)) {
+        tlb_flush(0);
+    }
 }
 
 void cpu_sync_avx_hflag(CPUX86State *env)
@@ -295,31 +299,37 @@ void cpu_set_mxcsr(CPUX86State *env, uint32_t val)
     env->mxcsr = val;
 }
 
-static uint8_t apic_tpr;
-static uint64_t apic_base;
+uint32_t latx_guest_nr_cpus = 1;
+uint32_t latx_guest_apic_id = 0;
+static uint8_t apic_tpr_per_cpu[64];
+static uint64_t apic_base_per_cpu[64];
 
 int cpu_get_apic_tpr(CPUX86State *env)
 {
     (void)env;
-    return apic_tpr;
+    return apic_tpr_per_cpu[latx_guest_apic_id & 63u];
 }
 
 void cpu_set_apic_tpr(CPUX86State *env, uint8_t val)
 {
     (void)env;
-    apic_tpr = val;
+    apic_tpr_per_cpu[latx_guest_apic_id & 63u] = val;
 }
 
 uint64_t cpu_get_apic_base(CPUX86State *env)
 {
+    uint32_t id = latx_guest_apic_id & 63u;
     (void)env;
-    return apic_base;
+    if (apic_base_per_cpu[id] == 0) {
+        apic_base_per_cpu[id] = 0xfee00800ULL | (id == 0 ? 0x100ULL : 0ULL);
+    }
+    return apic_base_per_cpu[id];
 }
 
 void cpu_set_apic_base(CPUX86State *env, uint64_t val)
 {
     (void)env;
-    apic_base = val;
+    apic_base_per_cpu[latx_guest_apic_id & 63u] = val;
 }
 
 /* ---------------- SVM / TLB / randomness ---------------- */
@@ -422,20 +432,25 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
     (void)count;
     *eax = *ebx = *ecx = *edx = 0;
 
+    uint32_t apic_id = latx_guest_apic_id;
+    uint32_t nr_cpus = latx_guest_nr_cpus ? latx_guest_nr_cpus : 1u;
+
     switch (index) {
     case 0x0:
-        *eax = 7;
+        *eax = 0x15;
         cpuid_vendor(ebx, edx, ecx);
         break;
     case 0x1: {
-        /* x86-64-v2 baseline: SSE4.2/POPCNT are always safe. */
+        /* x86-64-v2 baseline: SSE4.2/POPCNT + HTT (when SMP) + Hypervisor bit. */
         uint32_t f_edx = (1u << 0)  | (1u << 4)  | (1u << 5)  | (1u << 6)
                        | (1u << 8)  | (1u << 9)  | (1u << 11) | (1u << 12)
                        | (1u << 13) | (1u << 14) | (1u << 15) | (1u << 16)
                        | (1u << 17) | (1u << 19) | (1u << 23) | (1u << 24)
-                       | (1u << 25) | (1u << 26);
+                       | (1u << 25) | (1u << 26)
+                       | (nr_cpus > 1u ? (1u << 28) : 0u); /* HTT */
         uint32_t f_ecx = (1u << 0) | (1u << 1) | (1u << 9) | (1u << 19)
-                       | (1u << 20) | (1u << 23);
+                       | (1u << 20) | (1u << 23)
+                       | (1u << 31); /* HYPERVISOR */
 
         /* AVX/AVX2 need 256-bit vector state, i.e. LASX on the host. */
         if (latx_cpu_has_lasx()) {
@@ -446,33 +461,89 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
                    | (1u << 29);  /* F16C   */
         }
         *eax = 0x000306f2u;
-        *ebx = 0x00000800u;
+        *ebx = ((apic_id & 0xffu) << 24) | ((nr_cpus & 0xffu) << 16) | (8u << 8);
         *ecx = f_ecx;
         *edx = f_edx;
         break;
     }
-    case 0x4:
-    case 0xb:
-        break; /* no cache/APIC topology enumeration */
+    case 0x4: {
+        uint32_t max_cores = (nr_cpus > 1u) ? (nr_cpus - 1u) : 0u;
+        if (count == 0) { /* L1d: 32 KiB, 8-way, 64B line, 64 sets */
+            *eax = (max_cores << 26) | (0u << 14) | (1u << 8) | (1u << 5) | 1u;
+            *ebx = (7u << 22) | 63u;
+            *ecx = 63u;
+            *edx = 0;
+        } else if (count == 1) { /* L1i: 32 KiB, 8-way, 64B line, 64 sets */
+            *eax = (max_cores << 26) | (0u << 14) | (1u << 8) | (1u << 5) | 2u;
+            *ebx = (7u << 22) | 63u;
+            *ecx = 63u;
+            *edx = 0;
+        } else if (count == 2) { /* L2 unified: 256 KiB, 8-way, 512 sets */
+            *eax = (max_cores << 26) | (0u << 14) | (1u << 8) | (2u << 5) | 3u;
+            *ebx = (7u << 22) | 63u;
+            *ecx = 511u;
+            *edx = 0;
+        } else if (count == 3) { /* L3 unified: 4 MiB, 16-way, shared */
+            *eax = (max_cores << 26) | (max_cores << 14) | (1u << 8) | (3u << 5) | 3u;
+            *ebx = (15u << 22) | 63u;
+            *ecx = 4095u;
+            *edx = 2u; /* inclusive */
+        }
+        break;
+    }
+    case 0xb: {
+        uint32_t core_shift = 0;
+        while ((1u << core_shift) < nr_cpus) {
+            core_shift++;
+        }
+        if (count == 0) { /* SMT level: 1 thread/core */
+            *eax = 0;
+            *ebx = 1;
+            *ecx = (1u << 8) | 0u;
+            *edx = apic_id;
+        } else if (count == 1) { /* Core level: nr_cpus cores/pkg */
+            *eax = core_shift;
+            *ebx = nr_cpus;
+            *ecx = (2u << 8) | 1u;
+            *edx = apic_id;
+        } else {
+            *eax = 0;
+            *ebx = 0;
+            *ecx = count;
+            *edx = apic_id;
+        }
+        break;
+    }
     case 0xd:
         if (count == 0) {
             if (latx_cpu_has_lasx()) {
                 *eax = 0x7;      /* x87 | SSE | AVX */
                 *ebx = 0x340;    /* XSAVE area size for XCR0 = 7 */
-                *ecx = 0;        /* XSS unsupported */
+                *ecx = 0x340;    /* max XSAVE area size for all supported features */
                 *edx = 0;
             }
         } else if (count == 1) {
             if (latx_cpu_has_lasx()) {
                 *eax = 1;        /* XSAVEOPT */
-                *ebx = 0x240;
+                *ebx = 0x340;
+                *ecx = 0;
+                *edx = 0;
             }
         } else if (count == 2) {
             if (latx_cpu_has_lasx()) {
-                *eax = 0;        /* YMM state is 256-bit */
-                *ebx = 0x340;
+                *eax = 0x100;    /* YMM_Hi128 size = 256 bytes */
+                *ebx = 0x240;    /* YMM_Hi128 offset = 576 bytes */
+                *ecx = 0;
+                *edx = 0;
             }
         }
+        break;
+    case 0x15:
+        /* TSC / Core Crystal Clock: 25 MHz * 4 / 1 = 100 MHz (matches rdtime.d). */
+        *eax = 1;
+        *ebx = 4;
+        *ecx = 25000000u;
+        *edx = 0;
         break;
     case 0x6:
     case 0xa:
@@ -484,6 +555,23 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
                  | (1u << 5)    /* AVX2  */
                  | (1u << 8);   /* BMI2  */
         }
+        break;
+    case 0x40000000u:
+        /* Hypervisor CPUID leaf: "LoongEMUVMM\0" */
+        *eax = 0x40000010u;
+        *ebx = 0x6e6f6f4cu; /* "Loon" */
+        *ecx = 0x554d4567u; /* "gEMU" */
+        *edx = 0x004d4d56u; /* "VMM\0" */
+        break;
+    case 0x40000001u:
+        *eax = *ebx = *ecx = *edx = 0;
+        break;
+    case 0x40000010u:
+        /* Generic Timing Information Leaf: 100 MHz TSC & LAPIC bus (in kHz). */
+        *eax = 100000u;
+        *ebx = 100000u;
+        *ecx = 0;
+        *edx = 0;
         break;
     default:
         break;
