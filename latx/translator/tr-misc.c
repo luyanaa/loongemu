@@ -2009,8 +2009,16 @@ bool translate_cpuid(IR1_INST *pir1)
     /* R9/R12/R13/R14/R10/R11 need save */
      tr_save_x64_8_registers_to_env(GPR_USEDEF_TO_SAVE >> 8, 0);
 #endif
-    /* 2. call helper */
-    IR2_OPND helper_addr_opnd = ra_alloc_dbt_arg2();
+    /*
+     * The helper address goes in a temporary, not in dbt_arg2.
+     *
+     * S_UD1 ($r21) is the register the exit stubs store into env.eip, so
+     * loading a code address into it makes the block leave with a code address
+     * as the guest's next RIP -- which is how every `cpuid` block reported its
+     * own start as its successor and the kernel's feature probe never
+     * advanced.
+     */
+    IR2_OPND helper_addr_opnd = ra_alloc_itemp();
     IR2_OPND a0_opnd = a0_ir2_opnd;
 
     TranslationBlock *tb __attribute__((unused)) = lsenv->tr_data->curr_tb;
@@ -2019,6 +2027,7 @@ bool translate_cpuid(IR1_INST *pir1)
     la_mov64(a0_opnd, env_ir2_opnd);
     la_jirl(ra_ir2_opnd,
         helper_addr_opnd, 0);
+    ra_free_temp(helper_addr_opnd);
 
     /* 3. load registers from env */
     tr_load_registers_from_env(
