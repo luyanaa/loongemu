@@ -463,27 +463,19 @@ static void rebuild_host_mappings(void)
     lapg_zero_page((void *)(uintptr_t)g_root);
 
     /*
-     * The VMM's own image.
+     * The VMM's own image is deliberately not mapped here.
      *
-     * Its code, read-only data and bss all live above the guest's window and
-     * must be reachable at PLV0 once paging is on: the trap handler runs from
-     * here, pushes onto this stack, and touches the pool and every global in
-     * this file.  Mapping the whole linked span keeps the linker script the
-     * single place the guest/VMM split is decided, instead of a list of
-     * globals that silently goes stale when the image moves.
+     * DMW0 is configured as VSEG=0 with PLV0 set, which makes the whole low
+     * 512 MiB window directly addressable at PLV0 regardless of the TLB.  The
+     * VMM lives inside that window, so it never needs a page-table entry --
+     * and adding one is worse than redundant: the pool and every global in
+     * this file sit inside the span being mapped, so lapg_map() writes memory
+     * that is not reachable until the mapping it is installing exists.  That
+     * bootstrap cycle is what made an otherwise correct table report UNMAPPED.
+     *
+     * Addresses reached at PLV3 still go through the tables; this comment is
+     * about the VMM's own PLV0 accesses only.
      */
-    {
-        extern char _end[];
-        uint64_t img_start = VMM_IMAGE_BASE;
-        uint64_t img_end = (uint64_t)(uintptr_t)_end;
-
-        if (img_end > img_start) {
-            map_host_range(img_start, img_end - img_start,
-                           LAPG_PERM_READ | LAPG_PERM_WRITE |
-                           LAPG_PERM_EXEC | LAPG_PERM_USER);
-        }
-    }
-
     map_host_range((uint64_t)(uintptr_t)code_cache, CODE_CACHE_SIZE,
                    LAPG_PERM_READ | LAPG_PERM_WRITE |
                    LAPG_PERM_EXEC | LAPG_PERM_USER);
