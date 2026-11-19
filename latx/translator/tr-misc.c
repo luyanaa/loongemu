@@ -492,6 +492,31 @@ static IR2_OPND load_desc_word(uint32_t addr, int size_bits)
     return value;
 }
 
+/*
+ * Load one field of a {limit, base} descriptor from a runtime address.
+ *
+ * The address comes from convert_mem(), so it already accounts for RIP
+ * relativity, segments and 64-bit width; this only adds the field offset and
+ * picks the access width.
+ */
+static IR2_OPND load_desc_word_opnd(IR2_OPND addr, int off, int size_bits)
+{
+    IR2_OPND value = ra_alloc_itemp();
+
+    switch (size_bits) {
+    case 16:
+        la_ld_hu(value, addr, off);
+        break;
+    case 32:
+        la_ld_wu(value, addr, off);
+        break;
+    default:
+        la_ld_d(value, addr, off);
+        break;
+    }
+    return value;
+}
+
 /* Bring-up record: what the descriptor-table translation was handed. */
 
 static bool translate_descriptor_table(IR1_INST *pir1, bool is_gdt)
@@ -502,20 +527,35 @@ static bool translate_descriptor_table(IR1_INST *pir1, bool is_gdt)
                           : lsenv_offset_of_idt_base(lsenv);
     int limit_off = is_gdt ? lsenv_offset_of_gdt_limit(lsenv)
                            : lsenv_offset_of_idt_limit(lsenv);
-    uint32_t addr = (uint32_t)ir1_opnd_simm(mem);
-    IR2_OPND tmp, base, limit;
-
+    IR2_OPND tmp, base, limit, addr_opnd;
+    int imm = 0;
 
     if (size != 6 && size != 10) {
         return false;
     }
 
-    limit = load_desc_word(addr, 16);
+    /*
+     * The operand address is computed by convert_mem(), not taken from the
+     * displacement.  A kernel writes `lgdt [rip+disp32]`, so the displacement
+     * is relative to the next instruction and has to be added to RIP -- and
+     * in 64-bit mode it is a 64-bit address.  Reading the raw displacement as
+     * an absolute 32-bit address sent this to 0x183c9b1, a physical address
+     * nothing maps, which is exactly the fault the run reported.
+     */
+    addr_opnd = convert_mem(mem, &imm);
+    if (imm != 0) {
+        IR2_OPND adj = ra_alloc_itemp();
+
+        la_addi_d(adj, addr_opnd, imm);
+        addr_opnd = adj;
+    }
+
+    limit = load_desc_word_opnd(addr_opnd, 0, 16);
     la_st_w(limit, env_ir2_opnd, limit_off);
 
-    base = load_desc_word(addr + 2, 32);
+    base = load_desc_word_opnd(addr_opnd, 2, 32);
     if (size == 10) {
-        tmp = load_desc_word(addr + 8, 32);
+        tmp = load_desc_word_opnd(addr_opnd, 8, 32);
         la_slli_d(tmp, tmp, 32);
         la_or(base, base, tmp);
         ra_free_temp(tmp);
