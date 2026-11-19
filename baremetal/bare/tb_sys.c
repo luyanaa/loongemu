@@ -187,6 +187,13 @@ int latx_platform_apic_mmio(uint64_t gpa, int is_write, uint64_t *value)
 #define KERNEL_SEG3_REL  0x1d8f000ULL
 #define KERNEL_SEG3_SIZE 0x283000ULL
 
+/*
+ * boot_params (the "zero page") lives below the kernel image, where a real
+ * loader puts it.  Zeroed, which is what a loader with no memory map and no
+ * command line hands over.
+ */
+#define BOOT_PARAMS_GPA  0x00010000ULL
+
 /* Must match the linker script's load address (baremetal/bare/bare.lds). */
 #define VMM_IMAGE_BASE  0x4000000ULL
 #define GUEST_BASE     0x0
@@ -913,7 +920,8 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
          */
         {
             uint64_t fp = env.eip ^ (env.regs[R_EDX] << 1) ^
-                          (env.regs[R_EAX] << 2) ^ (env.regs[R_ESP] << 3);
+                          (env.regs[R_EAX] << 2) ^ (env.regs[R_ESP] << 3) ^
+                          (env.regs[R_ECX] << 4) ^ (env.regs[R_EBX] << 5);
 
             if (fp == last_fp) {
                 if (++stuck >= 16) {
@@ -2518,6 +2526,15 @@ void kmain(void)
                 uint64_t saved_cr4 = env.cr[4];
 
                 env.cr[4] = saved_cr4 | CR4_PAE_MASK;
+                /*
+                 * The boot protocol: RSI points at boot_params (the zero
+                 * page).  A kernel reads its memory map, command line and
+                 * loader type from there before it does anything else; leaving
+                 * RSI as whatever the harness last used makes it consume
+                 * garbage as if it were a real structure.
+                 */
+                env.regs[R_ESI] = (uint32_t)BOOT_PARAMS_GPA;
+                env.regs[R_EBP] = 0;
                 env.regs[R_EAX] = 0xdeadbeefu;
                 env.regs[R_EDI] = 0xdeadbeefu;
                 env.regs[R_EDX] = 0xdeadbeefu;
