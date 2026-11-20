@@ -56,71 +56,141 @@ static uint8_t code_buf[CODE_BUF_SIZE] __attribute__((aligned(4096)));
 #define PROLOGUE_OFFSET 0x1000
 #define EPILOGUE_OFFSET 0x3000
 #define TB_OFFSET       0x5000
+#define CHAIN_TARGET_OFFSET 0x6000
+#define CHAIN_SOURCE_OFFSET 0x7000
 
 static TranslationBlock tb;
 static CPUMIPSState env;
 
 /* daddiu $2,$0,5; daddiu $3,$0,7; daddu $4,$2,$3; dsubu $5,$4,$2;
  * dsll $6,$5,3; dsra $7,$6,1 */
-static uint32_t arith_code[] = {
+static uint32_t arith_code[] __attribute__((aligned(4096))) = {
     0x64020005, 0x64030007, 0x0043202d, 0x0082282f, 0x000530f8, 0x0006387b,
 };
 
 /* daddiu $2,$0,1; daddiu $3,$0,1; beq $2,$3,target;
  * daddiu $4,$0,0x22 (delay); daddiu $5,$0,0x33 (skipped);
  * target: daddiu $6,$0,0x44 */
-static uint32_t branch_taken_code[] = {
+static uint32_t branch_taken_code[] __attribute__((aligned(4096))) = {
     0x64020001, 0x64030001, 0x10430002, 0x64040022, 0x64050033, 0x64060044,
 };
 
 /* daddiu $8,$0,1; daddiu $9,$0,1; bne $8,$9,skip;
  * daddiu $10,$0,0x22 (delay); daddiu $11,$0,0x33 (fallthrough); skip: nop */
-static uint32_t branch_not_code[] = {
+static uint32_t branch_not_code[] __attribute__((aligned(4096))) = {
     0x64080001, 0x64090001, 0x15090002, 0x640a0022, 0x640b0033, 0x00000000,
 };
 
 /* daddiu $2,$0,6; daddiu $3,$0,7; dmultu $2,$3; mflo $4; mfhi $5;
  * daddiu $6,$0,0x123; rotr $7,$6,8; drotr $8,$6,12 */
-static uint32_t hilo_shift_code[] = {
+static uint32_t hilo_shift_code[] __attribute__((aligned(4096))) = {
     0x64020006, 0x64030007, 0x0043001d, 0x00002012, 0x00002810,
     0x64060123, 0x00263a02, 0x0026433a,
 };
 
 /* jal target; daddiu $9,$0,0x22 (delay); daddiu $10,$0,0x33 (skipped);
  * target: daddiu $11,$0,0x44 */
-static uint32_t jal_code[] = {
+static uint32_t jal_code[] __attribute__((aligned(4096))) = {
     0x64020001, 0x0c000000, 0x64090022, 0x640a0033, 0x640b0044,
 };
 
 /* beql $2,$2,target; daddiu $13,$0,0x22 (delay); daddiu $14,$0,0x33;
  * target: daddiu $15,$0,0x44 */
-static uint32_t likely_taken_code[] = {
+static uint32_t likely_taken_code[] __attribute__((aligned(4096))) = {
     0x50420002, 0x640d0022, 0x640e0033, 0x640f0044,
 };
 
 /* beql $2,$3,target; daddiu $16,$0,0x22 (must be skipped);
  * daddiu $17,$0,0x33 (fallthrough); target: nop */
-static uint32_t likely_not_code[] = {
+static uint32_t likely_not_code[] __attribute__((aligned(4096))) = {
     0x64020001, 0x64030002, 0x50430002, 0x64100022, 0x64110033, 0x00000000,
 };
 
 /* Store/load word, LWL+LWR, store/load double, LDL+LDR, SDL+LD. */
-static uint32_t mem_code[] = {
+static uint32_t mem_code[] __attribute__((aligned(4096))) = {
     0x64020400, 0x3c031122, 0x34633344, 0xac430000, 0x64040000,
     0x98440000, 0x88440003, 0x3c051122, 0x34a53344, 0x00052c38,
     0x34a55566, 0x00052c38, 0x34a57788, 0xfc450008, 0x64060000,
     0x6c460008, 0x6846000f, 0xb4450010, 0xdc470010,
 };
 
+/* BC1 with nonzero FCC and a helper in the delay slot. */
+static uint32_t fpu_bc_code[] __attribute__((aligned(4096))) = {
+    0x3c020400, 0x44c2f800, 0x64050400, 0x45090002,
+    0xc0a40000, 0x64060033, 0x64070044,
+};
+static uint32_t fpu_bc_likely_not_code[] __attribute__((aligned(4096))) = {
+    0x3c020400, 0x44c2f800, 0x64050400, 0x450a0002,
+    0xc0a40000, 0x64060033, 0x64070044,
+};
+
+/* Branch condition and JR target must survive a helper in the delay slot. */
+static uint32_t delay_branch_code[] __attribute__((aligned(4096))) = {
+    0x64020001, 0x64030001, 0x64050400, 0x10430002,
+    0xc0a40000, 0x64060033, 0x64070044,
+};
+static uint32_t delay_jr_code[] __attribute__((aligned(4096))) = {
+    0x64050400, 0x3c020000, 0x34420000, 0x00400008,
+    0xc0a40000, 0x00000000,
+};
+
+/* SC without LL, and LL(A)->SC(B). */
+static uint32_t sc_no_ll_code[] __attribute__((aligned(4096))) = {
+    0x64020400, 0x64030055, 0xe0440000,
+};
+static uint32_t ll_sc_alias_code[] __attribute__((aligned(4096))) = {
+    0x64020400, 0xc0440000, 0x64050404, 0xe0a60000,
+};
+
+/* LL/SC success, then LL/SC invalidated by an intervening normal store. */
+static uint32_t llsc_code[] __attribute__((aligned(4096))) = {
+    0x64020400, 0x64030123, 0xac430000, 0xc0440000, 0x64050456,
+    0xe0450000, 0xc0460000, 0xac430000, 0xe0470000,
+};
+
+/* COP1X: LDXC1/SDXC1, LWXC1/SWXC1, LUXC1/SUXC1. */
+static uint32_t cop1x_code[] __attribute__((aligned(4096))) = {
+    0x64020400, 0x64030000, 0x3c043ff8, 0x0004203c, 0xfc440000,
+    0x4c430001, 0x4c430009, 0xdc450000, 0x3c063f80, 0xac460020,
+    0x4c430040, 0x4c430808, 0x8c470020, 0x4c430085, 0x4c43100d,
+    0xdc480000,
+};
+
+/* COP1X MADD/MSUB/NMADD/NMSUB.D with f3=1, f1=1.5, f2=2.25. */
+static uint32_t cop1x_madd_code[] __attribute__((aligned(4096))) = {
+    0x64020400, 0x3c033ff8, 0x0003183c, 0xfc430000,
+    0x3c054002, 0x0005283c, 0xfc450008, 0x3c063ff0,
+    0x0006303c, 0xfc460010, 0xd4410000, 0xd4420008,
+    0xd4430010, 0x4c620821, 0x4c620929, 0x4c620971,
+    0x4c6209b9, 0xf4400018, 0xf4440020, 0xf4450028,
+    0xf4460030, 0xdc440018, 0xdc450020, 0xdc460028,
+    0xdc470030,
+};
+
 /* 1.5 + 2.25 through LDC1/add.d/SDC1. */
-static uint32_t fpu_code[] = {
+static uint32_t fpu_code[] __attribute__((aligned(4096))) = {
     0x64020400, 0x3c033ff8, 0x0003183c, 0xfc430000,
     0x3c054002, 0x0005283c, 0xfc450008, 0xd4410000,
     0xd4420008, 0x46220800, 0xf4400010, 0xdc440010,
 };
 
 /* lui/ori load the address of jr_code+4 into $2; jr $2; delay. */
-static uint32_t jr_code[] = {
+static uint32_t jr_code[] __attribute__((aligned(4096))) = {
+    0x3c020000, 0x34420000, 0x00400008, 0x64030022,
+};
+
+/* lui/ori target; cache 0x10,0($2); cache 0,0($2); synci 0($2). */
+static uint32_t cache_code[] __attribute__((aligned(4096))) = {
+    0x3c020000, 0x34420000, 0xbc500000, 0xbc400000, 0x045f0000,
+};
+
+/* Target TB for the indirect TB-link test: r5=0x55, r6=0x66. */
+static uint32_t chain_target_code[] __attribute__((aligned(4096))) = {
+    0x64050055, 0x64060066,
+};
+
+/* lui/ori target; jr $2; daddiu $3,$0,0x22 (delay). */
+static uint32_t chain_source_code[] __attribute__((aligned(4096))) = {
     0x3c020000, 0x34420000, 0x00400008, 0x64030022,
 };
 
@@ -141,6 +211,84 @@ extern void tr_init(void *tb);
 extern void tr_fini(void);
 extern uint64_t context_switch_bt_to_native;
 
+static int assemble_block(uint32_t *guest, int insns, uint8_t *host)
+{
+    for (size_t i = 0; i < sizeof(tb); i++) {
+        ((uint8_t *)&tb)[i] = 0;
+    }
+    tcg_ctx->code_ptr = host;
+    tcg_ctx->gen_insn_data = latx_tcg_gen_insn_data;
+    tb.pc = (uint64_t)(uintptr_t)guest;
+    tb.tc.ptr = host;
+    tb.jmp_reset_offset[0] = 0xffff;
+    tb.jmp_reset_offset[1] = 0xffff;
+
+    int max_insns = insns;
+    target_disasm(&tb, &max_insns, NULL);
+    if (tb.icount == 0 || !tr_ir2_generate(&tb)) {
+        tr_fini();
+        return -1;
+    }
+    int n = tr_ir2_assemble(host);
+    tr_fini();
+    __asm__ volatile("ibar 0" ::: "memory");
+    return n;
+}
+
+static void run_chain(int use_jiscr1)
+{
+    uint8_t *target_host = code_buf + CHAIN_TARGET_OFFSET;
+    uint8_t *source_host = code_buf + CHAIN_SOURCE_OFFSET;
+    uint32_t target_pc = (uint32_t)(uintptr_t)chain_target_code;
+
+    latx_bare_uart_puts(use_jiscr1 ? "latm-isa: chain-jiscr1 begin\n"
+                                   : "latm-isa: chain-jiscr0 begin\n");
+    for (size_t i = 0; i < sizeof(env); i++) {
+        ((uint8_t *)&env)[i] = 0;
+    }
+    for (size_t i = 0; i < CODE_BUF_SIZE; i++) {
+        code_buf[i] = 0;
+    }
+    latm_jmp_cache_flush();
+
+    tcg_ctx->code_ptr = code_buf + PROLOGUE_OFFSET;
+    lata_gen_prologue(tcg_ctx);
+    tcg_ctx->code_ptr = code_buf + EPILOGUE_OFFSET;
+    lata_gen_epilogue(tcg_ctx);
+
+    if (assemble_block(chain_target_code, 2, target_host) <= 0) {
+        fails++;
+        checks++;
+        latx_bare_uart_puts("latm-isa: FAIL chain target assemble\n");
+        return;
+    }
+    latm_jmp_cache_add((uint64_t)(uintptr_t)chain_target_code,
+                       (uint64_t)(uintptr_t)target_host, 8);
+
+    chain_source_code[0] = 0x3c020000u | ((target_pc >> 16) & 0xffffu);
+    chain_source_code[1] = 0x34420000u | (target_pc & 0xffffu);
+    latm_link_use_jiscr1 = use_jiscr1 != 0;
+    if (assemble_block(chain_source_code, 4, source_host) <= 0) {
+        fails++;
+        checks++;
+        latx_bare_uart_puts("latm-isa: FAIL chain source assemble\n");
+        latm_link_use_jiscr1 = false;
+        return;
+    }
+
+    ((void (*)(void *, void *))(uintptr_t)context_switch_bt_to_native)(
+        &env, source_host);
+    latm_link_use_jiscr1 = false;
+
+    check(env.active_tc.gpr[3], 0x22, "chain delay slot executed");
+    check(env.active_tc.gpr[5], 0x55, "chain target executed");
+    check(env.active_tc.gpr[6], 0x66, "chain target second instruction");
+    check(env.active_tc.PC, (uint64_t)(uintptr_t)(chain_target_code + 2),
+          "chain target exit PC");
+    latx_bare_uart_puts(use_jiscr1 ? "latm-isa: chain-jiscr1 done\n"
+                                   : "latm-isa: chain-jiscr0 done\n");
+}
+
 static void run_block(uint32_t *guest, int insns, const char *name)
 {
     uint8_t *tb_code = code_buf + TB_OFFSET;
@@ -158,6 +306,7 @@ static void run_block(uint32_t *guest, int insns, const char *name)
     for (size_t i = 0; i < CODE_BUF_SIZE; i++) {
         code_buf[i] = 0;
     }
+    env.active_fpu.fcr31_rw_bitmask = 0xff83ffff;
 
     env.active_tc.PC = (uint64_t)(uintptr_t)guest;
 
@@ -273,6 +422,8 @@ void kmain(void)
           "likely not-taken PC");
 
     run_block(mem_code, 19, "memory");
+    check(env.active_tc.gpr[2], 0x400, "memory base");
+    check(env.active_tc.gpr[3], 0x11223344u, "memory word source");
     check(env.active_tc.gpr[4], 0x11223344u, "lwl+lwr word");
     check(env.active_tc.gpr[6], 0x1122334455667788ull, "ldl+ldr double");
     check(env.active_tc.gpr[7], 0x1122334455667788ull, "sdl+ld double");
@@ -286,9 +437,74 @@ void kmain(void)
     check(env.active_tc.gpr[3], 0x22, "jr delay slot executed");
     check(env.active_tc.PC, (uint64_t)(uintptr_t)(jr_code + 4), "jr target PC");
 
+    run_block(delay_branch_code, 7, "delay-branch-helper");
+    check(env.active_tc.gpr[6], 0, "branch condition survives delay helper");
+    check(env.active_tc.PC,
+          (uint64_t)(uintptr_t)(delay_branch_code + 6),
+          "branch target survives delay helper");
+
+    {
+        uint32_t target = (uint32_t)(uintptr_t)(delay_jr_code + 5);
+        delay_jr_code[1] = 0x3c020000u | ((target >> 16) & 0xffffu);
+        delay_jr_code[2] = 0x34420000u | (target & 0xffffu);
+    }
+    run_block(delay_jr_code, 5, "delay-jr-helper");
+    check(env.active_tc.PC, (uint64_t)(uintptr_t)(delay_jr_code + 5),
+          "JR target survives delay helper");
+
+    run_block(llsc_code, 9, "llsc");
+    check(env.active_tc.gpr[5], 1, "sc succeeds after ll");
+    check(env.active_tc.gpr[7], 0, "sc fails after intervening store");
+
+    run_block(sc_no_ll_code, 3, "sc-no-ll");
+    check(env.active_tc.gpr[4], 0, "sc without ll fails");
+    run_block(ll_sc_alias_code, 4, "ll-sc-alias");
+    check(env.active_tc.gpr[6], 0, "ll(A)->sc(B) fails");
+
     enable_fpu();
+    run_block(cop1x_code, 16, "cop1x");
+    check(env.active_tc.gpr[5], 0x3ff8000000000000ull, "ldxc1/sdxc1");
+    check(env.active_tc.gpr[7], 0x3f800000u, "lwxc1/swxc1");
+    check(env.active_tc.gpr[8], 0x3ff8000000000000ull, "luxc1/suxc1");
+
+    run_block(cop1x_madd_code, 25, "cop1x-madd");
+    check(env.active_tc.gpr[4], 0x4011800000000000ull, "madd.d");
+    check(env.active_tc.gpr[5], 0x4003000000000000ull, "msub.d");
+    check(env.active_tc.gpr[6], 0xc011800000000000ull, "nmadd.d");
+    check(env.active_tc.gpr[7], 0xc003000000000000ull, "nmsub.d");
+
     run_block(fpu_code, 12, "fpu-add");
     check(env.active_tc.gpr[4], 0x400e000000000000ull, "1.5 + 2.25");
+
+    run_block(fpu_bc_code, 7, "fpu-bc-fcc2");
+    check(env.active_tc.gpr[6], 0, "bc1 delay slot runs on taken");
+    check(env.active_tc.PC, (uint64_t)(uintptr_t)(fpu_bc_code + 6),
+          "bc1t FCC2 target");
+
+    run_block(fpu_bc_likely_not_code, 6, "fpu-bc-likely");
+    check(env.active_tc.gpr[4], 0, "likely-not-taken skips delay slot");
+    check(env.active_tc.PC,
+          (uint64_t)(uintptr_t)(fpu_bc_likely_not_code + 5),
+          "bc1fl FCC2 fallthrough");
+
+    run_chain(0);
+    run_chain(1);
+
+    {
+        static const uint32_t flush_ops[] = { 0xbc500000, 0xbc400000, 0x045f0000 };
+        uint32_t target = (uint32_t)(uintptr_t)chain_target_code;
+        cache_code[0] = 0x3c020000u | ((target >> 16) & 0xffffu);
+        cache_code[1] = 0x34420000u | (target & 0xffffu);
+        for (unsigned i = 0; i < sizeof(flush_ops) / sizeof(flush_ops[0]); i++) {
+            cache_code[2] = flush_ops[i];
+            latm_jmp_cache_add((uint64_t)(uintptr_t)chain_target_code,
+                               (uint64_t)(uintptr_t)code_buf + 0x6000, 8);
+            run_block(cache_code, 3, "cache-synci");
+            check(latm_jmp_cache_lookup(
+                      (uint64_t)(uintptr_t)chain_target_code), 0,
+                  "CACHE/SYNCI invalidates TB link cache");
+        }
+    }
 
     latx_bare_uart_puts("latm-isa: checks=");
     puthex(checks);
@@ -308,5 +524,10 @@ __asm__(".text\n.globl _start\n_start:\n  la $sp, kstack\n  lu12i.w $t0, 16\n"
 
 static char kstack[65536] __attribute__((aligned(16), used));
 struct CPUState;
-void cpu_loop_exit(struct CPUState *cs) { (void)cs; latx_bare_uart_puts("latm-isa: cpu_loop_exit\n"); for (;;) { } }
+void cpu_loop_exit(struct CPUState *cs)
+{
+    (void)cs;
+    latx_bare_uart_puts("latm-isa: cpu_loop_exit\n");
+    for (;;) { }
+}
 FILE *stderr;

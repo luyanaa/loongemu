@@ -33,6 +33,8 @@ void do_raise_exception_err(CPUMIPSState *env, uint32_t exception,
 {
     target_ulong epc = exception_resume_pc(env);
 
+    env->llvalid = 0;
+    env->lladdr = UINT64_MAX;
     env->error_code = error_code;
     env->CP0_Cause = (env->CP0_Cause & ~(0x1f << 2)) |
                      ((exception & 0x1f) << 2);
@@ -56,10 +58,15 @@ void do_raise_exception_err(CPUMIPSState *env, uint32_t exception,
         break;
     }
 
-    if (exception == EXCP_EXT_INTERRUPT && (env->CP0_Cause & (1u << 23))) {
-        env->active_tc.PC = env->exception_base + 0x200;
-    } else {
-        env->active_tc.PC = env->exception_base + 0x180;
+    {
+        target_ulong base = (env->CP0_Status & (1u << CP0St_BEV)) ?
+                            0xbfc00000u : env->exception_base;
+        if (exception == EXCP_EXT_INTERRUPT &&
+            (env->CP0_Cause & (1u << 23))) {
+            env->active_tc.PC = base + 0x200;
+        } else {
+            env->active_tc.PC = base + 0x180;
+        }
     }
 
     (void)pc;

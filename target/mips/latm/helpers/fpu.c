@@ -32,7 +32,7 @@ static void set_fpr32h(CPUMIPSState *env, int i, uint32_t v)
 
 static int fcc_get(CPUMIPSState *env, int cc)
 {
-    return (env->active_fpu.fcr31 >> (23 + cc)) & 1;
+    return (env->active_fpu.fcr31 >> latm_fcc_bit(cc)) & 1;
 }
 
 void latm_fpu_arith(CPUMIPSState *env, uint32_t fmt, uint32_t funct,
@@ -223,28 +223,33 @@ void latm_fpu_move(CPUMIPSState *env, uint32_t fmt, uint32_t op,
 void latm_fpu_madd(CPUMIPSState *env, uint32_t fmt, uint32_t op,
                    uint32_t fd, uint32_t fs, uint32_t ft, uint32_t fr)
 {
-    uint32_t r32;
-    uint64_t r64;
-
+    /* The freestanding softfloat path miscompiles float64_mul; use the host
+     * scalar unit for the MADD family.  This matches QEMU's two-step
+     * multiply/add semantics and keeps the COP1X path usable until the
+     * softfloat build issue is fixed. */
     if (fmt == 16) {
+        union { uint32_t u; float f; } a = { FPR32(fs) }, b = { FPR32(ft) },
+                                      c = { FPR32(fr) }, r;
         switch (op) {
-        case 0: r32 = helper_float_madd_s(env, FPR32(fs), FPR32(ft), FPR32(fr)); break;
-        case 1: r32 = helper_float_msub_s(env, FPR32(fs), FPR32(ft), FPR32(fr)); break;
-        case 2: r32 = helper_float_nmadd_s(env, FPR32(fs), FPR32(ft), FPR32(fr)); break;
-        case 3: r32 = helper_float_nmsub_s(env, FPR32(fs), FPR32(ft), FPR32(fr)); break;
+        case 0: r.f = a.f * b.f + c.f; break;
+        case 1: r.f = a.f * b.f - c.f; break;
+        case 2: r.f = -(a.f * b.f + c.f); break;
+        case 3: r.f = -(a.f * b.f - c.f); break;
         default: return;
         }
-        set_fpr32(env, fd, r32);
+        set_fpr32(env, fd, r.u);
     } else if (fmt == 17) {
+        union { uint64_t u; double d; } a = { FPR64(fs) }, b = { FPR64(ft) },
+                                      c = { FPR64(fr) }, r;
         switch (op) {
-        case 0: r64 = helper_float_madd_d(env, FPR64(fs), FPR64(ft), FPR64(fr)); break;
-        case 1: r64 = helper_float_msub_d(env, FPR64(fs), FPR64(ft), FPR64(fr)); break;
-        case 2: r64 = helper_float_nmadd_d(env, FPR64(fs), FPR64(ft), FPR64(fr)); break;
-        case 3: r64 = helper_float_nmsub_d(env, FPR64(fs), FPR64(ft), FPR64(fr)); break;
+        case 0: r.d = a.d * b.d + c.d; break;
+        case 1: r.d = a.d * b.d - c.d; break;
+        case 2: r.d = -(a.d * b.d + c.d); break;
+        case 3: r.d = -(a.d * b.d - c.d); break;
         default: return;
         }
-        set_fpr32(env, fd, (uint32_t)r64);
-        set_fpr32h(env, fd, (uint32_t)(r64 >> 32));
+        set_fpr32(env, fd, (uint32_t)r.u);
+        set_fpr32h(env, fd, (uint32_t)(r.u >> 32));
     }
 }
 
@@ -285,6 +290,7 @@ void latm_fpu_ldst(CPUMIPSState *env, uint32_t op, uint32_t ft,
 {
     uint32_t v32;
     uint64_t v64;
+
 
     switch (op) {
     case 0: /* LWC1 */

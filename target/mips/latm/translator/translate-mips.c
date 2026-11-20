@@ -26,9 +26,7 @@ static void latm_set_pc(DisasContext *s)
     uint64_t pc = s->ir1.pc;
     IR2_OPND t = ra_alloc_itemp();
 
-    if (s->ir1.delay_slot && pc >= 4) {
-        pc -= 4;
-    }
+    /* exception_resume_pc() subtracts the branch PC for a delay slot. */
     li_d(t, pc);
     latm_env_st_d(t, env_offset_pc());
     ra_free_itemp(t._reg_num);
@@ -40,7 +38,7 @@ static void latm_set_delay_flag(DisasContext *s, bool on)
     IR2_OPND mask = ra_alloc_itemp();
 
     latm_env_ld_w(t, env_offset_hflags());
-    li_d(mask, MIPS_HFLAG_BMASK);
+    li_d(mask, MIPS_HFLAG_B);
     if (on) {
         la_or(t, t, mask);
     } else {
@@ -50,6 +48,29 @@ static void latm_set_delay_flag(DisasContext *s, bool on)
     latm_env_st_w(t, env_offset_hflags());
     ra_free_itemp(t._reg_num);
     ra_free_itemp(mask._reg_num);
+}
+
+static void latm_spill_st(int slot, IR2_OPND v)
+{
+    latm_env_st_d(v, offsetof(CPUMIPSState, latm_spill[slot]));
+}
+
+static void latm_spill_ld(int slot, IR2_OPND dst)
+{
+    latm_env_ld_d(dst, offsetof(CPUMIPSState, latm_spill[slot]));
+}
+
+static void latm_spill_put(int slot, IR2_OPND v)
+{
+    latm_spill_st(slot, v);
+    ra_free_itemp(v._reg_num);
+}
+
+static IR2_OPND latm_spill_get(int slot)
+{
+    IR2_OPND t = ra_alloc_itemp();
+    latm_spill_ld(slot, t);
+    return t;
 }
 
 static IR2_OPND hcall(uintptr_t fn, int nargs, IR2_OPND *args)
@@ -198,8 +219,37 @@ static void gen_goto_tb(DisasContext *s, int n, uint64_t dest)
 
 static void gen_goto_tb_indirect(DisasContext *s, IR2_OPND target)
 {
+    IR2_OPND host = ra_alloc_itemp();
+    IR2_OPND cached = ra_alloc_itemp();
+    IR2_OPND miss = ir2_opnd_new_type(IR2_OPND_LABEL);
+
+    /* idx = (target >> 2) & MASK; slot = cache + idx * 32 */
+    la_srli_d(a0_ir2_opnd, target, 2);
+    la_andi(a0_ir2_opnd, a0_ir2_opnd, LATM_JMP_CACHE_MASK);
+    li_d(host, (uint64_t)(uintptr_t)latm_jmp_cache);
+    la_slli_d(a0_ir2_opnd, a0_ir2_opnd, 5);
+    la_add_d(a0_ir2_opnd, a0_ir2_opnd, host);
+    la_ld_d(cached, a0_ir2_opnd, 0);
+    la_bne(target, cached, miss);
+    la_ld_d(host, a0_ir2_opnd, 8);
+    la_beqz(host, miss);
+
+    latm_env_st_d(target, env_offset_pc());
+    if (latm_link_use_jiscr1) {
+        la_gr2scr(scr0_ir2_opnd, host);
+        la_jiscr1(0);
+    } else if (latm_have_lbt) {
+        la_gr2scr(scr0_ir2_opnd, host);
+        la_jiscr0(0);
+    } else {
+        la_jirl(zero_ir2_opnd, host, 0);
+    }
+
+    la_label(miss);
     latm_env_st_d(target, env_offset_pc());
     lata_gen_exit_tb_ret_0(s);
+    ra_free_itemp(host._reg_num);
+    ra_free_itemp(cached._reg_num);
 }
 
 static void translate_delay_slot(DisasContext *s)
@@ -842,16 +892,21 @@ static bool trans_branch(DisasContext *s)
         store_gpr_dst_f(31, l);
     }
 
+    /* A delay-slot helper may clobber caller-saved itemps. */
     if (likely) {
         IR2_OPND skip = ir2_opnd_new_type(IR2_OPND_LABEL);
         la_beqz(cond, skip);
+        latm_spill_put(0, cond);
         translate_delay_slot(s);
+        cond = latm_spill_get(0);
         gen_goto_tb(s, 0, target);
         la_label(skip);
         gen_goto_tb(s, 1, fall);
     } else {
         IR2_OPND taken = ir2_opnd_new_type(IR2_OPND_LABEL);
+        latm_spill_put(0, cond);
         translate_delay_slot(s);
+        cond = latm_spill_get(0);
         la_bnez(cond, taken);
         gen_goto_tb(s, 1, fall);
         la_label(taken);
@@ -888,7 +943,9 @@ static bool trans_jump(DisasContext *s)
             IR2_OPND l = imm_opnd(s->ir1.pc + 8);
             store_gpr_dst_f(s->ir1.rd, l);
         }
+        latm_spill_put(1, target);
         translate_delay_slot(s);
+        target = latm_spill_get(1);
         gen_goto_tb_indirect(s, target);
         ra_free_itemp(target._reg_num);
         s->base->is_jmp = DISAS_NORETURN;
@@ -899,16 +956,17 @@ static bool trans_jump(DisasContext *s)
 
 static bool trans_fpu_bc(DisasContext *s)
 {
-    unsigned cc = s->ir1.cond & 7;
+    unsigned cc = (s->ir1.cond >> 2) & 7;
     unsigned tf = s->ir1.cond & 1;
     bool likely = s->ir1.likely;
+    unsigned fcc_bit = latm_fcc_bit(cc);
     IR2_OPND cond = ra_alloc_itemp();
     IR2_OPND t = ra_alloc_itemp();
     uint64_t target = s->ir1.pc + 4 + ((int64_t)s->ir1.simm << 2);
     uint64_t fall = s->ir1.pc + 8;
 
     latm_env_ld_w(t, offsetof(CPUMIPSState, active_fpu.fcr31));
-    la_bstrpick_d(cond, t, 23 + cc, 23 + cc);
+    la_bstrpick_d(cond, t, fcc_bit, fcc_bit);
     if (tf == 0) {
         la_xori(cond, cond, 1);
     }
@@ -917,13 +975,17 @@ static bool trans_fpu_bc(DisasContext *s)
     if (likely) {
         IR2_OPND skip = ir2_opnd_new_type(IR2_OPND_LABEL);
         la_beqz(cond, skip);
+        latm_spill_put(2, cond);
         translate_delay_slot(s);
+        cond = latm_spill_get(2);
         gen_goto_tb(s, 0, target);
         la_label(skip);
         gen_goto_tb(s, 1, fall);
     } else {
         IR2_OPND taken = ir2_opnd_new_type(IR2_OPND_LABEL);
+        latm_spill_put(2, cond);
         translate_delay_slot(s);
+        cond = latm_spill_get(2);
         la_bnez(cond, taken);
         gen_goto_tb(s, 1, fall);
         la_label(taken);

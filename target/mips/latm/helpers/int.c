@@ -127,7 +127,7 @@ void latm_helper_madd(CPUMIPSState *env, uint32_t op, uint64_t a, uint64_t b)
 
 uint64_t latm_helper_fcc(CPUMIPSState *env, uint32_t cc)
 {
-    return (env->active_fpu.fcr31 >> (23 + cc)) & 1;
+    return (env->active_fpu.fcr31 >> latm_fcc_bit(cc)) & 1;
 }
 
 void latm_helper_sync(CPUMIPSState *env, uint32_t stype)
@@ -148,9 +148,14 @@ void latm_helper_synci(CPUMIPSState *env, uint64_t addr)
 
 void latm_helper_cache(CPUMIPSState *env, uint32_t op, uint64_t addr)
 {
+    extern void latm_tb_flush_range(uint64_t start, uint64_t end)
+        __attribute__((weak));
     (void)env;
-    (void)op;
-    (void)addr;
+    /* Index/Hit Invalidate for the instruction cache. */
+    if (latm_tb_flush_range && (op == 0x00 || op == 0x10)) {
+        latm_tb_flush_range(addr & ~UINT64_C(0x1f),
+                            (addr & ~UINT64_C(0x1f)) + 32);
+    }
 }
 
 void latm_helper_pref(CPUMIPSState *env, uint32_t hint, uint64_t addr)
@@ -162,39 +167,64 @@ void latm_helper_pref(CPUMIPSState *env, uint32_t hint, uint64_t addr)
 
 uint64_t latm_helper_ll(CPUMIPSState *env, uint32_t op, uint64_t addr)
 {
-    uint64_t v;
-    if (op == MIPS_MEM_LL) {
-        v = cpu_ldl_mmuidx_ra(env, addr, 0, 0);
-        env->lladdr = addr;
-        env->llval = v;
-        return (int64_t)(int32_t)v;
+    uint64_t v, phys;
+    unsigned size = op == MIPS_MEM_LL ? 4 : 8;
+
+    if (addr & (size - 1)) {
+        do_raise_exception(env, EXCP_AdEL, 0);
+        return 0;
     }
-    v = cpu_ldq_mmuidx_ra(env, addr, 0, 0);
+    phys = cpu_mips_translate_address(env, addr, MMU_DATA_LOAD, 0);
+    if (size == 4) {
+        v = cpu_ldl_mmuidx_ra(env, addr, 0, 0);
+        env->llval = v;
+        env->llsize = 4;
+    } else {
+        v = cpu_ldq_mmuidx_ra(env, addr, 0, 0);
+        env->llval = v;
+        env->llsize = 8;
+    }
     env->lladdr = addr;
-    env->llval = v;
-    return v;
+    env->llpaddr = phys;
+    env->llvalid = 1;
+    return size == 4 ? (int64_t)(int32_t)v : v;
 }
 
 uint64_t latm_helper_sc(CPUMIPSState *env, uint32_t op, uint64_t addr,
                         uint64_t val)
 {
-    bool ok;
+    unsigned size = op == MIPS_MEM_SC ? 4 : 8;
+    bool ok = false;
 
-    if (op == MIPS_MEM_SC) {
-        ok = addr == env->lladdr &&
-             (uint32_t)cpu_ldl_mmuidx_ra(env, addr, 0, 0) ==
-             (uint32_t)env->llval;
-        if (ok) {
-            cpu_stl_mmuidx_ra(env, addr, (uint32_t)val, 0, 0);
+    if (addr & (size - 1)) {
+        do_raise_exception(env, EXCP_AdES, 0);
+        return 0;
+    }
+    {
+        uint64_t phys = cpu_mips_translate_address(env, addr,
+                                                   MMU_DATA_STORE, 0);
+        if (env->llvalid && env->llsize == size &&
+            phys == env->llpaddr) {
+        if (size == 4) {
+            uint32_t old = (uint32_t)env->llval;
+            uint32_t new = (uint32_t)val;
+            ok = __atomic_compare_exchange_n((uint32_t *)(uintptr_t)phys,
+                                             &old, new, false,
+                                             __ATOMIC_SEQ_CST,
+                                             __ATOMIC_SEQ_CST);
+        } else {
+            uint64_t old = env->llval;
+            ok = __atomic_compare_exchange_n((uint64_t *)(uintptr_t)phys,
+                                             &old, val, false,
+                                             __ATOMIC_SEQ_CST,
+                                             __ATOMIC_SEQ_CST);
         }
-    } else {
-        ok = addr == env->lladdr &&
-             cpu_ldq_mmuidx_ra(env, addr, 0, 0) == env->llval;
-        if (ok) {
-            cpu_stq_mmuidx_ra(env, addr, val, 0, 0);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
         }
     }
+    env->llvalid = 0;
     env->lladdr = UINT64_MAX;
+    env->llsize = 0;
     return ok;
 }
 

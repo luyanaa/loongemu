@@ -12,12 +12,6 @@
 #include "exec/exec-all.h"
 #include "latm-helpers.h"
 
-static void tlb_invalidate(CPUMIPSState *env, int idx)
-{
-    r4k_tlb_t *t = &env->tlb->mmu.r4k.tlb[idx];
-    memset(t, 0, sizeof(*t));
-}
-
 static uint64_t get_tlb_pfn(uint64_t entrylo)
 {
     return (entrylo >> 6) & UINT64_C(0x000003ffffffffff);
@@ -84,10 +78,57 @@ static int tlb_match(CPUMIPSState *env, int idx)
     if (!(t->G) && t->ASID != (env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask)) {
         return 0;
     }
-    if (t->MMID != env->CP0_MemoryMapID && env->CP0_Config5 & (1u << CP0C5_MI)) {
+    if (t->MMID != (uint32_t)env->CP0_MemoryMapID &&
+        (env->CP0_Config5 & (1u << CP0C5_MI))) {
         return 0;
     }
     return 1;
+}
+
+static int r4k_map_address(CPUMIPSState *env, hwaddr *physical, int *prot,
+                           target_ulong address, MMUAccessType access_type)
+{
+    uint16_t ASID = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
+    uint32_t MMID = env->CP0_MemoryMapID;
+    bool mi = !!((env->CP0_Config5 >> CP0C5_MI) & 1);
+    uint32_t tlb_mmid;
+
+    MMID = mi ? MMID : (uint32_t)ASID;
+    for (unsigned i = 0; i < env->tlb->tlb_in_use; i++) {
+        r4k_tlb_t *tlb = &env->tlb->mmu.r4k.tlb[i];
+        target_ulong mask = tlb->PageMask | ~(TARGET_PAGE_MASK << 1);
+        target_ulong tag = address & ~mask;
+        target_ulong VPN = tlb->VPN & ~mask;
+
+        tag &= env->SEGMask;
+        tlb_mmid = mi ? tlb->MMID : (uint32_t)tlb->ASID;
+        if ((tlb->G == 1 || tlb_mmid == MMID) &&
+            VPN == tag && !tlb->EHINV) {
+            int n = !!(address & mask & ~(mask >> 1));
+            if (!(n ? tlb->V1 : tlb->V0)) {
+                return TLBRET_INVALID;
+            }
+            if (access_type == MMU_INST_FETCH && (n ? tlb->XI1 : tlb->XI0)) {
+                return TLBRET_XI;
+            }
+            if (access_type == MMU_DATA_LOAD && (n ? tlb->RI1 : tlb->RI0)) {
+                return TLBRET_RI;
+            }
+            if (access_type != MMU_DATA_STORE || (n ? tlb->D1 : tlb->D0)) {
+                *physical = tlb->PFN[n] | (address & (mask >> 1));
+                *prot = PAGE_READ;
+                if (n ? tlb->D1 : tlb->D0) {
+                    *prot |= PAGE_WRITE;
+                }
+                if (!(n ? tlb->XI1 : tlb->XI0)) {
+                    *prot |= PAGE_EXEC;
+                }
+                return TLBRET_MATCH;
+            }
+            return TLBRET_DIRTY;
+        }
+    }
+    return TLBRET_NOMATCH;
 }
 
 static void r4k_tlbp(CPUMIPSState *env)
@@ -133,10 +174,24 @@ void latm_tlb_init(CPUMIPSState *env, CPUMIPSTLBContext *tlb, int nb_tlb)
 {
     memset(tlb, 0, sizeof(*tlb));
     tlb->nb_tlb = nb_tlb;
+    tlb->tlb_in_use = nb_tlb;
+    tlb->map_address = r4k_map_address;
+    tlb->helper_tlbwi = NULL;
+    tlb->helper_tlbwr = NULL;
+    tlb->helper_tlbp = NULL;
+    tlb->helper_tlbr = NULL;
     env->tlb = tlb;
     env->CP0_Random = nb_tlb - 1;
     env->CP0_EntryHi_ASID_mask = 0xff;
     env->SEGMask = (1ULL << env->SEGBITS) - 1;
+    env->PAMask = (1ULL << env->PABITS) - 1;
+    env->CP0_SegCtl0 = (CP0SC_AM_MK << CP0SC_AM) |
+                       ((CP0SC_AM_MSK << CP0SC_AM) << 16);
+    env->CP0_SegCtl1 = (CP0SC_AM_UK << CP0SC_AM) |
+                       ((CP0SC_AM_UK << CP0SC_AM) << 16) |
+                       (CP0SC_AM_UK << CP0SC1_XAM);
+    env->CP0_SegCtl2 = (2 << CP0SC_PA) | (CP0SC_AM_MUSK << CP0SC_AM) |
+                       (((0 << CP0SC_PA) | (CP0SC_AM_MUSK << CP0SC_AM)) << 16);
 }
 
 void latm_helper_tlb(CPUMIPSState *env, uint32_t op)
@@ -151,6 +206,8 @@ void latm_helper_tlb(CPUMIPSState *env, uint32_t op)
     case MIPS_TLB_TLBWR: r4k_tlbwr(env); break;
     case MIPS_TLB_TLBP:  r4k_tlbp(env); break;
     }
+    env->llvalid = 0;
+    env->lladdr = UINT64_MAX;
 }
 
 uint64_t latm_helper_cp0_read(CPUMIPSState *env, uint32_t reg, uint32_t sel)
@@ -340,6 +397,8 @@ uint32_t cpu_mips_get_count(CPUMIPSState *env)
 
 void latm_helper_eret(CPUMIPSState *env)
 {
+    env->llvalid = 0;
+    env->lladdr = UINT64_MAX;
     env->active_tc.PC = env->CP0_EPC;
     env->CP0_Status &= ~((1u << CP0St_EXL) | (1u << CP0St_ERL));
     env->hflags &= ~MIPS_HFLAG_BMASK;

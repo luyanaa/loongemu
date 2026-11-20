@@ -44,6 +44,27 @@ typedef struct ENV {
     TRANSLATION_DATA *tr_data;
 } ENV;
 
+#define LATM_JMP_CACHE_BITS 10
+#define LATM_JMP_CACHE_SIZE (1u << LATM_JMP_CACHE_BITS)
+#define LATM_JMP_CACHE_MASK (LATM_JMP_CACHE_SIZE - 1)
+
+/* Each slot is 32 bytes so generated code can index it with alsl.d. */
+typedef struct LatmJmpCacheEntry {
+    uint64_t guest_pc;
+    uint64_t host_pc;
+    uint64_t guest_size;
+    uint64_t pad;
+} LatmJmpCacheEntry;
+
+extern LatmJmpCacheEntry latm_jmp_cache[LATM_JMP_CACHE_SIZE];
+extern bool latm_have_lbt;
+extern bool latm_link_use_jiscr1;
+
+void latm_jmp_cache_add(uint64_t guest_pc, uint64_t host_pc, uint32_t guest_size);
+void latm_jmp_cache_flush(void);
+uint64_t latm_jmp_cache_lookup(uint64_t guest_pc);
+void latm_tb_register(void *tb);
+
 void lata_tr_data_init(void *env);
 void tr_init(void *tb);
 void tr_fini(void);

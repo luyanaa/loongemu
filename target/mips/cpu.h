@@ -996,8 +996,11 @@ typedef struct CPUArchState {
 /*
  * CP0 Register 17
  */
-    target_ulong lladdr; /* LL virtual address compared against SC */
+    target_ulong lladdr; /* LL virtual address (architectural/debug) */
+    target_ulong llpaddr; /* translated physical reservation address */
     target_ulong llval;
+    uint32_t llsize;
+    uint32_t llvalid;
     uint64_t llval_wp;
     uint32_t llnewval_wp;
     uint64_t CP0_LLAddr_rw_bitmask;
@@ -1190,6 +1193,8 @@ typedef struct CPUArchState {
     Clock *count_clock; /* CP0_Count clock */
     target_ulong exception_base; /* ExceptionBase input to the core */
     uint64_t shadow_gpr[16][32];
+    /* LATM TB-local live-value spill slots for branch/delay helpers. */
+    uint64_t latm_spill[4];
 } CPUMIPSState;
 
 /* Exceptions (copied from QEMU target/mips/cpu.h). */

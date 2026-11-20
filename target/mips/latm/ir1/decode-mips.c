@@ -383,13 +383,10 @@ static bool decode_cop1(MipsIR1 *ir1, uint32_t insn)
     case 0x05: ir1->op = MIPS_OP_FPU_GPR; ir1->subop = MIPS_FGPR_DMTC1; ir1->rs = fs; return true;
     case 0x06: ir1->op = MIPS_OP_FPU_GPR; ir1->subop = MIPS_FGPR_CTC1; ir1->rs = fs; return true;
     case 0x07: ir1->op = MIPS_OP_FPU_GPR; ir1->subop = MIPS_FGPR_MTHC1; ir1->rs = fs; return true;
-    case 0x08: /* BC1 */
-        if (ft > 3) {
-            return ri(ir1);
-        }
+    case 0x08: /* BC1: rt = {cc[2:0], likely, tf} */
         ir1->op = MIPS_OP_FPU_BC;
         ir1->cond = ft;
-        ir1->likely = ft >= 2;
+        ir1->likely = (ft & 2) != 0;
         ir1->link = false;
         return true;
     default:
@@ -499,10 +496,10 @@ static bool decode_cop1x(MipsIR1 *ir1, uint32_t insn)
     case 0x20: case 0x21: case 0x28: case 0x29:
     case 0x30: case 0x31: case 0x38: case 0x39:
         if (funct == 0x21 || funct == 0x29 || funct == 0x31 || funct == 0x39) {
-            /* double precision */
-            ir1->fmt = MIPS_FMT_D;
+            /* Raw CP1 format fields, matching decode_cop1(). */
+            ir1->fmt = 17;
         } else {
-            ir1->fmt = MIPS_FMT_S;
+            ir1->fmt = 16;
         }
         ir1->op = MIPS_OP_FPU_MADD;
         ir1->subop = funct == 0x20 || funct == 0x21 ? MIPS_FMADD_MADD :

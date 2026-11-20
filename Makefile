@@ -370,6 +370,18 @@ lata-smoke-run: lata-smoke-image
 test-latm-decode: build/test_latm_decode
 	./build/test_latm_decode
 
+test-latm-tlb: build/test_latm_tlb
+	./build/test_latm_tlb
+
+build/test_latm_tlb: tests/test_latm_tlb.c target/mips/latm/helpers/memory.c \
+                     target/mips/latm/helpers/cp0.c target/mips/latm/helpers/exception.c
+	@mkdir -p build
+	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
+	      -I target/mips -I latx/compat -I latx/upstream/include -I . \
+	      $(CFLAGS) -Wno-gnu-empty-struct \
+	      tests/test_latm_tlb.c target/mips/latm/helpers/memory.c \
+	      target/mips/latm/helpers/cp0.c target/mips/latm/helpers/exception.c -o $@
+
 build/test_latm_decode: tests/test_latm_decode.c target/mips/latm/ir1/decode-mips.c target/mips/latm/include/ir1.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -I target/mips/latm/include -I target/mips \
@@ -379,7 +391,7 @@ build/test_latm_decode: tests/test_latm_decode.c target/mips/latm/ir1/decode-mip
 
 # ---- LATM: MIPS64r2 -> LoongArch ----
 .PHONY: test-latm test-latm-decode latm-core latm-isa-image latm-isa-run
-test-latm: test-latm-decode latm-isa-run
+test-latm: test-latm-decode test-latm-tlb latm-isa-run
 
 # ---- bare-metal MIPS64r2 (LATM) execution harness ----
 LATM_BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \

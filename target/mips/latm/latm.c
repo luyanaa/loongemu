@@ -474,7 +474,7 @@ void store_gpr_zero(int i)
 void free_alloc_gpr(IR2_OPND opnd)
 {
     if (opnd._type == IR2_OPND_GPR && opnd._reg_num != la_zero &&
-        mips_la_reverse_map[opnd._reg_num] == NOT_DEF) {
+        reg_itemp_reverse_map[opnd._reg_num] != NOT_DEF) {
         ra_free_itemp(opnd._reg_num);
     }
 }
@@ -514,16 +514,74 @@ void lata_env_vst(IR2_OPND vector, int offset)
     la_vst(vector, env_ir2_opnd, offset);
 }
 
+LatmJmpCacheEntry latm_jmp_cache[LATM_JMP_CACHE_SIZE];
+bool latm_have_lbt = true;
+bool latm_link_use_jiscr1;
+
+static inline uint32_t latm_jmp_slot(uint64_t guest_pc)
+{
+    return (uint32_t)((guest_pc >> 2) & LATM_JMP_CACHE_MASK);
+}
+
+void latm_jmp_cache_add(uint64_t guest_pc, uint64_t host_pc, uint32_t guest_size)
+{
+    LatmJmpCacheEntry *e = &latm_jmp_cache[latm_jmp_slot(guest_pc)];
+
+    e->guest_pc = guest_pc;
+    e->host_pc = host_pc;
+    e->guest_size = guest_size;
+}
+
+void latm_jmp_cache_flush(void)
+{
+    memset(latm_jmp_cache, 0, sizeof(latm_jmp_cache));
+}
+
+uint64_t latm_jmp_cache_lookup(uint64_t guest_pc)
+{
+    LatmJmpCacheEntry *e = &latm_jmp_cache[latm_jmp_slot(guest_pc)];
+
+    return e->guest_pc == guest_pc ? e->host_pc : 0;
+}
+
+void latm_tb_register(void *tb_ptr)
+{
+    TranslationBlock *tb = tb_ptr;
+
+    if (tb && tb->tc.ptr) {
+        latm_jmp_cache_add(tb->pc, (uintptr_t)tb->tc.ptr, tb->size);
+    }
+}
+
+void latm_tb_flush_range(uint64_t start, uint64_t end)
+{
+    for (unsigned i = 0; i < LATM_JMP_CACHE_SIZE; i++) {
+        LatmJmpCacheEntry *e = &latm_jmp_cache[i];
+        uint64_t e_end;
+
+        if (!e->host_pc) {
+            continue;
+        }
+        e_end = e->guest_pc + (e->guest_size ? e->guest_size : 4);
+        if (e->guest_pc < end && start < e_end) {
+            memset(e, 0, sizeof(*e));
+        }
+    }
+#if defined(__loongarch__)
+    __asm__ volatile("ibar 0" ::: "memory");
+#endif
+}
+
 void lata_fast_jmp_cache_init(void *env, uint64_t start_code, uint64_t end_code)
 {
     (void)env;
     (void)start_code;
     (void)end_code;
+    latm_jmp_cache_flush();
 }
 
 void lata_fast_jmp_cache_add(void *env, uint64_t guest_pc, uint64_t host_pc)
 {
     (void)env;
-    (void)guest_pc;
-    (void)host_pc;
+    latm_jmp_cache_add(guest_pc, host_pc, 4);
 }
