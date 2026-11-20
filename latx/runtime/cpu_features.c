@@ -1,9 +1,17 @@
 /*
  * Runtime ISA probe for the bare translator.  The LoongArch CPUCFG.2 word
- * reports the vector extensions; x86 feature exposure is derived from them:
- *   LASX  -> x86-64-v3 style: AVX2/AVX/FMA/BMI (+ XSAVE/OSXSAVE)
- *   LSX   -> x86-64-v2 baseline: SSE4.2/POPCNT, no AVX
- *   none  -> x86-64 baseline: SSE2
+ * reports the vector extensions, and the x86 feature level follows from them:
+ *
+ *   LASX  -> x86-64-v3: v2 plus AVX/AVX2/FMA/F16C/BMI1/BMI2/LZCNT/MOVBE
+ *   LSX   -> x86-64-v2: SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT/CMPXCHG16B/LAHF
+ *   none  -> NOT USABLE.  x86-64 baseline mandates SSE and SSE2, and this
+ *            translator implements SSE on LSX; without it even v1 cannot be
+ *            honoured, so the engine refuses to start rather than exposing a
+ *            CPU that cannot run the ABI it advertises.
+ *
+ * The old policy ("none -> SSE2 baseline") claimed SSE2 on hardware that has
+ * no vector unit at all: every SSE instruction then faulted at run time, which
+ * is worse than declining to start.
  */
 #include "qemu/osdep.h"
 
@@ -47,4 +55,30 @@ int latx_cpu_has_lasx(void)
         return forced_lasx;
     }
     return (cpucfg2() & (1u << 7)) != 0;   /* CPUCFG.2[7] = LASX */
+}
+
+/*
+ * Which x86-64 microarchitecture level this host can honour.
+ *
+ * Returns 3 for v3, 2 for v2, and 0 when the host cannot run x86-64 at all
+ * (no LSX, hence no SSE/SSE2, hence not even the v1 baseline).
+ */
+int latx_cpu_x86_level(void)
+{
+    if (!latx_cpu_has_lsx()) {
+        return 0;
+    }
+    return latx_cpu_has_lasx() ? 3 : 2;
+}
+
+/*
+ * Refusal hook.  The default has to be to stop: the alternative is to hand the
+ * guest a CPU that advertises an ABI this host cannot execute.
+ */
+__attribute__((weak)) void latx_platform_refuse(const char *why)
+{
+    (void)why;
+    for (;;) {
+        __asm__ volatile("" ::: "memory");
+    }
 }

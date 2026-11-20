@@ -60,6 +60,24 @@ extern uint32_t latx_guest_apic_id;
 #define UART0_RBR ((volatile unsigned char *)0x1fe001e0)
 #define UART0_LSR ((volatile unsigned char *)0x1fe001e5)
 
+/*
+ * Called from latx_runtime_init() when the host cannot run the ABI it would
+ * otherwise advertise.  Printing the reason matters as much as stopping: the
+ * failure mode this replaces was a guest that booted and then faulted on its
+ * first SSE instruction, with nothing pointing at the real cause.
+ */
+void latx_platform_refuse(const char *why)
+{
+    latx_bare_uart_puts("loongemu: refusing to start: ");
+    latx_bare_uart_puts(why);
+    latx_bare_uart_puts("\n");
+    latx_bare_uart_puts("tb-sys: checks=0000000000000000 fails=0000000000000001");
+    latx_bare_uart_puts(" refused\n");
+    latx_bare_uart_puts("tb-sys: done\n");
+    for (;;) {
+    }
+}
+
 void latx_bare_uart_putc(int c) { *UART0_THR = (unsigned char)c; }
 void latx_bare_uart_puts(const char *s)
 {
@@ -3422,8 +3440,56 @@ void kmain(void)
     tcg_ctx = &tcg_storage;
     tcg_storage.gen_insn_data = latx_tcg_gen_insn_data;
 
+    /*
+     * Enforce the x86-64 baseline before anything is translated.
+     *
+     * See latx_platform_refuse() below: a host without LSX cannot honour even
+     * x86-64-v1, because SSE/SSE2 are part of that baseline and are executed
+     * on LSX here.
+     */
     latx_runtime_init();
     latx_x86_env_init_features(&env);
+
+    /*
+     * Report the advertised microarchitecture level, read back through the
+     * same CPUID path the guest uses.  Asserted below rather than trusted:
+     * these bits are what lscpu and any /proc/cpuinfo parser key off, and a
+     * wrong one sends a package manager off to build for the wrong ABI.
+     */
+    {
+        uint32_t a, b, c, d;
+        uint32_t lvl = (uint32_t)latx_cpu_x86_level();
+
+        cpu_x86_cpuid(&env, 0x1, 0, &a, &b, &c, &d);
+        latx_bare_uart_puts("tb-sys: x86_level=");
+        puthex(lvl);
+        latx_bare_uart_puts(" leaf1.ecx=");
+        puthex(c);
+        latx_bare_uart_puts("\n");
+        check((c & (1u << 13)) != 0, "CPUID.1:ECX[13] CMPXCHG16B");
+        check((c & (1u << 20)) != 0, "CPUID.1:ECX[20] SSE4.2");
+        check((c & (1u << 23)) != 0, "CPUID.1:ECX[23] POPCNT");
+        check((lvl < 3) || ((c & (1u << 22)) != 0),
+              "CPUID.1:ECX[22] MOVBE on v3");
+
+        cpu_x86_cpuid(&env, 0x80000001u, 0, &a, &b, &c, &d);
+        check((lvl < 3) || ((c & (1u << 5)) != 0),
+              "CPUID.80000001:ECX[5] ABM/LZCNT on v3");
+
+        cpu_x86_cpuid(&env, 0x80000008u, 0, &a, &b, &c, &d);
+        {
+            uint32_t phys = a & 0xffu;
+            uint32_t virt = (a >> 8) & 0xffu;
+
+            latx_bare_uart_puts("tb-sys: addr_bits phys=");
+            puthex(phys);
+            latx_bare_uart_puts(" virt=");
+            puthex(virt);
+            latx_bare_uart_puts("\n");
+            check(phys == 40 && virt == 48,
+                  "CPUID.80000008 address widths are 40/48");
+        }
+    }
 
     /*
      * Disable software guest-paging instrumentation: all guest memory

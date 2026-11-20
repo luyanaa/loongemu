@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Resolve through the script's own path.  `dirname` alone is relative, and the
+# old form then joined it with "/.." -- giving /Users/yanlu/Documents instead of
+# the repo, so the pid file could never be created.
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PID_FILE="$ROOT_DIR/build/qemu_tb_sys.pid"
 LOG_FILE="${QEMU_LOG:-$ROOT_DIR/build/tb_sys.log}"
@@ -28,6 +31,6 @@ fi
 
 # Replace shell with QEMU so SIGTERM/SIGKILL on this process kills QEMU directly.
 exec "$ROOT_DIR/qemu-system-loongarch64" \
-    -machine virt -cpu la464 -m 512M \
+    -machine virt -cpu "${QEMU_CPU:-la464}" -m 512M \
     -nic none -nographic -monitor none \
     -kernel "$KERNEL" > "$LOG_FILE" 2>&1

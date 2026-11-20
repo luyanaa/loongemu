@@ -448,17 +448,40 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
                        | (1u << 17) | (1u << 19) | (1u << 23) | (1u << 24)
                        | (1u << 25) | (1u << 26)
                        | (nr_cpus > 1u ? (1u << 28) : 0u); /* HTT */
-        uint32_t f_ecx = (1u << 0) | (1u << 1) | (1u << 9) | (1u << 19)
-                       | (1u << 20) | (1u << 23)
-                       | (1u << 31); /* HYPERVISOR */
+        uint32_t f_ecx = (1u << 31); /* HYPERVISOR */
 
-        /* AVX/AVX2 need 256-bit vector state, i.e. LASX on the host. */
+        /*
+         * x86-64-v2 on LSX.  These are the level's mandatory bits, and they are
+         * only claimed when the host can actually execute them: SSE* is
+         * implemented on LSX, so a host without LSX must not advertise them.
+         */
+        if (latx_cpu_has_lsx()) {
+            f_ecx |= (1u << 0)    /* SSE3        */
+                   | (1u << 1)    /* PCLMULQDQ   */
+                   | (1u << 9)    /* SSSE3       */
+                   | (1u << 13)   /* CMPXCHG16B  */
+                   | (1u << 19)   /* SSE4.1      */
+                   | (1u << 20)   /* SSE4.2      */
+                   | (1u << 23);  /* POPCNT      */
+        }
+
+        /* x86-64-v3 needs 256-bit vector state, i.e. LASX on the host. */
         if (latx_cpu_has_lasx()) {
-            f_ecx |= (1u << 12)   /* FMA    */
-                   | (1u << 26)   /* XSAVE  */
-                   | (1u << 27)   /* OSXSAVE*/
-                   | (1u << 28)   /* AVX    */
-                   | (1u << 29);  /* F16C   */
+            f_ecx |= (1u << 12)   /* FMA      */
+                   | (1u << 22)   /* MOVBE    */
+                   | (1u << 26)   /* XSAVE    */
+                   | (1u << 28)   /* AVX      */
+                   | (1u << 29);  /* F16C     */
+
+            /*
+             * OSXSAVE is not a capability of the CPU: it reports whether the
+             * OS enabled the state-saving interface (CR4.OSXSAVE).  A guest
+             * reads it to decide whether XSAVE/XRSTOR are usable, so it has to
+             * follow the guest's own CR4 rather than be constant.
+             */
+            if (env != NULL && (env->cr[4] & CR4_OSXSAVE_MASK)) {
+                f_ecx |= (1u << 27);  /* OSXSAVE */
+            }
         }
         *eax = 0x000306f2u;
         *ebx = ((apic_id & 0xffu) << 24) | ((nr_cpus & 0xffu) << 16) | (8u << 8);
@@ -582,12 +605,22 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
         cpuid_vendor(ebx, edx, ecx);
     } else if (index == 0x80000001u) {
         *ecx = (1u << 0);            /* LAHF/SAHF */
+        if (latx_cpu_has_lasx()) {
+            *ecx |= (1u << 5);       /* ABM (LZCNT) -- x86-64-v3 */
+        }
         *edx = (1u << 11)            /* SYSCALL/SYSRET */
              | (1u << 20)            /* NX */
              | (1u << 26)            /* 1 GiB pages */
              | (1u << 29);           /* long mode */
     } else if (index == 0x80000008u) {
-        *eax = ((40u - 1u) << 8) | (48u - 1u);
+        /*
+         * [7:0] = physical address bits, [15:8] = virtual address bits, both
+         * reported directly (not as a "minus one").  The previous encoding
+         * had the two fields swapped and subtracted one from each, so lscpu
+         * printed "39 bits physical, 47 bits virtual" for a guest whose page
+         * walker is 40/48.
+         */
+        *eax = (48u << 8) | 40u;
     } else if (index >= 0x80000002u && index <= 0x80000004u) {
         static const char brand[49] =
             "LoongEMU x86_64 Virtual CPU";

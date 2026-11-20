@@ -11,6 +11,25 @@
 
 void latx_runtime_init(void)
 {
+    /*
+     * Vector-extension policy, decided once at bring-up.
+     *
+     * AVX/AVX2 need 256-bit vector state, which this engine gets from LASX; the
+     * option is bound to the actual hardware rather than left to a default, so
+     * a translator built for a 3A5000-class host cannot emit xv* on a
+     * 2K2000-class one.
+     *
+     * A host with no LSX cannot run x86-64 at all: SSE and SSE2 are part of the
+     * baseline ABI and are implemented on LSX here.  Refusing at start is the
+     * only honest answer -- exposing SSE2 on such a host means the first SSE
+     * instruction faults in the guest with no explanation.
+     */
+    option_enable_lasx = latx_cpu_has_lasx();
+    if (!latx_cpu_has_lsx()) {
+        latx_platform_refuse(
+            "this host has no LSX: x86-64 requires SSE/SSE2 (x86-64-v1)");
+    }
+
     env_ir2_opnd = INIT_RA(IR2_OPND_GPR, reg_statics_map[S_ENV]);
 
     imm_zero_ir2_opnd = INIT_IMM(0);
