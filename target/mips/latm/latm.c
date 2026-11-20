@@ -60,8 +60,25 @@ uint64_t context_switch_bt_to_native;
 uint64_t context_switch_native_to_bt_ret_0;
 uint64_t context_switch_native_to_bt;
 
+static int global_register_init_state;
+
 static void global_register_init(void)
 {
+    int expected = 0;
+    int state = __atomic_load_n(&global_register_init_state, __ATOMIC_ACQUIRE);
+
+    if (state == 2) {
+        return;
+    }
+    if (!__atomic_compare_exchange_n(&global_register_init_state, &expected, 1,
+                                     false, __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE)) {
+        while (__atomic_load_n(&global_register_init_state,
+                               __ATOMIC_ACQUIRE) != 2) {
+        }
+        return;
+    }
+
     env_ir2_opnd = INIT_RA(IR2_OPND_GPR, reg_statics_map[S_ENV]);
     zero_ir2_opnd = INIT_RA(IR2_OPND_GPR, la_zero);
     ra_ir2_opnd = INIT_RA(IR2_OPND_GPR, la_ra);
@@ -112,6 +129,7 @@ static void global_register_init(void)
     scr1_ir2_opnd = INIT_RA(IR2_OPND_SCR, 1);
     scr2_ir2_opnd = INIT_RA(IR2_OPND_SCR, 2);
     scr3_ir2_opnd = INIT_RA(IR2_OPND_SCR, 3);
+    __atomic_store_n(&global_register_init_state, 2, __ATOMIC_RELEASE);
 }
 
 #if defined(CONFIG_LATM_TRANSLATE_TLS)
