@@ -100,6 +100,7 @@ static void check(int cond, const char *what)
 static uint8_t uart_tx[64];
 static int uart_tx_count;
 static uint8_t uart_ier;
+static int uart_thre_pending;
 static uint8_t uart_fcr;
 static uint8_t uart_lcr;
 static uint8_t uart_mcr;
@@ -112,7 +113,7 @@ static volatile uint64_t g_pit_port_writes;
 static volatile uint64_t g_pci_config_writes;
 static volatile uint64_t g_apic_mmio_reads;
 static volatile uint64_t g_apic_mmio_writes;
-#define MAX_VCPUS 2u
+#define MAX_VCPUS 4u
 
 typedef struct LapicState {
     uint32_t tpr;
@@ -178,7 +179,8 @@ uint64_t latx_platform_io_read(uint32_t port, int size)
             if (((*UART0_LSR) & 0x01u) && (uart_ier & 0x01u)) {
                 return fifo | 0x04u;
             }
-            if (uart_ier & 0x02u) {
+            if ((uart_ier & 0x02u) && uart_thre_pending) {
+                uart_thre_pending = 0;
                 return fifo | 0x02u;
             }
             return fifo | 0x01u;
@@ -253,12 +255,21 @@ void latx_platform_io_write(uint32_t port, int size, uint64_t value)
             }
             uart_tx_count++;
             latx_bare_uart_putc((int)v);
+            if (uart_ier & 0x02u) {
+                uart_thre_pending = 1;
+            }
             return;
         case 1: /* IER / DLM */
             if (uart_lcr & 0x80u) {
                 uart_dlm = v;
             } else {
-                uart_ier = v & 0x0fu;
+                uint8_t new_ier = v & 0x0fu;
+                if ((new_ier & 0x02u) && !(uart_ier & 0x02u)) {
+                    uart_thre_pending = 1;
+                } else if (!(new_ier & 0x02u)) {
+                    uart_thre_pending = 0;
+                }
+                uart_ier = new_ier;
             }
             return;
         case 2: /* FCR */
@@ -1743,12 +1754,34 @@ static uint32_t com1_irq_vector(void)
     return 0;
 }
 
+static int com1_irq_dest_match(uint32_t cpu)
+{
+    uint64_t red = g_ioapic_redtbl[4];
+    if ((red & (1ULL << 16)) == 0 && (red & 0xffu) >= 0x20u) {
+        uint32_t dest = (uint32_t)((red >> 56) & 0xffu);
+        uint32_t dest_mode = (uint32_t)((red >> 11) & 1u);
+        if (dest_mode == 0u) {
+            return (dest == 0xffu) ? (cpu == 0) : (cpu == dest);
+        } else {
+            uint32_t ldr_id = (g_lapic[cpu].ldr >> 24) & 0xffu;
+            if (ldr_id == 0u) {
+                ldr_id = (1u << cpu);
+            }
+            return (ldr_id & dest) != 0u;
+        }
+    }
+    if ((g_pic_imr[0] & (1u << 4)) == 0) {
+        return cpu == 0;
+    }
+    return 0;
+}
+
 static int com1_irq_pending(void)
 {
     if ((uart_mcr & 0x08u) == 0 || com1_irq_vector() == 0) {
         return 0;
     }
-    if ((uart_ier & 0x02u) != 0) {
+    if ((uart_ier & 0x02u) != 0 && uart_thre_pending) {
         return 1;
     }
     if ((uart_ier & 0x01u) != 0 && ((*UART0_LSR) & 0x01u) != 0) {
@@ -2011,7 +2044,7 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
     g_vcpu_preempt_needed = 0;
     g_plv3_timer_preempt = 1;
     timer_ack();
-    timer_start(250000);
+    timer_start(100000);
 
     while (ran < max_blocks) {
         for (uint32_t t = 1; t < MAX_VCPUS; t++) {
@@ -2233,7 +2266,7 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
                     prev_slot = -1;
                     continue;
                 }
-                if (g_cur_vcpu == 0 && com1_irq_pending()) {
+                if (com1_irq_dest_match(g_cur_vcpu) && com1_irq_pending()) {
                     uint32_t cvec = com1_irq_vector();
                     if (cvec != 0 && deliver_kernel_irq(cvec, irq_rip)) {
                         g_vcpu_halted[g_cur_vcpu] = 0;
@@ -2247,25 +2280,41 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
                 if (deliver_kernel_timer_tick(irq_rip)) {
                     g_timer_irq_pending[g_cur_vcpu] = 0;
                     g_vcpu_halted[g_cur_vcpu] = 0;
-                    timer_start(250000);
+                    timer_start(100000);
                     stuck = 0;
                     prev_slot = -1;
                     continue;
                 }
             }
             if (is_hlt && (env.eflags & IF_MASK) != 0) {
-                uint32_t next_cpu = (g_cur_vcpu + 1u) % MAX_VCPUS;
-                if (MAX_VCPUS > 1u && g_vcpu_online[next_cpu] && !g_vcpu_halted[next_cpu]) {
-                    g_vcpu_halted[g_cur_vcpu] = 1;
-                    switch_vcpu(next_cpu);
-                    prev_slot = -1;
-                    stuck = 0;
-                    continue;
+                if (MAX_VCPUS > 1u) {
+                    uint32_t target = MAX_VCPUS;
+                    for (uint32_t step = 1; step < MAX_VCPUS; step++) {
+                        uint32_t c = (g_cur_vcpu + step) % MAX_VCPUS;
+                        int urg = g_vcpu_nmi_pending[c] ||
+                                  (lapic_has_irr(c) &&
+                                   (g_vcpu_save[c].eflags & IF_MASK) != 0) ||
+                                  (g_timer_irq_pending[c] &&
+                                   (g_vcpu_save[c].eflags & IF_MASK) != 0) ||
+                                  (com1_irq_dest_match(c) && com1_irq_pending() &&
+                                   (g_vcpu_save[c].eflags & IF_MASK) != 0);
+                        if (g_vcpu_online[c] && (!g_vcpu_halted[c] || urg)) {
+                            target = c;
+                            break;
+                        }
+                    }
+                    if (target < MAX_VCPUS) {
+                        g_vcpu_halted[g_cur_vcpu] = 1;
+                        switch_vcpu(target);
+                        prev_slot = -1;
+                        stuck = 0;
+                        continue;
+                    }
                 }
                 if (deliver_kernel_timer_tick(env.eip + 1)) {
                     g_timer_irq_pending[g_cur_vcpu] = 0;
                     timer_ack();
-                    timer_start(250000);
+                    timer_start(100000);
                     g_vcpu_halted[g_cur_vcpu] = 0;
                     stuck = 0;
                     prev_slot = -1;
@@ -2273,16 +2322,33 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
                 }
             }
             if (MAX_VCPUS > 1u) {
-                uint32_t next_cpu = (g_cur_vcpu + 1u) % MAX_VCPUS;
-                int urgent = g_vcpu_nmi_pending[next_cpu] || lapic_has_irr(next_cpu);
-                if (g_vcpu_preempt_needed || (ran & 127) == 0 || urgent) {
-                    g_vcpu_preempt_needed = 0;
-                    if (g_vcpu_online[next_cpu] && (!g_vcpu_halted[next_cpu] || urgent)) {
-                        switch_vcpu(next_cpu);
-                        prev_slot = -1;
-                        stuck = 0;
-                        continue;
+                uint32_t target = MAX_VCPUS;
+                for (uint32_t step = 1; step < MAX_VCPUS; step++) {
+                    uint32_t c = (g_cur_vcpu + step) % MAX_VCPUS;
+                    if (g_vcpu_online[c] &&
+                        (g_vcpu_nmi_pending[c] ||
+                         (lapic_has_irr(c) &&
+                          (g_vcpu_save[c].eflags & IF_MASK) != 0))) {
+                        target = c;
+                        break;
                     }
+                }
+                if (target == MAX_VCPUS && (g_vcpu_preempt_needed || (ran & 127) == 0)) {
+                    g_vcpu_preempt_needed = 0;
+                    for (uint32_t step = 1; step < MAX_VCPUS; step++) {
+                        uint32_t c = (g_cur_vcpu + step) % MAX_VCPUS;
+                        if (g_vcpu_online[c] && !g_vcpu_halted[c]) {
+                            target = c;
+                            break;
+                        }
+                    }
+                }
+                if (target < MAX_VCPUS) {
+                    g_vcpu_preempt_needed = 0;
+                    switch_vcpu(target);
+                    prev_slot = -1;
+                    stuck = 0;
+                    continue;
                 }
             }
         }
@@ -2305,7 +2371,10 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
             }
 
             if (fp == last_fp) {
-                if (++stuck >= 16) {
+                if (++stuck >= 4 && MAX_VCPUS > 1u && env.idt.base != 0) {
+                    g_vcpu_preempt_needed = 1;
+                }
+                if (stuck >= 16 && env.idt.base == 0) {
                     g_run_blocks_exit = RUN_EXIT_STUCK;
                     break;
                 }
@@ -2693,6 +2762,45 @@ void latx_platform_cpu_loop_exit(CPUState *cs)
     }
 }
 
+static void unlink_tb_at_pc(uint64_t fault_pc)
+{
+    int found_slot = -1;
+    if (g_current_tb_map != 0 &&
+        fault_pc >= g_current_tb_code &&
+        fault_pc < g_current_tb_code + (uint64_t)g_current_tb_size) {
+        found_slot = (int)(g_current_tb_map - tb_insn_maps);
+    } else {
+        for (uint32_t i = 0; i < g_tb_highwater; i++) {
+            if (tb_entries[i].used &&
+                fault_pc >= tb_entries[i].code &&
+                fault_pc < tb_entries[i].code + (uint64_t)tb_entries[i].code_size) {
+                found_slot = (int)i;
+                break;
+            }
+        }
+    }
+    if (found_slot >= 0) {
+        TbCacheEntry *e = &tb_entries[found_slot];
+        TbInsnMap *map = &tb_insn_maps[found_slot];
+        int unlinked = 0;
+        for (int j = 0; j < 2; j++) {
+            if (map->jmp_slot_off[j] >= 0) {
+                uint32_t *slot_ptr =
+                    (uint32_t *)(uintptr_t)(e->code + (uint64_t)map->jmp_slot_off[j]);
+                if (*slot_ptr != 0x03400000u) {
+                    *slot_ptr = 0x03400000u;
+                    unlinked = 1;
+                }
+            }
+        }
+        if (unlinked) {
+            __asm__ volatile("ibar 0" ::: "memory");
+        } else if (map->jmp_slot_off[0] < 0 && map->jmp_slot_off[1] < 0) {
+            memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
+        }
+    }
+}
+
 void tb_sys_handle_trap(uint64_t *regs)
 {
     uint64_t tlbrera = csrrd(0x8a);
@@ -2734,19 +2842,24 @@ void tb_sys_handle_trap(uint64_t *regs)
             }
             if (g_plv3_timer_preempt) {
                 uint64_t exact_rip = 0;
-                uint32_t other_cpu = (g_cur_vcpu + 1u) % MAX_VCPUS;
-                int smp_yield = (MAX_VCPUS > 1u) && g_vcpu_online[other_cpu];
+                int smp_yield = 0;
+                for (uint32_t c = 0; c < MAX_VCPUS; c++) {
+                    if (c != g_cur_vcpu && g_vcpu_online[c]) {
+                        smp_yield = 1;
+                        break;
+                    }
+                }
                 int can_irq = ((env.eflags & IF_MASK) != 0 && env.idt.base != 0);
                 if (!can_irq && !smp_yield) {
                     g_timer_masked++;
                     g_timer_irq_pending[g_cur_vcpu] = 0;
-                    timer_start(250000);
+                    timer_start(100000);
                     return;
                 }
                 if (fault_pc == (uint64_t)(uintptr_t)pro_buf) {
                     if (can_irq && deliver_kernel_timer_tick(env.eip)) {
                         g_timer_irq_pending[g_cur_vcpu] = 0;
-                        timer_start(250000);
+                        timer_start(100000);
                         g_vcpu_preempt_needed = smp_yield;
                         g_plv3_exit.reason = PLV3_EXIT_NORMAL;
                         g_plv3_exit.guest_rip = env.eip;
@@ -2756,7 +2869,7 @@ void tb_sys_handle_trap(uint64_t *regs)
                     }
                     if (smp_yield) {
                         g_vcpu_preempt_needed = 1;
-                        timer_start(250000);
+                        timer_start(100000);
                         g_plv3_exit.reason = PLV3_EXIT_NORMAL;
                         g_plv3_exit.guest_rip = env.eip;
                         csrwr(0x1, csrrd(0x1) & ~UINT64_C(0x7));
@@ -2764,7 +2877,7 @@ void tb_sys_handle_trap(uint64_t *regs)
                         return;
                     }
                     g_timer_irq_pending[g_cur_vcpu] = 0;
-                    timer_start(250000);
+                    timer_start(100000);
                     return;
                 }
                 if (resolve_exact_insn_boundary_x86_pc(fault_pc, &exact_rip)) {
@@ -2772,7 +2885,7 @@ void tb_sys_handle_trap(uint64_t *regs)
                     can_irq = ((env.eflags & IF_MASK) != 0 && env.idt.base != 0);
                     if (can_irq && deliver_kernel_timer_tick(exact_rip)) {
                         g_timer_irq_pending[g_cur_vcpu] = 0;
-                        timer_start(250000);
+                        timer_start(100000);
                         g_vcpu_preempt_needed = smp_yield;
                         g_plv3_exit.reason = PLV3_EXIT_NORMAL;
                         g_plv3_exit.guest_rip = env.eip;
@@ -2783,7 +2896,7 @@ void tb_sys_handle_trap(uint64_t *regs)
                     if (smp_yield) {
                         env.eip = exact_rip;
                         g_vcpu_preempt_needed = 1;
-                        timer_start(250000);
+                        timer_start(100000);
                         g_plv3_exit.reason = PLV3_EXIT_NORMAL;
                         g_plv3_exit.guest_rip = env.eip;
                         csrwr(0x1, csrrd(0x1) & ~UINT64_C(0x7));
@@ -2791,7 +2904,7 @@ void tb_sys_handle_trap(uint64_t *regs)
                         return;
                     }
                     g_timer_irq_pending[g_cur_vcpu] = 0;
-                    timer_start(250000);
+                    timer_start(100000);
                 } else {
                     if (can_irq) {
                         g_timer_irq_pending[g_cur_vcpu] = 1;
@@ -2799,7 +2912,8 @@ void tb_sys_handle_trap(uint64_t *regs)
                     if (smp_yield) {
                         g_vcpu_preempt_needed = 1;
                     }
-                    timer_start(5003);
+                    unlink_tb_at_pc(fault_pc);
+                    timer_start(100000);
                 }
                 return;
             }
@@ -4293,7 +4407,7 @@ void kmain(void)
                     uint64_t cmdline_gpa = 0x00020000ULL;
                     static const char cmdline[] =
                         "earlycon=uart,io,0x3f8,115200n8 console=ttyS0,115200 "
-                        "nokaslr mitigations=off rdinit=/init";
+                        "nokaslr mitigations=off no_timer_check tsc=reliable rdinit=/init";
                     LoongemuAcpiInfo acpi_info;
                     uint64_t e0_addr = 0x00000000ULL;
                     uint64_t e0_size = 0x0009fc00ULL;
