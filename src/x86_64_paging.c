@@ -52,10 +52,36 @@ static int read_entry(const X86PagingMemory *memory, uint64_t address,
     return memory->read_u64(memory->opaque, address, entry);
 }
 
+/*
+ * Update A/D bits on one paging entry.
+ * Returns 0 on success (*entry updated), 1 on CAS mismatch (restart walk from
+ * CR3 so concurrent PTE replacement by another vCPU is never raced), or < 0
+ * on memory error.
+ */
 static int update_entry(const X86PagingMemory *memory, uint64_t address,
                         uint64_t bits, uint64_t *entry)
 {
-    return memory->atomic_or_u64(memory->opaque, address, bits, entry);
+    if ((*entry & bits) == bits) {
+        return 0;
+    }
+    if (memory->cmpxchg_u64 != 0) {
+        uint64_t expected = *entry;
+        uint64_t desired = expected | bits;
+        int rc = memory->cmpxchg_u64(memory->opaque, address, &expected, desired);
+        if (rc == 0) {
+            *entry = desired;
+            return 0;
+        }
+        if (rc > 0) {
+            *entry = expected;
+            return 1; /* CAS mismatch: restart walk from CR3 */
+        }
+        return -1;
+    }
+    if (memory->atomic_or_u64 != 0) {
+        return memory->atomic_or_u64(memory->opaque, address, bits, entry);
+    }
+    return -1;
 }
 
 static int is_canonical_48(uint64_t address)
@@ -162,7 +188,8 @@ X86PagingResult x86_64_walk_page_tables(
     int large_page = 0;
 
     if (state == 0 || memory == 0 || translation == 0 ||
-        memory->read_u64 == 0 || memory->atomic_or_u64 == 0 ||
+        memory->read_u64 == 0 ||
+        (memory->cmpxchg_u64 == 0 && memory->atomic_or_u64 == 0) ||
         state->cpl > 3 || state->maxphyaddr < 32 ||
         state->maxphyaddr > 52 || access < X86_PAGING_READ ||
         access > X86_PAGING_EXECUTE) {
@@ -187,100 +214,124 @@ X86PagingResult x86_64_walk_page_tables(
     if (!cr3_is_valid(state, address_mask)) {
         return X86_PAGING_INVALID_STATE;
     }
-    table_address = state->cr3 & address_mask;
 
-    for (level = 4; level != 0; --level) {
-        uint64_t index = (linear_address >> shifts[4 - level]) & 0x1ff;
-        uint64_t entry_address = table_address + index * sizeof(uint64_t);
+    for (int attempt = 0; attempt < 8; attempt++) {
+        int cas_restart = 0;
+        table_address = state->cr3 & address_mask;
+        entry = 0;
+        leaf_address = 0;
+        effective = UINT64_MAX;
+        effective_nx = 0;
+        large_page = 0;
 
-        if (read_entry(memory, entry_address, &entry) != 0) {
-            return X86_PAGING_MEMORY_ERROR;
-        }
-        if (!(entry & ENTRY_PRESENT)) {
-            return page_fault(state, linear_address, access, 0, fault);
-        }
+        for (level = 4; level != 0; --level) {
+            uint64_t index = (linear_address >> shifts[4 - level]) & 0x1ff;
+            uint64_t entry_address = table_address + index * sizeof(uint64_t);
+            int urc;
 
-        large_page = (level == 3 || level == 2) && (entry & ENTRY_PS);
-        if (entry_has_reserved_bits(state, entry, level, large_page,
-                                    address_mask)) {
-            return page_fault(state, linear_address, access,
-                              access_error_bits(state, access) |
-                                  X86_PF_PRESENT | X86_PF_RESERVED,
-                              fault);
-        }
-
-        if (update_entry(memory, entry_address, ENTRY_ACCESSED, &entry) != 0) {
-            return X86_PAGING_MEMORY_ERROR;
-        }
-        effective &= entry & ~ENTRY_NX;
-        effective_nx |= (entry & ENTRY_NX) != 0;
-
-        if (level == 1 || large_page) {
-            leaf_address = entry_address;
-            break;
-        }
-        table_address = entry & address_mask;
-    }
-
-    {
-        int user_page = (effective & ENTRY_USER) != 0;
-        int writable = (effective & ENTRY_WRITE) != 0;
-        int executable = !effective_nx;
-        int user_access = state->cpl == 3;
-        int denied = user_access && !user_page;
-
-        if (access == X86_PAGING_WRITE && !writable &&
-            (user_access || (state->cr0 & X86_CR0_WP))) {
-            denied = 1;
-        }
-        if (access == X86_PAGING_EXECUTE && !executable) {
-            denied = 1;
-        }
-        if (access == X86_PAGING_EXECUTE && !user_access && user_page &&
-            (state->cr4 & X86_CR4_SMEP)) {
-            denied = 1;
-        }
-        if (access != X86_PAGING_EXECUTE && !user_access && user_page &&
-            (state->cr4 & X86_CR4_SMAP) &&
-            !(state->rflags & RFLAGS_AC)) {
-            denied = 1;
-        }
-        if (protection_key_denies(state, entry, access, user_page)) {
-            if (fault != 0) {
-                fault->linear_address = linear_address;
-                fault->error_code = access_error_bits(state, access) |
-                                    X86_PF_PRESENT | X86_PF_PROTECTION_KEY;
-            }
-            return X86_PAGING_PAGE_FAULT;
-        }
-        if (denied) {
-            return page_fault(state, linear_address, access,
-                              X86_PF_PRESENT, fault);
-        }
-        if (access == X86_PAGING_WRITE) {
-            if (update_entry(memory, leaf_address, ENTRY_DIRTY, &entry) != 0) {
+            if (read_entry(memory, entry_address, &entry) != 0) {
                 return X86_PAGING_MEMORY_ERROR;
             }
+            if (!(entry & ENTRY_PRESENT)) {
+                return page_fault(state, linear_address, access, 0, fault);
+            }
+
+            large_page = (level == 3 || level == 2) && (entry & ENTRY_PS);
+            if (entry_has_reserved_bits(state, entry, level, large_page,
+                                        address_mask)) {
+                return page_fault(state, linear_address, access,
+                                  access_error_bits(state, access) |
+                                      X86_PF_PRESENT | X86_PF_RESERVED,
+                                  fault);
+            }
+
+            urc = update_entry(memory, entry_address, ENTRY_ACCESSED, &entry);
+            if (urc < 0) {
+                return X86_PAGING_MEMORY_ERROR;
+            }
+            if (urc > 0) {
+                cas_restart = 1;
+                break;
+            }
+            effective &= entry & ~ENTRY_NX;
+            effective_nx |= (entry & ENTRY_NX) != 0;
+
+            if (level == 1 || large_page) {
+                leaf_address = entry_address;
+                break;
+            }
+            table_address = entry & address_mask;
+        }
+        if (cas_restart) {
+            continue;
         }
 
         {
-            uint64_t page_shift = large_page ? (level == 3 ? 30 : 21) : 12;
-            uint64_t page_size = UINT64_C(1) << page_shift;
-            uint64_t page_base = (entry & address_mask) & ~(page_size - 1);
+            int user_page = (effective & ENTRY_USER) != 0;
+            int writable = (effective & ENTRY_WRITE) != 0;
+            int executable = !effective_nx;
+            int user_access = state->cpl == 3;
+            int denied = user_access && !user_page;
 
-            translation->guest_physical_address =
-                page_base | (linear_address & (page_size - 1));
-            translation->page_size = page_size;
-            translation->leaf_pte = entry;
-            translation->writable = (uint8_t)writable;
-            translation->user_accessible = (uint8_t)user_page;
-            translation->executable = (uint8_t)executable;
-            translation->global = (uint8_t)(((state->cr4 & X86_CR4_PGE) != 0) &&
-                                            ((entry & ENTRY_GLOBAL) != 0));
-            translation->pkey = (uint8_t)((entry & ENTRY_PKEY_MASK) >> 59);
-            translation->dirty = (uint8_t)((entry & ENTRY_DIRTY) != 0);
+            if (access == X86_PAGING_WRITE && !writable &&
+                (user_access || (state->cr0 & X86_CR0_WP))) {
+                denied = 1;
+            }
+            if (access == X86_PAGING_EXECUTE && !executable) {
+                denied = 1;
+            }
+            if (access == X86_PAGING_EXECUTE && !user_access && user_page &&
+                (state->cr4 & X86_CR4_SMEP)) {
+                denied = 1;
+            }
+            if (access != X86_PAGING_EXECUTE && !user_access && user_page &&
+                (state->cr4 & X86_CR4_SMAP) &&
+                !(state->rflags & RFLAGS_AC)) {
+                denied = 1;
+            }
+            if (protection_key_denies(state, entry, access, user_page)) {
+                if (fault != 0) {
+                    fault->linear_address = linear_address;
+                    fault->error_code = access_error_bits(state, access) |
+                                        X86_PF_PRESENT | X86_PF_PROTECTION_KEY;
+                }
+                return X86_PAGING_PAGE_FAULT;
+            }
+            if (denied) {
+                return page_fault(state, linear_address, access,
+                                  X86_PF_PRESENT, fault);
+            }
+            if (access == X86_PAGING_WRITE) {
+                int urc = update_entry(memory, leaf_address, ENTRY_DIRTY, &entry);
+                if (urc < 0) {
+                    return X86_PAGING_MEMORY_ERROR;
+                }
+                if (urc > 0) {
+                    continue; /* CAS mismatch on D-bit: restart walk from CR3 */
+                }
+            }
+
+            {
+                uint64_t page_shift = large_page ? (level == 3 ? 30 : 21) : 12;
+                uint64_t page_size = UINT64_C(1) << page_shift;
+                uint64_t page_base = (entry & address_mask) & ~(page_size - 1);
+
+                translation->guest_physical_address =
+                    page_base | (linear_address & (page_size - 1));
+                translation->page_size = page_size;
+                translation->leaf_pte = entry;
+                translation->writable = (uint8_t)writable;
+                translation->user_accessible = (uint8_t)user_page;
+                translation->executable = (uint8_t)executable;
+                translation->global = (uint8_t)(((state->cr4 & X86_CR4_PGE) != 0) &&
+                                                ((entry & ENTRY_GLOBAL) != 0));
+                translation->pkey = (uint8_t)((entry & ENTRY_PKEY_MASK) >> 59);
+                translation->dirty = (uint8_t)((entry & ENTRY_DIRTY) != 0);
+            }
         }
+
+        return X86_PAGING_OK;
     }
 
-    return X86_PAGING_OK;
+    return X86_PAGING_MEMORY_ERROR;
 }

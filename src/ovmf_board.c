@@ -114,14 +114,55 @@ static void ovmf_cmos_init(OvmfBoard *b)
     b->cmos[0x5f] = (uint8_t)(b->nr_cpus > 0 ? (b->nr_cpus - 1u) : 0u);
 }
 
-void ovmf_board_init(OvmfBoard *b, uint64_t ram_size, uint32_t nr_cpus,
-                     OvmfPhysReadFn phys_read, OvmfPhysWriteFn phys_write)
+static uint8_t ovmf_to_bcd(uint32_t v)
 {
+    return (uint8_t)(((v / 10u) << 4) | (v % 10u));
+}
+
+static void ovmf_rtc_refresh_from_epoch(OvmfBoard *b, uint64_t unix_sec)
+{
+    uint64_t days = unix_sec / 86400ULL;
+    uint32_t sod = (uint32_t)(unix_sec % 86400ULL);
+    uint32_t hour = sod / 3600u;
+    uint32_t minute = (sod % 3600u) / 60u;
+    uint32_t second = sod % 60u;
+    int64_t z = (int64_t)days + 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    uint32_t doe = (uint32_t)(z - era * 146097);
+    uint32_t yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
+    int64_t y = (int64_t)yoe + era * 400;
+    uint32_t doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);
+    uint32_t mp = (5u * doy + 2u) / 153u;
+    uint32_t day = doy - (153u * mp + 2u) / 5u + 1u;
+    uint32_t month = mp + (mp < 10u ? 3u : (uint32_t)-9);
+    if (month <= 2u) {
+        y += 1;
+    }
+    uint32_t year = (y >= 1970 && y <= 9999) ? (uint32_t)y : 2026u;
+    uint32_t dow = (uint32_t)((days + 4ULL) % 7ULL) + 1u;
+
+    b->cmos[0x00] = ovmf_to_bcd(second);
+    b->cmos[0x02] = ovmf_to_bcd(minute);
+    b->cmos[0x04] = ovmf_to_bcd(hour);
+    b->cmos[0x06] = ovmf_to_bcd(dow);
+    b->cmos[0x07] = ovmf_to_bcd(day);
+    b->cmos[0x08] = ovmf_to_bcd(month);
+    b->cmos[0x09] = ovmf_to_bcd(year % 100u);
+    b->cmos[0x32] = ovmf_to_bcd(year / 100u);
+}
+
+void ovmf_board_init(OvmfBoard *b, uint64_t ram_size, uint32_t nr_cpus,
+                     OvmfPhysReadCheckedFn phys_read_checked,
+                     OvmfPhysWriteCheckedFn phys_write_checked)
+{
+    if (!b) {
+        return;
+    }
     ovmf_memset(b, 0, sizeof(*b));
     b->ram_size = ram_size;
     b->nr_cpus = nr_cpus ? nr_cpus : 1u;
-    b->phys_read = phys_read;
-    b->phys_write = phys_write;
+    b->phys_read_checked = phys_read_checked;
+    b->phys_write_checked = phys_write_checked;
     ovmf_cmos_init(b);
 
     /* Populate default etc/e820 table (3 entries: low RAM, ACPI, high RAM). */
@@ -140,6 +181,18 @@ void ovmf_board_init(OvmfBoard *b, uint64_t ram_size, uint32_t nr_cpus,
     b->e820_len = 60u;
 
     ovmf_board_add_file(b, "etc/e820", b->e820_buf, b->e820_len);
+}
+
+void ovmf_board_set_wall_clock(OvmfBoard *b, OvmfWallTimeSecFn fn, void *opaque)
+{
+    if (!b) {
+        return;
+    }
+    b->wall_time_fn = fn;
+    b->wall_time_opaque = opaque;
+    if (fn != 0) {
+        ovmf_rtc_refresh_from_epoch(b, fn(opaque));
+    }
 }
 
 uint16_t ovmf_board_add_file(OvmfBoard *b, const char *name,
@@ -257,29 +310,74 @@ static uint8_t fw_cfg_read_byte(OvmfBoard *b)
 
 static void fw_cfg_do_dma(OvmfBoard *b, uint64_t dma_gpa)
 {
-    if (!b->phys_read || !b->phys_write) {
+    uint64_t raw_ctrl = 0, raw_len = 0, raw_addr = 0;
+    uint32_t ctrl, len;
+    uint64_t addr;
+    uint32_t status = 0;
+
+    if (!b->phys_read_checked || !b->phys_write_checked) {
         return;
     }
-    uint32_t ctrl = ovmf_bswap32((uint32_t)b->phys_read(dma_gpa + 0u, 4));
-    uint32_t len = ovmf_bswap32((uint32_t)b->phys_read(dma_gpa + 4u, 4));
-    uint64_t addr = ovmf_bswap64(b->phys_read(dma_gpa + 8u, 8));
+    /* Validate 16-byte DMA descriptor does not wrap and is readable guest RAM. */
+    if (dma_gpa + 16ULL < dma_gpa ||
+        !b->phys_read_checked(dma_gpa + 0u, 4, &raw_ctrl) ||
+        !b->phys_read_checked(dma_gpa + 4u, 4, &raw_len) ||
+        !b->phys_read_checked(dma_gpa + 8u, 8, &raw_addr)) {
+        (void)b->phys_write_checked(dma_gpa, 4, ovmf_bswap32(FW_CFG_DMA_CTL_ERROR));
+        return;
+    }
+    ctrl = ovmf_bswap32((uint32_t)raw_ctrl);
+    len = ovmf_bswap32((uint32_t)raw_len);
+    addr = ovmf_bswap64(raw_addr);
 
     if (ctrl & FW_CFG_DMA_CTL_SELECT) {
         b->fw_cfg_sel = (uint16_t)(ctrl >> 16);
         b->fw_cfg_off = 0;
     }
-    if (ctrl & FW_CFG_DMA_CTL_READ) {
-        for (uint32_t i = 0; i < len; i++) {
-            uint8_t byte = fw_cfg_read_byte(b);
-            b->phys_write(addr + i, 1, byte);
+
+    if (len > LOONGEMU_FW_CFG_DMA_MAX_LEN) {
+        status = FW_CFG_DMA_CTL_ERROR;
+    } else if (ctrl & FW_CFG_DMA_CTL_READ) {
+        if (len > 0u && (addr + (uint64_t)len < addr)) {
+            status = FW_CFG_DMA_CTL_ERROR;
+        } else {
+            /* Validate endpoints and transfer in bounded chunks via checked RAM writes. */
+            uint32_t done = 0;
+            while (done < len) {
+                uint32_t chunk = len - done;
+                if (chunk > LOONGEMU_FW_CFG_DMA_CHUNK_SZ) {
+                    chunk = LOONGEMU_FW_CFG_DMA_CHUNK_SZ;
+                }
+                for (uint32_t i = 0; i < chunk; i++) {
+                    uint8_t byte = fw_cfg_read_byte(b);
+                    if (!b->phys_write_checked(addr + (uint64_t)done + (uint64_t)i, 1, byte)) {
+                        status = FW_CFG_DMA_CTL_ERROR;
+                        break;
+                    }
+                }
+                if (status != 0u) {
+                    break;
+                }
+                done += chunk;
+            }
         }
     } else if (ctrl & FW_CFG_DMA_CTL_SKIP) {
-        b->fw_cfg_off += len;
+        if (b->fw_cfg_off + len < b->fw_cfg_off) {
+            status = FW_CFG_DMA_CTL_ERROR;
+        } else {
+            b->fw_cfg_off += len;
+        }
     } else if (ctrl & FW_CFG_DMA_CTL_WRITE) {
-        /* Read-only config entries ignore writes after advancing offset. */
-        b->fw_cfg_off += len;
+        /* Read-only config entries: reject invalid ranges, otherwise advance offset. */
+        if ((len > 0u && (addr + (uint64_t)len < addr)) ||
+            (b->fw_cfg_off + len < b->fw_cfg_off)) {
+            status = FW_CFG_DMA_CTL_ERROR;
+        } else {
+            b->fw_cfg_off += len;
+        }
     }
-    b->phys_write(dma_gpa + 0u, 4, 0u);
+
+    (void)b->phys_write_checked(dma_gpa + 0u, 4, ovmf_bswap32(status));
 }
 
 int ovmf_board_io_read(OvmfBoard *b, uint32_t port, int size, uint64_t *out)
@@ -292,7 +390,12 @@ int ovmf_board_io_read(OvmfBoard *b, uint32_t port, int size, uint64_t *out)
         return 1;
     }
     if (port == LOONGEMU_CMOS_DATA_PORT) {
-        *out = b->cmos[b->cmos_index & 0x7fu];
+        uint8_t idx = b->cmos_index & 0x7fu;
+        if (b->wall_time_fn != 0 &&
+            (idx <= 0x09u || idx == 0x32u)) {
+            ovmf_rtc_refresh_from_epoch(b, b->wall_time_fn(b->wall_time_opaque));
+        }
+        *out = b->cmos[idx];
         return 1;
     }
     if (port == LOONGEMU_FW_CFG_DATA_PORT) {

@@ -64,9 +64,17 @@ typedef struct X86PagingMemory {
     /* Read one aligned guest-physical 64-bit paging entry. */
     int (*read_u64)(void *opaque, uint64_t guest_physical_address,
                     uint64_t *value);
-    /* Atomically OR bits into one aligned entry and return its new value. */
+    /* Fallback atomic OR when cmpxchg_u64 is NULL (legacy unit tests). */
     int (*atomic_or_u64)(void *opaque, uint64_t guest_physical_address,
                          uint64_t bits, uint64_t *new_value);
+    /*
+     * Compare-and-swap one aligned guest-physical 64-bit paging entry.
+     * Returns 0 on success (*expected matched and updated to desired),
+     * 1 on CAS mismatch (*expected updated with observed value, caller
+     * restarts walk from CR3), or < 0 on memory error.
+     */
+    int (*cmpxchg_u64)(void *opaque, uint64_t guest_physical_address,
+                       uint64_t *expected, uint64_t desired);
 } X86PagingMemory;
 
 typedef struct X86PageFault {

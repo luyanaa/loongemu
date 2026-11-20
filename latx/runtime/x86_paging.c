@@ -81,6 +81,23 @@ __attribute__((weak)) int latx_platform_phys_atomic_or_u64(uint64_t pa,
     return 0;
 }
 
+__attribute__((weak)) int latx_platform_phys_cmpxchg_u64(uint64_t pa,
+                                                         uint64_t *expected,
+                                                         uint64_t desired)
+{
+    uint64_t cur;
+    if ((pa & 7u) != 0 || expected == 0) {
+        return -1;
+    }
+    cur = latx_platform_phys_read(pa, 8);
+    if (cur != *expected) {
+        *expected = cur;
+        return 1;
+    }
+    latx_platform_phys_write(pa, 8, desired);
+    return 0;
+}
+
 static int walker_read_u64(void *opaque, uint64_t gpa, uint64_t *value)
 {
     (void)opaque;
@@ -92,6 +109,13 @@ static int walker_atomic_or_u64(void *opaque, uint64_t gpa, uint64_t bits,
 {
     (void)opaque;
     return latx_platform_phys_atomic_or_u64(gpa, bits, new_value);
+}
+
+static int walker_cmpxchg_u64(void *opaque, uint64_t gpa,
+                              uint64_t *expected, uint64_t desired)
+{
+    (void)opaque;
+    return latx_platform_phys_cmpxchg_u64(gpa, expected, desired);
 }
 
 static uint32_t page_size_to_bits(uint64_t page_size)
@@ -154,6 +178,7 @@ LatxX86WalkResult latx_x86_walk(const CPUX86State *env, uint64_t va,
     mem.opaque = 0;
     mem.read_u64 = walker_read_u64;
     mem.atomic_or_u64 = walker_atomic_or_u64;
+    mem.cmpxchg_u64 = walker_cmpxchg_u64;
 
     memset(&tr, 0, sizeof(tr));
     memset(&pf, 0, sizeof(pf));

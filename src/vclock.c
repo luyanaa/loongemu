@@ -37,6 +37,7 @@ void loongemu_vclock_init(LoongemuVClock *vc,
     vc->opaque = opaque;
     vc->last_ns = 0;
     vc->virtual_ns = 0;
+    vc->wall_epoch_sec = LOONGEMU_VCLOCK_DEFAULT_EPOCH;
     vc->boot_host_ticks = (read_host_ticks != 0) ? read_host_ticks(opaque) : 0;
 }
 
@@ -98,6 +99,35 @@ uint64_t loongemu_vclock_now_ns(LoongemuVClock *vc)
             return ns;
         }
     }
+}
+
+void loongemu_vclock_set_wall_epoch(LoongemuVClock *vc, uint64_t unix_sec)
+{
+    if (vc != 0) {
+        vc->wall_epoch_sec = unix_sec;
+    }
+}
+
+void loongemu_vclock_wall_timespec(LoongemuVClock *vc,
+                                   uint64_t *out_sec, uint32_t *out_nsec)
+{
+    uint64_t ns = loongemu_vclock_now_ns(vc);
+    uint64_t base = (vc != 0 && vc->wall_epoch_sec != 0)
+                        ? vc->wall_epoch_sec
+                        : LOONGEMU_VCLOCK_DEFAULT_EPOCH;
+    if (out_sec != 0) {
+        *out_sec = base + (ns / LOONGEMU_VCLOCK_NS_PER_SEC);
+    }
+    if (out_nsec != 0) {
+        *out_nsec = (uint32_t)(ns % LOONGEMU_VCLOCK_NS_PER_SEC);
+    }
+}
+
+uint64_t loongemu_vclock_wall_sec(LoongemuVClock *vc)
+{
+    uint64_t sec = 0;
+    loongemu_vclock_wall_timespec(vc, &sec, 0);
+    return sec;
 }
 
 uint64_t loongemu_vclock_read_tsc(LoongemuVClock *vc)

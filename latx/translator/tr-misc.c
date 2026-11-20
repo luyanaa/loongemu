@@ -297,6 +297,9 @@ bool translate_int_3(IR1_INST *pir1)
     IR2_OPND intno = ra_alloc_itemp();
     li_guest_addr(intno, EXCP03_INT3);
     la_st_w(intno, env_ir2_opnd, lsenv_offset_exception_index(lsenv));
+    li_d(intno, 1);
+    la_st_w(intno, env_ir2_opnd, offsetof(CPUX86State, exception_is_int));
+    la_st_w(zero_ir2_opnd, env_ir2_opnd, offsetof(CPUX86State, error_code));
     ra_free_temp(intno);
 
     IR2_OPND next_pc = ra_alloc_itemp();
@@ -308,10 +311,11 @@ bool translate_int_3(IR1_INST *pir1)
                    lsenv_offset_exception_next_eip(lsenv));
     ra_free_temp(next_pc);
 
-    IR2_OPND helper_addr_opnd = ra_alloc_dbt_arg2();
+    IR2_OPND helper_addr_opnd = ra_alloc_itemp();
     aot_load_host_addr(helper_addr_opnd, (ADDR)helper_raise_int,
                        LOAD_HELPER_RAISE_INT, 0);
     la_jirl(ra_ir2_opnd, helper_addr_opnd, 0);
+    ra_free_temp(helper_addr_opnd);
 
     tr_load_registers_from_env(0x1, 0, 0, options_to_save());
     return true;
@@ -458,24 +462,29 @@ bool translate_wrmsr(IR1_INST *pir1)
     return translate_msr(pir1, true);
 }
 
-extern uint64_t latx_random_u64(void);
+extern int latx_random_u64_checked(uint64_t *out, int is_rdseed);
 extern void helper_hypercall(CPUX86State *env);
 
-static uint64_t helper_rdrand_val(CPUX86State *env)
+static uint64_t helper_rand_checked(CPUX86State *env, uint64_t is_rdseed)
 {
-    (void)env;
-    return latx_random_u64();
+    uint64_t val = 0;
+    int ok = latx_random_u64_checked(&val, (int)(is_rdseed != 0));
+    if (env != NULL) {
+        env->vregs[1] = ok ? 1ULL : 0ULL;
+    }
+    return ok ? val : 0ULL;
 }
 
-static bool translate_rand_common(IR1_INST *pir1)
+static bool translate_rand_common(IR1_INST *pir1, int is_rdseed)
 {
     IR1_OPND *dst = ir1_get_opnd(pir1, 0);
     IR2_OPND fn, res, cf;
 
     tr_save_guest_regs_for_helper();
     fn = ra_alloc_itemp();
-    li_d(fn, (ADDR)helper_rdrand_val);
+    li_d(fn, (ADDR)helper_rand_checked);
     la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    li_d(a1_ir2_opnd, (uint64_t)(is_rdseed ? 1u : 0u));
     la_jirl(ra_ir2_opnd, fn, 0);
     ra_free_temp(fn);
 
@@ -485,9 +494,10 @@ static bool translate_rand_common(IR1_INST *pir1)
     store_ireg_to_ir1(res, dst, false);
     ra_free_temp(res);
 
-    /* RDRAND/RDSEED success: CF=1, OF=SF=ZF=AF=PF=0 */
+    /* Set CF from helper_rand_checked outcome (0 when entropy unavailable), clear OF/SF/ZF/AF/PF. */
     cf = ra_alloc_itemp();
-    la_ori(cf, zero_ir2_opnd, 1);
+    la_ld_d(cf, env_ir2_opnd, offsetof(CPUX86State, vregs[1]));
+    la_andi(cf, cf, 1);
     la_x86mtflag(cf, 0x3f);
     ra_free_temp(cf);
     return true;
@@ -495,12 +505,12 @@ static bool translate_rand_common(IR1_INST *pir1)
 
 bool translate_rdrand(IR1_INST *pir1)
 {
-    return translate_rand_common(pir1);
+    return translate_rand_common(pir1, 0);
 }
 
 bool translate_rdseed(IR1_INST *pir1)
 {
-    return translate_rand_common(pir1);
+    return translate_rand_common(pir1, 1);
 }
 
 static bool translate_hypercall_common(IR1_INST *pir1)

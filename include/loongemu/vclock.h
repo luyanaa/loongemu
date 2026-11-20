@@ -20,6 +20,7 @@ extern "C" {
 #define LOONGEMU_VCLOCK_ACPI_PM_HZ     UINT64_C(3579545)
 #define LOONGEMU_VCLOCK_PIT_HZ         UINT64_C(1193182)
 #define LOONGEMU_VCLOCK_HPET_HZ        UINT64_C(10000000)  /* 10 MHz (100 ns) */
+#define LOONGEMU_VCLOCK_DEFAULT_EPOCH  UINT64_C(1767225600) /* 2026-01-01T00:00:00Z */
 
 typedef enum LoongemuVClockMode {
     /* Anchored to monotonic host counter (rdtime.d) with non-decreasing guard. */
@@ -37,6 +38,7 @@ typedef struct LoongemuVClock {
     uint64_t boot_host_ticks;
     uint64_t last_ns;
     uint64_t virtual_ns;
+    uint64_t wall_epoch_sec;
     uint64_t (*read_host_ticks)(void *opaque);
     void *opaque;
 } LoongemuVClock;
@@ -55,6 +57,12 @@ void loongemu_vclock_advance_ns(LoongemuVClock *vc, uint64_t delta_ns);
 
 /* Monotonic nanoseconds since VM boot. */
 uint64_t loongemu_vclock_now_ns(LoongemuVClock *vc);
+
+/* Unified virtual wall-clock (shared by CMOS/RTC and KVM wallclock MSR). */
+void loongemu_vclock_set_wall_epoch(LoongemuVClock *vc, uint64_t unix_sec);
+uint64_t loongemu_vclock_wall_sec(LoongemuVClock *vc);
+void loongemu_vclock_wall_timespec(LoongemuVClock *vc,
+                                   uint64_t *out_sec, uint32_t *out_nsec);
 
 /* Derived guest time sources sharing the same monotonic timeline. */
 uint64_t loongemu_vclock_read_tsc(LoongemuVClock *vc);

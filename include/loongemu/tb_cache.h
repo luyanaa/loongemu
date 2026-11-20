@@ -38,7 +38,8 @@ typedef struct TbCacheEntry {
     uint64_t cs_base;
     uint64_t cr3;
     uint64_t code;          /* translated code address */
-    uint32_t code_size;     /* bytes of emitted code */
+    uint32_t code_size;     /* bytes of emitted host code */
+    uint32_t guest_size;    /* bytes of guest x86 instructions covered */
     uint32_t hash_next;     /* next entry in the same bucket */
     uint32_t gen;           /* insertion generation, for eviction */
     uint8_t  cpl;

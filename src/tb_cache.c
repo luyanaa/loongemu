@@ -198,8 +198,14 @@ void tbc_invalidate_range(TbCache *cache, uint64_t cr3, uint64_t addr,
             continue;
         }
         start = e->pc & TBC_PAGE_MASK;
-        /* A TB may run past its start page; code_size bounds how far. */
-        end = (e->pc + (e->code_size ? e->code_size - 1 : 0)) & TBC_PAGE_MASK;
+        /* Use guest instruction length (guest_size), never host code_size. */
+        {
+            uint64_t glen = e->guest_size ? (uint64_t)e->guest_size : UINT64_C(1);
+            uint64_t last_byte = (e->pc + glen - 1u >= e->pc)
+                                     ? (e->pc + glen - 1u)
+                                     : UINT64_MAX;
+            end = last_byte & TBC_PAGE_MASK;
+        }
         if (end < start) {
             end = start;
         }

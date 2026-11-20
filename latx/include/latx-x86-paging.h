@@ -95,6 +95,8 @@ LatxX86WalkResult latx_x86_walk_cached(const struct CPUX86State *env,
 int latx_platform_phys_read_u64_checked(uint64_t pa, uint64_t *value);
 int latx_platform_phys_atomic_or_u64(uint64_t pa, uint64_t bits,
                                      uint64_t *new_value);
+int latx_platform_phys_cmpxchg_u64(uint64_t pa, uint64_t *expected,
+                                   uint64_t desired);
 
 /*
  * Validate one guest access.  `gva` is the first byte, `size_bits` the access

@@ -458,20 +458,38 @@ uint32_t latx_hv_vendor = 0u;
 /* 0 = Skylake (max leaf 0x16) on LASX, 1 = Ivy Bridge (max leaf 0x0D) on LASX */
 uint32_t latx_cpuid_lasx_ivybridge = 0u;
 
-static uint64_t g_rng_state = UINT64_C(0x9e3779b97f4a7c15);
+/*
+ * Cryptographic entropy policy (P0-A): do NOT advertise RDRAND/RDSEED or fake
+ * CF=1 using host rdtime.d + deterministic mixing. Platforms with a verified
+ * host TRNG/CSPRNG (e.g. EFI_RNG_PROTOCOL / hardware TRNG) must override
+ * latx_platform_get_entropy() and explicitly opt in via these trust flags.
+ */
+uint32_t latx_entropy_trusted = 0u;
+uint32_t latx_rdseed_trusted = 0u;
 
-uint64_t latx_random_u64(void)
+__attribute__((weak)) int latx_platform_get_entropy(uint64_t *out, int is_rdseed)
 {
-    uint64_t t = 0;
-    __asm__ volatile("rdtime.d %0, $zero" : "=r"(t) :: "memory");
-    uint64_t z = __atomic_fetch_add(&g_rng_state,
-                                    UINT64_C(0x9e3779b97f4a7c15) ^ (t << 1),
-                                    __ATOMIC_RELAXED);
-    z ^= t;
-    z = (z ^ (z >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
-    z = (z ^ (z >> 27)) * UINT64_C(0x94d049bb133111eb);
-    z ^= (z >> 31);
-    return z;
+    (void)is_rdseed;
+    if (out != NULL) {
+        *out = 0;
+    }
+    return 0;
+}
+
+int latx_random_u64_checked(uint64_t *out, int is_rdseed)
+{
+    uint32_t trusted = is_rdseed ? latx_rdseed_trusted : latx_entropy_trusted;
+    if (out != NULL) {
+        *out = 0;
+    }
+    if (!trusted || out == NULL) {
+        return 0;
+    }
+    if (!latx_platform_get_entropy(out, is_rdseed)) {
+        *out = 0;
+        return 0;
+    }
+    return 1;
 }
 
 __attribute__((weak)) void helper_hypercall(CPUX86State *env)
@@ -504,7 +522,10 @@ int qemu_guest_getrandom(void *buf, size_t len, void **errp)
     size_t i = 0;
     (void)errp;
     while (i < len) {
-        uint64_t r = latx_random_u64();
+        uint64_t r = 0;
+        if (!latx_random_u64_checked(&r, 0)) {
+            return -1;
+        }
         for (int b = 0; b < 8 && i < len; b++, i++) {
             out[i] = (uint8_t)(r >> (b * 8));
         }
@@ -583,7 +604,7 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
                        | (1u << 17) | (1u << 19) | (1u << 23) | (1u << 24)
                        | (1u << 25) | (1u << 26)
                        | (nr_cpus > 1u ? (1u << 28) : 0u); /* HTT */
-        uint32_t f_ecx = (1u << 30)  /* RDRAND     */
+        uint32_t f_ecx = (latx_entropy_trusted ? (1u << 30) : 0u) /* RDRAND */
                        | (1u << 31); /* HYPERVISOR */
 
         if (latx_cpu_has_lsx()) {
@@ -721,7 +742,7 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
         break;
     case 0x7:
         if (count == 0) {
-            *ebx = (1u << 18); /* RDSEED */
+            *ebx = latx_rdseed_trusted ? (1u << 18) : 0u; /* RDSEED */
             if (has_lasx) {
                 *ebx |= (1u << 3)    /* BMI1  */
                       | (1u << 5)    /* AVX2  */
@@ -754,7 +775,11 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
         if (latx_hv_vendor == 1u) {
             *eax = 0x31237648u; /* "Hv#1" */
         } else if (latx_hv_vendor == 0u) {
-            /* KVM PV: NOP_IO_DELAY | CLOCKSOURCE2 | PV_EOI | PV_UNHALT | PV_SEND_IPI | STABLE */
+            /*
+             * KVM PV: all advertised features are wired end-to-end:
+             * NOP_IO_DELAY (1) | CLOCKSOURCE2 (3) | PV_EOI (6) |
+             * PV_UNHALT (7) | PV_SEND_IPI (11) | CLOCKSOURCE_STABLE_BIT (24).
+             */
             *eax = (1u << 1) | (1u << 3) | (1u << 6) | (1u << 7) |
                    (1u << 11) | (1u << 24);
         }
@@ -767,13 +792,23 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
         break;
     case 0x40000003u:
         if (latx_hv_vendor == 1u) {
-            *eax = (1u << 1) | (1u << 4) | (1u << 5);
+            /*
+             * Hyper-V implemented privileges/features:
+             * Time Ref Count (1) | APIC Access MSRs + Assist (4) |
+             * Hypercall MSR + Dispatcher (5) | VP Index (6).
+             */
+            *eax = (1u << 1) | (1u << 4) | (1u << 5) | (1u << 6);
         }
         break;
     case 0x40000004u:
         if (latx_hv_vendor == 1u) {
-            *eax = (1u << 3) | (1u << 5);
-            *ebx = 0x00000fffu;
+            /*
+             * Hyper-V implementation recommendations (each backed by live code):
+             * Local TLB flush (1) | Remote TLB flush (2) | APIC MSRs (3) |
+             * Relaxed timing (5) | Synthetic cluster IPI (10).
+             */
+            *eax = (1u << 1) | (1u << 2) | (1u << 3) | (1u << 5) | (1u << 10);
+            *ebx = 0x00000fffu; /* Recommended spinlock retry limit */
         }
         break;
     case 0x40000005u:

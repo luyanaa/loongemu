@@ -36,14 +36,22 @@ extern "C" {
 #define FW_CFG_DMA_CTL_SELECT       0x08u
 #define FW_CFG_DMA_CTL_WRITE        0x10u
 
+/* Safety budget caps for synchronous fw_cfg DMA transfers */
+#define LOONGEMU_FW_CFG_DMA_MAX_LEN  (1u * 1024u * 1024u)
+#define LOONGEMU_FW_CFG_DMA_CHUNK_SZ 4096u
+
 /* Default OVMF 4 GiB top-of-32-bit ROM / pflash layout */
-#define LOONGEMU_OVMF_TOP_GPA       UINT64_C(0x100000000)
+#define LOONGEMU_OVMF_TOP_GPA         UINT64_C(0x100000000)
 #define LOONGEMU_OVMF_DEFAULT_ROM_SZ  (64u * 1024u)
 #define LOONGEMU_OVMF_DEFAULT_VARS_SZ (64u * 1024u)
-#define LOONGEMU_OVMF_MAX_FILES     8u
+#define LOONGEMU_OVMF_MAX_FILES       8u
 
-typedef uint64_t (*OvmfPhysReadFn)(uint64_t gpa, int size);
-typedef void (*OvmfPhysWriteFn)(uint64_t gpa, int size, uint64_t value);
+/* Checked guest-physical accessors: return 1 on success, 0 on fault/OOB/RO. */
+typedef int (*OvmfPhysReadCheckedFn)(uint64_t gpa, int size, uint64_t *out);
+typedef int (*OvmfPhysWriteCheckedFn)(uint64_t gpa, int size, uint64_t value);
+
+/* Optional live virtual wall-clock provider (returns UNIX seconds since 1970). */
+typedef uint64_t (*OvmfWallTimeSecFn)(void *opaque);
 
 typedef struct OvmfFwCfgFile {
     uint16_t selector;
@@ -69,6 +77,8 @@ typedef struct OvmfBoard {
     /* CMOS / RTC state */
     uint8_t cmos_index;
     uint8_t cmos[128];
+    OvmfWallTimeSecFn wall_time_fn;
+    void *wall_time_opaque;
 
     /* QEMU fw_cfg state */
     uint16_t fw_cfg_sel;
@@ -78,8 +88,8 @@ typedef struct OvmfBoard {
     OvmfFwCfgFile files[LOONGEMU_OVMF_MAX_FILES];
     uint8_t e820_buf[60]; /* 3 * 20-byte e820 entries */
     uint32_t e820_len;
-    OvmfPhysReadFn phys_read;
-    OvmfPhysWriteFn phys_write;
+    OvmfPhysReadCheckedFn phys_read_checked;
+    OvmfPhysWriteCheckedFn phys_write_checked;
 
     /* High 4 GiB OVMF_CODE.fd ROM & OVMF_VARS.fd CFI pflash */
     uint64_t rom_gpa_base;
@@ -89,7 +99,11 @@ typedef struct OvmfBoard {
 } OvmfBoard;
 
 void ovmf_board_init(OvmfBoard *b, uint64_t ram_size, uint32_t nr_cpus,
-                     OvmfPhysReadFn phys_read, OvmfPhysWriteFn phys_write);
+                     OvmfPhysReadCheckedFn phys_read_checked,
+                     OvmfPhysWriteCheckedFn phys_write_checked);
+
+/* Attach a unified virtual wall-clock source for live CMOS/RTC calendar reads. */
+void ovmf_board_set_wall_clock(OvmfBoard *b, OvmfWallTimeSecFn fn, void *opaque);
 
 /* Register a named file in fw_cfg (returns selector >= 0x20, or 0 on error). */
 uint16_t ovmf_board_add_file(OvmfBoard *b, const char *name,
