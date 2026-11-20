@@ -4,6 +4,7 @@
 #include "exec/exec-all.h"
 #include "tcg/tcg.h"
 #include "target/arm/tcg/translate.h"
+#include "cpregs.h"
 
 #define LATA_WEAK __attribute__((weak))
 
@@ -44,14 +45,66 @@ LATA_WEAK void *tcg_splitwx_to_rx(void *p) { return p; }
 LATA_WEAK TCGContext lata_tcg_ctx;
 LATA_WEAK TCGContext *tcg_ctx = &lata_tcg_ctx;
 
+/*
+ * System-register access.
+ *
+ * MRS/MSR reach these through the disassembler, which resolves the register to
+ * an ARMCPRegInfo and passes it here.  The value lives in CPUARMState at
+ * `fieldoffset`, so a read is a load and a write is a store -- the register
+ * file is the state, and keeping a second copy in this file would let the two
+ * disagree.
+ *
+ * ARM_CP_CONST registers ignore writes and return their reset value; ARM_CP_NOP
+ * does nothing in either direction.  Anything with a readfn/writefn is a
+ * register whose behaviour is not a plain field (a counter, a remapped index),
+ * and returning a stored field for those would be a fabrication -- so they are
+ * reported as zero rather than silently pretending to work.
+ */
+LATA_WEAK __attribute__((used)) const ARMCPRegInfo *
+lata_cp_reg_lookup(uint32_t key)
+{
+    return get_arm_cp_reginfo(NULL, key);
+}
+
+LATA_WEAK uint64_t helper_get_cp_reg64(CPUARMState *env,
+                                       const ARMCPRegInfo *ri)
+{
+    if (env == NULL || ri == NULL) {
+        return 0;
+    }
+    if (ri->type & ARM_CP_NOP) {
+        return 0;
+    }
+    if (ri->type & ARM_CP_CONST) {
+        return ri->resetvalue;
+    }
+    if (ri->fieldoffset <= 0) {
+        return 0;              /* not a plain field; see above */
+    }
+    return *(const uint64_t *)((const uint8_t *)env + ri->fieldoffset);
+}
+
+LATA_WEAK void helper_set_cp_reg64(CPUARMState *env,
+                                   const ARMCPRegInfo *ri, uint64_t value)
+{
+    if (env == NULL || ri == NULL) {
+        return;
+    }
+    if (ri->type & (ARM_CP_NOP | ARM_CP_CONST)) {
+        return;                /* read-only in hardware */
+    }
+    if (ri->fieldoffset <= 0) {
+        return;
+    }
+    *(uint64_t *)((uint8_t *)env + ri->fieldoffset) = value;
+}
+
 #define LATA_HELPER_STUB(name) LATA_WEAK void name(void) { }
 LATA_HELPER_STUB(helper_access_check_cp_reg)
 LATA_HELPER_STUB(helper_exception_with_syndrome)
-LATA_HELPER_STUB(helper_get_cp_reg64)
 LATA_HELPER_STUB(helper_lookup_cp_reg)
 LATA_HELPER_STUB(helper_neon_addl_saturate_s32)
 LATA_HELPER_STUB(helper_neon_addl_saturate_s64)
-LATA_HELPER_STUB(helper_set_cp_reg64)
 LATA_HELPER_STUB(helper_simd_tblx)
 LATA_HELPER_STUB(helper_vfp_tosld)
 LATA_HELPER_STUB(helper_vfp_tosls)
