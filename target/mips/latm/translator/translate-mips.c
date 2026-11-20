@@ -187,7 +187,7 @@ static void lata_gen_exit_tb_ret_0(DisasContext *s)
     IR2_OPND addr;
     int64_t curr_ins_pos = (uintptr_t)s->base->tb->tc.ptr +
                            (lsenv->tr_data->real_ir2_inst_num << 2);
-    int64_t exit_offset = context_switch_native_to_bt_ret_0 - curr_ins_pos;
+    int64_t exit_offset = lsenv->tr_data->cs_native_to_bt_ret_0 - curr_ins_pos;
 
     ir2_opnd_build(&addr, IR2_OPND_IMM, exit_offset >> 2);
     la_b(addr);
@@ -212,7 +212,7 @@ static void gen_goto_tb(DisasContext *s, int n, uint64_t dest)
 
     int64_t curr_ins_pos = (uintptr_t)tb->tc.ptr +
                            (lsenv->tr_data->real_ir2_inst_num << 2);
-    int64_t exit_offset = context_switch_native_to_bt - curr_ins_pos;
+    int64_t exit_offset = lsenv->tr_data->cs_native_to_bt - curr_ins_pos;
     ir2_opnd_build(&addr, IR2_OPND_IMM, exit_offset >> 2);
     la_b(addr);
 }

@@ -51,8 +51,8 @@ const int mips_la_reverse_fmap[32] = {
     [0 ... 31] = NOT_DEF,
 };
 
-__thread ENV *lsenv;
-__thread TRANSLATION_DATA *tr_data;
+LATM_TLS ENV *lsenv;
+LATM_TLS TRANSLATION_DATA *tr_data;
 
 bool lata_dump;
 static uint8_t latm_translation_lock_flag;
@@ -114,6 +114,10 @@ static void global_register_init(void)
     scr3_ir2_opnd = INIT_RA(IR2_OPND_SCR, 3);
 }
 
+#if defined(CONFIG_LATM_TRANSLATE_TLS)
+void latm_translate_lock(void) { }
+void latm_translate_unlock(void) { }
+#else
 void latm_translate_lock(void)
 {
     while (__atomic_test_and_set(&latm_translation_lock_flag,
@@ -125,6 +129,7 @@ void latm_translate_unlock(void)
 {
     __atomic_clear(&latm_translation_lock_flag, __ATOMIC_RELEASE);
 }
+#endif
 
 void latm_bind_env(void *cpu)
 {
@@ -318,31 +323,55 @@ static void generate_context_switch_native_to_bt(void)
     la_jirl(zero_ir2_opnd, ra_ir2_opnd, 0);
 }
 
-int lata_gen_prologue(TCGContext *tcg_ctx)
+int lata_gen_prologue_env(void *cpu, TCGContext *tcg_ctx)
 {
     void *code_buf_rw = tcg_ctx->code_ptr;
     const void *code_buf_rx = tcg_splitwx_to_rx(code_buf_rw);
-    context_switch_bt_to_native = (uint64_t)code_buf_rx;
 
+    latm_translate_lock();
+    latm_bind_env(cpu);
     tr_init(NULL);
+    lsenv->tr_data->cs_bt_to_native = (uint64_t)code_buf_rx;
     generate_context_switch_bt_to_native();
     int ins_nr = tr_ir2_assemble(code_buf_rw);
     tr_fini();
+    latm_translate_unlock();
     return ins_nr;
+}
+
+int lata_gen_epilogue_env(void *cpu, TCGContext *tcg_ctx)
+{
+    void *code_buf_rw = tcg_ctx->code_ptr;
+    const void *code_buf_rx = tcg_splitwx_to_rx(code_buf_rw);
+
+    latm_translate_lock();
+    latm_bind_env(cpu);
+    tr_init(NULL);
+    lsenv->tr_data->cs_native_to_bt_ret_0 = (uint64_t)code_buf_rx;
+    lsenv->tr_data->cs_native_to_bt = (uint64_t)code_buf_rx + 4;
+    generate_context_switch_native_to_bt();
+    int ins_nr = tr_ir2_assemble(code_buf_rw);
+    tr_fini();
+    latm_translate_unlock();
+    return ins_nr;
+}
+
+int lata_gen_prologue(TCGContext *tcg_ctx)
+{
+    void *cpu = lsenv ? lsenv->cpu_state : NULL;
+    int n = lata_gen_prologue_env(cpu, tcg_ctx);
+    context_switch_bt_to_native = lsenv->tr_data->cs_bt_to_native;
+    return n;
 }
 
 int lata_gen_epilogue(TCGContext *tcg_ctx)
 {
-    void *code_buf_rw = tcg_ctx->code_ptr;
-    const void *code_buf_rx = tcg_splitwx_to_rx(code_buf_rw);
-    context_switch_native_to_bt_ret_0 = (uint64_t)code_buf_rx;
-    context_switch_native_to_bt = (uint64_t)code_buf_rx + 4;
-
-    tr_init(NULL);
-    generate_context_switch_native_to_bt();
-    int ins_nr = tr_ir2_assemble(code_buf_rw);
-    tr_fini();
-    return ins_nr;
+    void *cpu = lsenv ? lsenv->cpu_state : NULL;
+    int n = lata_gen_epilogue_env(cpu, tcg_ctx);
+    context_switch_native_to_bt_ret_0 =
+        lsenv->tr_data->cs_native_to_bt_ret_0;
+    context_switch_native_to_bt = lsenv->tr_data->cs_native_to_bt;
+    return n;
 }
 
 void lata_gen_call_helper_prologue(TCGContext *tcg_ctx)

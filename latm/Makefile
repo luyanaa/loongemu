@@ -17,6 +17,10 @@ BASE := --target=$(TARGET) -ffreestanding -nostdinc -fno-builtin \
         -fno-stack-protector -O2 -g -mno-lsx -mno-lasx -fno-vectorize \
         -fno-slp-vectorize -Wno-unused-parameter -Wno-unused-variable \
         -Wno-initializer-overrides -ferror-limit=0
+TLS ?= 0
+ifeq ($(TLS),1)
+DEFS += -DCONFIG_LATM_TRANSLATE_TLS
+endif
 CFLAGS := $(BASE) $(INCS) $(DEFS)
 
 SHARED := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \

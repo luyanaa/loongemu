@@ -53,6 +53,7 @@ uint64_t latx_tcg_gen_insn_data[TCG_MAX_INSNS * 2];
 
 #define CODE_BUF_SIZE (1 << 16)
 static uint8_t code_buf[CODE_BUF_SIZE] __attribute__((aligned(4096)));
+static uint8_t code_buf2[CODE_BUF_SIZE] __attribute__((aligned(4096)));
 #define PROLOGUE_OFFSET 0x1000
 #define EPILOGUE_OFFSET 0x3000
 #define TB_OFFSET       0x5000
@@ -203,8 +204,8 @@ static void enable_fpu(void)
 }
 
 extern void lata_tr_data_init(void *env);
-extern int lata_gen_prologue(TCGContext *tcg_ctx);
-extern int lata_gen_epilogue(TCGContext *tcg_ctx);
+extern int lata_gen_prologue_env(void *cpu, TCGContext *tcg_ctx);
+extern int lata_gen_epilogue_env(void *cpu, TCGContext *tcg_ctx);
 extern int tr_ir2_assemble(const void *code_start_addr);
 extern bool tr_ir2_generate(TranslationBlock *tb);
 extern void tr_init(void *tb);
@@ -258,9 +259,9 @@ static void run_chain(int use_jiscr1)
     latm_jmp_cache_flush(&env);
 
     tcg_ctx->code_ptr = code_buf + PROLOGUE_OFFSET;
-    lata_gen_prologue(tcg_ctx);
+    lata_gen_prologue_env(&env, tcg_ctx);
     tcg_ctx->code_ptr = code_buf + EPILOGUE_OFFSET;
-    lata_gen_epilogue(tcg_ctx);
+    lata_gen_epilogue_env(&env, tcg_ctx);
 
     if (assemble_block(chain_target_code, 2, target_host) <= 0) {
         fails++;
@@ -282,7 +283,8 @@ static void run_chain(int use_jiscr1)
         return;
     }
 
-    ((void (*)(void *, void *))(uintptr_t)context_switch_bt_to_native)(
+    ((void (*)(void *, void *))(uintptr_t)
+     ((TRANSLATION_DATA *)env.latm_tr_data)->cs_bt_to_native)(
         &env, source_host);
     latm_link_use_jiscr1 = false;
 
@@ -324,9 +326,9 @@ static void run_block(uint32_t *guest, int insns, const char *name)
 
     /* The prologue/epilogue live in their own slots; the TB gets a clean one. */
     tcg_ctx->code_ptr = code_buf + PROLOGUE_OFFSET;
-    lata_gen_prologue(tcg_ctx);
+    lata_gen_prologue_env(&env, tcg_ctx);
     tcg_ctx->code_ptr = code_buf + EPILOGUE_OFFSET;
-    lata_gen_epilogue(tcg_ctx);
+    lata_gen_epilogue_env(&env, tcg_ctx);
 
     tcg_ctx->code_ptr = tb_code;
     tcg_ctx->gen_insn_data = latx_tcg_gen_insn_data;
@@ -369,7 +371,8 @@ static void run_block(uint32_t *guest, int insns, const char *name)
         return;
     }
 
-    ((void (*)(void *, void *))(uintptr_t)context_switch_bt_to_native)(
+    ((void (*)(void *, void *))(uintptr_t)
+     ((TRANSLATION_DATA *)env.latm_tr_data)->cs_bt_to_native)(
         &env, tb_code);
 
     latx_bare_uart_puts("latm-isa: ");
@@ -388,6 +391,11 @@ void kmain(void)
             ((uint8_t *)&env2)[i] = 0;
         }
         lata_tr_data_init(&env2);
+        latm_bind_env(&env);
+        tcg_ctx->code_ptr = code_buf + PROLOGUE_OFFSET;
+        lata_gen_prologue_env(&env, tcg_ctx);
+        tcg_ctx->code_ptr = code_buf + EPILOGUE_OFFSET;
+        lata_gen_epilogue_env(&env, tcg_ctx);
         check((uint64_t)(uintptr_t)env2.latm_tr_data !=
               (uint64_t)(uintptr_t)env.latm_tr_data, 1,
               "per-vCPU translation data");
@@ -397,6 +405,14 @@ void kmain(void)
         check((uint64_t)(uintptr_t)env2.latm_jmp_cache !=
               (uint64_t)(uintptr_t)env.latm_jmp_cache, 1,
               "per-vCPU TB link cache");
+        latm_bind_env(&env2);
+        tcg_ctx->code_ptr = code_buf2 + PROLOGUE_OFFSET;
+        lata_gen_prologue_env(&env2, tcg_ctx);
+        tcg_ctx->code_ptr = code_buf2 + EPILOGUE_OFFSET;
+        lata_gen_epilogue_env(&env2, tcg_ctx);
+        check(((TRANSLATION_DATA *)env2.latm_tr_data)->cs_bt_to_native !=
+              ((TRANSLATION_DATA *)env.latm_tr_data)->cs_bt_to_native, 1,
+              "per-vCPU context-switch entry");
         latm_bind_env(&env);
     }
 

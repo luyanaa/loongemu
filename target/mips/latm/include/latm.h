@@ -32,6 +32,9 @@ typedef struct TRANSLATION_DATA {
     void *ir1_list;
     void *db_rel;
     uint64_t cache_key;
+    uint64_t cs_bt_to_native;
+    uint64_t cs_native_to_bt_ret_0;
+    uint64_t cs_native_to_bt;
     bool lock_held;
 
     union {
@@ -85,8 +88,13 @@ void tr_fini(void);
 
 extern const int mips_la_map[];
 extern const int mips_la_fmap[];
-extern __thread TRANSLATION_DATA *tr_data;
-extern __thread ENV *lsenv;
+#if defined(CONFIG_LATM_TRANSLATE_TLS)
+#define LATM_TLS _Thread_local
+#else
+#define LATM_TLS
+#endif
+extern LATM_TLS TRANSLATION_DATA *tr_data;
+extern LATM_TLS ENV *lsenv;
 extern bool lata_dump;
 
 extern uint64_t context_switch_bt_to_native;
@@ -95,6 +103,8 @@ extern uint64_t context_switch_native_to_bt;
 
 int lata_gen_prologue(TCGContext *tcg_ctx);
 int lata_gen_epilogue(TCGContext *tcg_ctx);
+int lata_gen_prologue_env(void *cpu, TCGContext *tcg_ctx);
+int lata_gen_epilogue_env(void *cpu, TCGContext *tcg_ctx);
 void lata_fast_jmp_cache_init(void *env, uint64_t start_code, uint64_t end_code);
 void lata_fast_jmp_cache_add(void *env, uint64_t guest_pc, uint64_t host_pc);
 

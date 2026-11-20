@@ -704,7 +704,7 @@ SRCS   := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \
 ### 13.2 已通过的门禁
 
 - `make test-latm-decode`：21 条向量，覆盖 ALU/IMM、DMULTU、MFLO、ROTR、JAL/JR、BEQ/BEQL、LWL/SDR、SW/SD/LD、SYSCALL/BREAK、ERET/MFC0。
-- `make latm-isa-run`：QEMU-LVZ `-M virt -cpu la464`，67 项检查全部通过：
+- `make latm-isa-run`：QEMU-LVZ `-M virt -cpu la464`，68 项检查全部通过：
   - 整数 ALU、DSLL/DSRA、DMULTU/MFLO/MFHI、ROTR/DROTR；
   - 分支 taken/not-taken、BEQL taken/not-taken、JAL 链接值、JR 间接目标；
   - `lwl+lwr`、`ldl+ldr`、`sdr+ld` 以及普通 `sw/sd/ld`；
@@ -713,6 +713,7 @@ SRCS   := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \
   - COP1X `ldxc1/sdxc1/lwxc1/swxc1/luxc1/suxc1`；
   - 间接跳转 TB 直链：`jiscr0` 与 `jiscr1` 各一条两 TB 链，命中后直接进入目标 TB host code；
   - `CACHE 0`、`CACHE 0x10`、`SYNCI` 分别清除 `pc_map_cache` 中的 TB 链接项；
+  - 两个 `CPUMIPSState` 的 `tr_data`、IR1 scratch、TB link cache、prologue entry 均独立；
   - 分支/JR/BC1 的延迟槽内执行 helper（LL）时，分支条件与间接目标经 `latm_spill[]` 保存/恢复；
   - `BC1T/BC1FL` 使用 `cc=(rt>>2)&7`、`tf=rt&1`、`likely=rt&2`，FCC2 测试通过；
   - LL/SC：无 LL 的 SC 失败、LL(A)->SC(B) 失败、普通 store 使 reservation 失效。
@@ -729,5 +730,5 @@ SRCS   := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \
 6. **自修改代码边界**：`SYNCI/CACHE` 只清除 link cache 并执行 `ibar 0`；已发出的旧 TB 机器码不回收，正在执行的 TB 也不会被抢占。主循环接入 TB 分配器后需增加代码页回收。
 7. **COP1X 数值边界**：load/store 六个变体与四个 MADD 变体已通过。freestanding softfloat 的 `float64_mul` 路径会给出错误结果，因此 `latm_fpu_madd` 暂时使用宿主标量乘加（与 QEMU helper 的两步乘加语义一致）；FCR31 cause/enable/flags 的逐指令回填仍待 softfloat 修复后补齐，不能据此宣称完整 IEEE FMA 签核。
 8. **FPU 使能**：bare-metal QEMU 复位后 `EUEN.FPE=0`；执行 softfloat/C helper 中的浮点指令前必须置位 FPE（测试已显式使能）。
-9. **翻译器状态**：`ir1_list`/`db_rel`、寄存器分配、IR2 buffer、TB link cache 已移入 per-vCPU `TRANSLATION_DATA`/`CPUMIPSState`，`target_disasm()` 可按 CPU 绑定。当前 `lsenv/tr_data` 仍由进程级锁串行化；要实现并行翻译，下一轮需把它们改为真正的 per-worker/TLS 上下文。
+9. **翻译器状态**：`ir1_list`/`db_rel`、寄存器分配、IR2 buffer、TB link cache、context-switch 入口均已移入 per-vCPU `TRANSLATION_DATA`/`CPUMIPSState`；`target_disasm()` 可按 CPU 绑定。`latm/Makefile` 的 `TLS=1` 把 `lsenv/tr_data` 编译为 `_Thread_local` 并去掉翻译锁，可并行翻译；默认 freestanding 构建仍使用串行锁。多 vCPU 初始化 prologue/epilogue 时必须使用 `lata_gen_prologue_env/epilogue_env`。
 10. **其它未覆盖**：MIPS16/microMIPS/MSA/R6、big-endian、TLBINV/TLBINVF、完整系统态指令精确异常、MIPS SMP vCPU/IRQ 集成。
