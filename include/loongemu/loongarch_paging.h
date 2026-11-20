@@ -73,6 +73,7 @@ extern "C" {
 #define LAPG_PERM_WRITE  (1u << 1)
 #define LAPG_PERM_EXEC   (1u << 2)
 #define LAPG_PERM_USER   (1u << 3)
+#define LAPG_PERM_GLOBAL (1u << 4)
 
 typedef enum LapgResult {
     LAPG_OK = 0,

@@ -1528,6 +1528,7 @@ void etb_add_succ(void* etb,int depth);
 int tr_translate_tb(struct TranslationBlock *tb);
 int tr_ir2_generate(struct TranslationBlock *tb);
 int label_dispose(TranslationBlock *tb, TRANSLATION_DATA *lat_ctx);
+void tr_lower_sw_lbt(TRANSLATION_DATA *lat_ctx);
 int tr_ir2_assemble(const void *code_start_addr, const IR2_INST *pir2);
 #if defined(CONFIG_LATX_FLAG_REDUCTION) && \
     defined(CONFIG_LATX_FLAG_REDUCTION_EXTEND)

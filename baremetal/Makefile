@@ -44,6 +44,7 @@ SRCS := $(LATX)/compat/miniglib.c $(LATX)/compat/libc_min.c $(LATX)/compat/ldmat
         $(addprefix $(LATX)/translator/,$(addsuffix .c,$(TRANSLATOR))) \
         $(LATX)/ir1/ir1.c \
         $(LATX)/ir2/ir2.c $(LATX)/ir2/ir2-assemble.c $(LATX)/ir2/ir2-relocate.c \
+        $(LATX)/ir2/ir2-sw-lbt.c \
         gen/latx/ir2/la-append.c $(LATX)/ir2/la-decode.c $(LATX)/ir2/la-disasm.c \
         $(LATX)/optimization/flag-lbt.c $(LATX)/optimization/flag-reduction.c \
         $(LATX)/optimization/ir1-optimization.c $(LATX)/optimization/ir2-optimization.c

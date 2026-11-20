@@ -197,6 +197,16 @@ void tbc_invalidate_range(TbCache *cache, uint64_t cr3, uint64_t addr,
     }
 }
 
+void tbc_invalidate_slot(TbCache *cache, uint32_t index)
+{
+    if (cache == 0 || index >= cache->capacity || !cache->entries[index].used) {
+        return;
+    }
+    bucket_unlink(cache, index);
+    cache->entries[index].used = 0;
+    cache->count--;
+}
+
 void tbc_flush_asid(TbCache *cache, uint64_t cr3)
 {
     if (cache == 0 || cache->capacity == 0) {

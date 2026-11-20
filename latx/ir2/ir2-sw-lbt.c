@@ -736,17 +736,11 @@ static void lower_rot(int anchor_id, unsigned w, IR2_OPND rj,
             emit_opnd3(anchor_id, LISA_MASKNEZ, s[1], s[1], s[0]);
             emit_opnd3(anchor_id, LISA_OR, tp_ir2_opnd, tp_ir2_opnd, s[1]);
         } else {
-            /* Save old_cf in s[2] for OF if c == 1; compute new_cf in s[1] */
+            /* Compute new_cf in s[1]; tp still holds old_cf in bit 0 for OF if c == 1 */
             emit_opnd2i(anchor_id, LISA_ADDI_D, s[1], s[1], -1);
             emit_opnd3(anchor_id, LISA_SRL_D, s[1], rj, s[1]);
             emit_opnd2i(anchor_id, LISA_ANDI, s[1], s[1], 1); /* new_cf */
-            emit_opnd2i(anchor_id, LISA_ANDI, s[2], tp_ir2_opnd, 1); /* old_cf */
-            /* Clear CF & OF in $tp, set new_cf */
-            emit_opnd2i(anchor_id, LISA_ORI, tp_ir2_opnd, tp_ir2_opnd, 0); /* no-op avoided below */
-            /* Use s[2] after computing OF! */
             emit_opnd2ii(anchor_id, LISA_BSTRPICK_D, s[2], rj, (int)(w - 1), (int)(w - 1));
-            /* Wait: we overwrote old_cf! Keep old_cf via xor directly: */
-            /* Re-order cleanly: tp currently has old_cf in bit 0! */
             emit_opnd3(anchor_id, LISA_XOR, s[2], s[2], tp_ir2_opnd);
             emit_opnd2i(anchor_id, LISA_ANDI, s[2], s[2], 1); /* x[w-1] ^ old_cf */
             emit_opnd2i(anchor_id, LISA_SLLI_D, s[2], s[2], 11);

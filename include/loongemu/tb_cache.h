@@ -80,6 +80,9 @@ TbCacheEntry *tbc_insert(TbCache *cache, uint64_t pc, uint64_t cs_base,
 void tbc_invalidate_range(TbCache *cache, uint64_t cr3, uint64_t addr,
                           uint64_t len);
 
+/* Drop a single slot by index. */
+void tbc_invalidate_slot(TbCache *cache, uint32_t index);
+
 /* Drop every block of one address space (CR3 write). */
 void tbc_flush_asid(TbCache *cache, uint64_t cr3);
 

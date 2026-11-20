@@ -137,6 +137,9 @@ uint64_t lapg_make_leaf(uint64_t ppn, uint32_t perm)
     } else {
         pte |= LAPG_PTE_PLV0;
     }
+    if (perm & LAPG_PERM_GLOBAL) {
+        pte |= LAPG_PTE_G;
+    }
     return pte;
 }
 

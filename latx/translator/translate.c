@@ -2865,6 +2865,9 @@ int tr_translate_tb(struct TranslationBlock *tb)
         }
 
         /* label dispose */
+        if (option_sw_lbt) {
+            tr_lower_sw_lbt(lat_ctx);
+        }
         code_nr = label_dispose(tb, lat_ctx);
         /* check if buffer is overflow */
         if (tb->tc.ptr + (code_nr << 2) >

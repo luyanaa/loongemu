@@ -167,7 +167,9 @@ static volatile int g_vcpu_halted[MAX_VCPUS];
 static volatile int g_vcpu_init_pending[MAX_VCPUS];
 static volatile int g_vcpu_sipi_pending[MAX_VCPUS];
 static volatile uint32_t g_vcpu_sipi_vec[MAX_VCPUS];
-static CPUX86State g_vcpu_save[MAX_VCPUS];
+static CPUX86State g_vcpu_env[MAX_VCPUS] __attribute__((aligned(4096)));
+static CPUX86State *cur_env = &g_vcpu_env[0];
+#define env (*cur_env)
 static uint8_t g_pic_imr[2] = { 0xffu, 0xffu };
 static uint8_t g_pic_icw_idx[2];
 static uint8_t g_pic_icw_rem[2];
@@ -461,7 +463,6 @@ uint8_t latx_bare_ldub_code(uint64_t vaddr)
 
 /* ---------------- translator state ---------------- */
 
-static CPUX86State env;
 static TCGContext tcg_storage;
 static TRANSLATION_DATA tr;
 static ENV lsenv_storage;
@@ -471,8 +472,9 @@ typedef struct FastJmpEntry {
 } FastJmpEntry;
 
 #define FAST_JMP_CACHE_SIZE (1u << TB_JMP_CACHE_BITS)
-static FastJmpEntry fast_jmp_cache[FAST_JMP_CACHE_SIZE]
+static FastJmpEntry g_fast_jmp_cache[MAX_VCPUS][FAST_JMP_CACHE_SIZE]
     __attribute__((aligned(4096)));
+#define fast_jmp_cache (g_fast_jmp_cache[g_cur_vcpu])
 
 #define CODE_CACHE_SIZE (16 * 1024 * 1024)
 static uint8_t epi_buf[4096] __attribute__((aligned(4096)));
@@ -488,10 +490,63 @@ static TbCache tb_cache;
 static TbInsnMap tb_insn_maps[TB_TABLE_CAP];
 static uint64_t tb_code_hash[TB_TABLE_CAP];
 static uint16_t tb_code_len[TB_TABLE_CAP];
+static uint32_t tb_pfn0[TB_TABLE_CAP];
+static uint32_t tb_pfn1[TB_TABLE_CAP];
 static uint32_t g_tb_highwater;
+typedef struct TbCodeSpan {
+    uint64_t code_start;
+    uint64_t code_end;
+    uint32_t slot_idx;
+} TbCodeSpan;
+static TbCodeSpan g_tb_by_code[TB_TABLE_CAP];
+static uint32_t g_tb_by_code_count;
 #define CODE_PAGE_MAX_PFN (GUEST_RAM_SIZE >> 12)
+#define SMC_DIRTY_PFN_CAP 64u
 static uint64_t g_code_page_bitmap[CODE_PAGE_MAX_PFN / 64];
+static uint32_t g_smc_dirty_pfns[SMC_DIRTY_PFN_CAP];
+static uint32_t g_smc_dirty_count;
+static int g_smc_dirty_overflow;
+static uint64_t g_smc_granular_evicts;
 static volatile int g_smc_dirty;
+
+static void smc_record_dirty_pfn(uint32_t pfn)
+{
+    g_smc_dirty = 1;
+    if (g_smc_dirty_overflow) {
+        return;
+    }
+    for (uint32_t i = 0; i < g_smc_dirty_count; i++) {
+        if (g_smc_dirty_pfns[i] == pfn) {
+            return;
+        }
+    }
+    if (g_smc_dirty_count < SMC_DIRTY_PFN_CAP) {
+        g_smc_dirty_pfns[g_smc_dirty_count++] = pfn;
+    } else {
+        g_smc_dirty_overflow = 1;
+    }
+}
+
+static int find_tb_slot_by_code_pc(uint64_t fault_pc)
+{
+    uint32_t lo = 0, hi = g_tb_by_code_count;
+    while (lo < hi) {
+        uint32_t mid = lo + ((hi - lo) >> 1);
+        if (fault_pc < g_tb_by_code[mid].code_start) {
+            hi = mid;
+        } else if (fault_pc >= g_tb_by_code[mid].code_end) {
+            lo = mid + 1;
+        } else {
+            uint32_t slot = g_tb_by_code[mid].slot_idx;
+            if (tb_entries[slot].used &&
+                tb_entries[slot].code == g_tb_by_code[mid].code_start) {
+                return (int)slot;
+            }
+            return -1;
+        }
+    }
+    return -1;
+}
 
 unsigned char kstack[65536] __attribute__((aligned(4096)));
 void kmain(void);
@@ -551,15 +606,12 @@ static uint64_t resolve_fault_x86_pc(uint64_t fault_pc)
                                          fault_pc,
                                          g_current_tb_pc);
     }
-    for (uint32_t i = 0; i < g_tb_highwater; i++) {
-        if (tb_entries[i].used &&
-            fault_pc >= tb_entries[i].code &&
-            fault_pc < tb_entries[i].code + (uint64_t)tb_entries[i].code_size) {
-            return tb_harness_resolve_x86_pc(&tb_insn_maps[i],
-                                             tb_entries[i].code,
-                                             fault_pc,
-                                             tb_entries[i].pc);
-        }
+    int slot = find_tb_slot_by_code_pc(fault_pc);
+    if (slot >= 0) {
+        return tb_harness_resolve_x86_pc(&tb_insn_maps[slot],
+                                         tb_entries[slot].code,
+                                         fault_pc,
+                                         tb_entries[slot].pc);
     }
     return tb_harness_resolve_x86_pc(g_current_tb_map,
                                      g_current_tb_code,
@@ -727,12 +779,12 @@ static int is_host_vmm_va(uint64_t va)
                        LAPG_PAGE_SIZE - 1) & LAPG_PAGE_MASK;
     uint64_t pro_page = (uint64_t)(uintptr_t)pro_buf & LAPG_PAGE_MASK;
     uint64_t epi_page = (uint64_t)(uintptr_t)epi_buf & LAPG_PAGE_MASK;
-    uint64_t env_start = (uint64_t)(uintptr_t)&env & LAPG_PAGE_MASK;
-    uint64_t env_end = ((uint64_t)(uintptr_t)&env + sizeof(env) +
+    uint64_t env_start = (uint64_t)(uintptr_t)g_vcpu_env & LAPG_PAGE_MASK;
+    uint64_t env_end = ((uint64_t)(uintptr_t)g_vcpu_env + sizeof(g_vcpu_env) +
                         LAPG_PAGE_SIZE - 1) & LAPG_PAGE_MASK;
-    uint64_t jc_start = (uint64_t)(uintptr_t)fast_jmp_cache & LAPG_PAGE_MASK;
-    uint64_t jc_end = ((uint64_t)(uintptr_t)fast_jmp_cache +
-                       sizeof(fast_jmp_cache) + LAPG_PAGE_SIZE - 1) &
+    uint64_t jc_start = (uint64_t)(uintptr_t)g_fast_jmp_cache & LAPG_PAGE_MASK;
+    uint64_t jc_end = ((uint64_t)(uintptr_t)g_fast_jmp_cache +
+                       sizeof(g_fast_jmp_cache) + LAPG_PAGE_SIZE - 1) &
                       LAPG_PAGE_MASK;
     uint64_t ks_start = (uint64_t)(uintptr_t)kstack & LAPG_PAGE_MASK;
     uint64_t ks_end = ((uint64_t)(uintptr_t)kstack + sizeof(kstack) +
@@ -788,21 +840,125 @@ static void rebuild_host_mappings(void)
      */
     map_host_range((uint64_t)(uintptr_t)code_cache, CODE_CACHE_SIZE,
                    LAPG_PERM_READ | LAPG_PERM_WRITE |
-                   LAPG_PERM_EXEC | LAPG_PERM_USER);
+                   LAPG_PERM_EXEC | LAPG_PERM_USER | LAPG_PERM_GLOBAL);
     map_host_range((uint64_t)(uintptr_t)pro_buf, sizeof(pro_buf),
                    LAPG_PERM_READ | LAPG_PERM_WRITE |
-                   LAPG_PERM_EXEC | LAPG_PERM_USER);
+                   LAPG_PERM_EXEC | LAPG_PERM_USER | LAPG_PERM_GLOBAL);
     map_host_range((uint64_t)(uintptr_t)epi_buf, sizeof(epi_buf),
                    LAPG_PERM_READ | LAPG_PERM_WRITE |
-                   LAPG_PERM_EXEC | LAPG_PERM_USER);
-    map_host_range((uint64_t)(uintptr_t)&env, sizeof(env),
-                   LAPG_PERM_READ | LAPG_PERM_WRITE | LAPG_PERM_USER);
-    map_host_range((uint64_t)(uintptr_t)fast_jmp_cache, sizeof(fast_jmp_cache),
-                   LAPG_PERM_READ | LAPG_PERM_WRITE | LAPG_PERM_USER);
+                   LAPG_PERM_EXEC | LAPG_PERM_USER | LAPG_PERM_GLOBAL);
+    map_host_range((uint64_t)(uintptr_t)g_vcpu_env, sizeof(g_vcpu_env),
+                   LAPG_PERM_READ | LAPG_PERM_WRITE |
+                   LAPG_PERM_USER | LAPG_PERM_GLOBAL);
+    map_host_range((uint64_t)(uintptr_t)g_fast_jmp_cache, sizeof(g_fast_jmp_cache),
+                   LAPG_PERM_READ | LAPG_PERM_WRITE |
+                   LAPG_PERM_USER | LAPG_PERM_GLOBAL);
     map_host_range((uint64_t)(uintptr_t)kstack, sizeof(kstack),
-                   LAPG_PERM_READ | LAPG_PERM_WRITE | LAPG_PERM_USER);
+                   LAPG_PERM_READ | LAPG_PERM_WRITE |
+                   LAPG_PERM_USER | LAPG_PERM_GLOBAL);
     map_host_range((uint64_t)(uintptr_t)pf_table, sizeof(pf_table),
-                   LAPG_PERM_READ | LAPG_PERM_USER);
+                   LAPG_PERM_READ | LAPG_PERM_USER | LAPG_PERM_GLOBAL);
+}
+
+/*
+ * 10-bit hardware CSR.ASID allocator keyed by (vcpu, cr3, cpl, pg_wp).
+ * Host VMM PTEs are marked Global (G=1), so ASID switches never evict host
+ * code_cache/env/stack TLB entries.
+ */
+typedef struct AsidSlot {
+    uint64_t cr3;
+    uint32_t vcpu;
+    uint8_t  cpl;
+    uint8_t  pg_wp;
+    uint16_t asid;
+    uint8_t  valid;
+} AsidSlot;
+
+#define ASID_SLOTS 32
+static AsidSlot g_asid_slots[ASID_SLOTS];
+static uint16_t g_next_asid = 1;
+static uint16_t g_cur_asid = 1;
+static uint64_t g_cur_asid_cr3;
+static uint32_t g_cur_asid_vcpu;
+static uint8_t  g_cur_asid_cpl;
+static uint8_t  g_cur_asid_pg_wp;
+static volatile uint64_t g_asid_hits;
+static volatile uint64_t g_asid_allocs;
+static volatile uint64_t g_asid_rollovers;
+
+static uint16_t asid_alloc_fresh(uint32_t vcpu, uint64_t cr3,
+                                 uint8_t cpl, uint8_t pg_wp)
+{
+    if (g_next_asid >= 1024u) {
+        __asm__ volatile("invtlb 0x3, $zero, $zero" ::: "memory");
+        memset(g_asid_slots, 0, sizeof(g_asid_slots));
+        g_next_asid = 1;
+        g_asid_rollovers++;
+    }
+    uint16_t asid = g_next_asid++;
+    g_asid_allocs++;
+    int victim = -1;
+    for (int i = 0; i < ASID_SLOTS; i++) {
+        if (g_asid_slots[i].valid && g_asid_slots[i].vcpu == vcpu &&
+            g_asid_slots[i].cr3 == cr3 && g_asid_slots[i].cpl == cpl &&
+            g_asid_slots[i].pg_wp == pg_wp) {
+            victim = i;
+            break;
+        }
+        if (!g_asid_slots[i].valid && victim < 0) {
+            victim = i;
+        }
+    }
+    if (victim < 0) {
+        victim = (int)((vcpu * 8u + (uint32_t)cpl * 4u + (uint32_t)(cr3 >> 12)) &
+                       (ASID_SLOTS - 1));
+    }
+    g_asid_slots[victim].vcpu = vcpu;
+    g_asid_slots[victim].cr3 = cr3;
+    g_asid_slots[victim].cpl = cpl;
+    g_asid_slots[victim].pg_wp = pg_wp;
+    g_asid_slots[victim].asid = asid;
+    g_asid_slots[victim].valid = 1;
+    return asid;
+}
+
+static void asid_activate(int force_flush)
+{
+    uint32_t vcpu = g_cur_vcpu;
+    uint64_t cr3 = env.cr[3];
+    uint8_t cpl = (uint8_t)(env.hflags & HF_CPL_MASK);
+    uint8_t pg_wp = (uint8_t)(((env.cr[0] & CR0_PG_MASK) ? 1u : 0u) |
+                              ((env.cr[0] & CR0_WP_MASK) ? 2u : 0u));
+    uint16_t asid = 0;
+
+    if (force_flush) {
+        for (int i = 0; i < ASID_SLOTS; i++) {
+            if (g_asid_slots[i].valid && g_asid_slots[i].vcpu == vcpu &&
+                g_asid_slots[i].cr3 == cr3) {
+                g_asid_slots[i].valid = 0;
+            }
+        }
+        asid = asid_alloc_fresh(vcpu, cr3, cpl, pg_wp);
+    } else {
+        for (int i = 0; i < ASID_SLOTS; i++) {
+            if (g_asid_slots[i].valid && g_asid_slots[i].vcpu == vcpu &&
+                g_asid_slots[i].cr3 == cr3 && g_asid_slots[i].cpl == cpl &&
+                g_asid_slots[i].pg_wp == pg_wp) {
+                asid = g_asid_slots[i].asid;
+                g_asid_hits++;
+                break;
+            }
+        }
+        if (asid == 0) {
+            asid = asid_alloc_fresh(vcpu, cr3, cpl, pg_wp);
+        }
+    }
+    g_cur_asid = asid;
+    g_cur_asid_vcpu = vcpu;
+    g_cur_asid_cr3 = cr3;
+    g_cur_asid_cpl = cpl;
+    g_cur_asid_pg_wp = pg_wp;
+    csrwr(0x18, (uint64_t)asid);
 }
 
 /*
@@ -811,19 +967,32 @@ static void rebuild_host_mappings(void)
  */
 void latx_platform_tlb_flush_all(void)
 {
-    /*
-     * Drop the hardware entries and clear fast_jmp_cache so CR3/CR0 switches
-     * never jump directly to a TB translated under a different address space.
-     */
-    memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
-    __asm__ volatile("invtlb 0x0, $zero, $zero" ::: "memory");
+    uint8_t cpl = (uint8_t)(env.hflags & HF_CPL_MASK);
+    uint8_t pg_wp = (uint8_t)(((env.cr[0] & CR0_PG_MASK) ? 1u : 0u) |
+                              ((env.cr[0] & CR0_WP_MASK) ? 2u : 0u));
+    if (g_cur_vcpu == g_cur_asid_vcpu && env.cr[3] == g_cur_asid_cr3 &&
+        pg_wp == g_cur_asid_pg_wp && cpl != g_cur_asid_cpl) {
+        /* Pure CPL switch (syscall/sysret/iret/exception): reuse ASID without invtlb. */
+        asid_activate(0);
+        return;
+    }
+    memset(fast_jmp_cache, 0, sizeof(g_fast_jmp_cache[0]));
+    asid_activate(1);
 }
 
 void latx_platform_tlb_flush_page(uint64_t addr)
 {
     uint64_t vppn = addr & UINT64_C(0x0000ffffffffe000);
+    uint64_t asid = (uint64_t)g_cur_asid;
 
-    __asm__ volatile("invtlb 0x6, $zero, %0" :: "r"(vppn) : "memory");
+    __asm__ volatile("invtlb 0x5, %0, %1" :: "r"(asid), "r"(vppn) : "memory");
+    for (int i = 0; i < ASID_SLOTS; i++) {
+        if (g_asid_slots[i].valid && g_asid_slots[i].vcpu == g_cur_vcpu &&
+            g_asid_slots[i].cr3 == env.cr[3] && g_asid_slots[i].asid != g_cur_asid) {
+            uint64_t other = (uint64_t)g_asid_slots[i].asid;
+            __asm__ volatile("invtlb 0x5, %0, %1" :: "r"(other), "r"(vppn) : "memory");
+        }
+    }
 }
 
 /*
@@ -901,6 +1070,7 @@ static uint32_t classify_fault_access(uint64_t pc, uint64_t badv,
 }
 
 static int g_use_sw_lbt;
+static volatile uint64_t g_sw_lbt_traps;
 
 static void save_host_xmm_to_env(void)
 {
@@ -955,7 +1125,9 @@ static void sync_trap_regs_to_env(const uint64_t *regs)
         uint32_t non_cc = (uint32_t)regs[reg_statics_map[S_EFLAGS]] & 0x702u;
         uint32_t cc = 0;
 
-        if (g_use_sw_lbt) {
+        if (option_sw_lbt) {
+            cc = (uint32_t)regs[la_tp];
+        } else if (g_use_sw_lbt) {
             cc = sw_lbt.eflags;
         } else {
             __asm__ volatile(".word 0x005cfc0c\n" /* x86mfflag $t0, 0x3f */
@@ -1034,6 +1206,10 @@ static void fill_hw_tlb_pair(uint64_t badv, int is_refill)
                   LAPG_PERM_USER, &tr1) == LAPG_OK) {
         pte1 = tr1.pte;
     }
+    /* Host VMM pages are all >= VMM_IMAGE_BASE; set G on both halves so
+     * hardware TLB sets G = TLBELO0.G & TLBELO1.G = 1 across all ASIDs. */
+    pte0 |= LAPG_PTE_G;
+    pte1 |= LAPG_PTE_G;
 
     if (is_refill) {
         csrwr(0x8e, vppn | (uint64_t)LAPG_PAGE_BITS);
@@ -1395,12 +1571,14 @@ static void switch_vcpu(uint32_t next_id)
     if (next_id >= MAX_VCPUS || next_id == g_cur_vcpu) {
         return;
     }
-    /* env.eflags is already authoritative from epi_buf / sync_trap_regs_to_env;
-     * do not overwrite it with hardware LBT flags on vCPU switch. */
-    g_vcpu_save[g_cur_vcpu] = env;
-    env = g_vcpu_save[next_id];
+    /* Zero-copy vCPU switch: swap cur_env pointer, keep per-vCPU fast_jmp_cache,
+     * and switch CSR.ASID without invtlb 0x0 or 64 KiB memset. */
+    cur_env = &g_vcpu_env[next_id];
+    lsenv->cpu_state = cur_env;
     cc = (uint32_t)(env.eflags & 0x8d5u);
-    if (g_use_sw_lbt) {
+    if (option_sw_lbt) {
+        /* pro_buf loads env.eflags into $tp on PLV3 entry. */
+    } else if (g_use_sw_lbt) {
         sw_lbt.eflags = cc;
     } else {
         __asm__ volatile("move $t0, %0\n"
@@ -1409,8 +1587,7 @@ static void switch_vcpu(uint32_t next_id)
     }
     g_cur_vcpu = next_id;
     latx_guest_apic_id = next_id;
-    latx_x86_tlb_flush_all();
-    latx_platform_tlb_flush_all();
+    asid_activate(0);
 }
 
 static int start_ap_from_sipi(uint32_t cpu_id, uint32_t vec)
@@ -1475,10 +1652,9 @@ static int start_ap_from_sipi(uint32_t cpu_id, uint32_t vec)
         return 0;
     }
 
-    CPUX86State *ap = &g_vcpu_save[cpu_id];
+    CPUX86State *ap = &g_vcpu_env[cpu_id];
     memset(ap, 0, sizeof(*ap));
     latx_x86_env_init_features(ap);
-    (void)cpu_id;
     ap->sys.codemode = 1;
     ap->hflags = HF_LMA_MASK | HF_CS64_MASK | HF_PE_MASK;
     ap->cr[0] = 0x80050033u;
@@ -1492,7 +1668,8 @@ static int start_ap_from_sipi(uint32_t cpu_id, uint32_t vec)
     ap->eip = start_rip;
     ap->regs[R_ESP] = 0x7ff0;
     ap->eflags = 0x2;
-    ap->tb_jmp_cache_ptr = fast_jmp_cache;
+    memset(g_fast_jmp_cache[cpu_id], 0, sizeof(g_fast_jmp_cache[0]));
+    ap->tb_jmp_cache_ptr = g_fast_jmp_cache[cpu_id];
     g_vcpu_online[cpu_id] = 1;
     g_vcpu_halted[cpu_id] = 0;
     g_vcpu_init_pending[cpu_id] = 0;
@@ -1531,7 +1708,7 @@ static uint64_t build_guest_leaf_pte(uint32_t x86_r,
         if (gpa_pfn < CODE_PAGE_MAX_PFN &&
             ((g_code_page_bitmap[gpa_pfn >> 6] >> (gpa_pfn & 63u)) & 1u)) {
             if (x86_access & LATX_X86_ACCESS_WRITE) {
-                g_smc_dirty = 1;
+                smc_record_dirty_pfn((uint32_t)gpa_pfn);
                 g_code_page_bitmap[gpa_pfn >> 6] &= ~(UINT64_C(1) << (gpa_pfn & 63u));
             } else {
                 perm &= ~LAPG_PERM_WRITE;
@@ -1572,7 +1749,7 @@ static void fill_hw_tlb_guest(uint64_t badv, uint64_t fault_pte, int is_refill)
         csrwr(0x8c, pte0);
         csrwr(0x8d, pte1);
     } else {
-        __asm__ volatile("invtlb 0x6, $zero, %0" :: "r"(vppn) : "memory");
+        __asm__ volatile("invtlb 0x5, %0, %1" :: "r"((uint64_t)g_cur_asid), "r"(vppn) : "memory");
         csrwr(0x10, (uint64_t)LAPG_PAGE_BITS << 24);
         csrwr(0x11, vppn);
         csrwr(0x12, pte0);
@@ -1698,14 +1875,10 @@ static int resolve_exact_insn_boundary_x86_pc(uint64_t fault_pc,
 {
     /* Only preempt at TB entry (off == 0) where flag_reduction and IR2
      * optimizations have materialized all architectural EFLAGS and GPRs. */
-    for (uint32_t i = 0; i < g_tb_highwater; i++) {
-        if (!tb_entries[i].used) {
-            continue;
-        }
-        if (fault_pc == tb_entries[i].code) {
-            *out_x86_pc = tb_entries[i].pc;
-            return 1;
-        }
+    int slot = find_tb_slot_by_code_pc(fault_pc);
+    if (slot >= 0 && fault_pc == tb_entries[slot].code) {
+        *out_x86_pc = tb_entries[slot].pc;
+        return 1;
     }
     return 0;
 }
@@ -1917,10 +2090,11 @@ static uint64_t g_run_tb_links;
 static uint64_t g_sync_core_calls;
 static uint64_t g_sync_core_flushes;
 
-static void mark_code_pages_ro(uint64_t gva, uint16_t len)
+static void mark_code_pages_ro(uint32_t slot_idx, uint64_t gva, uint16_t len)
 {
     uint64_t cur = gva & LAPG_PAGE_MASK;
     uint64_t end = (gva + (uint64_t)len + LAPG_PAGE_SIZE - 1) & LAPG_PAGE_MASK;
+    uint32_t p0 = UINT32_MAX, p1 = UINT32_MAX;
 
     for (; cur < end; cur += LAPG_PAGE_SIZE) {
         LatxX86Translation tr_g;
@@ -1931,6 +2105,11 @@ static void mark_code_pages_ro(uint64_t gva, uint16_t len)
         if (pfn >= CODE_PAGE_MAX_PFN) {
             continue;
         }
+        if (p0 == UINT32_MAX) {
+            p0 = (uint32_t)pfn;
+        } else {
+            p1 = (uint32_t)pfn;
+        }
         uint64_t mask = UINT64_C(1) << (pfn & 63u);
         if ((g_code_page_bitmap[pfn >> 6] & mask) != 0) {
             continue;
@@ -1938,9 +2117,17 @@ static void mark_code_pages_ro(uint64_t gva, uint16_t len)
         g_code_page_bitmap[pfn >> 6] |= mask;
         if (!is_host_vmm_va(cur)) {
             uint64_t vppn = cur & UINT64_C(0x0000ffffffffe000);
-            __asm__ volatile("invtlb 0x6, $zero, %0" :: "r"(vppn) : "memory");
+            __asm__ volatile("invtlb 0x5, %0, %1" :: "r"((uint64_t)g_cur_asid), "r"(vppn) : "memory");
+            for (int k = 0; k < ASID_SLOTS; k++) {
+                if (g_asid_slots[k].valid && g_asid_slots[k].asid != g_cur_asid) {
+                    uint64_t a = (uint64_t)g_asid_slots[k].asid;
+                    __asm__ volatile("invtlb 0x5, %0, %1" :: "r"(a), "r"(vppn) : "memory");
+                }
+            }
         }
     }
+    tb_pfn0[slot_idx] = p0;
+    tb_pfn1[slot_idx] = (p1 == UINT32_MAX) ? p0 : p1;
 }
 
 static uint64_t hash_guest_code(uint64_t gva, uint16_t len)
@@ -2022,19 +2209,7 @@ static void link_new_tb(uint32_t new_slot)
         }
     }
 
-    /* 2. Incoming edges from existing TBs in the same (cr3, cpl) to this TB. */
-    for (uint32_t j = 0; j < g_tb_highwater; j++) {
-        if (!tb_entries[j].used || j == new_slot) {
-            continue;
-        }
-        if (tb_entries[j].cr3 != e->cr3 || tb_entries[j].cpl != e->cpl) {
-            continue;
-        }
-        if (tb_insn_maps[j].jmp_target_pc[0] == e->pc ||
-            tb_insn_maps[j].jmp_target_pc[1] == e->pc) {
-            try_link_tb_slot(j, new_slot);
-        }
-    }
+    /* Incoming edges are linked lazily on demand via prev_slot in run_blocks_from(). */
 }
 
 static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
@@ -2056,9 +2231,13 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
     g_sync_core_flushes = 0;
     tbc_flush_all(&tb_cache);
     g_tb_highwater = 0;
+    g_tb_by_code_count = 0;
     memset(g_code_page_bitmap, 0, sizeof(g_code_page_bitmap));
     g_smc_dirty = 0;
-    memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
+    g_smc_dirty_count = 0;
+    g_smc_dirty_overflow = 0;
+    g_smc_granular_evicts = 0;
+    memset(g_fast_jmp_cache, 0, sizeof(g_fast_jmp_cache));
     code_used = 0x2000;
     __asm__ volatile("ibar 0" ::: "memory");
     latx_x86_tlb_flush_all();
@@ -2143,13 +2322,17 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
 
             g_run_tb_misses++;
             if (code_used + 32768 > CODE_CACHE_SIZE ||
-                tbc_count(&tb_cache) >= TB_TABLE_CAP - 1) {
+                tbc_count(&tb_cache) >= TB_TABLE_CAP - 1 ||
+                g_tb_by_code_count >= TB_TABLE_CAP - 1) {
                 tbc_flush_all(&tb_cache);
                 g_tb_highwater = 0;
+                g_tb_by_code_count = 0;
                 prev_slot = -1;
                 memset(g_code_page_bitmap, 0, sizeof(g_code_page_bitmap));
                 g_smc_dirty = 0;
-                memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
+                g_smc_dirty_count = 0;
+                g_smc_dirty_overflow = 0;
+                memset(g_fast_jmp_cache, 0, sizeof(g_fast_jmp_cache));
                 code_used = 0x2000;
                 g_run_tb_flushes++;
                 __asm__ volatile("ibar 0" ::: "memory");
@@ -2158,10 +2341,13 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
             if (e == 0) {
                 tbc_flush_all(&tb_cache);
                 g_tb_highwater = 0;
+                g_tb_by_code_count = 0;
                 prev_slot = -1;
                 memset(g_code_page_bitmap, 0, sizeof(g_code_page_bitmap));
                 g_smc_dirty = 0;
-                memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
+                g_smc_dirty_count = 0;
+                g_smc_dirty_overflow = 0;
+                memset(g_fast_jmp_cache, 0, sizeof(g_fast_jmp_cache));
                 code_used = 0x2000;
                 g_run_tb_flushes++;
                 __asm__ volatile("ibar 0" ::: "memory");
@@ -2193,15 +2379,24 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
             if (rc <= 0) {
                 tbc_flush_all(&tb_cache);
                 g_tb_highwater = 0;
+                g_tb_by_code_count = 0;
                 prev_slot = -1;
                 memset(g_code_page_bitmap, 0, sizeof(g_code_page_bitmap));
                 g_smc_dirty = 0;
-                memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
+                g_smc_dirty_count = 0;
+                g_smc_dirty_overflow = 0;
+                memset(g_fast_jmp_cache, 0, sizeof(g_fast_jmp_cache));
                 g_run_blocks_exit = RUN_EXIT_TRANSLATE_FAIL;
                 break;
             }
             e->code = (uint64_t)(uintptr_t)code;
             e->code_size = (uint32_t)rc;
+            if (g_tb_by_code_count < TB_TABLE_CAP) {
+                g_tb_by_code[g_tb_by_code_count].code_start = e->code;
+                g_tb_by_code[g_tb_by_code_count].code_end = e->code + (uint64_t)e->code_size;
+                g_tb_by_code[g_tb_by_code_count].slot_idx = slot_idx;
+                g_tb_by_code_count++;
+            }
             {
                 uint16_t clen = 16;
                 const TbInsnMap *m = &tb_insn_maps[slot_idx];
@@ -2217,7 +2412,7 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
                 }
                 tb_code_len[slot_idx] = clen;
                 tb_code_hash[slot_idx] = hash_guest_code(before, clen);
-                mark_code_pages_ro(before, clen);
+                mark_code_pages_ro(slot_idx, before, clen);
             }
             code_used += (((uint64_t)rc + 255) & ~UINT64_C(255));
             __asm__ volatile("ibar 0" ::: "memory");
@@ -2262,28 +2457,93 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
                 if (env.eip == iret_next) {
                     g_sync_core_calls++;
                     if (g_smc_dirty) {
-                        int dirty = 0;
-                        for (uint32_t i = 0; i < g_tb_highwater; i++) {
-                            if (!tb_entries[i].used || (tb_entries[i].cr3 != 0 && tb_entries[i].cr3 != env.cr[3])) {
-                                continue;
-                            }
-                            if (hash_guest_code(tb_entries[i].pc, tb_code_len[i]) !=
-                                tb_code_hash[i]) {
-                                dirty = 1;
-                                break;
-                            }
-                        }
-                        g_smc_dirty = 0;
-                        if (dirty) {
+                        if (g_smc_dirty_overflow) {
                             tbc_flush_all(&tb_cache);
                             g_tb_highwater = 0;
+                            g_tb_by_code_count = 0;
                             prev_slot = -1;
                             memset(g_code_page_bitmap, 0, sizeof(g_code_page_bitmap));
-                            memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
+                            memset(g_fast_jmp_cache, 0, sizeof(g_fast_jmp_cache));
                             code_used = 0x2000;
                             g_sync_core_flushes++;
                             __asm__ volatile("ibar 0" ::: "memory");
+                        } else if (g_smc_dirty_count > 0) {
+                            uint64_t evicted_pcs[64];
+                            uint32_t evicted_cnt = 0;
+                            int overflow_evict = 0;
+                            for (uint32_t i = 0; i < g_tb_highwater; i++) {
+                                if (!tb_entries[i].used) {
+                                    continue;
+                                }
+                                int pfn_hit = 0;
+                                for (uint32_t d = 0; d < g_smc_dirty_count; d++) {
+                                    if (tb_pfn0[i] == g_smc_dirty_pfns[d] ||
+                                        tb_pfn1[i] == g_smc_dirty_pfns[d]) {
+                                        pfn_hit = 1;
+                                        break;
+                                    }
+                                }
+                                if (!pfn_hit) {
+                                    continue;
+                                }
+                                if ((tb_entries[i].cr3 == 0 || tb_entries[i].cr3 == env.cr[3]) &&
+                                    hash_guest_code(tb_entries[i].pc, tb_code_len[i]) ==
+                                    tb_code_hash[i]) {
+                                    continue;
+                                }
+                                uint64_t epc = tb_entries[i].pc;
+                                uint32_t h = (uint32_t)(((epc >> TB_JMP_CACHE_BITS) ^ epc) &
+                                                        (FAST_JMP_CACHE_SIZE - 1));
+                                for (uint32_t c = 0; c < MAX_VCPUS; c++) {
+                                    if (g_fast_jmp_cache[c][h].pc == epc) {
+                                        g_fast_jmp_cache[c][h].pc = 0;
+                                        g_fast_jmp_cache[c][h].code = 0;
+                                    }
+                                }
+                                tbc_invalidate_slot(&tb_cache, i);
+                                g_smc_granular_evicts++;
+                                if (evicted_cnt < 64u) {
+                                    evicted_pcs[evicted_cnt++] = epc;
+                                } else {
+                                    overflow_evict = 1;
+                                }
+                            }
+                            if (overflow_evict) {
+                                tbc_flush_all(&tb_cache);
+                                g_tb_highwater = 0;
+                                g_tb_by_code_count = 0;
+                                prev_slot = -1;
+                                memset(g_code_page_bitmap, 0, sizeof(g_code_page_bitmap));
+                                memset(g_fast_jmp_cache, 0, sizeof(g_fast_jmp_cache));
+                                code_used = 0x2000;
+                                g_sync_core_flushes++;
+                                __asm__ volatile("ibar 0" ::: "memory");
+                            } else if (evicted_cnt > 0) {
+                                for (uint32_t j = 0; j < g_tb_highwater; j++) {
+                                    if (!tb_entries[j].used) {
+                                        continue;
+                                    }
+                                    TbInsnMap *jm = &tb_insn_maps[j];
+                                    for (int e_i = 0; e_i < 2; e_i++) {
+                                        if (jm->jmp_slot_off[e_i] < 0) continue;
+                                        uint64_t tpc = jm->jmp_target_pc[e_i];
+                                        for (uint32_t k = 0; k < evicted_cnt; k++) {
+                                            if (tpc == evicted_pcs[k]) {
+                                                uint32_t *sp = (uint32_t *)(uintptr_t)(
+                                                    tb_entries[j].code + (uint64_t)jm->jmp_slot_off[e_i]);
+                                                *sp = 0x03400000u;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                prev_slot = -1;
+                                __asm__ volatile("ibar 0" ::: "memory");
+                            }
                         }
+                        g_smc_dirty = 0;
+                        g_smc_dirty_count = 0;
+                        g_smc_dirty_overflow = 0;
                     }
                 }
             }
@@ -2342,11 +2602,11 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
                         uint32_t c = (g_cur_vcpu + step) % MAX_VCPUS;
                         int urg = g_vcpu_nmi_pending[c] ||
                                   (lapic_has_irr(c) &&
-                                   (g_vcpu_save[c].eflags & IF_MASK) != 0) ||
+                                   (g_vcpu_env[c].eflags & IF_MASK) != 0) ||
                                   (g_timer_irq_pending[c] &&
-                                   (g_vcpu_save[c].eflags & IF_MASK) != 0) ||
+                                   (g_vcpu_env[c].eflags & IF_MASK) != 0) ||
                                   (com1_irq_dest_match(c) && com1_irq_pending() &&
-                                   (g_vcpu_save[c].eflags & IF_MASK) != 0);
+                                   (g_vcpu_env[c].eflags & IF_MASK) != 0);
                         if (g_vcpu_online[c] && (!g_vcpu_halted[c] || urg)) {
                             target = c;
                             break;
@@ -2377,7 +2637,7 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
                     if (g_vcpu_online[c] &&
                         (g_vcpu_nmi_pending[c] ||
                          (lapic_has_irr(c) &&
-                          (g_vcpu_save[c].eflags & IF_MASK) != 0))) {
+                          (g_vcpu_env[c].eflags & IF_MASK) != 0))) {
                         target = c;
                         break;
                     }
@@ -2817,14 +3077,7 @@ static void unlink_tb_at_pc(uint64_t fault_pc)
         fault_pc < g_current_tb_code + (uint64_t)g_current_tb_size) {
         found_slot = (int)(g_current_tb_map - tb_insn_maps);
     } else {
-        for (uint32_t i = 0; i < g_tb_highwater; i++) {
-            if (tb_entries[i].used &&
-                fault_pc >= tb_entries[i].code &&
-                fault_pc < tb_entries[i].code + (uint64_t)tb_entries[i].code_size) {
-                found_slot = (int)i;
-                break;
-            }
-        }
+        found_slot = find_tb_slot_by_code_pc(fault_pc);
     }
     if (found_slot >= 0) {
         TbCacheEntry *e = &tb_entries[found_slot];
@@ -2843,7 +3096,7 @@ static void unlink_tb_at_pc(uint64_t fault_pc)
         if (unlinked) {
             __asm__ volatile("ibar 0" ::: "memory");
         } else if (map->jmp_slot_off[0] < 0 && map->jmp_slot_off[1] < 0) {
-            memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
+            memset(fast_jmp_cache, 0, sizeof(g_fast_jmp_cache[0]));
         }
     }
 }
@@ -2857,6 +3110,7 @@ void tb_sys_handle_trap(uint64_t *regs)
 
     if (!is_refill && ecode == EXC_IPE) {
         g_use_sw_lbt = 1;
+        g_sw_lbt_traps++;
         lbt_handle_fast(regs, csrrd(0x6));
         return;
     }
@@ -3444,7 +3698,7 @@ void kmain(void)
     memset(&tr, 0, sizeof(tr));
     memset(&lsenv_storage, 0, sizeof(lsenv_storage));
     memset(&tcg_storage, 0, sizeof(tcg_storage));
-    memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
+    memset(g_fast_jmp_cache, 0, sizeof(g_fast_jmp_cache));
     memset(code_cache, 0, sizeof(code_cache));
     memset(epi_buf, 0, sizeof(epi_buf));
     memset(pro_buf, 0, sizeof(pro_buf));
@@ -3529,9 +3783,12 @@ void kmain(void)
      */
     option_guest_paging = 0;
     option_save_xmm = 0xff;
+    option_sw_lbt = g_use_sw_lbt;
     option_lbt_jiscr = !g_use_sw_lbt;
     latx_bare_uart_puts("tb-sys: lbt_hw=");
     puthex((uint64_t)!g_use_sw_lbt);
+    latx_bare_uart_puts(" sw_lbt=");
+    puthex((uint64_t)option_sw_lbt);
     latx_bare_uart_puts(" lbt_jiscr=");
     puthex((uint64_t)option_lbt_jiscr);
     latx_bare_uart_puts("\n");
@@ -3572,6 +3829,7 @@ void kmain(void)
         csrwr(0x0, crmd);
     }
     __asm__ volatile("invtlb 0x0, $zero, $zero" ::: "memory");
+    asid_activate(1);
 
     /*
      * Save host page 0x201000 before the guest test writes to PA 0x201000
@@ -4263,18 +4521,18 @@ void kmain(void)
         uint8_t *src_code = code_cache + 0x11000;
         int saved_lbt_jiscr = option_lbt_jiscr;
         int rc_dst, rc_src;
-        int has_gr2scr = 0, has_jiscr0 = 0;
+        int has_gr2scr = 0, has_jiscr0 = 0, has_jirl = 0;
 
         memcpy((void *)(uintptr_t)src_pc, src_x86, sizeof(src_x86));
         memcpy((void *)(uintptr_t)dst_pc, dst_x86, sizeof(dst_x86));
         memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
         env.tb_jmp_cache_ptr = fast_jmp_cache;
-        option_lbt_jiscr = 1;
+        option_lbt_jiscr = !option_sw_lbt;
         latx_x86_tlb_flush_all();
 
         rc_dst = tb_harness_translate_at(dst_pc, dst_code, 4096);
         rc_src = tb_harness_translate_at(src_pc, src_code, 4096);
-        check(rc_dst > 0 && rc_src > 0, "lbt jiscr0 indirect jump blocks translate");
+        check(rc_dst > 0 && rc_src > 0, "indirect jump fast-path blocks translate");
         if (rc_src > 0) {
             const uint32_t *insns = (const uint32_t *)(uintptr_t)src_code;
             for (int k = 0; k < rc_src / 4; k++) {
@@ -4284,9 +4542,17 @@ void kmain(void)
                 if (insns[k] == 0x48000200u) {
                     has_jiscr0 = 1;
                 }
+                if ((insns[k] & 0xfc00fc1fu) == 0x4c000000u && ((insns[k] >> 5) & 0x1fu) != 1u) {
+                    has_jirl = 1;
+                }
             }
         }
-        check(has_gr2scr && has_jiscr0, "indirect goto emitted gr2scr + jiscr0");
+        if (option_sw_lbt) {
+            check(!has_gr2scr && !has_jiscr0 && has_jirl,
+                  "sw_lbt indirect goto emitted pure-GPR jirl without gr2scr/jiscr0");
+        } else {
+            check(has_gr2scr && has_jiscr0, "indirect goto emitted gr2scr + jiscr0");
+        }
         if (rc_dst > 0 && rc_src > 0) {
             uint32_t h = (uint32_t)(((dst_pc >> TB_JMP_CACHE_BITS) ^ dst_pc) &
                                     (FAST_JMP_CACHE_SIZE - 1));
@@ -4666,6 +4932,14 @@ void kmain(void)
                             puthex(g_timer_delivered);
                             latx_bare_uart_puts(" irqs=");
                             puthex(g_timer_ticks);
+                            latx_bare_uart_puts(" sw_lbt_traps=");
+                            puthex(g_sw_lbt_traps);
+                            latx_bare_uart_puts(" asid_hits=");
+                            puthex(g_asid_hits);
+                            latx_bare_uart_puts(" asid_allocs=");
+                            puthex(g_asid_allocs);
+                            latx_bare_uart_puts(" smc_evicts=");
+                            puthex(g_smc_granular_evicts);
                             latx_bare_uart_puts("\n");
                             if (g_plv3_exit.reason != PLV3_EXIT_NORMAL) {
                                 uint64_t n = g_recent_count < 8 ? g_recent_count : 8;

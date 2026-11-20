@@ -179,6 +179,7 @@ static LapgPagePool g_pool;
 static uint64_t g_root;
 
 static int g_use_sw_lbt;
+static volatile uint64_t g_sw_lbt_traps;
 static uint32_t g_cur_vcpu;
 static volatile uint64_t g_plv3_timer_preempt __attribute__((used));
 static volatile int g_vcpu_preempt_needed;
@@ -334,7 +335,9 @@ static void sync_trap_regs_to_env(const uint64_t *regs)
     save_host_xmm_to_env();
     uint32_t non_cc = (uint32_t)regs[reg_statics_map[S_EFLAGS]] & 0x702u;
     uint32_t cc = 0;
-    if (g_use_sw_lbt) {
+    if (option_sw_lbt) {
+        cc = (uint32_t)regs[la_tp];
+    } else if (g_use_sw_lbt) {
         cc = sw_lbt.eflags;
     } else {
         __asm__ volatile(".word 0x005cfc0c\n move %0, $t0" : "=r"(cc) :: "t0");
@@ -418,6 +421,7 @@ void regress_handle_trap(uint64_t *regs)
 
     if (!is_refill && ecode == EXC_IPE) {
         g_use_sw_lbt = 1;
+        g_sw_lbt_traps++;
         lbt_handle_fast(regs, csrrd(0x6));
         return;
     }
@@ -679,7 +683,9 @@ static void switch_vcpu(uint32_t next_id)
     g_vcpu_save[g_cur_vcpu] = env;
     env = g_vcpu_save[next_id];
     uint32_t cc = (uint32_t)(env.eflags & 0x8d5u);
-    if (g_use_sw_lbt) {
+    if (option_sw_lbt) {
+        /* pro_buf loads env.eflags into $tp on PLV3 entry. */
+    } else if (g_use_sw_lbt) {
         sw_lbt.eflags = cc;
     } else {
         __asm__ volatile("move $t0, %0\n .word 0x005cfc2c\n" :: "r"(cc) : "t0");
@@ -1307,6 +1313,7 @@ void kmain(void)
 
     option_guest_paging = 0;
     option_save_xmm = 0xff;
+    option_sw_lbt = g_use_sw_lbt;
     option_lbt_jiscr = !g_use_sw_lbt;
 
     latx_gen_epilogue(epi_buf);
@@ -1354,8 +1361,85 @@ void kmain(void)
         test_v3_translation();
     }
     test_smp_isolation_and_atomics(lvl);
+    {
+        /* Pure-GPR (or LBT jiscr0) indirect jump + RET fast_jmp_cache chaining */
+        static const uint8_t code_ijmp_src[] = {
+            0xb8, 0x00, 0x17, 0x01, 0x00, /* mov eax, 0x11700 */
+            0xff, 0xe0,                   /* jmp rax          */
+        };
+        static const uint8_t code_ijmp_mid[] = {
+            0xbb, 0x78, 0x56, 0x34, 0x12, /* mov ebx, 0x12345678 */
+            0xc3,                         /* ret                 */
+        };
+        static const uint8_t code_ijmp_ret[] = {
+            0xb9, 0x01, 0xef, 0xcd, 0xab, /* mov ecx, 0xabcdef01 */
+            0xf4,                         /* hlt                 */
+        };
+        uint64_t pc_src = 0x11600, pc_mid = 0x11700, pc_ret = 0x11800;
+        uint8_t *c_src = code_cache + code_used;
+        uint8_t *c_mid = c_src + 4096;
+        uint8_t *c_ret = c_mid + 4096;
+        uint64_t *stk = (uint64_t *)(uintptr_t)0x38000;
+        int rc_s, rc_m, rc_r;
+        int has_gr2scr = 0, has_jiscr0 = 0, has_jirl = 0;
 
-    latx_bare_uart_puts("regress: checks=");
+        code_used += 3 * 4096;
+        memcpy((void *)(uintptr_t)pc_src, code_ijmp_src, sizeof(code_ijmp_src));
+        memcpy((void *)(uintptr_t)pc_mid, code_ijmp_mid, sizeof(code_ijmp_mid));
+        memcpy((void *)(uintptr_t)pc_ret, code_ijmp_ret, sizeof(code_ijmp_ret));
+        memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
+        reset_guest_env((uint64_t)(uintptr_t)stk);
+        *stk = pc_ret;
+        env.tb_jmp_cache_ptr = fast_jmp_cache;
+
+        rc_r = tb_harness_translate_at(pc_ret, c_ret, 4096);
+        rc_m = tb_harness_translate_at(pc_mid, c_mid, 4096);
+        rc_s = tb_harness_translate_at(pc_src, c_src, 4096);
+        check(rc_s > 0 && rc_m > 0 && rc_r > 0, "ijmp: src/mid/ret blocks translated");
+        if (rc_s > 0) {
+            const uint32_t *insns = (const uint32_t *)(uintptr_t)c_src;
+            for (int k = 0; k < rc_s / 4; k++) {
+                if ((insns[k] & 0xfffffc00u) == 0x00000800u) has_gr2scr = 1;
+                if (insns[k] == 0x48000200u) has_jiscr0 = 1;
+                if ((insns[k] & 0xfc00fc1fu) == 0x4c000000u &&
+                    ((insns[k] >> 5) & 0x1fu) != 1u) {
+                    has_jirl = 1;
+                }
+            }
+        }
+        if (option_sw_lbt) {
+            check(!has_gr2scr && !has_jiscr0 && has_jirl,
+                  "ijmp: sw_lbt emitted pure-GPR jirl without gr2scr/jiscr0");
+        } else {
+            check(has_gr2scr && has_jiscr0, "ijmp: hw_lbt emitted gr2scr + jiscr0");
+        }
+        if (rc_s > 0 && rc_m > 0 && rc_r > 0) {
+            uint32_t hm = (uint32_t)(((pc_mid >> TB_JMP_CACHE_BITS) ^ pc_mid) &
+                                     (FAST_JMP_CACHE_SIZE - 1));
+            uint32_t hr = (uint32_t)(((pc_ret >> TB_JMP_CACHE_BITS) ^ pc_ret) &
+                                     (FAST_JMP_CACHE_SIZE - 1));
+            fast_jmp_cache[hm].pc = pc_mid;
+            fast_jmp_cache[hm].code = (uint64_t)(uintptr_t)c_mid;
+            fast_jmp_cache[hr].pc = pc_ret;
+            fast_jmp_cache[hr].code = (uint64_t)(uintptr_t)c_ret;
+            __asm__ volatile("ibar 0" ::: "memory");
+
+            env.eip = pc_src;
+            regress_run_plv3(pro_buf, c_src, &env);
+            check(g_plv3_exit.reason == 1 &&
+                  env.regs[R_EBX] == 0x12345678u &&
+                  env.regs[R_ECX] == 0xabcdef01u &&
+                  env.eip == pc_ret + 5,
+                  "ijmp: single PLV3 run chained jmp*rax -> ret -> hlt");
+        }
+        env.tb_jmp_cache_ptr = 0;
+        memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
+    }
+    check(g_sw_lbt_traps == 0, "sw_lbt: zero EXC_IPE traps");
+
+    latx_bare_uart_puts("regress: sw_lbt_traps=");
+    puthex(g_sw_lbt_traps);
+    latx_bare_uart_puts(" checks=");
     puthex((uint64_t)checks);
     latx_bare_uart_puts(" fails=");
     puthex((uint64_t)fails);
