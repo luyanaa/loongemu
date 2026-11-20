@@ -206,21 +206,50 @@ Arm64WalkResult arm64_walk(const Arm64PagingMemory *memory,
                         uint32_t perm = 0;
                         uint32_t ap = (uint32_t)((desc & ARM64_PTE_AP_MASK) >> 6);
                         bool user = (access & ARM64_ACCESS_USER) != 0;
+                        bool el0_readable, el0_writable;
+                        bool el1_writable;
 
-                        perm |= ARM64_ACCESS_READ;        /* read is never denied */
-                        if (ap == 1u || ap == 3u) {
-                            perm |= ARM64_ACCESS_WRITE;
-                        } else if (!user) {
-                            perm |= ARM64_ACCESS_WRITE;   /* EL1 may write RO too */
-                        }
-                        if (user && ap == 0u) {
-                            /* AP=0b00 is EL1-only. */
-                            return ARM64_WALK_PROTECTION;
-                        }
-                        if (access & ARM64_ACCESS_WRITE) {
-                            if (!(perm & ARM64_ACCESS_WRITE)) {
+                        /*
+                         * AP[2:1] is the whole permission model at this level
+                         * (ARM DDI 0487 D8.3.1, "Stage 1 memory access
+                         * permissions"):
+                         *
+                         *   AP   EL1   EL0
+                         *   00   RW    none
+                         *   01   RW    RW
+                         *   10   RO    none
+                         *   11   RO    RO
+                         *
+                         * Readability is not universal: AP=00 and AP=10 deny
+                         * EL0 outright, so a user read must fault rather than
+                         * succeed with a read-only translation.  And AP=10/11
+                         * are read-only for EL1 as well -- only a privileged
+                         * write that the architecture routes through PAN/EPD
+                         * or a read-only memattr bypass can get past them, and
+                         * that is not a permission this walker may grant.
+                         */
+                        el0_readable = (ap == 1u || ap == 3u);
+                        el0_writable = (ap == 1u);
+                        el1_writable = (ap == 0u || ap == 1u);
+
+                        if (user) {
+                            if (!el0_readable) {
                                 return ARM64_WALK_PROTECTION;
                             }
+                            perm |= ARM64_ACCESS_READ;
+                            if (el0_writable) {
+                                perm |= ARM64_ACCESS_WRITE;
+                            }
+                        } else {
+                            perm |= ARM64_ACCESS_READ;
+                            if (el1_writable) {
+                                perm |= ARM64_ACCESS_WRITE;
+                            }
+                        }
+
+                        if ((access & ARM64_ACCESS_WRITE) &&
+                            !(perm & ARM64_ACCESS_WRITE)) {
+                            return ARM64_WALK_PROTECTION;
                         }
                         if (access & ARM64_ACCESS_EXEC) {
                             if (user ? (desc & ARM64_PTE_UXN) :

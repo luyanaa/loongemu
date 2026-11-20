@@ -110,24 +110,54 @@ int main(void)
     check(arm64_walk(&mem, L0_BASE, 0, tcr, va, ARM64_ACCESS_READ, &tr) ==
           ARM64_WALK_NOT_PRESENT, "a valid entry with AF clear faults");
 
-    /* --- write permission --------------------------------------------- */
-    build_map(&memory, va, pa, DESC_AP(2) | DESC_AF | DESC_VALID | DESC_TABLE);
-    check(arm64_walk(&mem, L0_BASE, 0, tcr, va, ARM64_ACCESS_READ, &tr) ==
-          ARM64_WALK_OK, "AP=RO still reads");
-    check(arm64_walk(&mem, L0_BASE, 0, tcr, va,
-                     ARM64_ACCESS_READ | ARM64_ACCESS_USER, &tr) ==
-          ARM64_WALK_OK, "AP=RO is readable at EL0");
-    check(arm64_walk(&mem, L0_BASE, 0, tcr, va,
-                     ARM64_ACCESS_WRITE | ARM64_ACCESS_USER, &tr) ==
-          ARM64_WALK_PROTECTION, "AP=RO refuses an EL0 write");
-    check(arm64_fault_status(ARM64_WALK_PROTECTION, ARM64_ACCESS_WRITE) != 0,
-          "a permission fault has a status");
+    /*
+     * --- the full AP matrix --------------------------------------------
+     *
+     * AP[2:1] is the permission model, and it is not monotone: only AP=01
+     * grants EL1+EL0 write, AP=00/10 deny EL0 entirely (without even a
+     * read), and AP=10/11 are read-only for EL1 too.  Enumerating the whole
+     * matrix is the point -- a test that only checks "a write is refused" can
+     * stay green while a *read* is wrongly allowed.
+     *
+     *   AP   EL1   EL0
+     *   00   RW    none
+     *   01   RW    RW
+     *   10   RO    none
+     *   11   RO    RO
+     */
+    {
+        static const struct {
+            uint32_t ap;
+            const char *el1_read, *el1_write, *el0_read, *el0_write;
+            int el1_read_ok, el1_write_ok, el0_read_ok, el0_write_ok;
+        } cases[] = {
+            { 0u, "00 EL1 read",  "00 EL1 write",  "00 EL0 read",  "00 EL0 write",  1, 1, 0, 0 },
+            { 1u, "01 EL1 read",  "01 EL1 write",  "01 EL0 read",  "01 EL0 write",  1, 1, 1, 1 },
+            { 2u, "10 EL1 read",  "10 EL1 write",  "10 EL0 read",  "10 EL0 write",  1, 0, 0, 0 },
+            { 3u, "11 EL1 read",  "11 EL1 write",  "11 EL0 read",  "11 EL0 write",  1, 0, 1, 0 },
+        };
 
-    /* --- EL1-only page ------------------------------------------------- */
-    build_map(&memory, va, pa, DESC_AP(0) | DESC_AF | DESC_VALID | DESC_TABLE);
-    check(arm64_walk(&mem, L0_BASE, 0, tcr, va,
-                     ARM64_ACCESS_READ | ARM64_ACCESS_USER, &tr) ==
-          ARM64_WALK_PROTECTION, "AP=EL1-only denies EL0");
+        for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            uint64_t attr = ((uint64_t)(cases[i].ap & 3u) << 6) | DESC_AF |
+                            DESC_VALID | DESC_TABLE;
+
+            build_map(&memory, va, pa, attr);
+            check((arm64_walk(&mem, L0_BASE, 0, tcr, va, ARM64_ACCESS_READ,
+                              &tr) == ARM64_WALK_OK) == (cases[i].el1_read_ok != 0),
+                  cases[i].el1_read);
+            check((arm64_walk(&mem, L0_BASE, 0, tcr, va, ARM64_ACCESS_WRITE,
+                              &tr) == ARM64_WALK_OK) == (cases[i].el1_write_ok != 0),
+                  cases[i].el1_write);
+            check((arm64_walk(&mem, L0_BASE, 0, tcr, va,
+                              ARM64_ACCESS_READ | ARM64_ACCESS_USER,
+                              &tr) == ARM64_WALK_OK) == (cases[i].el0_read_ok != 0),
+                  cases[i].el0_read);
+            check((arm64_walk(&mem, L0_BASE, 0, tcr, va,
+                              ARM64_ACCESS_WRITE | ARM64_ACCESS_USER,
+                              &tr) == ARM64_WALK_OK) == (cases[i].el0_write_ok != 0),
+                  cases[i].el0_write);
+        }
+    }
 
     /* --- execute-never ------------------------------------------------- */
     build_map(&memory, va, pa,

@@ -19,6 +19,9 @@ int latx_gen_prologue(void *code_buf)
     context_switch_bt_to_native = (ADDR)code_buf;
     tr_init(NULL);
     generate_context_switch_bt_to_native(code_buf);
+    if (option_sw_lbt) {
+        tr_lower_sw_lbt(lat_ctx);
+    }
     label_dispose(NULL, lat_ctx);
     code_nr = tr_ir2_assemble(code_buf, lat_ctx->first_ir2);
     tr_fini(false);
@@ -38,6 +41,9 @@ int latx_gen_epilogue(void *code_buf)
 
     tr_init(NULL);
     generate_context_switch_native_to_bt();
+    if (option_sw_lbt) {
+        tr_lower_sw_lbt(lat_ctx);
+    }
     label_dispose(NULL, lat_ctx);
     code_nr = tr_ir2_assemble(code_buf, lat_ctx->first_ir2);
     tr_fini(false);

@@ -53,6 +53,7 @@ uint64_t imm_skip_pc = 0;
 int option_mem_test = 0;
 int option_guest_paging = 0;
 int option_lbt_jiscr = 0;
+int option_sw_lbt = 0;
 int option_minke_16k_page_check = 0;
 int option_real_maps = 0;
 int option_monitor_shared_mem = 0;
