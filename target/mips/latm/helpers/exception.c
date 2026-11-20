@@ -32,6 +32,7 @@ void do_raise_exception_err(CPUMIPSState *env, uint32_t exception,
                             int error_code, uintptr_t pc)
 {
     target_ulong epc = exception_resume_pc(env);
+    bool was_exl = (env->CP0_Status & (1u << CP0St_EXL)) != 0;
 
     env->llvalid = 0;
     env->lladdr = UINT64_MAX;
@@ -64,6 +65,19 @@ void do_raise_exception_err(CPUMIPSState *env, uint32_t exception,
         if (exception == EXCP_EXT_INTERRUPT &&
             (env->CP0_Cause & (1u << 23))) {
             env->active_tc.PC = base + 0x200;
+        } else if ((exception == EXCP_TLBL || exception == EXCP_TLBS) &&
+                   (error_code & EXCP_TLB_NOMATCH) && !was_exl) {
+#if defined(TARGET_MIPS64)
+            int r = env->CP0_BadVAddr >> 62;
+            int ux = (env->CP0_Status & (1u << CP0St_UX)) != 0;
+            int kx = (env->CP0_Status & (1u << CP0St_KX)) != 0;
+            if ((r != 0 || ux) && (r != 3 || kx)) {
+                env->active_tc.PC = base + 0x080;
+            } else
+#endif
+            {
+                env->active_tc.PC = base + 0x000;
+            }
         } else {
             env->active_tc.PC = base + 0x180;
         }

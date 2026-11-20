@@ -83,6 +83,7 @@ void latm_jmp_cache_add(void *cpu, uint64_t guest_pc, uint64_t host_pc,
 void latm_jmp_cache_flush(void *cpu);
 uint64_t latm_jmp_cache_lookup(void *cpu, uint64_t guest_pc);
 void latm_tb_register(void *cpu, void *tb);
+void latm_platform_smc_broadcast(uint64_t start, uint64_t end);
 
 void lata_tr_data_init(void *env);
 void tr_init(void *tb);

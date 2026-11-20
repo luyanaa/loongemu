@@ -62,6 +62,13 @@ static uint8_t code_buf2[CODE_BUF_SIZE] __attribute__((aligned(4096)));
 
 static TranslationBlock tb;
 static CPUMIPSState env;
+static volatile uint64_t smc_broadcasts;
+void latm_platform_smc_broadcast(uint64_t start, uint64_t end)
+{
+    (void)start;
+    (void)end;
+    smc_broadcasts++;
+}
 
 /* daddiu $2,$0,5; daddiu $3,$0,7; daddu $4,$2,$3; dsubu $5,$4,$2;
  * dsll $6,$5,3; dsra $7,$6,1 */
@@ -574,6 +581,7 @@ void kmain(void)
                       &env, (uint64_t)(uintptr_t)chain_target_code), 0,
                   "CACHE/SYNCI invalidates TB link cache");
         }
+        check(smc_broadcasts >= 3, 1, "CACHE/SYNCI broadcasts SMC invalidation");
     }
 
     latx_bare_uart_puts("latm-isa: checks=");

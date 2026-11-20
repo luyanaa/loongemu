@@ -704,7 +704,7 @@ SRCS   := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \
 ### 13.2 已通过的门禁
 
 - `make test-latm-decode`：21 条向量，覆盖 ALU/IMM、DMULTU、MFLO、ROTR、JAL/JR、BEQ/BEQL、LWL/SDR、SW/SD/LD、SYSCALL/BREAK、ERET/MFC0。
-- `make latm-isa-run`：QEMU-LVZ `-M virt -cpu la464`，71 项检查全部通过：
+- `make latm-isa-run`：QEMU-LVZ `-M virt -cpu la464`，72 项检查全部通过：
   - 整数 ALU、DSLL/DSRA、DMULTU/MFLO/MFHI、ROTR/DROTR；
   - 分支 taken/not-taken、BEQL taken/not-taken、JAL 链接值、JR 间接目标；
   - `lwl+lwr`、`ldl+ldr`、`sdr+ld` 以及普通 `sw/sd/ld`；
@@ -712,15 +712,28 @@ SRCS   := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \
   - `ldc1/add.d/sdc1`（1.5 + 2.25 = 3.75）；
   - COP1X `ldxc1/sdxc1/lwxc1/swxc1/luxc1/suxc1`；
   - 间接跳转 TB 直链：`jiscr0` 与 `jiscr1` 各一条两 TB 链，命中后直接进入目标 TB host code；
-  - `CACHE 0`、`CACHE 0x10`、`SYNCI` 分别清除 `pc_map_cache` 中的 TB 链接项；
+  - `CACHE 0`、`CACHE 0x10`、`SYNCI` 分别清除 `pc_map_cache` 中的 TB 链接项，并调用 `latm_platform_smc_broadcast()` 平台钩子；
   - 两个 `CPUMIPSState` 的 `tr_data`、IR1 scratch、TB link cache、prologue entry 均独立；
   - 分支/JR/BC1 的延迟槽内执行 helper（LL）时，分支条件与间接目标经 `latm_spill[]` 保存/恢复；
   - `BC1T/BC1FL` 使用 `cc=(rt>>2)&7`、`tf=rt&1`、`likely=rt&2`，FCC2 测试通过；
   - LL/SC：无 LL 的 SC 失败、LL(A)->SC(B) 失败、普通 store 使 reservation 失效。
-- `make test-latm-tlb`：27 项主机检查，覆盖 kseg3 R4K TLB 映射、TLB-backed load、无效 V 位 fault、EPC/Cause/EXL/vector、延迟槽 Cause.BD。
+- `make test-latm-tlb`：30 项主机检查，覆盖 kseg3 R4K TLB 映射、TLB-backed load、无效 V 位 fault、EPC/Cause/EXL/vector、延迟槽 Cause.BD。
 - `make -C latm probe`：全部 LATM/共享/softfloat 源文件语法检查通过。
 
-### 13.3 已知边界
+#### 13.4 整机 checklist 状态
+
+| 项目 | 当前状态 |
+| --- | --- |
+| per-core 翻译/IR1/寄存器分配/TB cache/prologue | 已完成，`TLS=1` 可并行；默认 freestanding 用串行锁 |
+| TB link cache | 512×2 组相联、LRU、per-vCPU、ASID/mode key；未接 ASID/TLB shootdown 全量失效 |
+| LL/SC | 物理地址 reservation + 原子 CAS；异常/ERET/TLB 修改清除；`lladdr` 记录 GPA；跨核严格 generation/ABA 未做 |
+| SMC | `latm_platform_smc_broadcast()` 钩子已从 SYNCI/CACHE 调用；整机需实现为 `loongemu_ipi_send()` 适配器并处理目标 shard 失效 |
+| guest memory | R4000 TLB walk/段翻译已接；`LoongemuMemMap`/MMIO 解析尚未接入，直接 `ldx/stx` 与取指仍是宿主地址 |
+| 精确异常 | XTLB Refill +0x080 / TLB Refill +0x000 / generic +0x180 已分流；`cpu_loop_exit()` 有平台 unwind 钩子；TbInsnMap 反查未接 |
+| vclock / CP0 Count/Compare / 中断 | 尚未接入 LoongemuVClock、Compare deadline、TI/IP7、WAIT 唤醒 |
+| MIPS64 板级/DTB/vmlinux 直启 | 尚未实现 |
+
+## 13.3 已知边界
 
 1. **TB 链接是 per-vCPU 2-way set-associative cache**：512 sets × 2 ways，LRU age；每个 `CPUMIPSState` 持有独立 cache。key = `ASID | (hflags mode << 8)`；间接跳转通过 C helper 查找，测试覆盖同 key 命中、不同 ASID/模式拒绝、2-way 冲突淘汰、`SYNCI/CACHE` 失效。仍无 ASID flush/TLB shootdown，且尚未接入主循环的 TB 分配器。
 2. **`jiscr1` 语义按 QEMU-LVZ 实现**：QEMU 的 `helper_lbt_jiscr` 对两个 jiscr 都用 SCR0 作为目标，`jiscr1` 额外把 host PC 写回 SCR0；LATM 的测试按此语义。若真实硬件遵循指南的 SCR1 目标语义，需要在 feature probe 后选择编码。

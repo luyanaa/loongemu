@@ -720,6 +720,7 @@ void latm_tb_flush_range(void *cpu, uint64_t start, uint64_t end)
 #if defined(__loongarch__)
     __asm__ volatile("ibar 0" ::: "memory");
 #endif
+    latm_platform_smc_broadcast(start, end);
 }
 
 void lata_fast_jmp_cache_init(void *env, uint64_t start_code, uint64_t end_code)

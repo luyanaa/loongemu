@@ -108,6 +108,30 @@ int main(void)
         }
     }
 
+    /* XTLB Refill (+0x080) vs TLB Refill (+0x000) vs generic (+0x180). */
+    env.exception_base = 0x80000000;
+    env.CP0_BadVAddr = 0xffffffffe0001000ull;
+    env.CP0_Status = 1u << CP0St_KX;
+    env.CP0_Cause = 0;
+    env.hflags = 0;
+    env.active_tc.PC = 0xffffffffe0001000ull;
+    do_raise_exception_err(&env, EXCP_TLBL, EXCP_TLB_NOMATCH, 0);
+    check(env.active_tc.PC, 0x80000080, "XTLB refill vector");
+
+    env.CP0_BadVAddr = 0x1000;
+    env.CP0_Status = 0;
+    env.CP0_Cause = 0;
+    env.active_tc.PC = 0x1000;
+    do_raise_exception_err(&env, EXCP_TLBL, EXCP_TLB_NOMATCH, 0);
+    check(env.active_tc.PC, 0x80000000, "32-bit TLB refill vector");
+
+    env.CP0_BadVAddr = 0x1000;
+    env.CP0_Status = 1u << CP0St_EXL;
+    env.CP0_Cause = 0;
+    env.active_tc.PC = 0x1000;
+    do_raise_exception_err(&env, EXCP_TLBL, EXCP_TLB_NOMATCH, 0);
+    check(env.active_tc.PC, 0x80000180, "nested TLB generic vector");
+
     printf("latm-tlb: checks=%d fails=%d\n", checks, fails);
     return fails != 0;
 }

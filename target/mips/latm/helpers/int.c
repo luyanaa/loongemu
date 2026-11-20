@@ -182,7 +182,7 @@ uint64_t latm_helper_ll(CPUMIPSState *env, uint32_t op, uint64_t addr)
         env->llval = v;
         env->llsize = 8;
     }
-    env->lladdr = addr;
+    env->lladdr = phys;
     env->llpaddr = phys;
     env->llvalid = 1;
     return size == 4 ? (int64_t)(int32_t)v : v;
