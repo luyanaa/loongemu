@@ -7,7 +7,7 @@ CAPSTONE := ../latx/capstone_git
 QEMUSRC := ../latx/upstream/include
 
 INCS := -I$(LATX)/compat -I$(LATX)/compat/libm -I$(LATX)/qemu -I$(LATX)/runtime -Igen/latx/include -I$(LATX)/include -I$(LATX) \
-        -I$(CAPSTONE)/include -I$(QEMUSRC) -isystem $(RESINC)
+        -I$(CAPSTONE)/include -I$(QEMUSRC) -I../include -isystem $(RESINC)
 DEFS := -DTARGET_X86_64 -DCONFIG_LATX -DCONFIG_LATX_FLAG_REDUCTION -DCONFIG_LATX_AVX_OPT \
         -DCONFIG_LATX_CAPSTONE_GIT -DCAPSTONE_HAS_X86 -DCAPSTONE_USE_SYS_DYN_MEM=1 \
         -D__thread=
@@ -40,7 +40,7 @@ QEMU_SRC := $(LATX)/qemu/fpu_helper.c $(LATX)/qemu/int_helper.c \
             $(LATX)/qemu/misc_helper.c $(LATX)/qemu/cc_helper.c \
             $(LATX)/qemu/softfloat.c $(LATX)/qemu/aes.c
 
-SRCS := $(LATX)/compat/miniglib.c $(LATX)/compat/libc_min.c $(LATX)/compat/ldmath.c $(LIBM_SRC) $(QEMU_SRC) $(RUNTIME_SRC) $(CAPSTONE_SRC) \
+SRCS := ../src/x86_64_paging.c ../src/phys_mem.c ../src/vclock.c ../src/loongarch_smp.c $(LATX)/compat/miniglib.c $(LATX)/compat/libc_min.c $(LATX)/compat/ldmath.c $(LIBM_SRC) $(QEMU_SRC) $(RUNTIME_SRC) $(CAPSTONE_SRC) \
         $(addprefix $(LATX)/translator/,$(addsuffix .c,$(TRANSLATOR))) \
         $(LATX)/ir1/ir1.c \
         $(LATX)/ir2/ir2.c $(LATX)/ir2/ir2-assemble.c $(LATX)/ir2/ir2-relocate.c \

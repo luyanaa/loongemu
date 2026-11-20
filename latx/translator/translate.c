@@ -98,7 +98,7 @@ int FPR_USEDEF_TO_SAVE = 0xff;
 int XMM_USEDEF_TO_SAVE = 0xffff;
 #endif
 
-struct lat_lock lat_lock[16];
+struct lat_lock lat_lock[16] __attribute__((aligned(4096)));
 
 void tr_init(void *tb)
 {

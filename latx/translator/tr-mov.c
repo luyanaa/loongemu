@@ -1623,7 +1623,7 @@ bool translate_xchg(IR1_INST *pir1)
          * we pass mem_opnd with a copyed one.
          */
         mem_opnd = ra_alloc_itemp();
-        IR2_OPND imm_cache_mem_opnd = convert_mem_to_itemp(opnd0);
+        IR2_OPND imm_cache_mem_opnd = convert_mem_to_itemp(opnd1);
         la_or(mem_opnd, imm_cache_mem_opnd, zero_ir2_opnd);
 #else
         mem_opnd = convert_mem_to_itemp(opnd1);
@@ -1981,6 +1981,11 @@ bool translate_cmpxchg16b(IR1_INST *pir1)
 
     IR2_OPND mem_lo = ra_alloc_itemp();
     IR2_OPND mem_hi = ra_alloc_itemp();
+    IR2_OPND lat_lock_addr;
+
+    if (close_latx_parallel) {
+        lat_lock_addr = tr_lat_spin_lock(mem_opnd, 0);
+    }
 
     la_ld_d(mem_lo, mem_opnd, 0);
     la_ld_d(mem_hi, mem_opnd, 8);
@@ -1990,14 +1995,23 @@ bool translate_cmpxchg16b(IR1_INST *pir1)
     /* equal */
     la_st_d(rbx_opnd, mem_opnd, 0);
     la_st_d(rcx_opnd, mem_opnd, 8);
-    la_dbar(0);
+    if (close_latx_parallel) {
+        tr_lat_spin_unlock(lat_lock_addr);
+    } else {
+        la_dbar(0);
+    }
     generate_eflag_calculation(zero_ir2_opnd, zero_ir2_opnd, zero_ir2_opnd,
                                 pir1, true);
     la_b(label_exit);
 
     /* unequal */
     la_label(label_unequal);
-    la_dbar(0);
+    if (close_latx_parallel) {
+        la_dbar(0);
+        la_st_w(zero_ir2_opnd, lat_lock_addr, 0);
+    } else {
+        la_dbar(0);
+    }
     generate_eflag_calculation(mem_opnd, mem_opnd, zero_ir2_opnd,
                                 pir1, true);
     la_or(rax_opnd, zero_ir2_opnd, mem_lo);

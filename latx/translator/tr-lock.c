@@ -636,7 +636,7 @@ bool translate_lock_inc(IR1_INST *pir1)
     if (CODEIS64 && opnd0_size == 64) {
         la_addi_d(tmp, zero_ir2_opnd, 1);
         la_amadd_db_d(src0, tmp, mem_opnd);
-        generate_eflag_calculation(dest, src0, src0, pir1, true);
+        generate_eflag_calculation(src0, src0, src0, pir1, true);
         return true;
     }
 #endif
@@ -774,7 +774,7 @@ bool translate_lock_dec(IR1_INST *pir1)
     if (CODEIS64 && opnd0_size == 64) {
         la_addi_d(tmp, zero_ir2_opnd, -1);
         la_amadd_db_d(src0, tmp, mem_opnd);
-        generate_eflag_calculation(dest, src0, src0, pir1, true);
+        generate_eflag_calculation(src0, src0, src0, pir1, true);
         return true;
     }
 #endif
@@ -1858,7 +1858,7 @@ bool translate_lock_cmpxchg(IR1_INST *pir1)
     } else {
         uint32 mask;
 
-        IR2_OPND mask_opnd = a1_ir2_opnd;
+        IR2_OPND mask_opnd = ra_alloc_itemp();
         la_slli_d(tmp, tmp, 3);
 
         la_label(label_ll);
@@ -1886,6 +1886,7 @@ bool translate_lock_cmpxchg(IR1_INST *pir1)
         la_sc_d(dest, mem_opnd, 0);
         la_beq(dest, zero_ir2_opnd, label_ll);
         la_b(label_flag);
+        ra_free_temp(mask_opnd);
     }
 
     /*

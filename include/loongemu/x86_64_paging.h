@@ -11,6 +11,7 @@ extern "C" {
 #define X86_CR0_PG       (UINT64_C(1) << 31)
 #define X86_CR4_PSE      (UINT64_C(1) << 4)
 #define X86_CR4_PAE      (UINT64_C(1) << 5)
+#define X86_CR4_PGE      (UINT64_C(1) << 7)
 #define X86_CR4_LA57     (UINT64_C(1) << 12)
 #define X86_CR4_PCIDE    (UINT64_C(1) << 17)
 #define X86_CR4_SMEP     (UINT64_C(1) << 20)
@@ -76,9 +77,13 @@ typedef struct X86PageFault {
 typedef struct X86Translation {
     uint64_t guest_physical_address;
     uint64_t page_size;
+    uint64_t leaf_pte;
     uint8_t writable;
     uint8_t user_accessible;
     uint8_t executable;
+    uint8_t global;
+    uint8_t pkey;
+    uint8_t dirty;
 } X86Translation;
 
 /*

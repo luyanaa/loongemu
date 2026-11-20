@@ -211,12 +211,20 @@ void cpu_x86_update_cr0(CPUX86State *env, uint32_t new_cr0)
 
 void cpu_x86_update_cr3(CPUX86State *env, target_ulong new_cr3)
 {
-    env->cr[3] = new_cr3;
-    /*
-     * A new address space invalidates every cached guest translation.  The
-     * TB cache is keyed on cr3 separately, but a walk result is not.
-     */
-    tlb_flush(0);
+    int noflush = ((env->cr[4] & CR4_PCIDE_MASK) != 0) &&
+                  ((new_cr3 & (UINT64_C(1) << 63)) != 0);
+
+    env->cr[3] = new_cr3 & ~(UINT64_C(1) << 63);
+    if (!noflush) {
+        if (env->cr[4] & CR4_PGE_MASK) {
+            latx_x86_tlb_flush_non_global();
+            latx_platform_tlb_flush_all();
+        } else {
+            tlb_flush(0);
+        }
+    } else {
+        latx_platform_tlb_flush_all();
+    }
 }
 
 void cpu_x86_update_cr4(CPUX86State *env, uint32_t new_cr4)
@@ -226,7 +234,9 @@ void cpu_x86_update_cr4(CPUX86State *env, uint32_t new_cr4)
     env->hflags = (env->hflags & ~(HF_SMAP_MASK | HF_OSFXSR_MASK))
                   | ((new_cr4 & CR4_SMAP_MASK) ? HF_SMAP_MASK : 0)
                   | ((new_cr4 & CR4_OSFXSR_MASK) ? HF_OSFXSR_MASK : 0);
-    if ((old_cr4 ^ new_cr4) & (CR4_PGE_MASK | CR4_PSE_MASK | CR4_PAE_MASK | CR4_PCIDE_MASK)) {
+    if ((old_cr4 ^ new_cr4) &
+        (CR4_PGE_MASK | CR4_PSE_MASK | CR4_PAE_MASK | CR4_PCIDE_MASK |
+         CR4_SMEP_MASK | CR4_SMAP_MASK | CR4_PKE_MASK)) {
         tlb_flush(0);
     }
 }
@@ -304,21 +314,26 @@ uint32_t latx_guest_apic_id = 0;
 static uint8_t apic_tpr_per_cpu[64];
 static uint64_t apic_base_per_cpu[64];
 
+__attribute__((weak)) uint32_t latx_platform_apic_id(void)
+{
+    return latx_guest_apic_id;
+}
+
 int cpu_get_apic_tpr(CPUX86State *env)
 {
     (void)env;
-    return apic_tpr_per_cpu[latx_guest_apic_id & 63u];
+    return apic_tpr_per_cpu[latx_platform_apic_id() & 63u];
 }
 
 void cpu_set_apic_tpr(CPUX86State *env, uint8_t val)
 {
     (void)env;
-    apic_tpr_per_cpu[latx_guest_apic_id & 63u] = val;
+    apic_tpr_per_cpu[latx_platform_apic_id() & 63u] = val;
 }
 
 uint64_t cpu_get_apic_base(CPUX86State *env)
 {
-    uint32_t id = latx_guest_apic_id & 63u;
+    uint32_t id = latx_platform_apic_id() & 63u;
     (void)env;
     if (apic_base_per_cpu[id] == 0) {
         apic_base_per_cpu[id] = 0xfee00800ULL | (id == 0 ? 0x100ULL : 0ULL);
@@ -329,7 +344,7 @@ uint64_t cpu_get_apic_base(CPUX86State *env)
 void cpu_set_apic_base(CPUX86State *env, uint64_t val)
 {
     (void)env;
-    apic_base_per_cpu[latx_guest_apic_id & 63u] = val;
+    apic_base_per_cpu[latx_platform_apic_id() & 63u] = val;
 }
 
 /* ---------------- SVM / TLB / randomness ---------------- */
@@ -432,7 +447,7 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
     (void)count;
     *eax = *ebx = *ecx = *edx = 0;
 
-    uint32_t apic_id = latx_guest_apic_id;
+    uint32_t apic_id = latx_platform_apic_id();
     uint32_t nr_cpus = latx_guest_nr_cpus ? latx_guest_nr_cpus : 1u;
 
     switch (index) {

@@ -31,6 +31,6 @@ fi
 
 # Replace shell with QEMU so SIGTERM/SIGKILL on this process kills QEMU directly.
 exec "$ROOT_DIR/qemu-system-loongarch64" \
-    -machine virt -cpu "${QEMU_CPU:-la464}" -m 512M \
+    -machine virt -cpu "${QEMU_CPU:-la464}" -smp "${QEMU_SMP:-1}" -m 512M \
     -nic none -nographic -monitor none \
     -kernel "$KERNEL" > "$LOG_FILE" 2>&1

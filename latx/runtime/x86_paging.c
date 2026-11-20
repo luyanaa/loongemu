@@ -1,32 +1,27 @@
 /*
- * x86-64 guest page-table walker.  See latx-x86-paging.h for the contract.
+ * LATX runtime x86-64 MMU adapter & software TLB cache.
  *
- * Every reserved-bit and permission rule below is the one the manual states
- * for 4-level paging; the point of writing them out is that a malformed table
- * must be reported as #PF(RSVD) rather than silently producing an address,
- * because a shadow-paging layer that trusts a bad entry installs a mapping the
- * guest never asked for.
+ * Single authoritative walker architecture:
+ *   All x86-64 page-table walks, A/D-bit updates, reserved-bit validation,
+ *   SMEP/SMAP/PKU/NX/WP permission checks, and #PF error-code generation are
+ *   delegated to `x86_64_walk_page_tables()` in `src/x86_64_paging.c`.
+ *   This file adapts `CPUX86State`, maintains the fast software TLB cache
+ *   (honoring CR3/PCID, Global pages, Dirty-bit promotion, SMEP/SMAP/PKU),
+ *   and implements fault/syscall delivery.
  */
 #include "qemu/osdep.h"
 #include "exec/exec-all.h"
 #include "cpu.h"
 
+#include "loongemu/x86_64_paging.h"
 #include "latx-x86-paging.h"
 #include "latx_bare.h"
 
-/* PTE bits we care about (Intel SDM 4.5). */
-#define PTE_P       (UINT64_C(1) << 0)
-#define PTE_RW      (UINT64_C(1) << 1)
-#define PTE_US      (UINT64_C(1) << 2)
-#define PTE_PS      (UINT64_C(1) << 7)
-#define PTE_NX      (UINT64_C(1) << 63)
-
-/* Bits 51:12 of an entry hold the next table or the page frame. */
-#define PTE_PHYS_MASK UINT64_C(0x000ffffffffff000)
-#define LAPG_SIZE      UINT64_C(4096)
+#define PTE_PHYS_MASK UINT64_C(0x000000fffffff000) /* MAXPHYADDR = 40 */
+#define LAPG_SIZE     UINT64_C(4096)
 
 __attribute__((weak)) void latx_platform_phys_write(uint64_t pa, int size,
-                                                   uint64_t value)
+                                                    uint64_t value)
 {
     switch (size) {
     case 1:
@@ -58,39 +53,67 @@ __attribute__((weak)) uint64_t latx_platform_phys_read(uint64_t pa, int size)
     }
 }
 
-static uint64_t pte_lookup(uint64_t table_phys, unsigned index)
+__attribute__((weak)) int latx_platform_phys_read_u64_checked(uint64_t pa,
+                                                              uint64_t *value)
 {
-    return latx_platform_phys_read(table_phys + (uint64_t)index * 8, 8);
+    if ((pa & 7u) != 0) {
+        return -1;
+    }
+    *value = latx_platform_phys_read(pa, 8);
+    return 0;
 }
 
-/*
- * Bits that must be zero in a large-page leaf: the hardware ignores page
- * offset below the leaf size, so anything between it and bit 12 is reserved.
- *   1 GiB leaf keeps 51:30, so 29:13 must be clear.
- *   2 MiB leaf keeps 51:21, so 20:13 must be clear.
- */
-static bool leaf_is_reserved(uint64_t pte, int level)
+__attribute__((weak)) int latx_platform_phys_atomic_or_u64(uint64_t pa,
+                                                           uint64_t bits,
+                                                           uint64_t *new_value)
 {
-    switch (level) {
-    case 3:
-        return (pte & UINT64_C(0x3fffe000)) != 0;
-    case 2:
-        return (pte & UINT64_C(0x1fe000)) != 0;
-    default:
-        return false;
+    uint64_t cur;
+
+    if ((pa & 7u) != 0) {
+        return -1;
     }
+    cur = latx_platform_phys_read(pa, 8);
+    if ((cur & bits) != bits) {
+        cur |= bits;
+        latx_platform_phys_write(pa, 8, cur);
+    }
+    *new_value = cur;
+    return 0;
+}
+
+static int walker_read_u64(void *opaque, uint64_t gpa, uint64_t *value)
+{
+    (void)opaque;
+    return latx_platform_phys_read_u64_checked(gpa, value);
+}
+
+static int walker_atomic_or_u64(void *opaque, uint64_t gpa, uint64_t bits,
+                                uint64_t *new_value)
+{
+    (void)opaque;
+    return latx_platform_phys_atomic_or_u64(gpa, bits, new_value);
+}
+
+static uint32_t page_size_to_bits(uint64_t page_size)
+{
+    if (page_size == (UINT64_C(1) << 30)) {
+        return 30;
+    }
+    if (page_size == (UINT64_C(1) << 21)) {
+        return 21;
+    }
+    return 12;
 }
 
 LatxX86WalkResult latx_x86_walk(const CPUX86State *env, uint64_t va,
                                 uint32_t access, LatxX86Translation *out)
 {
-    bool user = (access & LATX_X86_ACCESS_USER) != 0;
-    bool write = (access & LATX_X86_ACCESS_WRITE) != 0;
-    bool exec = (access & LATX_X86_ACCESS_EXEC) != 0;
-    bool nx_enabled = (env->efer & MSR_EFER_NXE) != 0;
-    uint64_t table, pte;
-    uint32_t perm;
-    int level;
+    X86PagingState state;
+    X86PagingMemory mem;
+    X86Translation tr;
+    X86PageFault pf;
+    X86PagingAccess xacc;
+    X86PagingResult res;
 
     memset(out, 0, sizeof(*out));
     out->gpa = va;
@@ -101,86 +124,86 @@ LatxX86WalkResult latx_x86_walk(const CPUX86State *env, uint64_t va,
                               LATX_X86_ACCESS_EXEC);
         return LATX_X86_WALK_PAGING_OFF;
     }
-    /* Long mode always uses PAE paging; LA57 changes the index widths. */
     if (!(env->cr[4] & CR4_PAE_MASK)) {
         return LATX_X86_WALK_UNSUPPORTED;
     }
     if (env->cr[4] & CR4_LA57_MASK) {
         return LATX_X86_WALK_RESERVED;
     }
-    if (env->cr[3] & ~PTE_PHYS_MASK) {
-        return LATX_X86_WALK_RESERVED;
+
+    memset(&state, 0, sizeof(state));
+    state.cr0 = env->cr[0];
+    state.cr3 = env->cr[3];
+    state.cr4 = env->cr[4];
+    state.efer = env->efer | ((env->hflags & HF_LMA_MASK) ? X86_EFER_LMA : 0);
+    state.rflags = env->eflags;
+    state.pkru = env->pkru;
+    state.pkrs = 0;
+    state.features = X86_PAGING_FEATURE_1G_PAGES;
+    state.maxphyaddr = 40;
+    state.cpl = (access & LATX_X86_ACCESS_USER) ? 3 : 0;
+
+    if (access & LATX_X86_ACCESS_EXEC) {
+        xacc = X86_PAGING_EXECUTE;
+    } else if (access & LATX_X86_ACCESS_WRITE) {
+        xacc = X86_PAGING_WRITE;
+    } else {
+        xacc = X86_PAGING_READ;
     }
 
-    uint64_t combined_rw = PTE_RW;
-    uint64_t combined_us = PTE_US;
-    uint64_t combined_nx = 0;
+    mem.opaque = 0;
+    mem.read_u64 = walker_read_u64;
+    mem.atomic_or_u64 = walker_atomic_or_u64;
 
-    table = env->cr[3] & PTE_PHYS_MASK;
-    for (level = 4; level >= 1; level--) {
-        unsigned shift = 12 + 9 * (level - 1);
-        unsigned index = (unsigned)((va >> shift) & 0x1ff);
+    memset(&tr, 0, sizeof(tr));
+    memset(&pf, 0, sizeof(pf));
+    res = x86_64_walk_page_tables(&state, &mem, va, xacc, &tr, &pf);
 
-        pte = pte_lookup(table, index);
-        if (!(pte & PTE_P)) {
-            return LATX_X86_WALK_NOT_PRESENT;
+    if (res == X86_PAGING_OK) {
+        uint32_t perm = LATX_X86_ACCESS_READ;
+        if (tr.writable) {
+            perm |= LATX_X86_ACCESS_WRITE;
         }
-        if (!nx_enabled && (pte & PTE_NX)) {
+        if (tr.user_accessible) {
+            perm |= LATX_X86_ACCESS_USER;
+        }
+        if (tr.executable) {
+            perm |= LATX_X86_ACCESS_EXEC;
+        }
+        out->gpa = tr.guest_physical_address;
+        out->pte = tr.leaf_pte;
+        out->page_bits = page_size_to_bits(tr.page_size);
+        out->perm = perm;
+        out->global = tr.global;
+        out->pkey = tr.pkey;
+        out->dirty = tr.dirty;
+        out->fault_error_code = 0;
+        return LATX_X86_WALK_OK;
+    }
+
+    if (res == X86_PAGING_PAGE_FAULT) {
+        out->fault_error_code = pf.error_code;
+        if (pf.error_code & X86_PF_RESERVED) {
             return LATX_X86_WALK_RESERVED;
         }
-        combined_rw &= pte;
-        combined_us &= pte;
-        combined_nx |= (pte & PTE_NX);
-        if (pte & PTE_PS) {
-            /* PS is legal only at the 1 GiB (level 3) and 2 MiB (level 2)
-             * leaves; at the PML4 and PT levels the bit is reserved. */
-            if (level == 4 || level == 1) {
-                return LATX_X86_WALK_RESERVED;
-            }
-            if (leaf_is_reserved(pte, level)) {
-                return LATX_X86_WALK_RESERVED;
-            }
-            break;
-        }
-        if (level == 1) {
-            break;              /* 4 KiB leaf */
-        }
-        table = pte & PTE_PHYS_MASK;
-    }
-
-    perm = LATX_X86_ACCESS_READ;
-    out->page_bits = 12 + 9 * (uint32_t)(level - 1);
-    out->gpa = (pte & PTE_PHYS_MASK & ~((UINT64_C(1) << out->page_bits) - 1)) |
-               (va & ((UINT64_C(1) << out->page_bits) - 1));
-    if (combined_rw & PTE_RW) {
-        perm |= LATX_X86_ACCESS_WRITE;
-    }
-    if (combined_us & PTE_US) {
-        perm |= LATX_X86_ACCESS_USER;
-    }
-    if (!(combined_nx & PTE_NX)) {
-        perm |= LATX_X86_ACCESS_EXEC;
-    }
-    out->pte = pte;
-    out->perm = perm;
-
-    if (user && !(combined_us & PTE_US)) {
-        return LATX_X86_WALK_PROTECTION;
-    }
-    if (write && !(combined_rw & PTE_RW)) {
-        /*
-         * CR0.WP decides whether a supervisor write to a read-only page
-         * faults; a user write always does.  A kernel that clears WP is
-         * asking to write through page protection, e.g. to patch its text.
-         */
-        if (user || (env->cr[0] & CR0_WP_MASK)) {
+        if (pf.error_code & X86_PF_PRESENT) {
             return LATX_X86_WALK_PROTECTION;
         }
+        return LATX_X86_WALK_NOT_PRESENT;
     }
-    if (exec && (combined_nx & PTE_NX)) {
-        return LATX_X86_WALK_PROTECTION;
+    if (res == X86_PAGING_INVALID_STATE) {
+        out->fault_error_code = X86_PF_PRESENT | X86_PF_RESERVED;
+        return LATX_X86_WALK_RESERVED;
     }
-    return LATX_X86_WALK_OK;
+    if (res == X86_PAGING_GENERAL_PROTECTION) {
+        out->fault_error_code = 0;
+        return LATX_X86_WALK_NOT_PRESENT;
+    }
+    if (res == X86_PAGING_MEMORY_ERROR) {
+        out->fault_error_code = 0;
+        return LATX_X86_WALK_NOT_PRESENT;
+    }
+    return LATX_X86_WALK_UNSUPPORTED;
 }
 
 /* ---------------- cached walks ---------------- */
@@ -191,30 +214,87 @@ typedef struct LatxX86TlbEntry {
     uint64_t gpa_base;   /* leaf base */
     uint32_t page_bits;
     uint32_t perm;
-    bool valid;
+    uint16_t pcid;
+    uint8_t  global;
+    uint8_t  pkey;
+    uint8_t  dirty;
+    bool     valid;
 } LatxX86TlbEntry;
 
-static LatxX86TlbEntry latx_x86_tlb[LATX_X86_TLB_ENTRIES];
+#define LATX_MAX_PCPU 4u
+
+__attribute__((weak)) uint32_t latx_platform_cpu_id(void)
+{
+    return 0u;
+}
+
+static LatxX86TlbEntry latx_x86_tlb[LATX_MAX_PCPU][LATX_X86_TLB_ENTRIES];
+
+static inline LatxX86TlbEntry *cur_cpu_tlb(void)
+{
+    uint32_t cid = latx_platform_cpu_id();
+    return latx_x86_tlb[cid < LATX_MAX_PCPU ? cid : 0u];
+}
 
 void latx_x86_tlb_flush_all(void)
+{
+    memset(cur_cpu_tlb(), 0, sizeof(latx_x86_tlb[0]));
+}
+
+void latx_x86_tlb_flush_all_cpus(void)
 {
     memset(latx_x86_tlb, 0, sizeof(latx_x86_tlb));
 }
 
+void latx_x86_tlb_flush_non_global(void)
+{
+    LatxX86TlbEntry *tlb = cur_cpu_tlb();
+    for (unsigned i = 0; i < LATX_X86_TLB_ENTRIES; i++) {
+        if (tlb[i].valid && !tlb[i].global) {
+            tlb[i].valid = false;
+        }
+    }
+}
+
+void latx_x86_tlb_flush_pcid(uint16_t pcid)
+{
+    LatxX86TlbEntry *tlb = cur_cpu_tlb();
+    for (unsigned i = 0; i < LATX_X86_TLB_ENTRIES; i++) {
+        if (tlb[i].valid && !tlb[i].global &&
+            tlb[i].pcid == pcid) {
+            tlb[i].valid = false;
+        }
+    }
+}
+
 void latx_x86_tlb_flush_page(uint64_t va)
 {
+    LatxX86TlbEntry *tlb = cur_cpu_tlb();
     for (unsigned i = 0; i < LATX_X86_TLB_ENTRIES; i++) {
-        LatxX86TlbEntry *e = &latx_x86_tlb[i];
+        LatxX86TlbEntry *e = &tlb[i];
 
-        /*
-         * An entry answers every address inside its leaf, so a flush for any
-         * address in that leaf invalidates it.  Entries for smaller pages are
-         * separate slots and are matched by their own page size.
-         */
         if (e->valid && (va >> e->page_bits) == e->tag) {
             e->valid = false;
         }
     }
+}
+
+static uint32_t cached_access_fault_code(const CPUX86State *env, uint32_t access,
+                                         uint32_t extra)
+{
+    uint32_t ec = X86_PF_PRESENT | extra;
+
+    if (access & LATX_X86_ACCESS_WRITE) {
+        ec |= X86_PF_WRITE;
+    }
+    if (access & LATX_X86_ACCESS_USER) {
+        ec |= X86_PF_USER;
+    }
+    if ((access & LATX_X86_ACCESS_EXEC) &&
+        ((env->efer & MSR_EFER_NXE) || (env->cr[4] & X86_CR4_SMEP))) {
+        ec |= X86_PF_INSN;
+    }
+    return ec;
 }
 
 LatxX86WalkResult latx_x86_walk_cached(const CPUX86State *env, uint64_t va,
@@ -222,59 +302,91 @@ LatxX86WalkResult latx_x86_walk_cached(const CPUX86State *env, uint64_t va,
                                        LatxX86Translation *out)
 {
     uint64_t cr3 = env->cr[3] & PTE_PHYS_MASK;
-    LatxX86TlbEntry *e = &latx_x86_tlb[(va >> 12) & (LATX_X86_TLB_ENTRIES - 1)];
+    uint16_t pcid = (env->cr[4] & X86_CR4_PCIDE) ? (uint16_t)(env->cr[3] & 0xfffu) : 0u;
+    LatxX86TlbEntry *e = &cur_cpu_tlb()[(va >> 12) & (LATX_X86_TLB_ENTRIES - 1)];
     LatxX86WalkResult r;
 
-    /* Paging off, or no long-mode paging at all: no cache to consult. */
+    /* Paging off, or no long-mode paging at all: delegate directly. */
     if (!(env->cr[0] & CR0_PG_MASK) || !(env->cr[4] & CR4_PAE_MASK)) {
         return latx_x86_walk(env, va, access, out);
     }
 
-    if (e->valid && e->cr3 == cr3 && (va >> e->page_bits) == e->tag) {
+    if (e->valid && (va >> e->page_bits) == e->tag &&
+        ((e->global && (env->cr[4] & X86_CR4_PGE)) ||
+         (e->cr3 == cr3 && e->pcid == pcid))) {
+        bool user = (access & LATX_X86_ACCESS_USER) != 0;
+        bool write = (access & LATX_X86_ACCESS_WRITE) != 0;
+        bool exec = (access & LATX_X86_ACCESS_EXEC) != 0;
+        bool user_page = (e->perm & LATX_X86_ACCESS_USER) != 0;
+
         memset(out, 0, sizeof(*out));
         out->page_bits = e->page_bits;
         out->gpa = e->gpa_base | (va & ((UINT64_C(1) << e->page_bits) - 1));
         out->perm = e->perm;
-        out->pte = 0;            /* not kept: the cache may outlive an A/D bump */
+        out->global = e->global;
+        out->pkey = e->pkey;
+        out->dirty = e->dirty;
 
-        if ((access & LATX_X86_ACCESS_USER) && !(e->perm & LATX_X86_ACCESS_USER)) {
+        if (user && !user_page) {
+            out->fault_error_code = cached_access_fault_code(env, access, 0);
             return LATX_X86_WALK_PROTECTION;
         }
-        if ((access & LATX_X86_ACCESS_WRITE) &&
-            !(e->perm & LATX_X86_ACCESS_WRITE)) {
-            bool user = (access & LATX_X86_ACCESS_USER) != 0;
-
-            if (user || (env->cr[0] & CR0_WP_MASK)) {
+        if (write && !(e->perm & LATX_X86_ACCESS_WRITE) &&
+            (user || (env->cr[0] & CR0_WP_MASK))) {
+            out->fault_error_code = cached_access_fault_code(env, access, 0);
+            return LATX_X86_WALK_PROTECTION;
+        }
+        if (exec && !(e->perm & LATX_X86_ACCESS_EXEC)) {
+            out->fault_error_code = cached_access_fault_code(env, access, 0);
+            return LATX_X86_WALK_PROTECTION;
+        }
+        if (exec && !user && user_page && (env->cr[4] & X86_CR4_SMEP)) {
+            out->fault_error_code = cached_access_fault_code(env, access, 0);
+            return LATX_X86_WALK_PROTECTION;
+        }
+        if (!exec && !user && user_page && (env->cr[4] & X86_CR4_SMAP) &&
+            !(env->eflags & X86_RFLAGS_AC)) {
+            out->fault_error_code = cached_access_fault_code(env, access, 0);
+            return LATX_X86_WALK_PROTECTION;
+        }
+        if (!exec && user && user_page && (env->cr[4] & X86_CR4_PKE)) {
+            uint32_t rights = (env->pkru >> (e->pkey * 2u)) & 3u;
+            if ((rights & 1u) || (write && (rights & 2u))) {
+                out->fault_error_code = cached_access_fault_code(
+                    env, access, X86_PF_PROTECTION_KEY);
                 return LATX_X86_WALK_PROTECTION;
             }
         }
-        if ((access & LATX_X86_ACCESS_EXEC) &&
-            !(e->perm & LATX_X86_ACCESS_EXEC)) {
-            return LATX_X86_WALK_PROTECTION;
+        /* Dirty-bit promotion: fall through to authoritative walker on first write. */
+        if (write && !e->dirty) {
+            r = latx_x86_walk(env, va, access, out);
+            if (r == LATX_X86_WALK_OK) {
+                e->dirty = out->dirty;
+            }
+            return r;
         }
         return LATX_X86_WALK_OK;
     }
 
     r = latx_x86_walk(env, va, access, out);
-    if (r != LATX_X86_WALK_OK && r != LATX_X86_WALK_PROTECTION) {
-        /*
-         * A not-present or malformed entry is never cached: the guest may be
-         * about to fix it, and a negative entry would then need its own
-         * invalidation protocol.
-         */
+    if (r != LATX_X86_WALK_OK) {
+        /* Never cache faulting entries; only cache valid translations. */
         return r;
     }
     e->cr3 = cr3;
+    e->pcid = pcid;
     e->page_bits = out->page_bits;
     e->tag = va >> out->page_bits;
     e->gpa_base = out->gpa & ~((UINT64_C(1) << out->page_bits) - 1);
     e->perm = out->perm;
+    e->global = out->global;
+    e->pkey = out->pkey;
+    e->dirty = out->dirty;
     e->valid = true;
     return r;
 }
 
 uint64_t latx_x86_access_hpa;
-/* latx_x86_checked_operand lives in mem-interface.c: it is translation-time. */
 
 uint64_t latx_x86_check_guest_access(CPUX86State *env, uint64_t gva,
                                      uint32_t access, uint32_t size_bits,
@@ -293,15 +405,12 @@ uint64_t latx_x86_check_guest_access(CPUX86State *env, uint64_t gva,
         LatxX86WalkResult r = latx_x86_walk_cached(env, page, access, &t);
 
         if (r != LATX_X86_WALK_OK && r != LATX_X86_WALK_PAGING_OFF) {
-            /*
-             * Whatever produced this refusal must not be reused: a guest
-             * handler exists precisely because the mapping is about to
-             * change, and a cached leaf would make the retry fault forever.
-             */
             latx_x86_tlb_flush_page(gva);
             env->cr[2] = gva;
             env->exception_index = EXCP0E_PAGE;
-            env->error_code = (int)latx_x86_fault_error_code(env, r, access);
+            env->error_code = (int)(t.fault_error_code
+                                        ? t.fault_error_code
+                                        : latx_x86_fault_error_code(env, r, access));
             return LATX_X86_ACCESS_FAULTED;
         }
         {
@@ -312,14 +421,9 @@ uint64_t latx_x86_check_guest_access(CPUX86State *env, uint64_t gva,
                 have_delta = true;
                 hpa = gva + delta;
             } else if (d != delta) {
-                /*
-                 * The access spans pages with different translations.  The
-                 * emitted code can only carry one host address, so refuse
-                 * rather than write half of it to the wrong place.
-                 */
                 env->cr[2] = gva;
                 env->exception_index = EXCP0E_PAGE;
-                env->error_code = 1 | 8;        /* protection, RSVD */
+                env->error_code = 1 | 8;
                 return LATX_X86_ACCESS_FAULTED;
             }
         }
@@ -392,7 +496,7 @@ void helper_syscall_sys(CPUX86State *env, uint64_t next_rip)
     env->segs[R_SS].selector = (uint16_t)(cs_sel + 8U);
     env->hflags &= ~(uint32_t)HF_CPL_MASK;
     env->eip = env->lstar;
-    latx_x86_tlb_flush_all();
+    latx_x86_tlb_flush_non_global();
     latx_platform_tlb_flush_all();
 }
 
@@ -406,7 +510,7 @@ void helper_sysret_sys(CPUX86State *env)
     env->segs[R_CS].selector = (uint16_t)((star_hi + 16U) | 3U);
     env->segs[R_SS].selector = (uint16_t)((star_hi + 8U) | 3U);
     env->hflags = (env->hflags & ~(uint32_t)HF_CPL_MASK) | 3U;
-    latx_x86_tlb_flush_all();
+    latx_x86_tlb_flush_non_global();
     latx_platform_tlb_flush_all();
 }
 
@@ -423,11 +527,11 @@ int latx_x86_deliver_fault(CPUX86State *env, uint32_t vector)
     uint32_t old_cs = env->segs[R_CS].selector;
 
     if ((uint64_t)vector * 16 + 15 > env->idt.limit + 1) {
-        return 1;                       /* no such gate */
+        return 1;
     }
     if (!walk_or_flat(env, gate_gva, LATX_X86_ACCESS_READ, &gate_lo_pa) ||
         !walk_or_flat(env, gate_gva + 8, LATX_X86_ACCESS_READ, &gate_hi_pa)) {
-        return 1;                       /* IDT gate not mapped */
+        return 1;
     }
     lo = latx_platform_phys_read(gate_lo_pa, 8);
     hi = latx_platform_phys_read(gate_hi_pa, 8);
@@ -435,7 +539,6 @@ int latx_x86_deliver_fault(CPUX86State *env, uint32_t vector)
     {
         uint8_t type_attr = (uint8_t)(lo >> 40);
 
-        /* Present, and an interrupt (0xE) or trap (0xF) gate. */
         if (!(type_attr & 0x80) || (type_attr & 0x1f) < 0x0e) {
             return 1;
         }
@@ -455,12 +558,7 @@ int latx_x86_deliver_fault(CPUX86State *env, uint32_t vector)
         }
     }
     rsp &= ~UINT64_C(15);
-    /*
-     * Long-mode frame, top first: error code, RIP, CS, RFLAGS, RSP, SS.
-     * RSP and SS belong to the privilege-change form; they are pushed
-     * unconditionally because the translator's IRETQ pops them regardless,
-     * and SS selector 0 is what long mode uses.
-     */
+
 #define PUSH64(v)                                                             \
     do {                                                                      \
         uint64_t _pa;                                                         \
@@ -473,22 +571,18 @@ int latx_x86_deliver_fault(CPUX86State *env, uint32_t vector)
 
     PUSH64(old_ss);
     PUSH64(old_rsp);
-    PUSH64(env->eflags & ~(UINT64_C(1) << 8));   /* TF clear in the handler */
+    PUSH64(env->eflags & ~(UINT64_C(1) << 8));
     PUSH64(old_cs);
     PUSH64(env->eip);
     PUSH64((uint64_t)(uint32_t)env->error_code);
 #undef PUSH64
 
-    /*
-     * A handler runs because a mapping or a permission is about to change,
-     * and nothing here can know which, so every cached walk is suspect.
-     */
     latx_x86_tlb_flush_all();
 
     env->regs[R_ESP] = rsp;
     env->eip = off;
     env->segs[R_CS].selector = (uint32_t)selector;
-    env->segs[R_CS].base = 0;                    /* ignored in long mode */
+    env->segs[R_CS].base = 0;
     if (old_cpl != 0) {
         env->segs[R_SS].selector = 0;
     }
@@ -497,7 +591,7 @@ int latx_x86_deliver_fault(CPUX86State *env, uint32_t vector)
     if (gate_type == 0x0eu) {
         env->eflags &= ~IF_MASK;
     }
-    env->exception_index = 0;                    /* the guest now owns it */
+    env->exception_index = 0;
     return 0;
 }
 
@@ -506,12 +600,6 @@ uint8_t latx_x86_fetch_byte(const CPUX86State *env, uint64_t gva)
     LatxX86Translation t;
     LatxX86WalkResult r;
 
-    /*
-     * Paging is only real once the guest has loaded a PML4.  A harness that
-     * sets CR0.PG with CR3 == 0 has no tables at all and means the flat layout,
-     * which is also how the translator treated it before fetch went through
-     * the walker.
-     */
     if (!(env->cr[0] & CR0_PG_MASK) || !(env->cr[4] & CR4_PAE_MASK) ||
         env->cr[3] == 0) {
         return latx_bare_ldub_code(gva);
@@ -525,7 +613,9 @@ uint8_t latx_x86_fetch_byte(const CPUX86State *env, uint64_t gva)
 
         mutable->cr[2] = gva;
         mutable->exception_index = EXCP0E_PAGE;
-        mutable->error_code = (int)latx_x86_fault_error_code(env, r, fetch_acc);
+        mutable->error_code = (int)(t.fault_error_code
+                                        ? t.fault_error_code
+                                        : latx_x86_fault_error_code(env, r, fetch_acc));
         return 0xcc;
     }
     return (uint8_t)latx_platform_phys_read(t.gpa, 1);
@@ -536,22 +626,19 @@ uint32_t latx_x86_fault_error_code(const CPUX86State *env,
 {
     uint32_t ec = 0;
 
-    /* bit 0: 0 = not present, 1 = protection violation */
     if (result == LATX_X86_WALK_PROTECTION) {
         ec |= 1u;
     } else if (result == LATX_X86_WALK_RESERVED) {
         ec |= 1u | 8u;
     }
-    /* bit 1: the access was a write */
     if (access & LATX_X86_ACCESS_WRITE) {
         ec |= 2u;
     }
-    /* bit 2: the access came from CPL 3 */
     if (access & LATX_X86_ACCESS_USER) {
         ec |= 4u;
     }
-    /* bit 4: instruction fetch, only reported when NX is enabled */
-    if ((access & LATX_X86_ACCESS_EXEC) && (env->efer & MSR_EFER_NXE)) {
+    if ((access & LATX_X86_ACCESS_EXEC) &&
+        ((env->efer & MSR_EFER_NXE) || (env->cr[4] & X86_CR4_SMEP))) {
         ec |= 16u;
     }
     return ec;

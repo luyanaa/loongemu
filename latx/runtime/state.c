@@ -69,7 +69,7 @@ void siglongjmp(sigjmp_buf env, int val)
 {
     (void)env;
     (void)val;
-    latx_platform_cpu_loop_exit(env_cpu((CPUX86State *)lsenv->cpu_state));
+    latx_platform_cpu_loop_exit(NULL);
     for (;;) {
     }
 }

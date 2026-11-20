@@ -49,6 +49,10 @@ typedef struct LatxX86Translation {
     uint64_t pte;        /* the leaf entry that produced it */
     uint32_t page_bits;  /* 12, 21 or 30 */
     uint32_t perm;       /* the same bits as the access mask */
+    uint32_t fault_error_code; /* authoritative #PF error code from x86_64_walk_page_tables */
+    uint8_t  global;     /* leaf G=1 && CR4.PGE */
+    uint8_t  pkey;       /* leaf protection key [62:59] */
+    uint8_t  dirty;      /* leaf D=1 */
 } LatxX86Translation;
 
 struct CPUX86State;
@@ -68,19 +72,29 @@ uint32_t latx_x86_fault_error_code(const struct CPUX86State *env,
 /*
  * Cached walks.
  *
- * A page-granular cache keyed by (cr3, leaf index) is what makes a per-access
- * check affordable.  It is direct mapped and small: a miss simply walks, and
- * correctness does not depend on the cache at all, only on the flushes below
- * being called.  A large leaf is stored with its own size, so an entry for a
- * 2 MiB page answers every address inside it.
+ * A page-granular cache keyed by (cr3, pcid, leaf index) delegates every miss
+ * and dirty-bit promotion to the single authoritative x86_64_walk_page_tables().
  */
 #define LATX_X86_TLB_ENTRIES 64
 
 void latx_x86_tlb_flush_all(void);
+void latx_x86_tlb_flush_non_global(void);
+void latx_x86_tlb_flush_pcid(uint16_t pcid);
 void latx_x86_tlb_flush_page(uint64_t va);
+void latx_x86_tlb_flush_all_cpus(void);
+uint32_t latx_platform_cpu_id(void);
 LatxX86WalkResult latx_x86_walk_cached(const struct CPUX86State *env,
                                        uint64_t va, uint32_t access,
                                        LatxX86Translation *out);
+
+/*
+ * Checked physical memory hooks used by the authoritative page-table walker.
+ * Return 0 on success, non-zero if the GPA is unmapped, MMIO, ROM, or
+ * VMM-protected reserved memory.
+ */
+int latx_platform_phys_read_u64_checked(uint64_t pa, uint64_t *value);
+int latx_platform_phys_atomic_or_u64(uint64_t pa, uint64_t bits,
+                                     uint64_t *new_value);
 
 /*
  * Validate one guest access.  `gva` is the first byte, `size_bits` the access

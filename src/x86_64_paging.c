@@ -8,6 +8,7 @@
 #define ENTRY_ACCESSED (UINT64_C(1) << 5)
 #define ENTRY_DIRTY    (UINT64_C(1) << 6)
 #define ENTRY_PS       (UINT64_C(1) << 7)
+#define ENTRY_GLOBAL   (UINT64_C(1) << 8)
 #define ENTRY_NX       (UINT64_C(1) << 63)
 #define ENTRY_PKEY_MASK (UINT64_C(0xf) << 59)
 #define ENTRY_SOFTWARE_MASK (UINT64_C(0x7f) << 52)
@@ -270,9 +271,14 @@ X86PagingResult x86_64_walk_page_tables(
             translation->guest_physical_address =
                 page_base | (linear_address & (page_size - 1));
             translation->page_size = page_size;
+            translation->leaf_pte = entry;
             translation->writable = (uint8_t)writable;
             translation->user_accessible = (uint8_t)user_page;
             translation->executable = (uint8_t)executable;
+            translation->global = (uint8_t)(((state->cr4 & X86_CR4_PGE) != 0) &&
+                                            ((entry & ENTRY_GLOBAL) != 0));
+            translation->pkey = (uint8_t)((entry & ENTRY_PKEY_MASK) >> 59);
+            translation->dirty = (uint8_t)((entry & ENTRY_DIRTY) != 0);
         }
     }
 
