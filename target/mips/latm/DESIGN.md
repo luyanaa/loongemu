@@ -704,7 +704,7 @@ SRCS   := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \
 ### 13.2 已通过的门禁
 
 - `make test-latm-decode`：21 条向量，覆盖 ALU/IMM、DMULTU、MFLO、ROTR、JAL/JR、BEQ/BEQL、LWL/SDR、SW/SD/LD、SYSCALL/BREAK、ERET/MFC0。
-- `make latm-isa-run`：QEMU-LVZ `-M virt -cpu la464`，61 项检查全部通过：
+- `make latm-isa-run`：QEMU-LVZ `-M virt -cpu la464`，67 项检查全部通过：
   - 整数 ALU、DSLL/DSRA、DMULTU/MFLO/MFHI、ROTR/DROTR；
   - 分支 taken/not-taken、BEQL taken/not-taken、JAL 链接值、JR 间接目标；
   - `lwl+lwr`、`ldl+ldr`、`sdr+ld` 以及普通 `sw/sd/ld`；
@@ -721,7 +721,7 @@ SRCS   := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \
 
 ### 13.3 已知边界
 
-1. **TB 链接是直接映射缓存**：`latm_jmp_cache` 1024 项、每项 32 B，冲突直接覆盖；key 目前只有 guest PC，未包含 ASID/模式，且没有按 vCPU 隔离。已覆盖命中/未命中与 `SYNCI/CACHE` 失效，但尚未接入主循环的 TB 分配器。
+1. **TB 链接是 per-vCPU 直接映射缓存**：每个 `CPUMIPSState` 持有 1024×32 B cache；key = `ASID | (hflags mode << 8)`，生成代码同时比较 guest PC、ASID 与 mode。测试覆盖同 key 命中、不同 ASID/模式拒绝、`SYNCI/CACHE` 失效。仍无容量/代际管理、ASID flush/TLB shootdown，且尚未接入主循环的 TB 分配器。
 2. **`jiscr1` 语义按 QEMU-LVZ 实现**：QEMU 的 `helper_lbt_jiscr` 对两个 jiscr 都用 SCR0 作为目标，`jiscr1` 额外把 host PC 写回 SCR0；LATM 的测试按此语义。若真实硬件遵循指南的 SCR1 目标语义，需要在 feature probe 后选择编码。
 3. **CPUMIPSState 位移**：`PC=512`、`hflags≈16116`，后者超出 LoongArch `si12`。`latm_env_ld/st_*` 对超界位移先用 `a0` 物化地址；`a0` 不映射任何 MIPS GPR（r4→a4）。
 4. **TLB 精度边界**：已实现 R4000 `map_address`、MIPS64 segment/SegCtl walk、TLB fault 的 BadVAddr/Context/EntryHi/Cause/EPC/BD；尚未实现 TLB shadow 页、TLBINV/TLBINVF 的全量失效语义，也未把 guest physical 与宿主物理内存解耦（测试直接把 PFN 指向宿主 buffer）。
@@ -729,5 +729,5 @@ SRCS   := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \
 6. **自修改代码边界**：`SYNCI/CACHE` 只清除 link cache 并执行 `ibar 0`；已发出的旧 TB 机器码不回收，正在执行的 TB 也不会被抢占。主循环接入 TB 分配器后需增加代码页回收。
 7. **COP1X 数值边界**：load/store 六个变体与四个 MADD 变体已通过。freestanding softfloat 的 `float64_mul` 路径会给出错误结果，因此 `latm_fpu_madd` 暂时使用宿主标量乘加（与 QEMU helper 的两步乘加语义一致）；FCR31 cause/enable/flags 的逐指令回填仍待 softfloat 修复后补齐，不能据此宣称完整 IEEE FMA 签核。
 8. **FPU 使能**：bare-metal QEMU 复位后 `EUEN.FPE=0`；执行 softfloat/C helper 中的浮点指令前必须置位 FPE（测试已显式使能）。
-9. **翻译器状态仍为进程级静态**：`ir1_list`、`db_rel`、`lsenv/tr_data` 在 freestanding 构建中不是 per-vCPU；SMP 下多个核同时译码/翻译会互相覆盖。需要把 IR1 scratch、translation context、寄存器分配、TB buffer 与异常上下文移入每 vCPU/worker 结构。
+9. **翻译器状态**：`ir1_list`/`db_rel`、寄存器分配、IR2 buffer、TB link cache 已移入 per-vCPU `TRANSLATION_DATA`/`CPUMIPSState`，`target_disasm()` 可按 CPU 绑定。当前 `lsenv/tr_data` 仍由进程级锁串行化；要实现并行翻译，下一轮需把它们改为真正的 per-worker/TLS 上下文。
 10. **其它未覆盖**：MIPS16/microMIPS/MSA/R6、big-endian、TLBINV/TLBINVF、完整系统态指令精确异常、MIPS SMP vCPU/IRQ 集成。

@@ -138,22 +138,20 @@ void latm_helper_sync(CPUMIPSState *env, uint32_t stype)
 
 void latm_helper_synci(CPUMIPSState *env, uint64_t addr)
 {
-    extern void latm_tb_flush_range(uint64_t start, uint64_t end)
+    extern void latm_tb_flush_range(void *cpu, uint64_t start, uint64_t end)
         __attribute__((weak));
-    (void)env;
     if (latm_tb_flush_range) {
-        latm_tb_flush_range(addr, addr + 32);
+        latm_tb_flush_range(env, addr, addr + 32);
     }
 }
 
 void latm_helper_cache(CPUMIPSState *env, uint32_t op, uint64_t addr)
 {
-    extern void latm_tb_flush_range(uint64_t start, uint64_t end)
+    extern void latm_tb_flush_range(void *cpu, uint64_t start, uint64_t end)
         __attribute__((weak));
-    (void)env;
     /* Index/Hit Invalidate for the instruction cache. */
     if (latm_tb_flush_range && (op == 0x00 || op == 0x10)) {
-        latm_tb_flush_range(addr & ~UINT64_C(0x1f),
+        latm_tb_flush_range(env, addr & ~UINT64_C(0x1f),
                             (addr & ~UINT64_C(0x1f)) + 32);
     }
 }

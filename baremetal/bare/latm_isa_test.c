@@ -224,7 +224,7 @@ static int assemble_block(uint32_t *guest, int insns, uint8_t *host)
     tb.jmp_reset_offset[1] = 0xffff;
 
     int max_insns = insns;
-    target_disasm(&tb, &max_insns, NULL);
+    target_disasm(&tb, &max_insns, &env);
     if (tb.icount == 0 || !tr_ir2_generate(&tb)) {
         tr_fini();
         return -1;
@@ -243,13 +243,19 @@ static void run_chain(int use_jiscr1)
 
     latx_bare_uart_puts(use_jiscr1 ? "latm-isa: chain-jiscr1 begin\n"
                                    : "latm-isa: chain-jiscr0 begin\n");
-    for (size_t i = 0; i < sizeof(env); i++) {
-        ((uint8_t *)&env)[i] = 0;
+    {
+        void *le = env.latm_env, *lt = env.latm_tr_data, *lc = env.latm_jmp_cache;
+        for (size_t i = 0; i < sizeof(env); i++) {
+            ((uint8_t *)&env)[i] = 0;
+        }
+        env.latm_env = le;
+        env.latm_tr_data = lt;
+        env.latm_jmp_cache = lc;
     }
     for (size_t i = 0; i < CODE_BUF_SIZE; i++) {
         code_buf[i] = 0;
     }
-    latm_jmp_cache_flush();
+    latm_jmp_cache_flush(&env);
 
     tcg_ctx->code_ptr = code_buf + PROLOGUE_OFFSET;
     lata_gen_prologue(tcg_ctx);
@@ -262,7 +268,7 @@ static void run_chain(int use_jiscr1)
         latx_bare_uart_puts("latm-isa: FAIL chain target assemble\n");
         return;
     }
-    latm_jmp_cache_add((uint64_t)(uintptr_t)chain_target_code,
+    latm_jmp_cache_add(&env, (uint64_t)(uintptr_t)chain_target_code,
                        (uint64_t)(uintptr_t)target_host, 8);
 
     chain_source_code[0] = 0x3c020000u | ((target_pc >> 16) & 0xffffu);
@@ -297,8 +303,14 @@ static void run_block(uint32_t *guest, int insns, const char *name)
     latx_bare_uart_puts(name);
     latx_bare_uart_puts(" begin\n");
 
-    for (size_t i = 0; i < sizeof(env); i++) {
-        ((uint8_t *)&env)[i] = 0;
+    {
+        void *le = env.latm_env, *lt = env.latm_tr_data, *lc = env.latm_jmp_cache;
+        for (size_t i = 0; i < sizeof(env); i++) {
+            ((uint8_t *)&env)[i] = 0;
+        }
+        env.latm_env = le;
+        env.latm_tr_data = lt;
+        env.latm_jmp_cache = lc;
     }
     for (size_t i = 0; i < sizeof(tb); i++) {
         ((uint8_t *)&tb)[i] = 0;
@@ -325,13 +337,14 @@ static void run_block(uint32_t *guest, int insns, const char *name)
     tb.jmp_reset_offset[1] = 0xffff;
 
     int max_insns = insns;
-    target_disasm(&tb, &max_insns, NULL);
+    target_disasm(&tb, &max_insns, &env);
     if (tb.icount == 0) {
         fails++;
         checks++;
         latx_bare_uart_puts("latm-isa: FAIL ");
         latx_bare_uart_puts(name);
         latx_bare_uart_puts(" decoded=0\n");
+        tr_fini();
         return;
     }
 
@@ -369,6 +382,23 @@ void kmain(void)
     latx_bare_uart_puts("latm-isa: begin\n");
 
     lata_tr_data_init(&env);
+    {
+        CPUMIPSState env2;
+        for (size_t i = 0; i < sizeof(env2); i++) {
+            ((uint8_t *)&env2)[i] = 0;
+        }
+        lata_tr_data_init(&env2);
+        check((uint64_t)(uintptr_t)env2.latm_tr_data !=
+              (uint64_t)(uintptr_t)env.latm_tr_data, 1,
+              "per-vCPU translation data");
+        check(((TRANSLATION_DATA *)env2.latm_tr_data)->ir1_list !=
+              ((TRANSLATION_DATA *)env.latm_tr_data)->ir1_list, 1,
+              "per-vCPU IR1 scratch");
+        check((uint64_t)(uintptr_t)env2.latm_jmp_cache !=
+              (uint64_t)(uintptr_t)env.latm_jmp_cache, 1,
+              "per-vCPU TB link cache");
+        latm_bind_env(&env);
+    }
 
     run_block(arith_code, 6, "arith");
     check(env.active_tc.gpr[4], 12, "arith daddu");
@@ -495,13 +525,28 @@ void kmain(void)
         uint32_t target = (uint32_t)(uintptr_t)chain_target_code;
         cache_code[0] = 0x3c020000u | ((target >> 16) & 0xffffu);
         cache_code[1] = 0x34420000u | (target & 0xffffu);
+        latm_jmp_cache_add(&env, (uint64_t)(uintptr_t)chain_target_code,
+                           (uint64_t)(uintptr_t)code_buf + 0x6000, 8);
+        check(latm_jmp_cache_lookup(
+                  &env, (uint64_t)(uintptr_t)chain_target_code),
+              (uint64_t)(uintptr_t)code_buf + 0x6000, "cache key hit ASID0");
+        env.CP0_EntryHi = 1;
+        check(latm_jmp_cache_lookup(
+                  &env, (uint64_t)(uintptr_t)chain_target_code), 0,
+              "cache key rejects different ASID");
+        env.CP0_EntryHi = 0;
+        env.hflags = MIPS_HFLAG_UM;
+        check(latm_jmp_cache_lookup(
+                  &env, (uint64_t)(uintptr_t)chain_target_code), 0,
+              "cache key rejects different mode");
+        env.hflags = 0;
         for (unsigned i = 0; i < sizeof(flush_ops) / sizeof(flush_ops[0]); i++) {
             cache_code[2] = flush_ops[i];
-            latm_jmp_cache_add((uint64_t)(uintptr_t)chain_target_code,
+            latm_jmp_cache_add(&env, (uint64_t)(uintptr_t)chain_target_code,
                                (uint64_t)(uintptr_t)code_buf + 0x6000, 8);
             run_block(cache_code, 3, "cache-synci");
             check(latm_jmp_cache_lookup(
-                      (uint64_t)(uintptr_t)chain_target_code), 0,
+                      &env, (uint64_t)(uintptr_t)chain_target_code), 0,
                   "CACHE/SYNCI invalidates TB link cache");
         }
     }

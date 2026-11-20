@@ -219,36 +219,53 @@ static void gen_goto_tb(DisasContext *s, int n, uint64_t dest)
 
 static void gen_goto_tb_indirect(DisasContext *s, IR2_OPND target)
 {
-    IR2_OPND host = ra_alloc_itemp();
+    IR2_OPND slot = ra_alloc_itemp();
     IR2_OPND cached = ra_alloc_itemp();
-    IR2_OPND miss = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND miss0 = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND miss1 = ir2_opnd_new_type(IR2_OPND_LABEL);
 
-    /* idx = (target >> 2) & MASK; slot = cache + idx * 32 */
-    la_srli_d(a0_ir2_opnd, target, 2);
-    la_andi(a0_ir2_opnd, a0_ir2_opnd, LATM_JMP_CACHE_MASK);
-    li_d(host, (uint64_t)(uintptr_t)latm_jmp_cache);
-    la_slli_d(a0_ir2_opnd, a0_ir2_opnd, 5);
-    la_add_d(a0_ir2_opnd, a0_ir2_opnd, host);
-    la_ld_d(cached, a0_ir2_opnd, 0);
-    la_bne(target, cached, miss);
-    la_ld_d(host, a0_ir2_opnd, 8);
-    la_beqz(host, miss);
+    /* a0 = this vCPU's cache; slot = cache + ((target >> 2) & MASK) * 32 */
+    latm_env_ld_d(a0_ir2_opnd,
+                  offsetof(CPUMIPSState, latm_jmp_cache));
+    la_beqz(a0_ir2_opnd, miss0);
+    la_srli_d(slot, target, 2);
+    la_andi(slot, slot, LATM_JMP_CACHE_MASK);
+    la_slli_d(slot, slot, 5);
+    la_add_d(slot, slot, a0_ir2_opnd);
+    la_ld_d(cached, slot, 0);
+    la_bne(target, cached, miss0);
 
+    /* PC is now safe to publish; reuse target as a key temp. */
     latm_env_st_d(target, env_offset_pc());
+    la_ld_d(cached, slot, 24);
+
+    latm_env_ld_w(a0_ir2_opnd, env_offset_hflags());
+    la_andi(a0_ir2_opnd, a0_ir2_opnd,
+            MIPS_HFLAG_UM | MIPS_HFLAG_SM);
+    la_slli_d(a0_ir2_opnd, a0_ir2_opnd, 8);
+    la_mov64(target, a0_ir2_opnd);
+    latm_env_ld_d(a0_ir2_opnd, offsetof(CPUMIPSState, CP0_EntryHi));
+    la_andi(a0_ir2_opnd, a0_ir2_opnd, 0xff);
+    la_or(a0_ir2_opnd, target, a0_ir2_opnd);
+    la_bne(cached, a0_ir2_opnd, miss1);
+
+    la_ld_d(cached, slot, 8);
+    la_beqz(cached, miss1);
     if (latm_link_use_jiscr1) {
-        la_gr2scr(scr0_ir2_opnd, host);
+        la_gr2scr(scr0_ir2_opnd, cached);
         la_jiscr1(0);
     } else if (latm_have_lbt) {
-        la_gr2scr(scr0_ir2_opnd, host);
+        la_gr2scr(scr0_ir2_opnd, cached);
         la_jiscr0(0);
     } else {
-        la_jirl(zero_ir2_opnd, host, 0);
+        la_jirl(zero_ir2_opnd, cached, 0);
     }
 
-    la_label(miss);
+    la_label(miss0);
     latm_env_st_d(target, env_offset_pc());
+    la_label(miss1);
     lata_gen_exit_tb_ret_0(s);
-    ra_free_itemp(host._reg_num);
+    ra_free_itemp(slot._reg_num);
     ra_free_itemp(cached._reg_num);
 }
 
@@ -1392,12 +1409,10 @@ __attribute__((weak)) uint32_t latm_guest_ldl(uint64_t addr)
     return *(const uint32_t *)(uintptr_t)addr;
 }
 
-static DisasContext ir1_list[TCG_MAX_INSNS];
-static DisasContextBase db_rel;
-
 static DisasContext *get_ir1_list(TranslationBlock *tb, int max_insns)
 {
-    DisasContextBase *db = &db_rel;
+    DisasContext *ir1_list = lsenv->tr_data->ir1_list;
+    DisasContextBase *db = lsenv->tr_data->db_rel;
     int n = 0;
     uint64_t pc = tb->pc;
     uint64_t page_start = pc & TARGET_PAGE_MASK;
@@ -1453,7 +1468,15 @@ static DisasContext *get_ir1_list(TranslationBlock *tb, int max_insns)
 
 void target_disasm(TranslationBlock *tb, int *max_insns, void *cpu)
 {
-    (void)cpu;
+    latm_translate_lock();
+    if (cpu) {
+        latm_bind_env(cpu);
+    }
+    if (lsenv && lsenv->tr_data) {
+        CPUMIPSState *env = cpu;
+        lsenv->tr_data->lock_held = true;
+        lsenv->tr_data->cache_key = env ? latm_cache_key(env) : 0;
+    }
     tb->ir1 = get_ir1_list(tb, *max_insns);
 }
 

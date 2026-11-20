@@ -52,11 +52,10 @@ const int mips_la_reverse_fmap[32] = {
 };
 
 __thread ENV *lsenv;
-static __thread ENV lsenv_real;
-static __thread TRANSLATION_DATA tr_data_real;
 __thread TRANSLATION_DATA *tr_data;
 
 bool lata_dump;
+static uint8_t latm_translation_lock_flag;
 uint64_t context_switch_bt_to_native;
 uint64_t context_switch_native_to_bt_ret_0;
 uint64_t context_switch_native_to_bt;
@@ -115,11 +114,49 @@ static void global_register_init(void)
     scr3_ir2_opnd = INIT_RA(IR2_OPND_SCR, 3);
 }
 
-void lata_tr_data_init(void *env)
+void latm_translate_lock(void)
 {
-    lsenv = &lsenv_real;
+    while (__atomic_test_and_set(&latm_translation_lock_flag,
+                                 __ATOMIC_ACQUIRE)) {
+    }
+}
+
+void latm_translate_unlock(void)
+{
+    __atomic_clear(&latm_translation_lock_flag, __ATOMIC_RELEASE);
+}
+
+void latm_bind_env(void *cpu)
+{
+    CPUMIPSState *env = cpu;
+    if (!env) {
+        return;
+    }
+    if (!env->latm_env) {
+        lata_tr_data_init(env);
+        return;
+    }
+    lsenv = env->latm_env;
+    tr_data = env->latm_tr_data;
+}
+
+void lata_tr_data_init(void *envp)
+{
+    CPUMIPSState *env = envp;
+    if (!env->latm_env) {
+        env->latm_env = mm_calloc(1, sizeof(ENV));
+        env->latm_tr_data = mm_calloc(1, sizeof(TRANSLATION_DATA));
+        env->latm_jmp_cache = mm_calloc(LATM_JMP_CACHE_SIZE,
+                                        sizeof(LatmJmpCacheEntry));
+    }
+    lsenv = env->latm_env;
+    tr_data = env->latm_tr_data;
     lsenv->cpu_state = env;
-    lsenv->tr_data = &tr_data_real;
+    lsenv->tr_data = tr_data;
+    if (!tr_data->ir1_list) {
+        tr_data->ir1_list = mm_calloc(TCG_MAX_INSNS, sizeof(DisasContext));
+        tr_data->db_rel = mm_calloc(1, sizeof(DisasContextBase));
+    }
     global_register_init();
 }
 
@@ -139,6 +176,10 @@ void tr_init(void *tb)
     t->first_ir2 = NULL;
     t->last_ir2 = NULL;
     t->label_num = 0;
+    if (!t->ir1_list) {
+        t->ir1_list = mm_calloc(TCG_MAX_INSNS, sizeof(DisasContext));
+        t->db_rel = mm_calloc(1, sizeof(DisasContextBase));
+    }
 }
 
 void tr_fini(void)
@@ -149,6 +190,10 @@ void tr_fini(void)
     t->first_ir2 = NULL;
     t->last_ir2 = NULL;
     t->label_num = 0;
+    if (t->lock_held) {
+        t->lock_held = false;
+        latm_translate_unlock();
+    }
 }
 
 #define EXTRA_SPACE 40
@@ -514,7 +559,6 @@ void lata_env_vst(IR2_OPND vector, int offset)
     la_vst(vector, env_ir2_opnd, offset);
 }
 
-LatmJmpCacheEntry latm_jmp_cache[LATM_JMP_CACHE_SIZE];
 bool latm_have_lbt = true;
 bool latm_link_use_jiscr1;
 
@@ -523,40 +567,80 @@ static inline uint32_t latm_jmp_slot(uint64_t guest_pc)
     return (uint32_t)((guest_pc >> 2) & LATM_JMP_CACHE_MASK);
 }
 
-void latm_jmp_cache_add(uint64_t guest_pc, uint64_t host_pc, uint32_t guest_size)
+static LatmJmpCacheEntry *latm_jmp_entries(void *cpu)
 {
-    LatmJmpCacheEntry *e = &latm_jmp_cache[latm_jmp_slot(guest_pc)];
+    return ((CPUMIPSState *)cpu)->latm_jmp_cache;
+}
 
+static void latm_jmp_cache_add_key(void *cpu, uint64_t key,
+                                   uint64_t guest_pc, uint64_t host_pc,
+                                   uint32_t guest_size)
+{
+    LatmJmpCacheEntry *cache = latm_jmp_entries(cpu);
+    LatmJmpCacheEntry *e;
+
+    if (!cache) {
+        return;
+    }
+    e = &cache[latm_jmp_slot(guest_pc)];
     e->guest_pc = guest_pc;
     e->host_pc = host_pc;
     e->guest_size = guest_size;
+    e->key = key;
 }
 
-void latm_jmp_cache_flush(void)
+void latm_jmp_cache_add(void *cpu, uint64_t guest_pc, uint64_t host_pc,
+                        uint32_t guest_size)
 {
-    memset(latm_jmp_cache, 0, sizeof(latm_jmp_cache));
+    CPUMIPSState *env = cpu;
+    latm_jmp_cache_add_key(cpu, latm_cache_key(env), guest_pc, host_pc,
+                           guest_size);
 }
 
-uint64_t latm_jmp_cache_lookup(uint64_t guest_pc)
+void latm_jmp_cache_flush(void *cpu)
 {
-    LatmJmpCacheEntry *e = &latm_jmp_cache[latm_jmp_slot(guest_pc)];
+    LatmJmpCacheEntry *cache = latm_jmp_entries(cpu);
 
-    return e->guest_pc == guest_pc ? e->host_pc : 0;
-}
-
-void latm_tb_register(void *tb_ptr)
-{
-    TranslationBlock *tb = tb_ptr;
-
-    if (tb && tb->tc.ptr) {
-        latm_jmp_cache_add(tb->pc, (uintptr_t)tb->tc.ptr, tb->size);
+    if (cache) {
+        memset(cache, 0, LATM_JMP_CACHE_SIZE * sizeof(*cache));
     }
 }
 
-void latm_tb_flush_range(uint64_t start, uint64_t end)
+uint64_t latm_jmp_cache_lookup(void *cpu, uint64_t guest_pc)
 {
+    CPUMIPSState *env = cpu;
+    LatmJmpCacheEntry *e;
+
+    if (!env || !env->latm_jmp_cache) {
+        return 0;
+    }
+    e = &((LatmJmpCacheEntry *)env->latm_jmp_cache)[latm_jmp_slot(guest_pc)];
+    return e->guest_pc == guest_pc && e->key == latm_cache_key(env) ?
+           e->host_pc : 0;
+}
+
+void latm_tb_register(void *cpu, void *tb_ptr)
+{
+    CPUMIPSState *env = cpu;
+    TranslationBlock *tb = tb_ptr;
+    TRANSLATION_DATA *t = env ? env->latm_tr_data : NULL;
+
+    if (tb && tb->tc.ptr) {
+        uint64_t key = t ? t->cache_key : latm_cache_key(env);
+        latm_jmp_cache_add_key(cpu, key, tb->pc, (uintptr_t)tb->tc.ptr,
+                               tb->size);
+    }
+}
+
+void latm_tb_flush_range(void *cpu, uint64_t start, uint64_t end)
+{
+    LatmJmpCacheEntry *cache = latm_jmp_entries(cpu);
+
+    if (!cache) {
+        return;
+    }
     for (unsigned i = 0; i < LATM_JMP_CACHE_SIZE; i++) {
-        LatmJmpCacheEntry *e = &latm_jmp_cache[i];
+        LatmJmpCacheEntry *e = &cache[i];
         uint64_t e_end;
 
         if (!e->host_pc) {
@@ -577,11 +661,10 @@ void lata_fast_jmp_cache_init(void *env, uint64_t start_code, uint64_t end_code)
     (void)env;
     (void)start_code;
     (void)end_code;
-    latm_jmp_cache_flush();
+    latm_jmp_cache_flush(env);
 }
 
 void lata_fast_jmp_cache_add(void *env, uint64_t guest_pc, uint64_t host_pc)
 {
-    (void)env;
-    latm_jmp_cache_add(guest_pc, host_pc, 4);
+    latm_jmp_cache_add(env, guest_pc, host_pc, 4);
 }

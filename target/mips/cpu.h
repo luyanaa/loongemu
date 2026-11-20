@@ -1195,6 +1195,9 @@ typedef struct CPUArchState {
     uint64_t shadow_gpr[16][32];
     /* LATM TB-local live-value spill slots for branch/delay helpers. */
     uint64_t latm_spill[4];
+    void *latm_env;
+    void *latm_tr_data;
+    void *latm_jmp_cache;
 } CPUMIPSState;
 
 /* Exceptions (copied from QEMU target/mips/cpu.h). */

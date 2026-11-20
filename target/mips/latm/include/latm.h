@@ -29,6 +29,10 @@ typedef struct TRANSLATION_DATA {
     IR2_INST *last_ir2;
 
     int label_num;
+    void *ir1_list;
+    void *db_rel;
+    uint64_t cache_key;
+    bool lock_held;
 
     union {
         uint32 all_temp_status;
@@ -53,17 +57,27 @@ typedef struct LatmJmpCacheEntry {
     uint64_t guest_pc;
     uint64_t host_pc;
     uint64_t guest_size;
-    uint64_t pad;
+    uint64_t key;          /* ASID | (hflags mode << 8) */
 } LatmJmpCacheEntry;
 
-extern LatmJmpCacheEntry latm_jmp_cache[LATM_JMP_CACHE_SIZE];
 extern bool latm_have_lbt;
 extern bool latm_link_use_jiscr1;
 
-void latm_jmp_cache_add(uint64_t guest_pc, uint64_t host_pc, uint32_t guest_size);
-void latm_jmp_cache_flush(void);
-uint64_t latm_jmp_cache_lookup(uint64_t guest_pc);
-void latm_tb_register(void *tb);
+static inline uint64_t latm_cache_key(void *cpu)
+{
+    CPUMIPSState *env = cpu;
+    return ((uint64_t)env->CP0_EntryHi & 0xff) |
+           ((uint64_t)(env->hflags & (MIPS_HFLAG_UM | MIPS_HFLAG_SM)) << 8);
+}
+
+void latm_bind_env(void *cpu);
+void latm_translate_lock(void);
+void latm_translate_unlock(void);
+void latm_jmp_cache_add(void *cpu, uint64_t guest_pc, uint64_t host_pc,
+                        uint32_t guest_size);
+void latm_jmp_cache_flush(void *cpu);
+uint64_t latm_jmp_cache_lookup(void *cpu, uint64_t guest_pc);
+void latm_tb_register(void *cpu, void *tb);
 
 void lata_tr_data_init(void *env);
 void tr_init(void *tb);

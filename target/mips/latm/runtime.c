@@ -20,8 +20,8 @@ LATM_WEAK void cpu_loop_exit(struct CPUState *cs)
 
 LATM_WEAK void tcg_debug_assert_(int cond) { (void)cond; }
 LATM_WEAK void g_assert_not_reached(void) { for (;;) { } }
-LATM_WEAK void latm_tb_flush_range(uint64_t start, uint64_t end)
-{ (void)start; (void)end; }
+LATM_WEAK void latm_tb_flush_range(void *cpu, uint64_t start, uint64_t end)
+{ (void)cpu; (void)start; (void)end; }
 LATM_WEAK void qemu_spin_init(QemuSpin *s) { (void)s; }
 LATM_WEAK void tb_flush(struct CPUState *cpu) { (void)cpu; }
 LATM_WEAK TranslationBlock *tb_htable_lookup(struct CPUState *cpu, uint64_t pc,
