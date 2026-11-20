@@ -1168,11 +1168,12 @@ static bool (*translate_functions[])(IR1_INST *) = {
     TRANS_FUNC_GEN(INTO, into),
     TRANS_FUNC_GEN(INSB, nop),
     TRANS_FUNC_GEN(RETF, retf),
+    TRANS_FUNC_GEN(RETFQ, retf),
     TRANS_FUNC_GEN(INT1, nop),
     TRANS_FUNC_GEN(OUTSD, nop),
     TRANS_FUNC_GEN(SLDT, nop),
     TRANS_FUNC_GEN(ARPL, nop),
-    TRANS_FUNC_GEN(SIDT, nop),
+    TRANS_FUNC_GEN(SIDT, sidt),
 
     /* ssse3 */
     TRANS_FUNC_GEN(PSIGNB, psignb),
@@ -3584,6 +3585,7 @@ direct_jmp:
 
     case dt_X86_INS_RET:
     case dt_X86_INS_RETF:
+    case dt_X86_INS_RETFQ:
     case dt_X86_INS_IRET:
     case dt_X86_INS_IRETD:
     case dt_X86_INS_IRETQ:
@@ -3600,7 +3602,7 @@ indirect_jmp:
          *
          * If using tb_link, LATX will jmp to jmp_glue finding the next TB.
          */
-        if (opcode != dt_X86_INS_RETF && opcode != dt_X86_INS_IRET &&
+        if (opcode != dt_X86_INS_RETF && opcode != dt_X86_INS_RETFQ && opcode != dt_X86_INS_IRET &&
             opcode != dt_X86_INS_IRETD && opcode != dt_X86_INS_IRETQ &&
             (!qemu_loglevel_mask(CPU_LOG_TB_NOCHAIN) ||
              ((CPUX86State *)lsenv->cpu_state)->tb_jmp_cache_ptr != NULL)) {

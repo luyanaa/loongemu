@@ -358,3 +358,63 @@ int loongemu_acpi_validate_rsdp(const void *rsdp_ptr,
     }
     return 1;
 }
+
+int loongemu_acpi_find_mcfg(const void *host_rsdp_ptr,
+                            const void *(*pa_to_ptr)(uint64_t pa),
+                            LoongemuAcpiMcfgInfo *out_mcfg)
+{
+    uint8_t rev = 0;
+    uint64_t xsdt_pa = 0;
+    const AcpiSdtHeader *xsdt;
+    uint32_t entry_size, count;
+
+    if (host_rsdp_ptr == 0 || out_mcfg == 0) {
+        return 0;
+    }
+    if (!loongemu_acpi_validate_rsdp(host_rsdp_ptr, &rev, &xsdt_pa, 0) ||
+        xsdt_pa == 0) {
+        return 0;
+    }
+    xsdt = (const AcpiSdtHeader *)(pa_to_ptr ? pa_to_ptr(xsdt_pa)
+                                             : (const void *)(uintptr_t)xsdt_pa);
+    if (xsdt == 0 || xsdt->length < sizeof(AcpiSdtHeader)) {
+        return 0;
+    }
+    entry_size = (rev >= 2) ? 8u : 4u;
+    count = (xsdt->length - (uint32_t)sizeof(AcpiSdtHeader)) / entry_size;
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t tbl_pa = 0;
+        const uint8_t *ent_ptr = (const uint8_t *)xsdt + sizeof(AcpiSdtHeader) +
+                                 (uint64_t)i * entry_size;
+        if (entry_size == 8u) {
+            for (int b = 7; b >= 0; b--) {
+                tbl_pa = (tbl_pa << 8) | ent_ptr[b];
+            }
+        } else {
+            for (int b = 3; b >= 0; b--) {
+                tbl_pa = (tbl_pa << 8) | ent_ptr[b];
+            }
+        }
+        if (tbl_pa == 0) {
+            continue;
+        }
+        const uint8_t *tbl = (const uint8_t *)(pa_to_ptr ? pa_to_ptr(tbl_pa)
+                                                         : (const void *)(uintptr_t)tbl_pa);
+        if (tbl[0] == 'M' && tbl[1] == 'C' && tbl[2] == 'F' && tbl[3] == 'G') {
+            const AcpiSdtHeader *sh = (const AcpiSdtHeader *)tbl;
+            /* MCFG header = 36 + 8 reserved = 44 bytes; each entry = 16 bytes */
+            if (sh->length >= 60u && acpi_checksum(tbl, sh->length) == 0) {
+                uint64_t base = 0;
+                for (int b = 7; b >= 0; b--) {
+                    base = (base << 8) | tbl[44 + b];
+                }
+                out_mcfg->base_addr = base;
+                out_mcfg->pci_segment = (uint16_t)tbl[52] | ((uint16_t)tbl[53] << 8);
+                out_mcfg->start_bus = tbl[54];
+                out_mcfg->end_bus = tbl[55];
+                return 1;
+            }
+        }
+    }
+    return 0;
+}

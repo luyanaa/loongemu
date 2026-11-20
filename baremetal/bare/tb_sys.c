@@ -51,6 +51,8 @@
 #include "loongemu/acpi_tables.h"
 #include "loongemu/smbios_tables.h"
 #include "loongemu/ovmf_board.h"
+#include "loongemu/pci_host.h"
+#include "loongemu/vmm_handoff.h"
 #include "loongemu/tb_cache.h"
 #include "loongemu/x86_64_paging.h"
 #include "loongemu/phys_mem.h"
@@ -221,8 +223,11 @@ static int deliver_x86_exception(uint32_t vec, uint64_t push_rip,
 static LoongemuMemMap g_mem_map;
 static LoongemuVClock g_vclock;
 static OvmfBoard g_ovmf_board;
+static LoongemuPciHost g_pci_host;
+static LoongemuVmmHandoff g_vmm_handoff;
 static uint8_t *g_ovmf_code_rom;
 static uint8_t *g_ovmf_vars_flash;
+static uint64_t g_bochs_fb_fallback_hpa;
 static LoongemuSpinLock g_lapic_lock;
 static LoongemuSpinLock g_ioapic_lock;
 static LoongemuSpinLock g_pic_lock;
@@ -237,6 +242,12 @@ uint64_t latx_platform_io_read(uint32_t port, int size)
 {
     uint64_t ovmf_val = 0;
     if (ovmf_board_io_read(&g_ovmf_board, port, size, &ovmf_val)) {
+        return ovmf_val;
+    }
+    if (port == LOONGEMU_QEMU_DEBUGCON_PORT) {
+        return 0xe9u;
+    }
+    if (loongemu_pci_io_read(&g_pci_host, port, size, &ovmf_val)) {
         return ovmf_val;
     }
     if (port >= 0x3f8 && port <= 0x3ff) {
@@ -304,15 +315,22 @@ uint64_t latx_platform_io_read(uint32_t port, int size)
     if (port == LOONGEMU_ACPI_PM1A_CNT_PORT) {
         return g_acpi_pm1_cnt;
     }
-    if (port == 0xcf8 || port == 0xcfc) {
-        return 0xffffffffu;          /* no device at this selector */
-    }
     return 0xffffffffull;
 }
 
 void latx_platform_io_write(uint32_t port, int size, uint64_t value)
 {
     if (ovmf_board_io_write(&g_ovmf_board, port, size, value)) {
+        return;
+    }
+    if (port == LOONGEMU_QEMU_DEBUGCON_PORT) {
+        latx_bare_uart_putc((int)(value & 0xffu));
+        return;
+    }
+    if (port >= LOONGEMU_PCI_CFG_ADDR_PORT && port <= LOONGEMU_PCI_CFG_DATA_PORT + 3u) {
+        g_pci_config_writes++;
+    }
+    if (loongemu_pci_io_write(&g_pci_host, port, size, value)) {
         return;
     }
     if (port >= 0x3f8 && port <= 0x3ff) {
@@ -397,10 +415,6 @@ void latx_platform_io_write(uint32_t port, int size, uint64_t value)
     }
     if (port == LOONGEMU_ACPI_PM1A_CNT_PORT) {
         g_acpi_pm1_cnt = (uint16_t)value;
-        return;
-    }
-    if (port == 0xcf8 || port == 0xcfc) {
-        g_pci_config_writes++;
         return;
     }
 }
@@ -557,6 +571,83 @@ static const MmioRegion *mmio_find_region(uint64_t gpa)
     return 0;
 }
 
+static int mem_map_upsert_named(LoongemuMemMap *map, const char *name,
+                                uint64_t gpa_base, uint64_t size,
+                                uint64_t hpa_base, LoongemuMemKind kind)
+{
+    for (uint32_t i = 0; i < map->count; i++) {
+        if (map->regions[i].name != 0 && strcmp(map->regions[i].name, name) == 0) {
+            map->regions[i].gpa_base = gpa_base;
+            map->regions[i].size = size;
+            map->regions[i].hpa_base = hpa_base;
+            map->regions[i].kind = kind;
+            return 1;
+        }
+    }
+    return loongemu_mem_map_add(map, gpa_base, size, hpa_base, kind, name);
+}
+
+static int mmio_upsert_by_cb(uint64_t gpa_base, uint64_t size,
+                             MmioReadCb read_cb, MmioWriteCb write_cb, void *opaque)
+{
+    for (uint32_t i = 0; i < g_mmio_region_count; i++) {
+        if (g_mmio_regions[i].read_cb == read_cb && g_mmio_regions[i].opaque == opaque) {
+            g_mmio_regions[i].gpa_base = gpa_base;
+            g_mmio_regions[i].size = size;
+            g_mmio_regions[i].write_cb = write_cb;
+            return 1;
+        }
+    }
+    return mmio_register(gpa_base, size, read_cb, write_cb, opaque);
+}
+
+static void bochs_display_bar_map_cb(void *opaque, uint32_t bar_idx,
+                                     uint64_t new_gpa, uint64_t size, int enabled)
+{
+    (void)opaque;
+    if (!enabled || new_gpa == 0 || size == 0) {
+        return;
+    }
+#ifdef LOONGEMU_BOOT_OVMF
+    latx_bare_uart_puts("ovmf_pci: bochs BAR");
+    puthex((uint64_t)bar_idx);
+    latx_bare_uart_puts(" gpa=");
+    puthex(new_gpa);
+    latx_bare_uart_puts(" sz=");
+    puthex(size);
+    latx_bare_uart_puts("\n");
+#endif
+    if (bar_idx == 0u) {
+        uint64_t fb_hpa = (g_pci_host.display.gop.valid && g_pci_host.display.gop.fb_hpa != 0)
+                              ? g_pci_host.display.gop.fb_hpa
+                              : g_bochs_fb_fallback_hpa;
+        if (fb_hpa != 0) {
+            mem_map_upsert_named(&g_mem_map, "bochs_fb", new_gpa, size, fb_hpa, LOONGEMU_MEM_RAM);
+        }
+    } else if (bar_idx == 2u) {
+        mem_map_upsert_named(&g_mem_map, "bochs_mmio", new_gpa, size, 0, LOONGEMU_MEM_MMIO);
+        mmio_upsert_by_cb(new_gpa, size, loongemu_bochs_mmio_read,
+                          loongemu_bochs_mmio_write, &g_pci_host.display);
+    }
+}
+
+void tb_sys_set_vmm_handoff(const LoongemuVmmHandoff *handoff)
+{
+    if (!handoff || handoff->magic != LOONGEMU_VMM_HANDOFF_MAGIC) {
+        return;
+    }
+    g_vmm_handoff = *handoff;
+    const LoongemuGopHandover *gop = g_vmm_handoff.gop.valid ? &g_vmm_handoff.gop : 0;
+    loongemu_pci_host_init(&g_pci_host, gop, bochs_display_bar_map_cb, 0);
+    if (g_vmm_handoff.ls7a_mcfg_valid) {
+        loongemu_pci_host_attach_ls7a(&g_pci_host,
+                                      g_vmm_handoff.ls7a_cfg_type0_base,
+                                      g_vmm_handoff.ls7a_cfg_type1_base,
+                                      (int)(g_vmm_handoff.hide_host_dc_gpu != 0u),
+                                      0, 0);
+    }
+}
+
 static uint64_t lapic_mmio_read_cb(void *opaque, uint64_t off, unsigned size);
 static void lapic_mmio_write_cb(void *opaque, uint64_t off, uint64_t val, unsigned size);
 static uint64_t ioapic_mmio_read_cb(void *opaque, uint64_t off, unsigned size);
@@ -607,20 +698,35 @@ static void init_phys_mem_and_vclock(void)
 
     /* OVMF board peripherals (CMOS/RTC, QEMU fw_cfg+DMA, 4GiB ROM & CFI pflash).
      * Place ROM/flash backing buffers above g_vmm_image_end so VMM .bss stays isolated. */
+    uint64_t rom_sz = LOONGEMU_OVMF_DEFAULT_ROM_SZ;
+    uint64_t vars_sz = LOONGEMU_OVMF_DEFAULT_VARS_SZ;
     {
         uint64_t rom_hpa = (g_vmm_image_end + 0x10000ULL) & LAPG_PAGE_MASK;
-        uint64_t vars_hpa = rom_hpa + LOONGEMU_OVMF_DEFAULT_ROM_SZ;
+#ifdef LOONGEMU_BOOT_OVMF
+        extern const uint8_t _ovmf_code_start[], _ovmf_code_end[];
+        extern const uint8_t _ovmf_vars_start[], _ovmf_vars_end[];
+        rom_sz = (uint64_t)(_ovmf_code_end - _ovmf_code_start);
+        vars_sz = (uint64_t)(_ovmf_vars_end - _ovmf_vars_start);
+        uint64_t vars_hpa = (rom_hpa + rom_sz + LAPG_PAGE_SIZE - 1u) & LAPG_PAGE_MASK;
         g_ovmf_code_rom = (uint8_t *)(uintptr_t)rom_hpa;
         g_ovmf_vars_flash = (uint8_t *)(uintptr_t)vars_hpa;
-        memset(g_ovmf_code_rom, 0x90, LOONGEMU_OVMF_DEFAULT_ROM_SZ);
-        memset(g_ovmf_vars_flash, 0xff, LOONGEMU_OVMF_DEFAULT_VARS_SZ);
+        memcpy(g_ovmf_code_rom, _ovmf_code_start, (size_t)rom_sz);
+        memcpy(g_ovmf_vars_flash, _ovmf_vars_start, (size_t)vars_sz);
+#else
+        uint64_t vars_hpa = rom_hpa + rom_sz;
+        g_ovmf_code_rom = (uint8_t *)(uintptr_t)rom_hpa;
+        g_ovmf_vars_flash = (uint8_t *)(uintptr_t)vars_hpa;
+        memset(g_ovmf_code_rom, 0x90, (size_t)rom_sz);
+        memset(g_ovmf_vars_flash, 0xff, (size_t)vars_sz);
         /* Default 16-bit real-mode reset vector at GPA 0xFFFFFFF0 (CS.base=0xFFFF0000, IP=0xFFF0) */
         static const uint8_t rv16[] = {
             0xb8, 0x34, 0x12, /* mov ax, 0x1234 */
             0x8e, 0xd8,       /* mov ds, ax     */
             0xf4,             /* hlt            */
         };
-        memcpy(&g_ovmf_code_rom[LOONGEMU_OVMF_DEFAULT_ROM_SZ - 16u], rv16, sizeof(rv16));
+        memcpy(&g_ovmf_code_rom[rom_sz - 16u], rv16, sizeof(rv16));
+#endif
+        g_bochs_fb_fallback_hpa = (vars_hpa + vars_sz + 0xfffffULL) & ~UINT64_C(0xfffff);
     }
     loongemu_vclock_init(&g_vclock, LOONGEMU_VCLOCK_HOST_MONO,
                          g_host_timer_hz, g_host_timer_hz,
@@ -630,11 +736,21 @@ static void init_phys_mem_and_vclock(void)
                     guest_phys_read_checked, guest_phys_write_checked);
     ovmf_board_set_wall_clock(&g_ovmf_board, vclock_wall_sec_cb, &g_vclock);
     ovmf_board_map_firmware(&g_ovmf_board, &g_mem_map,
-                            g_ovmf_code_rom, LOONGEMU_OVMF_DEFAULT_ROM_SZ,
-                            g_ovmf_vars_flash, LOONGEMU_OVMF_DEFAULT_VARS_SZ);
+                            g_ovmf_code_rom, rom_sz,
+                            g_ovmf_vars_flash, vars_sz);
     mmio_register(g_ovmf_board.vars_flash.gpa_base, g_ovmf_board.vars_flash.size,
                   ovmf_pflash_mmio_read, ovmf_pflash_mmio_write,
                   &g_ovmf_board.vars_flash);
+    /* PCI Host Bridge (0xCF8/0xCFC + ECAM 0xB0000000) + Bochs Display GOP handover */
+    loongemu_mem_map_add(&g_mem_map, LOONGEMU_PCI_ECAM_GPA, LOONGEMU_PCI_ECAM_SIZE,
+                         0, LOONGEMU_MEM_MMIO, "pci_ecam");
+    mmio_register(LOONGEMU_PCI_ECAM_GPA, LOONGEMU_PCI_ECAM_SIZE,
+                  loongemu_pci_ecam_read, loongemu_pci_ecam_write, &g_pci_host);
+    if (g_vmm_handoff.magic == LOONGEMU_VMM_HANDOFF_MAGIC && g_vmm_handoff.gop.valid) {
+        tb_sys_set_vmm_handoff(&g_vmm_handoff);
+    } else {
+        loongemu_pci_host_init(&g_pci_host, 0, bochs_display_bar_map_cb, 0);
+    }
     loongemu_spin_init(&g_uart_lock);
     loongemu_spin_init(&g_lapic_lock);
     loongemu_spin_init(&g_ioapic_lock);
@@ -3054,6 +3170,12 @@ static int deliver_kernel_timer_tick(uint64_t guest_rip)
  */
 static uint64_t g_recent_pcs[16];
 static uint64_t g_recent_count;
+#ifdef LOONGEMU_BOOT_OVMF
+static uint64_t g_ovmf_uniq_pcs[16];
+static uint16_t g_ovmf_uniq_cs[16];
+static uint64_t g_ovmf_uniq_count;
+static uint32_t g_ovmf_exc_logs;
+#endif
 static uint64_t g_run_tb_hits;
 static uint64_t g_run_tb_misses;
 static uint64_t g_run_tb_flushes;
@@ -3117,7 +3239,12 @@ static uint64_t hash_guest_code(uint64_t gva, uint16_t len)
         if (!walk_ok(latx_x86_walk_cached(&env, cur, LATX_X86_ACCESS_READ, &tr_g))) {
             return 0;
         }
-        const volatile uint8_t *p = (const volatile uint8_t *)(uintptr_t)tr_g.gpa;
+        LoongemuMemLookup lk_h;
+        LoongemuMemKind mk_h = loongemu_mem_resolve(&g_mem_map, tr_g.gpa, chunk, &lk_h);
+        if (mk_h != LOONGEMU_MEM_RAM && mk_h != LOONGEMU_MEM_ROM) {
+            return 0;
+        }
+        const volatile uint8_t *p = (const volatile uint8_t *)(uintptr_t)lk_h.hpa;
         for (uint16_t i = 0; i < chunk; i++) {
             h ^= (uint64_t)p[i];
             h *= UINT64_C(1099511628211);
@@ -3786,6 +3913,30 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
 
         g_recent_pcs[g_recent_count & 15] = before;
         g_recent_count++;
+#ifdef LOONGEMU_BOOT_OVMF
+        if (before < 0x10000ULL && tb_cs_base == 0ULL && env.cr[3] >= 0x01000000ULL) {
+            g_run_blocks_exit = 0xdeadULL;
+            break;
+        }
+        if (ran > 0 && (ran & 0x3fffff) == 0) {
+            latx_bare_uart_puts("ovmf_hb: blk=");
+            puthex((uint64_t)ran);
+            latx_bare_uart_puts(" rip=");
+            puthex(before);
+            latx_bare_uart_puts(" cr3=");
+            puthex(env.cr[3]);
+            latx_bare_uart_puts(" gdt=");
+            puthex(env.gdt.base);
+            latx_bare_uart_puts(" pci_w=");
+            puthex(g_pci_config_writes);
+            latx_bare_uart_puts("\n");
+        }
+        if (g_ovmf_uniq_count == 0 || g_ovmf_uniq_pcs[(g_ovmf_uniq_count - 1) & 15] != before) {
+            g_ovmf_uniq_pcs[g_ovmf_uniq_count & 15] = before;
+            g_ovmf_uniq_cs[g_ovmf_uniq_count & 15] = (uint16_t)env.segs[R_CS].selector;
+            g_ovmf_uniq_count++;
+        }
+#endif
 
         e = tbc_lookup_mode(&tb_cache, before, tb_cs_base, tb_cr3, cpl, tb_mode);
         if (e != 0) {
@@ -3962,11 +4113,16 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
             int is_hlt = 0;
             {
                 LatxX86Translation tr_hlt;
-                if (walk_ok(latx_x86_walk_cached(&env, env.eip,
+                LoongemuMemLookup lk_hlt;
+                uint64_t hlt_lin = current_tb_cs_base() + env.eip;
+                if (walk_ok(latx_x86_walk_cached(&env, hlt_lin,
                                                  LATX_X86_ACCESS_READ,
-                                                 &tr_hlt)) &&
-                    *(const volatile uint8_t *)(uintptr_t)tr_hlt.gpa == 0xf4u) {
-                    is_hlt = 1;
+                                                 &tr_hlt))) {
+                    LoongemuMemKind mk_hlt = loongemu_mem_resolve(&g_mem_map, tr_hlt.gpa, 1u, &lk_hlt);
+                    if ((mk_hlt == LOONGEMU_MEM_RAM || mk_hlt == LOONGEMU_MEM_ROM) &&
+                        *(const volatile uint8_t *)(uintptr_t)lk_hlt.hpa == 0xf4u) {
+                        is_hlt = 1;
+                    }
                 }
             }
 
@@ -4393,6 +4549,38 @@ static int deliver_x86_exception(uint32_t vec, uint64_t push_rip,
     int nwords = has_err ? 6 : 5;
     int idx = 0;
 
+#ifdef LOONGEMU_BOOT_OVMF
+    if (g_ovmf_exc_logs < 3u) {
+        g_ovmf_exc_logs++;
+        latx_bare_uart_puts("ovmf_exc: vec=");
+        puthex((uint64_t)vec);
+        latx_bare_uart_puts(" rip=");
+        puthex(push_rip);
+        latx_bare_uart_puts(" err=");
+        puthex((uint64_t)error_code);
+        latx_bare_uart_puts(" ecx=");
+        puthex(env.regs[R_ECX]);
+        latx_bare_uart_puts(" eax=");
+        puthex(env.regs[R_EAX]);
+        latx_bare_uart_puts(" idt=");
+        puthex(idt_base);
+        latx_bare_uart_puts(" bytes=");
+        {
+            LatxX86Translation tr_b;
+            if (walk_ok(latx_x86_walk(&env, push_rip, LATX_X86_ACCESS_READ, &tr_b))) {
+                LoongemuMemLookup lk_b;
+                LoongemuMemKind mk_b = loongemu_mem_resolve(&g_mem_map, tr_b.gpa, 8u, &lk_b);
+                if (mk_b == LOONGEMU_MEM_RAM || mk_b == LOONGEMU_MEM_ROM) {
+                    const uint8_t *bp = (const uint8_t *)(uintptr_t)lk_b.hpa;
+                    uint64_t qw = 0;
+                    for (int bi = 0; bi < 8; bi++) qw |= ((uint64_t)bp[bi]) << (bi * 8);
+                    puthex(qw);
+                }
+            }
+        }
+        latx_bare_uart_puts("\n");
+    }
+#endif
     if (idt_base == 0 || (uint64_t)vec * 16 + 15 > (uint64_t)env.idt.limit + 1) {
         return 0;
     }
@@ -5929,13 +6117,74 @@ void kmain(void)
 
         latx_platform_io_write(0x43, 1, 0x34);       /* PIT mode/command */
         latx_platform_io_write(0x40, 1, 0x9c);       /* PIT counter 0    */
-        latx_platform_io_write(0xcf8, 4, 0x80000000); /* PCI CONFIG_ADDR */
+        latx_platform_io_write(0xcf8, 4, 0x80000000); /* PCI CONFIG_ADDR 00:00.0 */
         check(g_pit_port_writes == 2, "PIT port writes recorded");
         check(g_pci_config_writes == 1, "PCI config write recorded");
         check(latx_platform_io_read(0x40, 1) == 0x1234,
               "PIT counter reads back");
+        check(latx_platform_io_read(0xcfc, 4) == 0x12378086u,
+              "PCI 00:00.0 reports i440FX host bridge (8086:1237)");
+        latx_platform_io_write(0xcf8, 4, 0x8000f800); /* unoccupied 00:1f.0 */
         check(latx_platform_io_read(0xcfc, 4) == 0xffffffffu,
-              "PCI config reports no device");
+              "PCI unoccupied slot reports 0xffffffff");
+        /* Verify PCI Host Bridge devices, ECAM, Bochs Display GOP/EDID, and Loongson 7A split-CFG */
+        {
+            uint64_t bochs_id = loongemu_pci_ecam_read(&g_pci_host, (2ULL << 15), 4u);
+            uint64_t piix3_id = loongemu_pci_ecam_read(&g_pci_host, (1ULL << 15), 4u);
+            uint64_t piix4_id = loongemu_pci_ecam_read(&g_pci_host, (1ULL << 15) | (3ULL << 12), 4u);
+            uint64_t edid0 = loongemu_bochs_mmio_read(&g_pci_host.display, 0x000u, 4u);
+            uint64_t dispi_id = loongemu_bochs_mmio_read(&g_pci_host.display, 0x500u, 2u);
+            uint64_t ls7a_t0 = loongemu_ls7a_cfg_addr(LOONGSON_7A_CFG_TYPE0_BASE,
+                                                      LOONGSON_7A_CFG_TYPE1_BASE,
+                                                      0u, 6u, 1u, 0x104u);
+            uint64_t ls7a_t1 = loongemu_ls7a_cfg_addr(LOONGSON_7A_CFG_TYPE0_BASE,
+                                                      LOONGSON_7A_CFG_TYPE1_BASE,
+                                                      2u, 0u, 0u, 0x208u);
+            check(piix3_id == 0x70008086u && piix4_id == 0x71138086u && bochs_id == 0x11111234u,
+                  "PCI ECAM enumerates PIIX3 (8086:7000), PIIX4 PM (8086:7113), Bochs Display (1234:1111)");
+            check(edid0 == 0xffffff00u && dispi_id == 0xb0c5u,
+                  "Bochs Display BAR2 exposes valid EDID header and DISPI ID 0xB0C5");
+            check(ls7a_t0 == UINT64_C(0x00000efe01003104) && ls7a_t1 == UINT64_C(0x00000efe12020008),
+                  "Loongson 7A1000/7A2000 HT split-CFG encodes [27:24]=reg[11:8] and [7:0]=reg[7:0]");
+            check(loongemu_ls7a_is_display_or_gpu(0x0014u, 0x7a06u) &&
+                  loongemu_ls7a_is_display_or_gpu(0x0014u, 0x7a36u) &&
+                  loongemu_ls7a_is_display_or_gpu(0x0014u, 0x7a15u) &&
+                  loongemu_ls7a_is_display_or_gpu(0x0014u, 0x7a25u) &&
+                  loongemu_ls7a_is_internal_bridge(0x0014u, 0x7a09u),
+                  "Loongson 7A DC/GPU filter & internal root port quirk classification verified");
+            check(latx_platform_io_read(LOONGEMU_QEMU_DEBUGCON_PORT, 1) == 0xe9u,
+                  "QEMU debugcon port 0x402 returns 0xE9 signature");
+            /* Verify Host UEFI -> tb_sys VMM handoff (GOP zero-copy HPA + 1920x1080 EDID + 7A MCFG) */
+            {
+                LoongemuVmmHandoff h;
+                LoongemuMemLookup lk_fb;
+                memset(&h, 0, sizeof(h));
+                h.magic = LOONGEMU_VMM_HANDOFF_MAGIC;
+                h.version = LOONGEMU_VMM_HANDOFF_VERSION;
+                h.gop.fb_hpa = UINT64_C(0x00000000e0000000);
+                h.gop.fb_size = UINT64_C(0x01000000);
+                h.gop.width = 1920u;
+                h.gop.height = 1080u;
+                h.gop.stride_px = 1920u;
+                h.gop.bpp = 32u;
+                h.gop.pixel_format = 1u;
+                h.gop.valid = 1u;
+                h.ls7a_cfg_type0_base = LOONGSON_7A_CFG_TYPE0_BASE;
+                h.ls7a_cfg_type1_base = LOONGSON_7A_CFG_TYPE1_BASE;
+                h.ls7a_mcfg_valid = 1u;
+                h.hide_host_dc_gpu = 1u;
+                tb_sys_set_vmm_handoff(&h);
+                LoongemuMemKind k_fb = loongemu_mem_resolve(&g_mem_map, LOONGEMU_BOCHS_FB_DEFAULT_GPA, 4u, &lk_fb);
+                uint64_t xres = loongemu_bochs_mmio_read(&g_pci_host.display, 0x502u, 2u);
+                uint64_t yres = loongemu_bochs_mmio_read(&g_pci_host.display, 0x504u, 2u);
+                check(k_fb == LOONGEMU_MEM_RAM && lk_fb.hpa == h.gop.fb_hpa &&
+                      xres == 1920u && yres == 1080u && g_pci_host.ls7a.hide_host_dc_gpu == 1,
+                      "Host UEFI VmmHandoff binds Bochs BAR0 zero-copy to GOP HPA & 1920x1080 EDID/DISPI");
+                /* Restore fallback FB backing for subsequent local tests */
+                memset(&g_vmm_handoff, 0, sizeof(g_vmm_handoff));
+                loongemu_pci_host_init(&g_pci_host, 0, bochs_display_bar_map_cb, 0);
+            }
+        }
 
         {
             uint64_t v = 0x1234;
@@ -6817,6 +7066,7 @@ void kmain(void)
                                   env.eip == 0xfff0u,
                                   "latx_x86_reset_real_mode sets CS=0xF000/base=0xFFFF0000/IP=0xFFF0");
 
+#ifndef LOONGEMU_BOOT_OVMF
                             int rc_rm = tb_harness_translate_at(env.eip, rm_code, 4096);
                             check(rc_rm > 0, "16-bit real-mode OVMF reset vector at 0xFFFFFFF0 translates");
                             if (rc_rm > 0) {
@@ -6830,6 +7080,7 @@ void kmain(void)
                                       env.segs[R_DS].base == UINT64_C(0x12340),
                                       "16-bit real-mode ROM executes mov ax,0x1234; mov ds,ax (ds.base=0x12340)");
                             }
+#endif
 
                             /* 2. Direct far jump ljmp 0x0008:0x1000 in 16-bit real mode. */
                             {
@@ -7097,6 +7348,7 @@ void kmain(void)
                     puthex(env.regs[R_EDI]);
                     latx_bare_uart_puts("\n");
 
+#ifndef LOONGEMU_BOOT_OVMF
                         {
                             uint64_t stop = 0;
                             /*
@@ -7171,6 +7423,7 @@ void kmain(void)
                             check(ran >= 1,
                                   "kernel entry runs at least one block");
                         }
+#endif
 
                     }
                 }
@@ -7207,6 +7460,88 @@ void kmain(void)
         check(g_bad_fetch == 0, "no fetch outside guest RAM");
     }
 
+#ifdef LOONGEMU_BOOT_OVMF
+    {
+        uint64_t stop = 0;
+        latx_bare_uart_puts("tb-sys: booting real OVMF_CODE.fd rom_base=");
+        puthex(g_ovmf_board.rom_gpa_base);
+        latx_bare_uart_puts(" rom_sz=");
+        puthex(g_ovmf_board.rom_size);
+        latx_bare_uart_puts(" vars_base=");
+        puthex(g_ovmf_board.vars_flash.gpa_base);
+        latx_bare_uart_puts(" vars_sz=");
+        puthex(g_ovmf_board.vars_flash.size);
+        latx_bare_uart_puts("\n");
+
+        /* Clear guest RAM of prior self-test artifacts before real OVMF boot. */
+        memset((void *)(uintptr_t)g_guest_ram_hpa, 0, GUEST_RAM_SIZE);
+        latx_guest_nr_cpus = 1u;
+        latx_x86_reset_real_mode(&env);
+        latx_x86_tlb_flush_all();
+        tbc_flush_all(&tb_cache);
+        int ran = run_blocks_from(0xfff0ULL, 50000000, &stop);
+        latx_bare_uart_puts("tb-sys: ovmf_blocks_run=");
+        puthex((uint64_t)(ran < 0 ? 0 : ran));
+        latx_bare_uart_puts(" stop=");
+        puthex(stop);
+        latx_bare_uart_puts(" cs=");
+        puthex(env.segs[R_CS].selector);
+        latx_bare_uart_puts(" cs_base=");
+        puthex(env.segs[R_CS].base);
+        latx_bare_uart_puts(" cr0=");
+        puthex(env.cr[0]);
+        latx_bare_uart_puts(" efer=");
+        puthex(env.efer);
+        latx_bare_uart_puts(" mode=");
+        puthex((uint64_t)env.sys.codemode);
+        latx_bare_uart_puts(" run_exit=");
+        puthex(g_run_blocks_exit);
+        latx_bare_uart_puts(" plv3_exit=");
+        puthex(g_plv3_exit.reason);
+        latx_bare_uart_puts("\n");
+        if (g_plv3_exit.reason != PLV3_EXIT_NORMAL || g_run_blocks_exit != 0) {
+            uint64_t n = g_recent_count < 8 ? g_recent_count : 8;
+            uint64_t start = g_recent_count - n;
+            latx_bare_uart_puts("tb-sys: ovmf_abort ecode=");
+            puthex(g_plv3_exit.ecode);
+            latx_bare_uart_puts(" esub=");
+            puthex(g_plv3_exit.esubcode);
+            latx_bare_uart_puts(" era=");
+            puthex(g_plv3_exit.era);
+            latx_bare_uart_puts(" badv=");
+            puthex(g_plv3_exit.badv);
+            latx_bare_uart_puts(" grip=");
+            puthex(g_plv3_exit.guest_rip);
+            latx_bare_uart_puts("\n");
+            latx_bare_uart_puts("tb-sys: ovmf_regs rax=");
+            puthex(env.regs[R_EAX]);
+            latx_bare_uart_puts(" rsp=");
+            puthex(env.regs[R_ESP]);
+            latx_bare_uart_puts(" rbp=");
+            puthex(env.regs[R_EBP]);
+            latx_bare_uart_puts(" cr2=");
+            puthex(env.cr[2]);
+            latx_bare_uart_puts(" cr3=");
+            puthex(env.cr[3]);
+            latx_bare_uart_puts(" idt=");
+            puthex(env.idt.base);
+            latx_bare_uart_puts(" gdt=");
+            puthex(env.gdt.base);
+            latx_bare_uart_puts("\n");
+            latx_bare_uart_puts("tb-sys: ovmf_uniq_pcs=");
+            uint64_t un = g_ovmf_uniq_count < 16 ? g_ovmf_uniq_count : 16;
+            uint64_t us = g_ovmf_uniq_count - un;
+            for (uint64_t idx = us; idx < g_ovmf_uniq_count; idx++) {
+                if (idx > us) latx_bare_uart_puts(" ");
+                puthex(g_ovmf_uniq_pcs[idx & 15]);
+                latx_bare_uart_puts(":");
+                puthex((uint64_t)g_ovmf_uniq_cs[idx & 15]);
+            }
+            latx_bare_uart_puts("\n");
+        }
+        check(ran >= 1, "real OVMF_CODE.fd executes at least one block from reset vector");
+    }
+#endif
 
     latx_bare_uart_puts("tb-sys: checks=");
     puthex((uint64_t)checks);

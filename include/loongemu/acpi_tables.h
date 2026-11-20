@@ -193,6 +193,13 @@ int loongemu_acpi_validate_rsdp(const void *rsdp_ptr,
                                 uint64_t *out_xsdt_pa,
                                 char out_oem_id[7]);
 
+typedef struct LoongemuAcpiMcfgInfo {
+    uint64_t base_addr;    /* ECAM / Loongson 7A Split-CFG Type 0 base PA */
+    uint16_t pci_segment;
+    uint8_t  start_bus;
+    uint8_t  end_bus;
+} LoongemuAcpiMcfgInfo;
+
 /*
  * Parse the host UEFI ACPI XSDT/RSDT to locate the SPCR (Serial Port Console
  * Redirection) table and extract the real hardware UART MMIO/IO base address.
@@ -200,6 +207,14 @@ int loongemu_acpi_validate_rsdp(const void *rsdp_ptr,
 int loongemu_acpi_find_spcr(const void *host_rsdp_ptr,
                             const void *(*pa_to_ptr)(uint64_t pa),
                             LoongemuAcpiSpcrInfo *out_spcr);
+
+/*
+ * Parse the host UEFI ACPI XSDT/RSDT to locate the MCFG table and extract the
+ * first PCIe ECAM / Loongson 7A1000/7A2000 Split-CFG base allocation entry.
+ */
+int loongemu_acpi_find_mcfg(const void *host_rsdp_ptr,
+                            const void *(*pa_to_ptr)(uint64_t pa),
+                            LoongemuAcpiMcfgInfo *out_mcfg);
 
 #ifdef __cplusplus
 }

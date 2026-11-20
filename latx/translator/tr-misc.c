@@ -1151,8 +1151,8 @@ bool translate_retf(IR1_INST *pir1)
         la_ld_d(return_addr_opnd, esp_opnd, 0);
         /* pop cs */
         la_ld_w(cs_opnd, esp_opnd, 8);
-        /* 2. adjust esp */
-        la_addi_addrx(esp_opnd, esp_opnd, 8);
+        /* 2. adjust esp (pop both 8-byte RIP and 8-byte CS) */
+        la_addi_addrx(esp_opnd, esp_opnd, 16);
     } else {
         la_bstrpick_d(esp_opnd, esp_opnd, 31, 0);
         /* pop rip */

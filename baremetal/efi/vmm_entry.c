@@ -9,6 +9,8 @@
 #include "loongemu/loongarch_paging.h"
 #include "loongemu/acpi_tables.h"
 #include "loongemu/vclock.h"
+#include "loongemu/pci_host.h"
+#include "loongemu/vmm_handoff.h"
 #include "efi_min.h"
 
 #define VMM_GUEST_RAM_PAGES  256      /* 1 MiB  */
@@ -54,13 +56,20 @@ static uint64_t g_uart_phys = 0x1fe001e0ULL;
 static uint8_t  g_uart_reg_shift;
 static int      g_paging_on;
 
-/* UEFI GOP linear framebuffer console (survives ExitBootServices on real HW) */
+/* UEFI GOP linear framebuffer console + guest handover descriptor (survives ExitBootServices) */
 static uint64_t g_gop_fb_phys;
 static uint32_t g_gop_width;
 static uint32_t g_gop_height;
 static uint32_t g_gop_stride;
 static uint32_t g_gop_cursor_x;
 static uint32_t g_gop_cursor_y;
+static LoongemuGopHandover g_gop_handover;
+static LoongemuVmmHandoff g_vmm_handoff;
+
+const LoongemuVmmHandoff *loongemu_vmm_get_handoff(void)
+{
+    return &g_vmm_handoff;
+}
 
 static inline void *phys_to_cached(uint64_t phys)
 {
@@ -442,6 +451,19 @@ static void __attribute__((noreturn)) vmm_post_ebs_main(void)
     puthex(g_image_base);
     puts_(" image_size=");
     puthex(g_image_size);
+    g_vmm_handoff.host_timer_hz = g_host_timer_hz;
+    if (g_gop_handover.valid) {
+        puts_(" gop_hpa=");
+        puthex(g_gop_handover.fb_hpa);
+        puts_(" gop_sz=");
+        puthex(g_gop_handover.fb_size);
+        puts_(" gop_wh=");
+        puthex(((uint64_t)g_gop_handover.width << 32) | g_gop_handover.height);
+    }
+    if (g_vmm_handoff.ls7a_mcfg_valid) {
+        puts_(" ls7a_mcfg=");
+        puthex(g_vmm_handoff.ls7a_cfg_type0_base);
+    }
     puts_("\n");
 
     if (!vmm_build_tables()) {
@@ -554,7 +576,7 @@ int efi_main(void *image, void *systab)
         }
     }
 
-    /* Probe UEFI GOP framebuffer for real-hardware console fallback. */
+    /* Probe UEFI GOP framebuffer for real-hardware console fallback and Guest Bochs Display handover. */
     {
         static const EFI_GUID gop_guid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
         EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = 0;
@@ -566,10 +588,27 @@ int efi_main(void *image, void *systab)
             g_gop_width = gop->Mode->Info->HorizontalResolution;
             g_gop_height = gop->Mode->Info->VerticalResolution;
             g_gop_stride = gop->Mode->Info->PixelsPerScanLine;
+            g_gop_handover.fb_hpa = gop->Mode->FrameBufferBase;
+            g_gop_handover.fb_size = (uint64_t)gop->Mode->FrameBufferSize;
+            if (g_gop_handover.fb_size == 0) {
+                g_gop_handover.fb_size = (uint64_t)g_gop_stride * (uint64_t)g_gop_height * 4ULL;
+            }
+            g_gop_handover.width = g_gop_width;
+            g_gop_handover.height = g_gop_height;
+            g_gop_handover.stride_px = g_gop_stride;
+            g_gop_handover.bpp = 32u;
+            g_gop_handover.pixel_format = gop->Mode->Info->PixelFormat;
+            g_gop_handover.valid = 1u;
         }
     }
 
-    /* Capture host UEFI ACPI 2.0 RSDP and probe SPCR UART base for real hardware. */
+    /* Capture host UEFI ACPI 2.0 RSDP and probe SPCR UART + MCFG 7A Split-CFG base. */
+    g_vmm_handoff.magic = LOONGEMU_VMM_HANDOFF_MAGIC;
+    g_vmm_handoff.version = LOONGEMU_VMM_HANDOFF_VERSION;
+    g_vmm_handoff.gop = g_gop_handover;
+    g_vmm_handoff.hide_host_dc_gpu = g_gop_handover.valid ? 1u : 0u;
+    g_vmm_handoff.ls7a_cfg_type0_base = LOONGSON_7A_CFG_TYPE0_BASE;
+    g_vmm_handoff.ls7a_cfg_type1_base = LOONGSON_7A_CFG_TYPE1_BASE;
     g_host_acpi_rsdp = uefi_find_acpi_rsdp(st);
     if (g_host_acpi_rsdp != 0) {
         uint8_t rev = 0;
@@ -577,9 +616,19 @@ int efi_main(void *image, void *systab)
         char oem[7];
         if (loongemu_acpi_validate_rsdp(g_host_acpi_rsdp, &rev, &xsdt_pa, oem)) {
             LoongemuAcpiSpcrInfo spcr;
+            LoongemuAcpiMcfgInfo mcfg;
+            g_vmm_handoff.host_acpi_rsdp = (uint64_t)(uintptr_t)g_host_acpi_rsdp;
             if (loongemu_acpi_find_spcr(g_host_acpi_rsdp, 0, &spcr) && spcr.base_addr != 0) {
                 g_uart_phys = spcr.base_addr;
                 g_uart_reg_shift = (spcr.access_size == 3u) ? 2u : 0u;
+            }
+            if (loongemu_acpi_find_mcfg(g_host_acpi_rsdp, 0, &mcfg) && mcfg.base_addr != 0) {
+                g_vmm_handoff.ls7a_cfg_type0_base = mcfg.base_addr;
+                g_vmm_handoff.ls7a_cfg_type1_base = mcfg.base_addr + UINT64_C(0x10000000);
+                g_vmm_handoff.ls7a_pci_segment = mcfg.pci_segment;
+                g_vmm_handoff.ls7a_start_bus = mcfg.start_bus;
+                g_vmm_handoff.ls7a_end_bus = mcfg.end_bus;
+                g_vmm_handoff.ls7a_mcfg_valid = 1u;
             }
             puts_("vmm: host ACPI RSDP=");
             puthex((uint64_t)(uintptr_t)g_host_acpi_rsdp);
@@ -588,6 +637,8 @@ int efi_main(void *image, void *systab)
             puts_("\n");
         }
     }
+    g_vmm_handoff.host_uart_phys = g_uart_phys;
+    g_vmm_handoff.host_uart_reg_shift = g_uart_reg_shift;
 
     /* Allocate all VMM memory before the ExitBootServices loop. */
     addr = 0;

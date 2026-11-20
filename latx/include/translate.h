@@ -169,6 +169,7 @@ TRANS_FUNC_DEF(invlpg);
 TRANS_FUNC_DEF(lgdt);
 TRANS_FUNC_DEF(lidt);
 TRANS_FUNC_DEF(sgdt);
+TRANS_FUNC_DEF(sidt);
 TRANS_FUNC_DEF(sysret);
 TRANS_FUNC_DEF(swapgs);
 TRANS_FUNC_DEF(ltr);
