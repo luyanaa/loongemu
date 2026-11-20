@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-#ifdef CONFIG_LATA
+#if defined(CONFIG_LATA) || defined(CONFIG_LATM)
 #define lsassert(cond)                                                  \
     do {                                                                \
         if (!(cond)) {                                                  \

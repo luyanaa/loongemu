@@ -1,0 +1,210 @@
+#ifndef LATM_IR1_H
+#define LATM_IR1_H
+
+#include <stdint.h>
+#include <stdbool.h>
+
+/* IR1 is the decoded, pre-IR2 form of one MIPS64r2 instruction.  Branch
+ * instructions and their delay slot are adjacent entries; the decoder sets
+ * delay_slot on the second entry and the translator consumes both together,
+ * mirroring LATA's IR1 list and QEMU's gen_compute_branch/gen_branch split. */
+typedef enum {
+    MIPS_OP_NONE = 0,
+    MIPS_OP_NOP,
+    MIPS_OP_ALU,
+    MIPS_OP_ALU_IMM,
+    MIPS_OP_SHIFT,
+    MIPS_OP_SHIFT_V,
+    MIPS_OP_BITFIELD,
+    MIPS_OP_BSHFL,
+    MIPS_OP_MULDIV,
+    MIPS_OP_HILO,
+    MIPS_OP_LOAD,
+    MIPS_OP_STORE,
+    MIPS_OP_BRANCH,
+    MIPS_OP_JUMP,
+    MIPS_OP_TRAP,
+    MIPS_OP_SYSCALL,
+    MIPS_OP_BREAK,
+    MIPS_OP_SYNC,
+    MIPS_OP_SYNCI,
+    MIPS_OP_CACHE,
+    MIPS_OP_PREF,
+    MIPS_OP_EHB,
+    MIPS_OP_PAUSE,
+    MIPS_OP_RDHWR,
+    MIPS_OP_CP0_MOVE,
+    MIPS_OP_CP0_OP,
+    MIPS_OP_TLB,
+    MIPS_OP_FPU_ARITH,
+    MIPS_OP_FPU_CMP,
+    MIPS_OP_FPU_CVT,
+    MIPS_OP_FPU_MOVE,
+    MIPS_OP_FPU_MADD,
+    MIPS_OP_FPU_MOVC,
+    MIPS_OP_FPU_BC,
+    MIPS_OP_FPU_LDST,
+    MIPS_OP_FPU_GPR,
+    MIPS_OP_COP1X,
+    MIPS_OP_RI,
+    MIPS_OP__COUNT
+} MIPS_OP;
+
+/* ALU sub-ops. */
+enum {
+    MIPS_ALU_ADD, MIPS_ALU_ADDU, MIPS_ALU_SUB, MIPS_ALU_SUBU,
+    MIPS_ALU_DADD, MIPS_ALU_DADDU, MIPS_ALU_DSUB, MIPS_ALU_DSUBU,
+    MIPS_ALU_AND, MIPS_ALU_OR, MIPS_ALU_XOR, MIPS_ALU_NOR,
+    MIPS_ALU_SLT, MIPS_ALU_SLTU, MIPS_ALU_MUL,
+    MIPS_ALU_MOVZ, MIPS_ALU_MOVN,
+};
+
+enum {
+    /* Offset from MIPS_ALU_* so helpers can switch on one op namespace. */
+    MIPS_IMM_ADDI = 0x100, MIPS_IMM_ADDIU, MIPS_IMM_DADDI, MIPS_IMM_DADDIU,
+    MIPS_IMM_SLTI, MIPS_IMM_SLTIU, MIPS_IMM_ANDI, MIPS_IMM_ORI,
+    MIPS_IMM_XORI, MIPS_IMM_LUI,
+};
+
+enum {
+    MIPS_SH_SLL, MIPS_SH_SRL, MIPS_SH_SRA,
+    MIPS_SH_DSLL, MIPS_SH_DSRL, MIPS_SH_DSRA,
+    MIPS_SH_DSLL32, MIPS_SH_DSRL32, MIPS_SH_DSRA32,
+};
+
+enum {
+    /* Offset so trans_shift can mix immediate/variable rotate sub-ops. */
+    MIPS_SHV_SLLV = 0x100, MIPS_SHV_SRLV, MIPS_SHV_SRAV,
+    MIPS_SHV_DSLLV, MIPS_SHV_DSRLV, MIPS_SHV_DSRAV,
+    MIPS_SHV_ROTR, MIPS_SHV_ROTRV,
+    MIPS_SHV_DROTR, MIPS_SHV_DROTR32, MIPS_SHV_DROTRV,
+};
+
+enum {
+    MIPS_BF_EXT, MIPS_BF_INS, MIPS_BF_DEXT, MIPS_BF_DEXTM,
+    MIPS_BF_DEXTU, MIPS_BF_DINS, MIPS_BF_DINSM, MIPS_BF_DINSU,
+};
+
+enum {
+    MIPS_BS_WSBH, MIPS_BS_SEB, MIPS_BS_SEH, MIPS_BS_DSBH, MIPS_BS_DSHD,
+};
+
+enum {
+    MIPS_MD_MULT, MIPS_MD_MULTU, MIPS_MD_DMULT, MIPS_MD_DMULTU,
+    MIPS_MD_DIV, MIPS_MD_DIVU, MIPS_MD_DDIV, MIPS_MD_DDIVU,
+    MIPS_MD_MADD, MIPS_MD_MADDU, MIPS_MD_MSUB, MIPS_MD_MSUBU,
+    MIPS_MD_CLZ, MIPS_MD_CLO, MIPS_MD_DCLZ, MIPS_MD_DCLO,
+};
+
+enum { MIPS_HILO_MFHI, MIPS_HILO_MFLO, MIPS_HILO_MTHI, MIPS_HILO_MTLO };
+
+enum {
+    MIPS_MEM_LB, MIPS_MEM_LBU, MIPS_MEM_LH, MIPS_MEM_LHU,
+    MIPS_MEM_LW, MIPS_MEM_LWU, MIPS_MEM_LD,
+    MIPS_MEM_LWL, MIPS_MEM_LWR, MIPS_MEM_LDL, MIPS_MEM_LDR,
+    MIPS_MEM_SB, MIPS_MEM_SH, MIPS_MEM_SW, MIPS_MEM_SD,
+    MIPS_MEM_SWL, MIPS_MEM_SWR, MIPS_MEM_SDL, MIPS_MEM_SDR,
+    MIPS_MEM_LL, MIPS_MEM_LLD, MIPS_MEM_SC, MIPS_MEM_SCD,
+};
+
+enum {
+    MIPS_BR_BEQ, MIPS_BR_BNE, MIPS_BR_BLEZ, MIPS_BR_BGTZ,
+    MIPS_BR_BLTZ, MIPS_BR_BGEZ, MIPS_BR_BEQL, MIPS_BR_BNEL,
+    MIPS_BR_BLEZL, MIPS_BR_BGTZL, MIPS_BR_BLTZL, MIPS_BR_BGEZL,
+    MIPS_BR_BLTZAL, MIPS_BR_BGEZAL, MIPS_BR_BLTZALL, MIPS_BR_BGEZALL,
+};
+
+enum { MIPS_JP_J, MIPS_JP_JAL, MIPS_JP_JR, MIPS_JP_JALR };
+
+enum {
+    MIPS_TRAP_TGE, MIPS_TRAP_TGEU, MIPS_TRAP_TLT, MIPS_TRAP_TLTU,
+    MIPS_TRAP_TEQ, MIPS_TRAP_TNE,
+};
+
+enum {
+    MIPS_CP0_MFC0, MIPS_CP0_MTC0, MIPS_CP0_DMFC0, MIPS_CP0_DMTC0,
+    MIPS_CP0_MFHC0, MIPS_CP0_MTHC0, MIPS_CP0_RDPGPR, MIPS_CP0_WRPGPR,
+};
+
+enum {
+    MIPS_CP0OP_ERET, MIPS_CP0OP_DERET, MIPS_CP0OP_WAIT,
+    MIPS_CP0OP_DI, MIPS_CP0OP_EI,
+};
+
+enum { MIPS_TLB_TLBR, MIPS_TLB_TLBWI, MIPS_TLB_TLBWR, MIPS_TLB_TLBP };
+
+/* CP1 formats. */
+enum { MIPS_FMT_S, MIPS_FMT_D, MIPS_FMT_W, MIPS_FMT_L, MIPS_FMT_PS };
+
+enum {
+    MIPS_FOP_ADD, MIPS_FOP_SUB, MIPS_FOP_MUL, MIPS_FOP_DIV,
+    MIPS_FOP_SQRT, MIPS_FOP_ABS, MIPS_FOP_MOV, MIPS_FOP_NEG,
+    MIPS_FOP_ROUND_L, MIPS_FOP_TRUNC_L, MIPS_FOP_CEIL_L, MIPS_FOP_FLOOR_L,
+    MIPS_FOP_ROUND_W, MIPS_FOP_TRUNC_W, MIPS_FOP_CEIL_W, MIPS_FOP_FLOOR_W,
+    MIPS_FOP_RECIP, MIPS_FOP_RSQRT,
+};
+
+enum {
+    MIPS_FCVT_S, MIPS_FCVT_D, MIPS_FCVT_W, MIPS_FCVT_L,
+    MIPS_FCVT_PS, MIPS_FCVT_PW,
+};
+
+enum {
+    MIPS_FMOVE_MOVF, MIPS_FMOVE_MOVT, MIPS_FMOVE_MOVZ, MIPS_FMOVE_MOVN,
+};
+
+enum {
+    MIPS_FMADD_MADD, MIPS_FMADD_MSUB, MIPS_FMADD_NMADD, MIPS_FMADD_NMSUB,
+};
+
+enum { MIPS_FBC_BC1F, MIPS_FBC_BC1T, MIPS_FBC_BC1FL, MIPS_FBC_BC1TL };
+
+enum {
+    MIPS_FLDST_LWC1, MIPS_FLDST_LDC1, MIPS_FLDST_SWC1, MIPS_FLDST_SDC1,
+    MIPS_FLDST_LUXC1, MIPS_FLDST_SUXC1, MIPS_FLDST_LWXC1, MIPS_FLDST_SWXC1,
+    MIPS_FLDST_LWXC1_3D = MIPS_FLDST_LWXC1,
+};
+
+enum {
+    MIPS_FGPR_MFC1, MIPS_FGPR_DMFC1, MIPS_FGPR_CFC1,
+    MIPS_FGPR_MTC1, MIPS_FGPR_DMTC1, MIPS_FGPR_CTC1,
+    MIPS_FGPR_MFHC1, MIPS_FGPR_MTHC1,
+};
+
+typedef struct MipsIR1 {
+    MIPS_OP op;
+    uint32_t insn;
+    uint64_t pc;
+    uint8_t rs, rt, rd, sa, sel, fmt, cond;
+    uint16_t subop;
+    int16_t simm;
+    uint32_t target;
+    bool likely;
+    bool link;
+    bool delay_slot;
+} MipsIR1;
+
+static inline void mips_ir1_init(MipsIR1 *ir1, uint32_t insn, uint64_t pc)
+{
+    ir1->op = MIPS_OP_NONE;
+    ir1->insn = insn;
+    ir1->pc = pc;
+    ir1->rs = (insn >> 21) & 0x1f;
+    ir1->rt = (insn >> 16) & 0x1f;
+    ir1->rd = (insn >> 11) & 0x1f;
+    ir1->sa = (insn >> 6) & 0x1f;
+    ir1->sel = insn & 0x7;
+    ir1->fmt = 0;
+    ir1->cond = 0;
+    ir1->subop = 0;
+    ir1->simm = (int16_t)insn;
+    ir1->target = insn & 0x03ffffff;
+    ir1->likely = false;
+    ir1->link = false;
+    ir1->delay_slot = false;
+}
+
+bool mips_decode_one(MipsIR1 *ir1, uint32_t insn, uint64_t pc);
+bool mips_ir1_is_branch(const MipsIR1 *ir1);
+
+#endif

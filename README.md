@@ -14,9 +14,10 @@ The project is a research/testbed tree rather than a single product binary. Its
 central question is: *how far can translated guest code run on real LoongArch
 hardware, with no host libc and no hypervisor underneath?*
 
-Guest code is decoded and translated by **LATX** (x86-64 → LoongArch) or
-**LATA** (AArch64 → LoongArch), both adapted from upstream QEMU-related sources
-into self-contained freestanding static archives. x86 arithmetic flags are
+Guest code is decoded and translated by **LATX** (x86-64 → LoongArch),
+**LATA** (AArch64 → LoongArch), or **LATM** (MIPS64r2 → LoongArch), all adapted
+from upstream QEMU-related sources into self-contained freestanding static
+archives. x86 arithmetic flags are
 handled through the **LBT** (Loongson Binary Translation) extension. Because
 not every LoongArch core implements LBT, LoongEMU provides two back ends behind
 one interface:
@@ -38,6 +39,7 @@ translation-block cache keyed by `(pc, cs_base, cr3, cpl)`.
 | `include/loongemu/`, `src/` | Portable, host-testable core: `loongbt` (LBT ops + EFLAGS + IR2 mapping), `tb_cache`, `loongarch_paging`, `x86_64_paging`. |
 | `latx/` | LATX x86-64 translator: Capstone-based IR1 decoder, IR2, translator, optimizations, runtime, and minimal libc/libm. |
 | `lata/`, `target/arm/lata/` | LATA AArch64 → LoongArch translator core. |
+| `latm/`, `target/mips/latm/` | LATM MIPS64r2 → LoongArch translator core (integer, LBT unaligned memory, FPU helpers). |
 | `target/i386/`, `target/arm/` | Target-side headers and sources consumed by the translators. |
 | `baremetal/bare/` | `-kernel` harnesses: single-TB, multi-TB loop, paging smoke, LATA/LBT smoke, and the long-mode `tb_sys` bring-up test. |
 | `baremetal/efi/` | UEFI applications: LBT fallback self-test, IR1 decode smoke test, LVZ probe, VMM entry. |
@@ -97,6 +99,7 @@ make -C baremetal all   # baremetal/build/liblatx_core.a  (x86-64 translator)
 make lata-all           # lata/build/liblata_core.a       (AArch64 translator)
 make lata-probe         # per-file syntax check
 make lata-check         # build LATA and verify its external-symbol allowlist
+make test-latm          # LATM decoder + bare-metal MIPS64r2 execution test
 ```
 
 The `check_bare_symbols.sh` and `check_lata_symbols.sh` tools compare each
@@ -126,6 +129,7 @@ make tb-sys-image && make tb-sys-run
 
 # LATA and LBT smoke tests
 make lata-smoke-run
+make latm-isa-run
 make lbt-smoke-run
 
 # UEFI applications (EDK2 GenFw + QEMU_EFI.fd)

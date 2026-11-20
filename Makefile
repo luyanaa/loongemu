@@ -3,8 +3,8 @@ CC      ?= cc
 CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Werror -pedantic -Iinclude
 LBT_SRC := src/loongbt_semantics.c src/loongbt_cpu.c src/loongbt_hw.c src/loongbt_ir2.c
 
-CLANG   ?= /opt/homebrew/Cellar/llvm/23.1.5_1/bin/clang
-OBJDUMP ?= /opt/homebrew/Cellar/llvm/23.1.5_1/bin/llvm-objdump
+CLANG   ?= $(shell brew --prefix llvm)/bin/clang
+OBJDUMP ?= $(shell brew --prefix llvm)/bin/llvm-objdump
 
 .PHONY: all test test-cpu test-lapaging test-tbc test-p0 vmm-efi vmm-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot clean
 
@@ -366,6 +366,59 @@ lata-smoke-run: lata-smoke-image
 	     bash scripts/run_qemu_lata.sh
 	@grep -aE 'lata-smoke' build/lata_smoke.log | head -20
 	@grep -qa 'lata-smoke: PASS' build/lata_smoke.log
+
+test-latm-decode: build/test_latm_decode
+	./build/test_latm_decode
+
+build/test_latm_decode: tests/test_latm_decode.c target/mips/latm/ir1/decode-mips.c target/mips/latm/include/ir1.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -I target/mips/latm/include -I target/mips \
+	      -I target/mips/latm/compat -I latx/compat \
+	      -I latx/upstream/include -I . \
+	      tests/test_latm_decode.c target/mips/latm/ir1/decode-mips.c -o $@
+
+# ---- LATM: MIPS64r2 -> LoongArch ----
+.PHONY: test-latm test-latm-decode latm-core latm-isa-image latm-isa-run
+test-latm: test-latm-decode latm-isa-run
+
+# ---- bare-metal MIPS64r2 (LATM) execution harness ----
+LATM_BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
+               -fno-builtin -O2 -mno-lsx -mno-lasx -fno-vectorize -fno-slp-vectorize \
+               -DTARGET_MIPS64 -DCONFIG_LATM -DCONFIG_LATM_STANDALONE \
+               -D__WORDSIZE=64 -D__thread= \
+               -I target/mips/latm/include -I target/mips/latm/compat -I target/mips \
+               -I target/arm/lata/include -I target/arm/lata \
+               -I latx/compat -I latx/include -I latx/upstream/include -I . \
+               -isystem $(shell $(CLANG) -print-resource-dir)/include
+
+latm-core:
+	@$(MAKE) -C latm all
+
+build/latm_isa_test.o: baremetal/bare/latm_isa_test.c
+	@mkdir -p build
+	$(CLANG) $(LATM_BARE_CFLAGS) -c $< -o $@
+
+build/latm_miniglib.o: latx/compat/miniglib.c
+	@mkdir -p build
+	$(CLANG) $(LATM_BARE_CFLAGS) -c $< -o $@
+
+build/latm_libc_min.o: latx/compat/libc_min.c
+	@mkdir -p build
+	$(CLANG) $(LATM_BARE_CFLAGS) -c $< -o $@
+
+build/bare_latm_isa.elf: build/latm_isa_test.o build/latm_miniglib.o build/latm_libc_min.o latm/build/liblatm_core.a baremetal/bare/bare.lds
+	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	   build/latm_isa_test.o build/latm_miniglib.o build/latm_libc_min.o latm/build/liblatm_core.a -o $@
+
+latm-isa-image: latm-core build/bare_latm_isa.elf
+
+latm-isa-run: latm-isa-image
+	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_latm_isa.elf" \
+	     QEMU_LOG="build/latm_isa.log" QEMU_DONE="latm-isa: checks=.*PASS" \
+	     QEMU_TIMEOUT=60 CPU=la464 \
+	     bash scripts/run_qemu_lata.sh
+	@grep -aE 'latm-isa' build/latm_isa.log | head -40
+	@grep -qa 'latm-isa: checks=.*PASS' build/latm_isa.log
 
 BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
                -fno-builtin -O2 -mno-lsx -mno-lasx -fno-vectorize -fno-slp-vectorize \
