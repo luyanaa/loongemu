@@ -40,8 +40,24 @@ int main(void)
     check(latm_helper_loongson_arith(NULL, MIPS_LG_GT, 3, 3), 0, "gsgt");
 
     check(latm_helper_crc(NULL, MIPS_CRC32B, 0x01, 0), 0x77073096u, "crc32b");
-    check(latm_helper_cpucfg(&(CPUMIPSState){.CP0_PRid = 0x14c004}, 0),
-          0x14c004, "cpucfg0");
+    CPUMIPSState cfg = { .CP0_PRid = 0x14c004 };
+    check(latm_helper_cpucfg(&cfg, 0), 0x14c004, "cpucfg0");
+    check(latm_helper_cpucfg(&cfg, 1) & (1u << CPUCFG1_FP), 1u << CPUCFG1_FP,
+          "cpucfg1 FP");
+    check(latm_helper_cpucfg(&cfg, 1) & (1u << CPUCFG1_MMI), 1u << CPUCFG1_MMI,
+          "cpucfg1 MMI");
+    check(latm_helper_cpucfg(&cfg, 2) & (1u << CPUCFG2_LEXT1),
+          1u << CPUCFG2_LEXT1, "cpucfg2 LEXT1");
+    check(latm_helper_cpucfg(&cfg, 2) & (1u << CPUCFG2_LSPW),
+          1u << CPUCFG2_LSPW, "cpucfg2 LSPW");
+
+    CPUMIPSState mem_env;
+    memset(&mem_env, 0, sizeof(mem_env));
+    mem_env.active_tc.gpr[0] = 0xdeadbeef;
+    latm_helper_loongson_mem(&mem_env, MIPS_LM_GSLQ, 0, 0, 0, 0, 5);
+    check(mem_env.active_tc.gpr[0], 0xdeadbeef, "gslq preserves $zero");
+    latm_helper_loongson_mem(&mem_env, MIPS_LM_GSLWX, 0, 0, 0, 0, 0);
+    check(mem_env.active_tc.gpr[0], 0xdeadbeef, "load preserves $zero");
 
     printf("latm-loongson: checks=%d fails=%d\n", checks, fails);
     return fails != 0;

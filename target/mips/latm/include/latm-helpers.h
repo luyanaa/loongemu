@@ -61,6 +61,10 @@ uint64_t latm_helper_sc(CPUMIPSState *env, uint32_t op, uint64_t addr,
 uint64_t latm_helper_load(CPUMIPSState *env, uint32_t op, uint64_t addr);
 void latm_helper_store(CPUMIPSState *env, uint32_t op, uint64_t addr,
                        uint64_t val);
+uint64_t latm_helper_unaligned_load(CPUMIPSState *env, uint32_t op,
+                                    uint64_t addr, uint64_t old);
+void latm_helper_unaligned_store(CPUMIPSState *env, uint32_t op,
+                                 uint64_t addr, uint64_t value);
 uint64_t latm_helper_cp0_read(CPUMIPSState *env, uint32_t reg, uint32_t sel);
 void latm_helper_cp0_write(CPUMIPSState *env, uint32_t reg, uint32_t sel,
                            uint64_t val);

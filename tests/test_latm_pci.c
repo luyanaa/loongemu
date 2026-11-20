@@ -24,10 +24,6 @@ static uint32_t mock_read(uint64_t addr)
     if (bus < 64 && reg < 0x100) return mock_cfg[bus][dev][fn] + reg;
     return 0xffffffffu;
 }
-static void mock_write(uint64_t addr, uint32_t value)
-{
-    (void)addr; (void)value;
-}
 
 int main(void)
 {
@@ -40,7 +36,7 @@ int main(void)
     latm_pci_init(&pci, NULL);
     latm_pci_attach_ls7a_mock(&pci, LOONGSON_7A_CFG_TYPE0_BASE,
                               LOONGSON_7A_CFG_TYPE1_BASE,
-                              mock_read, mock_write);
+                              mock_read, NULL);
     check(latm_pci_cfg_read(&pci, 0, 6, 0, 0, 4), 0xffffffffu,
           "7A DC blacklisted");
     check(latm_pci_cfg_read(&pci, 0, 2, 0, 0, 4) & 0xffff, 0x1234u,

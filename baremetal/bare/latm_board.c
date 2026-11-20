@@ -50,11 +50,60 @@ static uint32_t count_bias;
 static uint32_t compare_value;
 static int compare_armed;
 static volatile int board_exit_code;
+static uint64_t board_exit_jmp[16] __attribute__((aligned(16)));
+static volatile int board_exit_active;
+
+/* Minimal LoongArch setjmp/longjmp pair.  The generated TB may clobber the
+ * callee-saved guest-mapped registers, so restore ra/sp/fp/s0..s8 exactly. */
+__asm__(
+    ".text\n"
+    ".globl board_setjmp\n"
+    ".type board_setjmp,@function\n"
+    "board_setjmp:\n"
+    "  st.d $ra, $a0, 0\n"
+    "  st.d $sp, $a0, 8\n"
+    "  st.d $fp, $a0, 16\n"
+    "  st.d $s0, $a0, 24\n"
+    "  st.d $s1, $a0, 32\n"
+    "  st.d $s2, $a0, 40\n"
+    "  st.d $s3, $a0, 48\n"
+    "  st.d $s4, $a0, 56\n"
+    "  st.d $s5, $a0, 64\n"
+    "  st.d $s6, $a0, 72\n"
+    "  st.d $s7, $a0, 80\n"
+    "  st.d $s8, $a0, 88\n"
+    "  move $a0, $zero\n"
+    "  jirl $zero, $ra, 0\n"
+    ".size board_setjmp, .-board_setjmp\n"
+    ".globl board_longjmp\n"
+    ".type board_longjmp,@function\n"
+    "board_longjmp:\n"
+    "  ld.d $ra, $a0, 0\n"
+    "  ld.d $sp, $a0, 8\n"
+    "  ld.d $fp, $a0, 16\n"
+    "  ld.d $s0, $a0, 24\n"
+    "  ld.d $s1, $a0, 32\n"
+    "  ld.d $s2, $a0, 40\n"
+    "  ld.d $s3, $a0, 48\n"
+    "  ld.d $s4, $a0, 56\n"
+    "  ld.d $s5, $a0, 64\n"
+    "  ld.d $s6, $a0, 72\n"
+    "  ld.d $s7, $a0, 80\n"
+    "  ld.d $s8, $a0, 88\n"
+    "  li.d $a0, 1\n"
+    "  jirl $zero, $ra, 0\n"
+    ".size board_longjmp, .-board_longjmp\n"
+);
+extern int board_setjmp(uint64_t *);
+extern void board_longjmp(uint64_t *);
 
 void cpu_loop_exit(struct CPUState *cs)
 {
     (void)cs;
     board_exit_code = 1;
+    if (board_exit_active) {
+        board_longjmp(board_exit_jmp);
+    }
 }
 
 static int uart_rx_available(void)
@@ -232,6 +281,47 @@ static int board_write(CPUMIPSState *env, uint64_t gpa, uint64_t value,
     return LATM_MEM_FAULT;
 }
 
+static int board_atomic_ll(CPUMIPSState *env, uint64_t gpa, unsigned size,
+                           uint64_t *value)
+{
+    LoongemuMemLookup lk;
+    (void)env;
+    if (!value || (size != 4 && size != 8) ||
+        loongemu_mem_resolve(&mem_map, gpa, size, &lk) != LOONGEMU_MEM_RAM) {
+        return LATM_MEM_FAULT;
+    }
+    uint64_t v = 0;
+    for (unsigned i = 0; i < size; i++) {
+        v |= (uint64_t)ram[lk.offset + i] << (8 * i);
+    }
+    *value = v;
+    return LATM_MEM_OK;
+}
+
+static int board_atomic_sc(CPUMIPSState *env, uint64_t gpa, unsigned size,
+                           uint64_t expected, uint64_t desired, int *ok)
+{
+    LoongemuMemLookup lk;
+    (void)env;
+    if (!ok || (size != 4 && size != 8) ||
+        loongemu_mem_resolve(&mem_map, gpa, size, &lk) != LOONGEMU_MEM_RAM) {
+        return LATM_MEM_FAULT;
+    }
+    *ok = 0;
+    if (size == 4) {
+        uint32_t old = (uint32_t)expected;
+        *ok = __atomic_compare_exchange_n(
+            (uint32_t *)(void *)(ram + lk.offset), &old, (uint32_t)desired,
+            false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    } else {
+        uint64_t old = expected;
+        *ok = __atomic_compare_exchange_n(
+            (uint64_t *)(void *)(ram + lk.offset), &old, desired, false,
+            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    }
+    return LATM_MEM_OK;
+}
+
 static int board_fetch(CPUMIPSState *env, uint64_t gpa, uint32_t *value)
 {
     uint64_t v;
@@ -249,6 +339,8 @@ static const LatmPlatform platform = {
     .set_compare = board_set_compare,
     .tlb_flush = board_tlb_flush,
     .request_interrupt = board_request_interrupt,
+    .atomic_ll = board_atomic_ll,
+    .atomic_sc = board_atomic_sc,
 };
 
 /* Tiny big-endian FDT builder. */
@@ -385,6 +477,9 @@ static uint32_t kernel_code[] = {
 };
 
 static uint8_t code_buf[65536] __attribute__((aligned(4096)));
+#define BOARD_TB_START 0x5000u
+#define BOARD_TB_SLOT  0x2000u
+static uint32_t board_tb_next = BOARD_TB_START;
 static TranslationBlock tb;
 static CPUMIPSState env;
 static CPUMIPSTLBContext tlb;
@@ -411,7 +506,12 @@ static void board_poll(void)
 
 static int run_one_tb(void)
 {
-    uint8_t *host = code_buf + 0x5000;
+    if (board_tb_next + BOARD_TB_SLOT > sizeof(code_buf)) {
+        board_tb_next = BOARD_TB_START;
+        latm_tb_insn_map_flush(env.latm_tr_data);
+    }
+    uint8_t *host = code_buf + board_tb_next;
+    board_tb_next += BOARD_TB_SLOT;
     memset(&tb, 0, sizeof(tb));
     tb.pc = env.active_tc.PC;
     tb.tc.ptr = host;
@@ -426,8 +526,14 @@ static int run_one_tb(void)
     tr_fini();
     __asm__ volatile("ibar 0" ::: "memory");
     if (n <= 0) return 0;
-    ((void (*)(void *, void *))(uintptr_t)
-     ((TRANSLATION_DATA *)env.latm_tr_data)->cs_bt_to_native)(&env, host);
+    if (board_setjmp(board_exit_jmp) == 0) {
+        board_exit_active = 1;
+        ((void (*)(void *, void *))(uintptr_t)
+         ((TRANSLATION_DATA *)env.latm_tr_data)->cs_bt_to_native)(&env, host);
+        board_exit_active = 0;
+    } else {
+        board_exit_active = 0;
+    }
     return 1;
 }
 

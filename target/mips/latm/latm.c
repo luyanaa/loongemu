@@ -179,6 +179,15 @@ void lata_tr_data_init(void *envp)
     tr_data = env->latm_tr_data;
     lsenv->cpu_state = env;
     lsenv->tr_data = tr_data;
+    if (!env->lcsr_cpucfg1) {
+        env->lcsr_cpucfg1 = (1u << CPUCFG1_FP) | (1u << CPUCFG1_MMI) |
+                            (1u << CPUCFG1_LSLDR0) | (1u << CPUCFG1_LLEXC);
+    }
+    if (!env->lcsr_cpucfg2) {
+        env->lcsr_cpucfg2 = (1u << CPUCFG2_LEXT1) | (1u << CPUCFG2_LEXT2) |
+                            (1u << CPUCFG2_LEXT3) | (1u << CPUCFG2_LSPW) |
+                            (1u << CPUCFG2_LCSRP);
+    }
     if (!tr_data->ir1_list) {
         tr_data->ir1_list = mm_calloc(TCG_MAX_INSNS, sizeof(DisasContext));
         tr_data->db_rel = mm_calloc(1, sizeof(DisasContextBase));
@@ -706,8 +715,12 @@ void latm_tb_register(void *cpu, void *tb_ptr)
 
 void latm_tb_flush_range(void *cpu, uint64_t start, uint64_t end)
 {
+    CPUMIPSState *env = cpu;
     LatmJmpCacheEntry *cache = latm_jmp_entries(cpu);
 
+    if (env && env->latm_tr_data) {
+        latm_tb_insn_map_flush(env->latm_tr_data);
+    }
     if (!cache) {
         return;
     }

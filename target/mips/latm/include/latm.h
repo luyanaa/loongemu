@@ -16,6 +16,7 @@
 #define B_STUB_SIZE 4
 #define TARGET_INSN_START_WORDS 2
 #define LATM_TB_MAP_MAX TCG_MAX_INSNS
+#define LATM_TB_MAP_POOL 32
 
 typedef struct LatmTbInsnSpan {
     uint64_t guest_pc;
@@ -27,7 +28,9 @@ typedef struct LatmTbInsnSpan {
 typedef struct LatmTbInsnMap {
     uintptr_t code_base;
     uint32_t code_size;
+    uint32_t generation;
     uint16_t count;
+    uint16_t reserved;
     LatmTbInsnSpan spans[LATM_TB_MAP_MAX];
 } LatmTbInsnMap;
 
@@ -47,7 +50,10 @@ typedef struct TRANSLATION_DATA {
     void *ir1_list;
     void *db_rel;
     uint64_t cache_key;
-    LatmTbInsnMap insn_map;
+    LatmTbInsnMap *active_insn_map;
+    LatmTbInsnMap insn_maps[LATM_TB_MAP_POOL];
+    uint32_t insn_map_count;
+    uint32_t insn_map_generation;
     uint64_t cs_bt_to_native;
     uint64_t cs_native_to_bt_ret_0;
     uint64_t cs_native_to_bt;
@@ -103,6 +109,8 @@ void latm_tb_insn_map_add(void *trd, uint64_t guest_pc, uint32_t native_start,
                           uint32_t native_end, uint8_t delay_slot);
 int latm_tb_insn_map_resolve(void *trd, uintptr_t host_pc,
                              uint64_t *guest_pc, uint8_t *delay_slot);
+void latm_tb_insn_map_flush(void *trd);
+void latm_tb_insn_map_forget(void *trd, const void *code);
 void latm_tb_register(void *cpu, void *tb);
 void latm_platform_smc_broadcast(uint64_t start, uint64_t end);
 

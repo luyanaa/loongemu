@@ -100,6 +100,11 @@ static uint32_t loongson_code[] __attribute__((aligned(4096))) = {
     0x640b0014, 0x640c0006, 0x716c6814, /* gsdiv $13,$11,$12 = 3 */
     0x640e0014, 0x640f0006, 0x71cf801c, /* gsmod $16,$14,$15 = 2 */
 };
+static uint8_t cross_page_code[8192] __attribute__((aligned(4096)));
+static uint32_t hcall_arg_code[] __attribute__((aligned(4096))) = {
+    0x64010007, 0x64020006,
+    0x70221810, /* gsmult $3,$1,$2: sources use a1/a2 */
+};
 static uint32_t loongson_mem_code[] __attribute__((aligned(4096))) = {
     0x64080400, 0x64090011, 0x640a0022,
     0xe909002a,                         /* gssq $9,$10,0($8) */
@@ -460,6 +465,16 @@ void kmain(void)
     check(env.active_tc.gpr[10], 42, "gsmult");
     check(env.active_tc.gpr[13], 3, "gsdiv");
     check(env.active_tc.gpr[16], 2, "gsmod");
+    run_block(hcall_arg_code, 3, "hcall-args");
+    check(env.active_tc.gpr[3], 42, "hcall parallel argument copy");
+    {
+        uint32_t *last = (uint32_t *)(cross_page_code + 4096 - 4);
+        last[0] = 0x10420001; /* beq $2,$2,+1 */
+        last[1] = 0x64030022; /* daddiu $3,$0,0x22 (delay) */
+        last[2] = 0x00000000;
+        run_block(last, 3, "branch-cross-page");
+        check(env.active_tc.gpr[3], 0x22, "cross-page delay slot executed");
+    }
     run_block(loongson_mem_code, 5, "loongson-mem");
     check(env.active_tc.gpr[11], 0x11, "gssq/gslq first");
     check(env.active_tc.gpr[12], 0x22, "gssq/gslq second");
@@ -516,14 +531,14 @@ void kmain(void)
           "likely not-taken PC");
 
     {
-        LatmPlatform plat = { .mem_read = platform_read,
-                              .mem_write = platform_write };
+        static LatmPlatform plat = { .mem_read = platform_read,
+                                     .mem_write = platform_write };
         latm_platform_set(&plat);
         latm_set_system_memory(true);
+        run_block(mem_code, 19, "memory-system");
+        latm_set_system_memory(false);
+        latm_platform_set(NULL);
     }
-    run_block(mem_code, 19, "memory-system");
-    latm_set_system_memory(false);
-    latm_platform_set(NULL);
     check(env.active_tc.gpr[2], 0x400, "memory base");
     check(env.active_tc.gpr[3], 0x11223344u, "memory word source");
     check(env.active_tc.gpr[4], 0x11223344u, "lwl+lwr word");

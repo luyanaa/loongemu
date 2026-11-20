@@ -811,11 +811,30 @@ FDT 已用 `dtc -I dtb -O dts` 反编译验证：无 `FDT_END` 缺失、无 rese
 - `make test-latm-cpu`：9 项 profile/CP0/Diag/VTLB。
 - `make test-latm-loongson`：10 项 gs 算术与 CRC。
 - `make test-latm-system`：21 项 exact-width MMIO、内存布局、DTB 和 `fw_arg2`。
-- `make test-latm-uncore`：13 项 MailBox/PIC/MSI/EXTIOI 4-core 路由。
+- `make test-latm-uncore`：19 项 MailBox/PIC/MSI/EXTIOI 4-core 路由、共享 IP EOI、IOCSR IPMAP/COREMAP/COREISR。
 - `make test-latm-pci`：7 项 7A mock blacklist + PCI BAR exact-width。
-- `make test-latm-board-system`：18 项 system composition + UART + DTB。
+- `make test-latm-board-system`：35 项 system composition + UART + DTB + 7A Split-CFG + ELF/handoff 入口。
 - `latm-isa` 新增 `loongson`/`loongson-mem`：gs 算术、gslq/gssq 端到端通过；`test-latm-decode` 32 项。
 
 DTB 已由 host test 生成并用 `dtc -I dtb -O dts` 验证（3A4000 compatible、reserved-memory、initrd、serial/PIC、PCI 节点）。
 
 **仍为缺口**：真实 Linux 启动镜像与内核 ABI 实机验证、LEFI、3A3000/LIOINTC/HT、MMI/LSX/LASX、AMO 编码确认、真实 7A 透传/宿主中断/1:1 DMA、PLV3/TB 性能。
+
+
+### 13.7 P0 系统态内存与 helper 参数修复（2026-11-21）
+
+- **P0-A LL/SC**：`LatmPlatform` 新增 `atomic_ll/atomic_sc`。系统态 `LL/SC` 先做 VA→GPA 翻译，再交给平台原子回调；平台缺失回调或 GPA 不属于可原子 RAM（MMIO/Reserved）时直接拒绝并清除 reservation。只有 `latm_platform_get()==NULL` 的 identity 测试路径保留宿主 CAS。
+- **P0-B 非对齐/COP1**：系统态 `LWL/LWR/LDL/LDR` 和 `SWL/SWR/SDL/SDR` 改走 `latm_helper_unaligned_load/store`，由平台 `mem_read/mem_write` 逐字节/对齐字完成；COP1 `LWC1/LDC1/SWC1/SDC1` 及 indexed 变体在系统态改走 `latm_helper_load/store`。普通系统态 LW/LD/SW/SD 在 helper 内检查 MIPS 对齐，错误地址分别注入 AdEL/AdES。
+- **P0-C helper 参数**：`hcall()` 先把所有参数写入 `CPUMIPSState.latm_hcall_args[]`，完成 helper prologue 后再装载 ABI 参数寄存器，避免 Guest `$1..$7` 映射到 `a1..a7` 时的顺序覆盖。
+- 新增门禁：`latm-llsc` 11 项（GPA/HPA 非 identity、reservation、MMIO 拒绝）、`latm-unaligned` 6 项（对齐 fault、SWL/SWR、LWL/LWR）、ISA `hcall-args` 覆盖 `$1/$2` 源参数。
+
+### 13.8 P0-D / P1 索引、异常与 3A4000 平台修复（2026-11-21）
+
+- **P0-D 多 TB 映射**：`TRANSLATION_DATA` 不再只保留一份 `LatmTbInsnMap`。`insn_maps[32]` 按 host code base 持久保存，同一 code base 重译只重置该映射；resolve 扫描全部映射并按最小 host span 命中。`latm_tb_insn_map_flush()` 在 SMC/代码页失效时整体撤销；池满时淘汰最老 generation。**边界**：32 个 code range 是固定池，接入 TB allocator/eviction 后必须在该路径显式撤销对应 map；board 已改为 0x2000 步进的 bump 分配器（0x5000 起，回绕时 flush map），不再是单一固定 `code_buf+0x5000`。
+- **P0-D 嵌套异常**：`do_raise_exception_err()` 仅在 `CP0_Status.EXL==0` 时写 EPC/BD；EXL 已置位时保留外层 handler 的 EPC/BD，新增 nested TLB/BD 测试。
+- **P1 跨页 branch**：`get_ir1_list()` 不再用当前 page 的 `bound` 截断翻译窗口；普通直线取指仍由 page 检查停止，页末 branch 允许通过 `latm_guest_ldl()` 取下一页 delay slot，取指权限/异常仍由 fetch helper 判定。ISA `branch-cross-page` 覆盖 `0xFFC` branch + `0x1000` delay slot。
+- **P1 board 异常退出**：`latm_board.c` 的 `cpu_loop_exit()` 使用 LoongArch 专用 `board_setjmp/longjmp` 汇编，从 generated TB 不可返回地退出；fault helper 后的指令不再继续执行。ISA harness 的平台对象改为 static 生命周期。
+- **P1 共享 IRQ**：`LatmUncore` 增加 per-vector pending/ISR；`extioi_raise/eoi` 从全部 pending vector 重算 CPU IP，两个 vector 共用 IP 时 EOI 一个不再清掉另一个。
+- **真实 3A4000 IOCSR**：EXTIOI 寄存器窗口按 Linux/QEMU 3A ABI 实现于 `0x1400 + {0xa0 nodetype, 0xc0 ipmap, 0x200 enable, 0x280 bounce, 0x300 isr, 0x400 coreisr, 0x800 coremap}`；CoreMap/IPMap/Enable 更新 route，COREISR 写 1 清除。`latm_system` 绑定 `LatmPlatform.iocsr_read/write`，并用 `latm_cpu_index` 选择 per-CPU COREISR。
+- **PCH/MailBox/CPUCFG**：PCH-PIC 使用 `0x20 MASK/0x40 HTMSI/0x60 EDGE/0x80 CLR/0x200 HTMSI_VEC/0x3a0 STATUS`；MailBox Buf0..3 改到 `0x20..0x3f`；CPUCFG sel1/sel2 返回 FP/MMI/LEXT/LSPW/LCSRP 非零能力位。
+- **7A/DTB/ELF/VMM 入口**：7A Split-CFG Type0/Type1 注册进 `LatmMmioBus`，`LatmPci` 的 VGA BAR map callback 接入 bus；DTB 生成 4 个 `cpu@N` 与 `cpu-map`；新增 `latm_system_load_elf`（KSEG0 物理折算）、`latm_system_load_initrd`、`latm_system_boot`，entry/initrd/fw_arg2 可直接设置；`latm_system_init_from_handoff()` 消费 `LoongemuVmmHandoff` 的 guest RAM/VMM/code-cache/7A CFG 基址。**仍不是完整 3A4000 虚拟机**：真实 vmlinux/initrd 文件加载入口、四 vCPU 调度、TB allocator/回收、宿主 VMM 交接与真实 7A 中断仍未接入。

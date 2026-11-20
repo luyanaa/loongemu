@@ -333,14 +333,18 @@ uint64_t latm_helper_load(CPUMIPSState *env, uint32_t op, uint64_t addr)
     uint64_t v = 0;
     unsigned size;
 
+    switch (op) {
+    case MIPS_MEM_LB: case MIPS_MEM_LBU: size = 1; break;
+    case MIPS_MEM_LH: case MIPS_MEM_LHU: size = 2; break;
+    case MIPS_MEM_LW: case MIPS_MEM_LWU: size = 4; break;
+    case MIPS_MEM_LD: size = 8; break;
+    default: return 0;
+    }
+    if (addr & (size - 1)) {
+        do_raise_exception(env, EXCP_AdEL, GETPC());
+        return 0;
+    }
     if (plat && plat->mem_read) {
-        switch (op) {
-        case MIPS_MEM_LB: case MIPS_MEM_LBU: size = 1; break;
-        case MIPS_MEM_LH: case MIPS_MEM_LHU: size = 2; break;
-        case MIPS_MEM_LW: case MIPS_MEM_LWU: size = 4; break;
-        case MIPS_MEM_LD: size = 8; break;
-        default: return 0;
-        }
         p = latm_translate(env, addr, MMU_DATA_LOAD, GETPC());
         if (plat->mem_read(env, p, &v, size) != LATM_MEM_OK) {
             do_raise_exception(env, EXCP_AdEL, GETPC());
@@ -382,6 +386,10 @@ void latm_helper_store(CPUMIPSState *env, uint32_t op, uint64_t addr,
     case MIPS_MEM_SD: size = 8; break;
     default: return;
     }
+    if (addr & (size - 1)) {
+        do_raise_exception(env, EXCP_AdES, GETPC());
+        return;
+    }
     p = latm_translate(env, addr, MMU_DATA_STORE, GETPC());
     if (plat && plat->mem_write) {
         if (plat->mem_write(env, p, val, size) != LATM_MEM_OK) {
@@ -395,5 +403,99 @@ void latm_helper_store(CPUMIPSState *env, uint32_t op, uint64_t addr,
     case MIPS_MEM_SW: *(uint32_t *)(uintptr_t)p = (uint32_t)val; break;
     case MIPS_MEM_SD: *(uint64_t *)(uintptr_t)p = val; break;
     default: break;
+    }
+}
+
+
+static int latm_big_endian(CPUMIPSState *env)
+{
+    return (env->CP0_Config0 & (1u << CP0C0_BE)) != 0;
+}
+
+static unsigned latm_lmask(CPUMIPSState *env, uint64_t addr, unsigned bits)
+{
+    unsigned mask = bits / 8u - 1u;
+    unsigned v = (unsigned)addr & mask;
+    if (!latm_big_endian(env)) v ^= mask;
+    return v;
+}
+
+uint64_t latm_helper_unaligned_load(CPUMIPSState *env, uint32_t op,
+                                    uint64_t addr, uint64_t old)
+{
+    unsigned size = (op == MIPS_MEM_LWL || op == MIPS_MEM_LWR) ? 4u : 8u;
+    unsigned mask = size - 1u;
+    unsigned pos = (unsigned)addr & mask;
+    unsigned shift;
+    uint64_t word;
+
+    /* Trigger the page/alignment exception at the guest address. */
+    (void)latm_helper_load(env, MIPS_MEM_LBU, addr);
+    word = latm_helper_load(env, size == 4 ? MIPS_MEM_LW : MIPS_MEM_LD,
+                            addr & ~(uint64_t)mask);
+    if (op == MIPS_MEM_LWL || op == MIPS_MEM_LDL) {
+        shift = (latm_big_endian(env) ? pos : (mask - pos)) * 8u;
+        return (old & ~((size == 4 ? UINT64_C(0xffffffff) : UINT64_MAX)
+                        << shift)) | (word << shift);
+    } else {
+        shift = (latm_big_endian(env) ? (mask - pos) : pos) * 8u;
+        word >>= shift;
+        {
+            uint64_t keep = ~UINT64_C(0) << (size * 8u - 1u - shift);
+            return (old & keep) | word;
+        }
+    }
+}
+
+void latm_helper_unaligned_store(CPUMIPSState *env, uint32_t op,
+                                 uint64_t addr, uint64_t value)
+{
+    unsigned size = (op == MIPS_MEM_SWL || op == MIPS_MEM_SWR) ? 4u : 8u;
+    unsigned bits = size * 8u;
+    unsigned lmask = latm_lmask(env, addr, bits);
+    int dir = latm_big_endian(env) ? 1 : -1;
+
+    if (op == MIPS_MEM_SWL || op == MIPS_MEM_SDL) {
+        latm_helper_store(env, MIPS_MEM_SB, addr, value >> (bits - 8u));
+        if (lmask <= size - 2u)
+            latm_helper_store(env, MIPS_MEM_SB, addr + dir,
+                              value >> (bits - 16u));
+        if (lmask <= size - 3u)
+            latm_helper_store(env, MIPS_MEM_SB, addr + 2 * dir,
+                              value >> (bits - 24u));
+        if (lmask <= size - 4u)
+            latm_helper_store(env, MIPS_MEM_SB, addr + 3 * dir,
+                              value >> (bits - 32u));
+        if (size == 8) {
+            if (lmask <= 3u)
+                latm_helper_store(env, MIPS_MEM_SB, addr + 4 * dir,
+                                  value >> 24u);
+            if (lmask <= 2u)
+                latm_helper_store(env, MIPS_MEM_SB, addr + 5 * dir,
+                                  value >> 16u);
+            if (lmask <= 1u)
+                latm_helper_store(env, MIPS_MEM_SB, addr + 6 * dir,
+                                  value >> 8u);
+            if (lmask == 0u)
+                latm_helper_store(env, MIPS_MEM_SB, addr + 7 * dir, value);
+        }
+    } else {
+        latm_helper_store(env, MIPS_MEM_SB, addr, value);
+        if (lmask >= 1u)
+            latm_helper_store(env, MIPS_MEM_SB, addr - dir, value >> 8u);
+        if (lmask >= 2u)
+            latm_helper_store(env, MIPS_MEM_SB, addr - 2 * dir, value >> 16u);
+        if (lmask >= 3u)
+            latm_helper_store(env, MIPS_MEM_SB, addr - 3 * dir, value >> 24u);
+        if (size == 8) {
+            if (lmask >= 4u)
+                latm_helper_store(env, MIPS_MEM_SB, addr - 4 * dir, value >> 32u);
+            if (lmask >= 5u)
+                latm_helper_store(env, MIPS_MEM_SB, addr - 5 * dir, value >> 40u);
+            if (lmask >= 6u)
+                latm_helper_store(env, MIPS_MEM_SB, addr - 6 * dir, value >> 48u);
+            if (lmask == 7u)
+                latm_helper_store(env, MIPS_MEM_SB, addr - 7 * dir, value >> 56u);
+        }
     }
 }

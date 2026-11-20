@@ -53,7 +53,7 @@ LatmMmioRegion *latm_mmio_find(LatmMmioBus *bus, uint64_t addr, unsigned size)
     if (!bus || size == 0) return NULL;
     for (unsigned i = 0; i < bus->count; i++) {
         LatmMmioRegion *r = &bus->regions[i];
-        if (addr >= r->base && addr - r->base <= r->size &&
+        if (addr >= r->base && addr - r->base < r->size &&
             size <= r->size - (addr - r->base)) {
             return r;
         }

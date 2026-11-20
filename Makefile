@@ -7,6 +7,7 @@ CLANG   ?= $(shell brew --prefix llvm)/bin/clang
 OBJDUMP ?= $(shell brew --prefix llvm)/bin/llvm-objdump
 
 .PHONY: all test test-cpu test-lapaging test-tbc test-p0 vmm-efi vmm-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot clean
+.PHONY: all test test-pvir test-sve-decode test-sve-pvir test-arm-state test-cpu test-lapaging test-pci-host test-hyperv test-tbc test-p0 vmm-efi vmm-boot vmm-integrated vmm-integrated-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot test-latr latr-core latr-isa-image latr-isa-run latr-riscv-ref test-latm test-latm-decode latm-core latm-isa-image latm-isa-run latm-riscv-ref clean
 
 all: test
 
@@ -23,10 +24,12 @@ test-tbc: build/test_tb_cache
 
 test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging \
       build/test_tb_cache
+      build/test_latm_decode
 	./build/test_loongbt
 	./build/test_loongbt_cpu
 	./build/test_loongarch_paging
 	./build/test_tb_cache
+	./build/test_latm_decode
 
 # Back-end selection and the EFLAGS pack/unpack bridge.  Kept separate from
 # test_loongbt so a failure points at the glue rather than the semantics.
@@ -403,6 +406,30 @@ test-latm-system: build/test_latm_system
 test-latm-uncore: build/test_latm_uncore
 	./build/test_latm_uncore
 
+test-latm-llsc: build/test_latm_llsc
+	./build/test_latm_llsc
+
+test-latm-unaligned: build/test_latm_unaligned
+	./build/test_latm_unaligned
+
+build/test_latm_unaligned: tests/test_latm_unaligned.c \
+                           target/mips/latm/helpers/memory.c
+	@mkdir -p build
+	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
+	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
+	      -I latx/compat -I latx/upstream/include -I . \
+	      $(CFLAGS) -Wno-gnu-empty-struct \
+	      tests/test_latm_unaligned.c target/mips/latm/helpers/memory.c -o $@
+
+build/test_latm_llsc: tests/test_latm_llsc.c \
+                      target/mips/latm/helpers/int.c
+	@mkdir -p build
+	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
+	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
+	      -I latx/compat -I latx/upstream/include -I . \
+	      $(CFLAGS) -Wno-gnu-empty-struct \
+	      tests/test_latm_llsc.c target/mips/latm/helpers/int.c -o $@
+
 test-latm-pci: build/test_latm_pci
 	./build/test_latm_pci
 
@@ -418,6 +445,8 @@ build/test_latm_board_system: tests/test_latm_board_system.c \
                               target/mips/latm/system/latm_uart.c \
                               target/mips/latm/uncore/latm_uncore.c \
                               src/pci_host.c src/phys_mem.c src/acpi_tables.c
+                              src/pci_host.c src/phys_mem.c src/acpi_tables.c \
+                              target/mips/latm/runtime.c
 	@mkdir -p build
 	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
 	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
@@ -522,7 +551,7 @@ build/test_latm_decode: tests/test_latm_decode.c target/mips/latm/ir1/decode-mip
 
 # ---- LATM: MIPS64r2 -> LoongArch ----
 .PHONY: test-latm test-latm-decode test-latm-tlb test-latm-vclock latm-core latm-isa-image latm-isa-run latm-board-image latm-board-run
-test-latm: test-latm-decode test-latm-tlb test-latm-vclock test-latm-interrupts test-latm-insn-map test-latm-cpu test-latm-loongson test-latm-system test-latm-uncore test-latm-pci test-latm-board-system latm-isa-run latm-board-run
+test-latm: test-latm-decode test-latm-tlb test-latm-vclock test-latm-interrupts test-latm-insn-map test-latm-cpu test-latm-loongson test-latm-system test-latm-uncore test-latm-llsc test-latm-unaligned test-latm-pci test-latm-board-system latm-isa-run latm-board-run
 
 # ---- bare-metal MIPS64r2 (LATM) execution harness ----
 LATM_BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \

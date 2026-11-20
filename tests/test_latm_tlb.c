@@ -170,10 +170,14 @@ int main(void)
 
     env.CP0_BadVAddr = 0x1000;
     env.CP0_Status = 1u << CP0St_EXL;
-    env.CP0_Cause = 0;
+    env.CP0_Cause = 1u << 31;
+    env.CP0_EPC = 0xdead0000;
     env.active_tc.PC = 0x1000;
     do_raise_exception_err(&env, EXCP_TLBL, EXCP_TLB_NOMATCH, 0);
+    check(env.CP0_EPC, 0xdead0000, "nested exception preserves EPC");
+    check(env.CP0_Cause & (1u << 31), 1u << 31, "nested preserves BD");
     check(env.active_tc.PC, 0x80000180, "nested TLB generic vector");
+    env.CP0_Status = 0;
 
     printf("latm-tlb: checks=%d fails=%d\n", checks, fails);
     return fails != 0;

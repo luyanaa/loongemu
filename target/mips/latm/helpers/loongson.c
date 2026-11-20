@@ -154,19 +154,25 @@ void latm_helper_loongson_mem(CPUMIPSState *env, uint32_t op,
     uint64_t addr = base + (uint64_t)(int64_t)offset + index;
 
     if (op == MIPS_LM_GSLQ) {
-        env->active_tc.gpr[rt] = latm_helper_load(env, MIPS_MEM_LD, addr);
-        env->active_tc.gpr[rt2] = latm_helper_load(env, MIPS_MEM_LD, addr + 8);
+        uint64_t lo = latm_helper_load(env, MIPS_MEM_LD, addr);
+        uint64_t hi = latm_helper_load(env, MIPS_MEM_LD, addr + 8);
+        if (rt) env->active_tc.gpr[rt] = lo;
+        if (rt2) env->active_tc.gpr[rt2] = hi;
         return;
     }
     if (op == MIPS_LM_GSSQ) {
-        latm_helper_store(env, MIPS_MEM_SD, addr, env->active_tc.gpr[rt]);
-        latm_helper_store(env, MIPS_MEM_SD, addr + 8, env->active_tc.gpr[rt2]);
+        latm_helper_store(env, MIPS_MEM_SD, addr,
+                          rt ? env->active_tc.gpr[rt] : 0);
+        latm_helper_store(env, MIPS_MEM_SD, addr + 8,
+                          rt2 ? env->active_tc.gpr[rt2] : 0);
         return;
     }
     if (lg_is_store((uint16_t)op)) {
-        lg_store(env, (uint16_t)op, addr, env->active_tc.gpr[rt]);
+        lg_store(env, (uint16_t)op, addr,
+                 rt ? env->active_tc.gpr[rt] : 0);
     } else {
-        env->active_tc.gpr[rt] = lg_load(env, (uint16_t)op, addr);
+        uint64_t v = lg_load(env, (uint16_t)op, addr);
+        if (rt) env->active_tc.gpr[rt] = v;
     }
 }
 
@@ -192,8 +198,13 @@ uint64_t latm_helper_cpucfg(CPUMIPSState *env, uint32_t sel)
 {
     switch (sel) {
     case 0: return (uint32_t)env->CP0_PRid;
-    case 1: return 0x0000000000000000ULL;
-    case 2: return 0;
+    case 1:
+        return (1u << CPUCFG1_FP) | (1u << CPUCFG1_MMI) |
+               (1u << CPUCFG1_LSLDR0) | (1u << CPUCFG1_LLEXC);
+    case 2:
+        return (1u << CPUCFG2_LEXT1) | (1u << CPUCFG2_LEXT2) |
+               (1u << CPUCFG2_LEXT3) | (1u << CPUCFG2_LSPW) |
+               (1u << CPUCFG2_LCSRP);
     default: return 0;
     }
 }

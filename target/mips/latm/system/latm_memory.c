@@ -99,7 +99,7 @@ const LatmMemoryRegion *latm_memory_find(const LatmMemoryLayout *layout,
     if (!layout || !size) return NULL;
     for (unsigned i = 0; i < layout->count; i++) {
         const LatmMemoryRegion *r = &layout->regions[i];
-        if (addr >= r->base && addr - r->base <= r->size &&
+        if (addr >= r->base && addr - r->base < r->size &&
             size <= r->size - (addr - r->base)) {
             return r;
         }
@@ -147,4 +147,5 @@ void latm_boot_info_apply_args(LatmBootInfo *info, void *envp)
     env->active_tc.gpr[4] = info->a0;
     env->active_tc.gpr[5] = info->a1;
     env->active_tc.gpr[6] = info->a2;
+    if (info->entry_pc) env->active_tc.PC = info->entry_pc;
 }

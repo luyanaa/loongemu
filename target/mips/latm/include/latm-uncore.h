@@ -33,8 +33,20 @@ typedef struct LatmUncore {
     uint64_t pic_pending;
     uint64_t pic_mask;
     uint64_t pic_ack;
+    uint64_t pic_htmsi_en;
+    uint64_t pic_edge;
+    uint64_t pic_isr;
     LatmExtioiRoute route[LATM_EXTIOI_VECTORS];
     uint8_t msi_route[LATM_EXTIOI_VECTORS];
+    uint8_t extioi_pending[LATM_EXTIOI_VECTORS];
+    uint32_t extioi_nodetype[8];
+    uint32_t extioi_enable[8];
+    uint32_t extioi_bounce[8];
+    uint32_t extioi_isr[8];
+    uint32_t extioi_coreisr[LATM_MAX_CPUS][8];
+    uint32_t extioi_coremap[64];
+    uint8_t extioi_ipmap[8];
+    uint8_t extioi_sw_coremap[LATM_EXTIOI_VECTORS];
     uint32_t cpu_ip[LATM_MAX_CPUS]; /* CP0 Cause IP bit mask */
 } LatmUncore;
 
@@ -60,5 +72,12 @@ void latm_uncore_extioi_route(LatmUncore *u, unsigned vector, unsigned cpu,
 void latm_uncore_extioi_raise(LatmUncore *u, unsigned vector);
 void latm_uncore_extioi_eoi(LatmUncore *u, unsigned vector);
 uint32_t latm_uncore_cpu_ip(LatmUncore *u, unsigned cpu);
+uint64_t latm_uncore_iocsr_read(LatmUncore *u, uint64_t addr, unsigned size);
+void latm_uncore_iocsr_write(LatmUncore *u, uint64_t addr, uint64_t value,
+                             unsigned size);
+uint64_t latm_uncore_iocsr_read_cpu(LatmUncore *u, uint64_t addr,
+                                    unsigned size, unsigned cpu);
+void latm_uncore_iocsr_write_cpu(LatmUncore *u, uint64_t addr, uint64_t value,
+                                 unsigned size, unsigned cpu);
 
 #endif

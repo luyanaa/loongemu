@@ -91,13 +91,16 @@ void do_raise_exception_err(CPUMIPSState *env, uint32_t exception,
     env->error_code = error_code;
     env->CP0_Cause = (env->CP0_Cause & ~(0x1f << 2)) |
                      ((uint32_t)cause << 2);
-    env->CP0_EPC = epc;
     env->CP0_Status |= 1u << CP0St_EXL;
-    if (in_delay) {
-        env->CP0_Cause |= 1u << 31;
-    } else {
-        env->CP0_Cause &= ~(1u << 31);
+    if (!was_exl) {
+        env->CP0_EPC = epc;
+        if (in_delay) {
+            env->CP0_Cause |= 1u << 31;
+        } else {
+            env->CP0_Cause &= ~(1u << 31);
+        }
     }
+    /* A nested exception keeps the outer handler's EPC/BD state. */
 
     switch (exception) {
     case EXCP_AdEL:

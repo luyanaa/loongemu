@@ -79,17 +79,32 @@ static IR2_OPND hcall(uintptr_t fn, int nargs, IR2_OPND *args)
     static const int arg_regs[6] = { la_a1, la_a2, la_a3, la_a4, la_a5, la_a6 };
     IR2_OPND f;
 
+    /*
+     * Stage every argument in the guest-state scratch area before loading
+     * the ABI registers.  Guest $1..$7 are mapped onto a1..a7, so a naive
+     * left-to-right move can overwrite an argument that a later move still
+     * needs.  The scratch slots are independent of both guest GPRs and the
+     * helper prologue.
+     */
+    for (int i = 0; i < nargs; i++) {
+        if (ir2_opnd_is_imm(&args[i])) {
+            IR2_OPND t = ra_alloc_itemp();
+            li_d(t, ir2_opnd_imm(&args[i]));
+            latm_env_st_d(t, offsetof(CPUMIPSState, latm_hcall_args[i]));
+            ra_free_itemp(t._reg_num);
+        } else {
+            latm_env_st_d(args[i], offsetof(CPUMIPSState, latm_hcall_args[i]));
+        }
+    }
+
     lata_gen_call_helper_prologue(tcg_ctx);
-    la_mov64(a0_ir2_opnd, env_ir2_opnd);
 
     for (int i = 0; i < nargs; i++) {
         IR2_OPND dst = ir2_opnd_new(IR2_OPND_GPR, arg_regs[i]);
-        if (ir2_opnd_is_imm(&args[i])) {
-            li_d(dst, ir2_opnd_imm(&args[i]));
-        } else {
-            la_mov64(dst, args[i]);
-        }
+        latm_env_ld_d(dst, offsetof(CPUMIPSState, latm_hcall_args[i]));
     }
+    /* latm_env_ld_d() may use a0 as a large-offset scratch. */
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
 
     f = ra_alloc_itemp();
     li_d(f, fn);
@@ -746,6 +761,22 @@ static bool trans_load(DisasContext *s)
         ra_free_itemp(addr._reg_num);
         return true;
     }
+    if (latm_system_memory &&
+        (op == MIPS_MEM_LWL || op == MIPS_MEM_LWR ||
+         op == MIPS_MEM_LDL || op == MIPS_MEM_LDR)) {
+        IR2_OPND a = imm_opnd(op);
+        IR2_OPND old = alloc_gpr_src(s->ir1.rt);
+        IR2_OPND r = hcall3((uintptr_t)latm_helper_unaligned_load,
+                            a, addr, old);
+        free_gpr_temp(old, s->ir1.rt);
+        ra_free_itemp(a._reg_num);
+        if (op == MIPS_MEM_LWL || op == MIPS_MEM_LWR)
+            store_gpr32_dst_f(s->ir1.rt, r);
+        else
+            store_gpr_dst_f(s->ir1.rt, r);
+        ra_free_itemp(addr._reg_num);
+        return true;
+    }
 
     switch (op) {
     case MIPS_MEM_LB:  rd = alloc_gpr_dst(s->ir1.rt); la_ldx_b(rd, addr, zero_ir2_opnd); store_gpr_dst_f(s->ir1.rt, rd); break;
@@ -791,6 +822,16 @@ static bool trans_store(DisasContext *s)
     if (latm_system_memory && op >= MIPS_MEM_SB && op <= MIPS_MEM_SD) {
         IR2_OPND a = imm_opnd(op);
         hcall3((uintptr_t)latm_helper_store, a, addr, rt);
+        ra_free_itemp(a._reg_num);
+        ra_free_itemp(addr._reg_num);
+        free_gpr_temp(rt, s->ir1.rt);
+        return true;
+    }
+    if (latm_system_memory &&
+        (op == MIPS_MEM_SWL || op == MIPS_MEM_SWR ||
+         op == MIPS_MEM_SDL || op == MIPS_MEM_SDR)) {
+        IR2_OPND a = imm_opnd(op);
+        hcall3((uintptr_t)latm_helper_unaligned_store, a, addr, rt);
         ra_free_itemp(a._reg_num);
         ra_free_itemp(addr._reg_num);
         free_gpr_temp(rt, s->ir1.rt);
@@ -1502,14 +1543,17 @@ static DisasContext *get_ir1_list(TranslationBlock *tb, int max_insns)
     int n = 0;
     uint64_t pc = tb->pc;
     uint64_t page_start = pc & TARGET_PAGE_MASK;
-    int bound = -(pc | TARGET_PAGE_MASK) / 4;
 
     db->tb = tb;
     db->pc_first = pc;
     db->pc_next = pc;
     db->is_jmp = DISAS_NEXT;
     db->num_insns = 0;
-    db->max_insns = MIN(max_insns, bound);
+    /* The page check below still stops ordinary straight-line fetch at the
+     * page boundary.  A branch at the last word must be allowed to decode its
+     * delay slot from the next page; the fetch helper applies that page's
+     * permissions and faults. */
+    db->max_insns = max_insns;
 
     while (true) {
         uint32_t insn;

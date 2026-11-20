@@ -216,11 +216,28 @@ size_t latm_dtb_build_3a4000(uint8_t *out, size_t cap,
     latm_dtb_begin_node(&b, "cpus");
     latm_dtb_prop_u32(&b, "#address-cells", 1);
     latm_dtb_prop_u32(&b, "#size-cells", 0);
-    latm_dtb_begin_node(&b, "cpu@0");
-    latm_dtb_prop_string(&b, "device_type", "cpu");
-    latm_dtb_prop_string(&b, "compatible", "loongson,gs464v");
-    latm_dtb_prop_u32(&b, "reg", 0);
-    latm_dtb_prop_u32(&b, "clock-frequency", 1500000000u);
+    for (unsigned cpu = 0; cpu < 4; cpu++) {
+        char name[16], core[16];
+        snprintf(name, sizeof(name), "cpu@%u", cpu);
+        latm_dtb_begin_node(&b, name);
+        latm_dtb_prop_string(&b, "device_type", "cpu");
+        latm_dtb_prop_string(&b, "compatible", "loongson,gs464v");
+        latm_dtb_prop_u32(&b, "reg", cpu);
+        latm_dtb_prop_u32(&b, "clock-frequency", 1500000000u);
+        latm_dtb_prop_string(&b, "enable-method", "loongson,3a4000");
+        latm_dtb_end_node(&b);
+        snprintf(core, sizeof(core), "core%u", cpu);
+    }
+    latm_dtb_begin_node(&b, "cpu-map");
+    latm_dtb_begin_node(&b, "cluster0");
+    for (unsigned cpu = 0; cpu < 4; cpu++) {
+        char core[16];
+        snprintf(core, sizeof(core), "core%u", cpu);
+        latm_dtb_begin_node(&b, core);
+        latm_dtb_prop_u32(&b, "reg", cpu);
+        latm_dtb_end_node(&b);
+    }
+    latm_dtb_end_node(&b);
     latm_dtb_end_node(&b);
     latm_dtb_end_node(&b);
 

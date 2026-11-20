@@ -10,6 +10,7 @@
 #include "exec/helper-proto.h"
 #include "exec/cpu_ldst.h"
 #include "latm-helpers.h"
+#include "latm-platform.h"
 
 static void raise_overflow(CPUMIPSState *env)
 {
@@ -165,7 +166,8 @@ void latm_helper_pref(CPUMIPSState *env, uint32_t hint, uint64_t addr)
 
 uint64_t latm_helper_ll(CPUMIPSState *env, uint32_t op, uint64_t addr)
 {
-    uint64_t v, phys;
+    const LatmPlatform *plat = latm_platform_get();
+    uint64_t v = 0, phys;
     unsigned size = op == MIPS_MEM_LL ? 4 : 8;
 
     if (addr & (size - 1)) {
@@ -173,15 +175,24 @@ uint64_t latm_helper_ll(CPUMIPSState *env, uint32_t op, uint64_t addr)
         return 0;
     }
     phys = cpu_mips_translate_address(env, addr, MMU_DATA_LOAD, 0);
-    if (size == 4) {
+    if (plat) {
+        if (!plat->atomic_ll ||
+            plat->atomic_ll(env, phys, size, &v) != LATM_MEM_OK) {
+            /* MMIO/reserved or an embedder without atomic RAM support must
+             * not expose a reservation that could later bypass the bus. */
+            env->llvalid = 0;
+            env->lladdr = UINT64_MAX;
+            env->llsize = 0;
+            do_raise_exception(env, EXCP_AdEL, GETPC());
+            return 0;
+        }
+    } else if (size == 4) {
         v = cpu_ldl_mmuidx_ra(env, addr, 0, 0);
-        env->llval = v;
-        env->llsize = 4;
     } else {
         v = cpu_ldq_mmuidx_ra(env, addr, 0, 0);
-        env->llval = v;
-        env->llsize = 8;
     }
+    env->llval = v;
+    env->llsize = size;
     env->lladdr = phys;
     env->llpaddr = phys;
     env->llvalid = 1;
@@ -191,8 +202,9 @@ uint64_t latm_helper_ll(CPUMIPSState *env, uint32_t op, uint64_t addr)
 uint64_t latm_helper_sc(CPUMIPSState *env, uint32_t op, uint64_t addr,
                         uint64_t val)
 {
+    const LatmPlatform *plat = latm_platform_get();
     unsigned size = op == MIPS_MEM_SC ? 4 : 8;
-    bool ok = false;
+    int ok = 0;
 
     if (addr & (size - 1)) {
         do_raise_exception(env, EXCP_AdES, GETPC());
@@ -203,27 +215,31 @@ uint64_t latm_helper_sc(CPUMIPSState *env, uint32_t op, uint64_t addr,
                                                    MMU_DATA_STORE, 0);
         if (env->llvalid && env->llsize == size &&
             phys == env->llpaddr) {
-        if (size == 4) {
-            uint32_t old = (uint32_t)env->llval;
-            uint32_t new = (uint32_t)val;
-            ok = __atomic_compare_exchange_n((uint32_t *)(uintptr_t)phys,
-                                             &old, new, false,
-                                             __ATOMIC_SEQ_CST,
-                                             __ATOMIC_SEQ_CST);
-        } else {
-            uint64_t old = env->llval;
-            ok = __atomic_compare_exchange_n((uint64_t *)(uintptr_t)phys,
-                                             &old, val, false,
-                                             __ATOMIC_SEQ_CST,
-                                             __ATOMIC_SEQ_CST);
-        }
-        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            if (plat) {
+                if (!plat->atomic_sc ||
+                    plat->atomic_sc(env, phys, size, env->llval, val,
+                                    &ok) != LATM_MEM_OK) {
+                    do_raise_exception(env, EXCP_AdES, GETPC());
+                    ok = 0;
+                }
+            } else if (size == 4) {
+                uint32_t old = (uint32_t)env->llval;
+                ok = __atomic_compare_exchange_n(
+                    (uint32_t *)(uintptr_t)phys, &old, (uint32_t)val, false,
+                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            } else {
+                uint64_t old = env->llval;
+                ok = __atomic_compare_exchange_n(
+                    (uint64_t *)(uintptr_t)phys, &old, val, false,
+                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            }
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
         }
     }
     env->llvalid = 0;
     env->lladdr = UINT64_MAX;
     env->llsize = 0;
-    return ok;
+    return ok != 0;
 }
 
 uint64_t latm_helper_rdhwr(CPUMIPSState *env, uint32_t rd, uint32_t sel)

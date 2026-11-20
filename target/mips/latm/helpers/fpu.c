@@ -12,6 +12,7 @@
 #include "exec/helper-proto.h"
 #include "exec/cpu_ldst.h"
 #include "latm-helpers.h"
+#include "latm.h"
 
 #define FPR64(i) (env->active_fpu.fpr[(i)].d)
 #define FPR32(i) ((uint32_t)env->active_fpu.fpr[(i)].d)
@@ -292,6 +293,35 @@ void latm_fpu_ldst(CPUMIPSState *env, uint32_t op, uint32_t ft,
     uint64_t v64;
 
 
+    if (latm_system_memory) {
+        switch (op) {
+        case 0: /* LWC1 */
+        case 4: /* LWXC1 */
+            v32 = (uint32_t)latm_helper_load(env, MIPS_MEM_LW, addr);
+            set_fpr32(env, ft, v32);
+            return;
+        case 1: /* LDC1 */
+        case 5: /* LDXC1 */
+        case 6: /* LUXC1 */
+            v64 = latm_helper_load(env, MIPS_MEM_LD,
+                                   op == 6 ? addr & ~UINT64_C(7) : addr);
+            env->active_fpu.fpr[ft].d = v64;
+            return;
+        case 2: /* SWC1 */
+        case 7: /* SWXC1 */
+            latm_helper_store(env, MIPS_MEM_SW, addr, FPR32(fs));
+            return;
+        case 3: /* SDC1 */
+        case 8: /* SDXC1 */
+        case 9: /* SUXC1 */
+            latm_helper_store(env, MIPS_MEM_SD,
+                              op == 9 ? addr & ~UINT64_C(7) : addr,
+                              FPR64(fs));
+            return;
+        default:
+            return;
+        }
+    }
     switch (op) {
     case 0: /* LWC1 */
         v32 = cpu_ldl_mmuidx_ra(env, addr, 0, 0);

@@ -25,6 +25,10 @@ typedef struct LatmPlatform {
     uint64_t (*iocsr_read)(CPUMIPSState *env, uint64_t addr, unsigned size);
     void (*iocsr_write)(CPUMIPSState *env, uint64_t addr, uint64_t val,
                         unsigned size);
+    int (*atomic_ll)(CPUMIPSState *env, uint64_t gpa, unsigned size,
+                     uint64_t *value);
+    int (*atomic_sc)(CPUMIPSState *env, uint64_t gpa, unsigned size,
+                     uint64_t expected, uint64_t desired, int *ok);
     void *opaque;
 } LatmPlatform;
 
