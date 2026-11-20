@@ -1593,23 +1593,15 @@ static void timer_start(uint64_t period_ticks)
 {
     uint64_t tcfg = (period_ticks << 2) | 0x2 | 0x1;
 
-    /*
-     * CSR.ECFG.LIE enables the timer's entry in the interrupt tree; CRMD.IE is
-     * deliberately left alone.  This layer runs the harness at PLV0 and is not
-     * ready to take asynchronous exceptions yet, so the tick is observed by
-     * polling CSR.ESTAT.TI instead -- which still proves the counter advanced
-     * and the interrupt latched, without letting a stray entry unwind the
-     * harness mid-check.
-     */
     {
         uint64_t ecfg;
 
         __asm__ volatile("csrrd %0, 0x4" : "=r"(ecfg) :: "memory");
         ecfg |= (1ULL << 11);
-        __asm__ volatile("csrwr %0, 0x4" :: "r"(ecfg) : "memory");
+        __asm__ volatile("csrwr %0, 0x4" : "+r"(ecfg) :: "memory");
     }
 
-    __asm__ volatile("csrwr %0, 0x41" :: "r"(tcfg) : "memory");
+    __asm__ volatile("csrwr %0, 0x41" : "+r"(tcfg) :: "memory");
 }
 
 static void timer_stop(void)
@@ -1617,11 +1609,11 @@ static void timer_stop(void)
     uint64_t tcfg = 0;
     uint64_t ecfg;
 
-    __asm__ volatile("csrwr %0, 0x41" :: "r"(tcfg) : "memory");
+    __asm__ volatile("csrwr %0, 0x41" : "+r"(tcfg) :: "memory");
 
     __asm__ volatile("csrrd %0, 0x4" : "=r"(ecfg) :: "memory");
     ecfg &= ~(1ULL << 11);
-    __asm__ volatile("csrwr %0, 0x4" :: "r"(ecfg) : "memory");
+    __asm__ volatile("csrwr %0, 0x4" : "+r"(ecfg) :: "memory");
 }
 
 /* Acknowledge one timer interrupt at the source. */
@@ -1629,7 +1621,7 @@ static void timer_ack(void)
 {
     uint64_t one = 1;
 
-    __asm__ volatile("csrwr %0, 0x44" :: "r"(one) : "memory");
+    __asm__ volatile("csrwr %0, 0x44" : "+r"(one) :: "memory");
 }
 
 /*

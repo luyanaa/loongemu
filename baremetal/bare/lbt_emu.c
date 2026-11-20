@@ -470,7 +470,7 @@ void lbt_handle_fast(uint64_t *regs, uint64_t era)
         puthex(w);
         latx_bare_uart_puts("\n");
     }
-    __asm__ volatile("csrwr %0, 0x6" :: "r"(next_era));
+    __asm__ volatile("csrwr %0, 0x6" : "+r"(next_era) :: "memory");
 }
 
 void lbt_handle(uint64_t *regs)
@@ -526,5 +526,6 @@ __asm__(
 
 void lbt_emu_install(void)
 {
-    __asm__ volatile("csrwr %0, 0xc" :: "r"((uint64_t)lbt_entry));
+    uint64_t entry = (uint64_t)(uintptr_t)lbt_entry;
+    __asm__ volatile("csrwr %0, 0xc" : "+r"(entry) :: "memory");
 }

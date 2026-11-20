@@ -78,6 +78,15 @@ build/test_x86_64_paging: tests/test_x86_64_paging.c src/x86_64_paging.c include
 test-paging: build/test_x86_64_paging
 	./build/test_x86_64_paging
 
+build/test_arm64_paging: tests/test_arm64_paging.c src/arm64_paging.c include/loongemu/arm64_paging.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) src/arm64_paging.c tests/test_arm64_paging.c -o $@
+
+# ARMv8 Stage-1 4 KiB walker.  Pure host test: the walker takes a memory
+# callback, so the descriptor interpretation is checked without a machine.
+test-arm64-paging: build/test_arm64_paging
+	./build/test_arm64_paging
+
 # Assemble the hardware back end for LoongArch with the LBT extension enabled
 # and prove the expected instructions really reach the object.
 build/loongbt_hw_lbt.o: src/loongbt_hw.c include/loongemu/loongbt.h
@@ -422,6 +431,16 @@ build/tb_sys.elf: build/tb_sys.o build/tb_harness.o build/tb_cache_bare.o build/
 	   build/tb_sys.o build/tb_harness.o build/tb_cache_bare.o build/loongarch_paging_bare.o build/lbt_emu.o build/acpi_tables_bare.o build/vmlinux_text.o build/vmlinux_segs.o baremetal/build/liblatx_core.a -o $@
 
 tb-sys-image: build/tb_sys.elf
+
+build/regress_x86.o: baremetal/bare/regress_x86.c include/loongemu/tb_cache.h include/loongemu/loongarch_paging.h baremetal/bare/lbt_emu.h baremetal/bare/tb_harness.h
+	@mkdir -p build
+	$(CLANG) $(BARE_CFLAGS) -Iinclude -Ibaremetal/bare -c $< -o $@
+
+build/regress_x86.elf: build/regress_x86.o build/tb_harness.o build/tb_cache_bare.o build/loongarch_paging_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a baremetal/bare/bare.lds
+	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	   build/regress_x86.o build/tb_harness.o build/tb_cache_bare.o build/loongarch_paging_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a -o $@
+
+regress-x86-image: build/regress_x86.elf
 
 tb-sys-run: build/tb_sys.elf
 	@rm -f build/tb_sys.log
