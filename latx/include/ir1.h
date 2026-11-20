@@ -31,7 +31,7 @@
 #else
 #define CS_MODE CS_MODE_64
 #endif
-extern csh handle[2];
+extern csh handle[3];
 
 
 typedef enum {

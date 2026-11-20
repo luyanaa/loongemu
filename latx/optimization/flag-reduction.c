@@ -207,7 +207,11 @@ static const IR1_EFLAG_USEDEF ir1_opcode_eflag_usedef[] = {
     FLAG_DEFINE(RCR,     __CF, __CF | __OF, __NONE),
     FLAG_DEFINE(RDMSR,   __NONE, __INVALID, __NONE),
     FLAG_DEFINE(RDPMC,   __NONE, __INVALID, __NONE),
+    FLAG_DEFINE(RDRAND,  __NONE, __ALL_EFLAGS, __NONE),
+    FLAG_DEFINE(RDSEED,  __NONE, __ALL_EFLAGS, __NONE),
     FLAG_DEFINE(RDTSC,   __NONE, __NONE, __NONE),
+    FLAG_DEFINE(VMCALL,  __NONE, __NONE, __NONE),
+    FLAG_DEFINE(VMMCALL, __NONE, __NONE, __NONE),
     /* FLAG_DEFINE(REP,     __NONE, __INVALID, __NONE), */
     /* FLAG_DEFINE(REPNE,     __NONE, __INVALID, __NONE), */
     FLAG_DEFINE(RET,     __NONE, __NONE, __NONE), /* change */

@@ -246,6 +246,9 @@ void helper_rdmsr(CPUX86State *env)
 {
 }
 #else
+extern void latx_platform_kvm_wrmsr(CPUX86State *env, uint32_t msr, uint64_t val);
+extern int latx_platform_kvm_rdmsr(CPUX86State *env, uint32_t msr, uint64_t *val);
+
 void helper_wrmsr(CPUX86State *env)
 {
     uint64_t val;
@@ -399,6 +402,14 @@ void helper_wrmsr(CPUX86State *env)
         cpu_sync_bndcs_hflags(env);
         break;
     default:
+        if ((uint32_t)env->regs[R_ECX] == 0x4b564d00u ||
+            (uint32_t)env->regs[R_ECX] == 0x4b564d01u ||
+            (uint32_t)env->regs[R_ECX] == 0x4b564d04u ||
+            ((uint32_t)env->regs[R_ECX] >= 0x40000000u &&
+             (uint32_t)env->regs[R_ECX] <= 0x400000ffu)) {
+            latx_platform_kvm_wrmsr(env, (uint32_t)env->regs[R_ECX], val);
+            break;
+        }
         if ((uint32_t)env->regs[R_ECX] >= MSR_MC0_CTL
             && (uint32_t)env->regs[R_ECX] < MSR_MC0_CTL +
             (4 * env->mcg_cap & 0xff)) {
@@ -560,6 +571,14 @@ void helper_rdmsr(CPUX86State *env)
         val = x86_cpu->ucode_rev;
         break;
     default:
+        if (((uint32_t)env->regs[R_ECX] == 0x4b564d00u ||
+             (uint32_t)env->regs[R_ECX] == 0x4b564d01u ||
+             (uint32_t)env->regs[R_ECX] == 0x4b564d04u ||
+             ((uint32_t)env->regs[R_ECX] >= 0x40000000u &&
+              (uint32_t)env->regs[R_ECX] <= 0x400000ffu)) &&
+            latx_platform_kvm_rdmsr(env, (uint32_t)env->regs[R_ECX], &val)) {
+            break;
+        }
         if ((uint32_t)env->regs[R_ECX] >= MSR_MC0_CTL
             && (uint32_t)env->regs[R_ECX] < MSR_MC0_CTL +
             (4 * env->mcg_cap & 0xff)) {

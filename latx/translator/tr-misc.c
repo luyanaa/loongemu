@@ -458,6 +458,75 @@ bool translate_wrmsr(IR1_INST *pir1)
     return translate_msr(pir1, true);
 }
 
+extern uint64_t latx_random_u64(void);
+extern void helper_hypercall(CPUX86State *env);
+
+static uint64_t helper_rdrand_val(CPUX86State *env)
+{
+    (void)env;
+    return latx_random_u64();
+}
+
+static bool translate_rand_common(IR1_INST *pir1)
+{
+    IR1_OPND *dst = ir1_get_opnd(pir1, 0);
+    IR2_OPND fn, res, cf;
+
+    tr_save_guest_regs_for_helper();
+    fn = ra_alloc_itemp();
+    li_d(fn, (ADDR)helper_rdrand_val);
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    la_jirl(ra_ir2_opnd, fn, 0);
+    ra_free_temp(fn);
+
+    res = ra_alloc_itemp();
+    la_mov64(res, a0_ir2_opnd);
+    tr_load_guest_regs_after_helper();
+    store_ireg_to_ir1(res, dst, false);
+    ra_free_temp(res);
+
+    /* RDRAND/RDSEED success: CF=1, OF=SF=ZF=AF=PF=0 */
+    cf = ra_alloc_itemp();
+    la_ori(cf, zero_ir2_opnd, 1);
+    la_x86mtflag(cf, 0x3f);
+    ra_free_temp(cf);
+    return true;
+}
+
+bool translate_rdrand(IR1_INST *pir1)
+{
+    return translate_rand_common(pir1);
+}
+
+bool translate_rdseed(IR1_INST *pir1)
+{
+    return translate_rand_common(pir1);
+}
+
+static bool translate_hypercall_common(IR1_INST *pir1)
+{
+    IR2_OPND fn;
+    (void)pir1;
+    tr_save_guest_regs_for_helper();
+    fn = ra_alloc_itemp();
+    li_d(fn, (ADDR)helper_hypercall);
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    la_jirl(ra_ir2_opnd, fn, 0);
+    ra_free_temp(fn);
+    tr_load_guest_regs_after_helper();
+    return true;
+}
+
+bool translate_vmcall(IR1_INST *pir1)
+{
+    return translate_hypercall_common(pir1);
+}
+
+bool translate_vmmcall(IR1_INST *pir1)
+{
+    return translate_hypercall_common(pir1);
+}
+
 bool translate_invlpg(IR1_INST *pir1)
 {
     IR1_OPND *opnd = ir1_get_opnd(pir1, 0);
@@ -1251,15 +1320,47 @@ bool translate_ret(IR1_INST *pir1)
 {
     return translate_ret_without_ss_opt(pir1);
 }
+extern void helper_ljmp_far(CPUX86State *env, uint32_t selector, uint64_t offset);
+
 bool translate_ljmp(IR1_INST *pir1)
 {
-    ADDR local_fs_index;
     IR1_OPND* opnd0 = ir1_get_opnd(pir1, 0);
+
+    /* Direct far jump (0xea): ljmp ptr16:16 / ptr16:32 (two immediates). */
+    if (ir1_opnd_num(pir1) >= 2 &&
+        ir1_opnd_is_imm(opnd0) && ir1_opnd_is_imm(ir1_get_opnd(pir1, 1))) {
+        TranslationBlock *tb = lsenv->tr_data->curr_tb;
+        uint32_t sel = (uint32_t)ir1_opnd_uimm(opnd0) & 0xffffu;
+        uint64_t off = (uint64_t)ir1_opnd_uimm(ir1_get_opnd(pir1, 1));
+        IR2_OPND fn, eip_opnd, base, target;
+
+        emit_ymmh_zeros();
+        tr_save_guest_regs_for_helper();
+        fn = ra_alloc_itemp();
+        li_d(fn, (ADDR)helper_ljmp_far);
+        la_mov64(a0_ir2_opnd, env_ir2_opnd);
+        li_d(a1_ir2_opnd, (uint64_t)sel);
+        li_d(a2_ir2_opnd, off);
+        la_jirl(ra_ir2_opnd, fn, 0);
+        ra_free_temp(fn);
+        tr_load_guest_regs_after_helper();
+
+        eip_opnd = ra_alloc_dbt_arg2();
+        la_ld_d(eip_opnd, env_ir2_opnd, lsenv_offset_of_eip(lsenv));
+        base = ra_alloc_data();
+        target = ra_alloc_data();
+        la_data_li(base, (ADDR)tb->tc.ptr);
+        la_data_li(target, context_switch_native_to_bt_ret_0);
+        aot_la_append_ir2_jmp_far(target, base, B_EPILOGUE_RET_0, 0);
+        return true;
+    }
+
+    ADDR local_fs_index;
     IR2_OPND tmp_opnd = ra_alloc_itemp();
     IR1_OPND seg_opnd;
     uint32_t old_size = 0;
     #ifdef TARGET_X86_64
-    if (CODEIS64 == LATX_DT_X64 &&
+    if (CODEIS64 &&
         (!(pir1->info->x86.rex & 0x4))) {//rex.w be set.size is 64bit.
         opnd0->size = 6;
     }

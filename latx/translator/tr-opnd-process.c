@@ -632,6 +632,31 @@ void store_ireg_to_ir1_seg(IR2_OPND seg_value_opnd, IR1_OPND *opnd1)
                       lsenv_offset_of_seg_selector(lsenv, seg_num));
 
 
+    /* Real mode (CR0.PE == 0): seg.base = selector << 4, limit = 0xffff. */
+    IR2_OPND label_prot_mode = ra_alloc_label();
+    IR2_OPND label_real_done = ra_alloc_label();
+    IR2_OPND cr0_pe = ra_alloc_itemp_internal();
+    la_ld_d(cr0_pe, env_ir2_opnd, (int)offsetof(CPUX86State, cr[0]));
+    la_andi(cr0_pe, cr0_pe, CR0_PE_MASK);
+    la_bnez(cr0_pe, label_prot_mode);
+    {
+        IR2_OPND rm_base = ra_alloc_itemp_internal();
+        IR2_OPND rm_limit = ra_alloc_itemp_internal();
+        la_slli_d(rm_base, selector_opnd, 4);
+        la_st_d(rm_base, env_ir2_opnd, lsenv_offset_of_seg_base(lsenv, seg_num));
+        li_wu(rm_limit, 0xffffu);
+        la_st_w(rm_limit, env_ir2_opnd, lsenv_offset_of_seg_limit(lsenv, seg_num));
+        if (seg_num == cs_index) {
+            li_d(rm_base, LATX_DT_X16);
+            la_st_w(rm_base, env_ir2_opnd, offsetof(CPUX86State, sys.codemode));
+        }
+        ra_free_temp(rm_limit);
+        ra_free_temp(rm_base);
+    }
+    la_b(label_real_done);
+    la_label(label_prot_mode);
+    ra_free_temp(cr0_pe);
+
 #ifdef TARGET_X86_64
     if (seg_num == cs_index) {
         IR2_OPND ir2_tmp = ra_alloc_itemp();
@@ -774,6 +799,7 @@ void store_ireg_to_ir1_seg(IR2_OPND seg_value_opnd, IR1_OPND *opnd1)
                       lsenv_offset_of_seg_flags(lsenv, seg_num));
 
     la_label(label_seg_done);
+    la_label(label_real_done);
     ra_free_temp(seg_limit);
     ra_free_temp(seg_base);
     ra_free_temp(seg_flags);

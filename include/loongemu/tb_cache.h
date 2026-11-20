@@ -42,6 +42,7 @@ typedef struct TbCacheEntry {
     uint32_t hash_next;     /* next entry in the same bucket */
     uint32_t gen;           /* insertion generation, for eviction */
     uint8_t  cpl;
+    uint8_t  mode_flags;    /* codemode (16/32/64) | PE | CS32 */
     uint8_t  used;
 } TbCacheEntry;
 
@@ -65,9 +66,13 @@ typedef struct TbCache {
 int tbc_init(TbCache *cache, TbCacheEntry *storage, uint32_t *bucket_storage,
              uint32_t capacity);
 
-/* Exact-key lookup; NULL when absent. */
+/* Exact-key lookup (default mode_flags=0); NULL when absent. */
 TbCacheEntry *tbc_lookup(TbCache *cache, uint64_t pc, uint64_t cs_base,
                          uint64_t cr3, uint8_t cpl);
+
+/* Mode-aware exact-key lookup separating 16/32/64-bit TBs at the same PC. */
+TbCacheEntry *tbc_lookup_mode(TbCache *cache, uint64_t pc, uint64_t cs_base,
+                              uint64_t cr3, uint8_t cpl, uint8_t mode_flags);
 
 /*
  * Insert or replace a key.  Returns the entry, or NULL when the table is
@@ -75,6 +80,9 @@ TbCacheEntry *tbc_lookup(TbCache *cache, uint64_t pc, uint64_t cs_base,
  */
 TbCacheEntry *tbc_insert(TbCache *cache, uint64_t pc, uint64_t cs_base,
                          uint64_t cr3, uint8_t cpl);
+
+TbCacheEntry *tbc_insert_mode(TbCache *cache, uint64_t pc, uint64_t cs_base,
+                              uint64_t cr3, uint8_t cpl, uint8_t mode_flags);
 
 /* Drop every block overlapping [addr, addr+len) in the given address space. */
 void tbc_invalidate_range(TbCache *cache, uint64_t cr3, uint64_t addr,

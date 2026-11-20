@@ -20,21 +20,22 @@ static uint32_t mix64(uint64_t v)
 }
 
 static uint32_t key_hash(uint64_t pc, uint64_t cs_base, uint64_t cr3,
-                         uint8_t cpl)
+                         uint8_t cpl, uint8_t mode_flags)
 {
     uint64_t h = pc;
+    uint64_t cm = ((uint64_t)mode_flags << 8) | (uint64_t)cpl;
 
     h ^= cs_base + UINT64_C(0x9e3779b97f4a7c15) + (h << 6) + (h >> 2);
     h ^= cr3 + UINT64_C(0x9e3779b97f4a7c15) + (h << 6) + (h >> 2);
-    h ^= (uint64_t)cpl + UINT64_C(0x9e3779b97f4a7c15) + (h << 6) + (h >> 2);
+    h ^= cm + UINT64_C(0x9e3779b97f4a7c15) + (h << 6) + (h >> 2);
     return mix64(h);
 }
 
 static int key_matches(const TbCacheEntry *e, uint64_t pc, uint64_t cs_base,
-                       uint64_t cr3, uint8_t cpl)
+                       uint64_t cr3, uint8_t cpl, uint8_t mode_flags)
 {
     return e->used && e->pc == pc && e->cs_base == cs_base &&
-           e->cr3 == cr3 && e->cpl == cpl;
+           e->cr3 == cr3 && e->cpl == cpl && e->mode_flags == mode_flags;
 }
 
 int tbc_init(TbCache *cache, TbCacheEntry *storage, uint32_t *bucket_storage,
@@ -73,7 +74,8 @@ static void bucket_unlink(TbCache *cache, uint32_t index)
     uint32_t h = key_hash(cache->entries[index].pc,
                           cache->entries[index].cs_base,
                           cache->entries[index].cr3,
-                          cache->entries[index].cpl) & cache->mask;
+                          cache->entries[index].cpl,
+                          cache->entries[index].mode_flags) & cache->mask;
     uint32_t *link = &cache->buckets[h];
 
     while (*link != TBC_NO_ENTRY) {
@@ -85,21 +87,27 @@ static void bucket_unlink(TbCache *cache, uint32_t index)
     }
 }
 
-TbCacheEntry *tbc_lookup(TbCache *cache, uint64_t pc, uint64_t cs_base,
-                         uint64_t cr3, uint8_t cpl)
+TbCacheEntry *tbc_lookup_mode(TbCache *cache, uint64_t pc, uint64_t cs_base,
+                              uint64_t cr3, uint8_t cpl, uint8_t mode_flags)
 {
-    uint32_t h = key_hash(pc, cs_base, cr3, cpl) & cache->mask;
+    uint32_t h = key_hash(pc, cs_base, cr3, cpl, mode_flags) & cache->mask;
     uint32_t idx = cache->buckets[h];
 
     while (idx != TBC_NO_ENTRY) {
         TbCacheEntry *e = &cache->entries[idx];
 
-        if (key_matches(e, pc, cs_base, cr3, cpl)) {
+        if (key_matches(e, pc, cs_base, cr3, cpl, mode_flags)) {
             return e;
         }
         idx = e->hash_next;
     }
     return 0;
+}
+
+TbCacheEntry *tbc_lookup(TbCache *cache, uint64_t pc, uint64_t cs_base,
+                         uint64_t cr3, uint8_t cpl)
+{
+    return tbc_lookup_mode(cache, pc, cs_base, cr3, cpl, 0);
 }
 
 /*
@@ -126,10 +134,10 @@ static uint32_t pick_slot(TbCache *cache)
     return oldest;
 }
 
-TbCacheEntry *tbc_insert(TbCache *cache, uint64_t pc, uint64_t cs_base,
-                         uint64_t cr3, uint8_t cpl)
+TbCacheEntry *tbc_insert_mode(TbCache *cache, uint64_t pc, uint64_t cs_base,
+                              uint64_t cr3, uint8_t cpl, uint8_t mode_flags)
 {
-    TbCacheEntry *existing = tbc_lookup(cache, pc, cs_base, cr3, cpl);
+    TbCacheEntry *existing = tbc_lookup_mode(cache, pc, cs_base, cr3, cpl, mode_flags);
     TbCacheEntry *e;
     uint32_t idx, h;
 
@@ -152,16 +160,23 @@ TbCacheEntry *tbc_insert(TbCache *cache, uint64_t pc, uint64_t cs_base,
     e->cs_base = cs_base;
     e->cr3 = cr3;
     e->cpl = cpl;
+    e->mode_flags = mode_flags;
     e->code = 0;
     e->code_size = 0;
     e->used = 1;
     e->gen = ++cache->generation;
 
-    h = key_hash(pc, cs_base, cr3, cpl) & cache->mask;
+    h = key_hash(pc, cs_base, cr3, cpl, mode_flags) & cache->mask;
     e->hash_next = cache->buckets[h];
     cache->buckets[h] = idx;
     cache->count++;
     return e;
+}
+
+TbCacheEntry *tbc_insert(TbCache *cache, uint64_t pc, uint64_t cs_base,
+                         uint64_t cr3, uint8_t cpl)
+{
+    return tbc_insert_mode(cache, pc, cs_base, cr3, cpl, 0);
 }
 
 void tbc_invalidate_range(TbCache *cache, uint64_t cr3, uint64_t addr,

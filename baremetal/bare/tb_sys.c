@@ -49,6 +49,8 @@
 
 #include "loongemu/loongarch_paging.h"
 #include "loongemu/acpi_tables.h"
+#include "loongemu/smbios_tables.h"
+#include "loongemu/ovmf_board.h"
 #include "loongemu/tb_cache.h"
 #include "loongemu/x86_64_paging.h"
 #include "loongemu/phys_mem.h"
@@ -57,12 +59,17 @@
 #include "lbt_emu.h"
 #include "tb_harness.h"
 
+extern void latx_x86_reset_real_mode(CPUX86State *env);
 extern uint32_t latx_guest_nr_cpus;
 extern uint32_t latx_guest_apic_id;
+extern uint64_t latx_host_timer_hz;
+extern uint32_t latx_hv_vendor;
+extern uint64_t latx_random_u64(void);
 
-#define UART0_THR ((volatile unsigned char *)0x1fe001e0)
-#define UART0_RBR ((volatile unsigned char *)0x1fe001e0)
-#define UART0_LSR ((volatile unsigned char *)0x1fe001e5)
+static uint64_t g_uart_base = 0x1fe001e0ULL;
+#define UART0_THR ((volatile unsigned char *)(uintptr_t)(g_uart_base + 0u))
+#define UART0_RBR ((volatile unsigned char *)(uintptr_t)(g_uart_base + 0u))
+#define UART0_LSR ((volatile unsigned char *)(uintptr_t)(g_uart_base + 5u))
 
 /*
  * Called from latx_runtime_init() when the host cannot run the ABI it would
@@ -84,7 +91,16 @@ void latx_platform_refuse(const char *why)
 
 static LoongemuSpinLock g_uart_lock;
 
-void latx_bare_uart_putc(int c) { *UART0_THR = (unsigned char)c; }
+void latx_bare_uart_putc(int c)
+{
+    /* Poll 16550 LSR.THRE (bit 5) for real LoongArch hardware UARTs. */
+    for (uint32_t spin = 0; spin < 100000u; spin++) {
+        if (((*UART0_LSR) & 0x20u) != 0u) {
+            break;
+        }
+    }
+    *UART0_THR = (unsigned char)c;
+}
 void latx_bare_uart_puts(const char *s)
 {
     loongemu_spin_lock(&g_uart_lock);
@@ -203,6 +219,9 @@ static int deliver_x86_exception(uint32_t vec, uint64_t push_rip,
 
 static LoongemuMemMap g_mem_map;
 static LoongemuVClock g_vclock;
+static OvmfBoard g_ovmf_board;
+static uint8_t *g_ovmf_code_rom;
+static uint8_t *g_ovmf_vars_flash;
 static LoongemuSpinLock g_lapic_lock;
 static LoongemuSpinLock g_ioapic_lock;
 static LoongemuSpinLock g_pic_lock;
@@ -215,7 +234,10 @@ static volatile uint64_t g_ipi_smc_handled;
 
 uint64_t latx_platform_io_read(uint32_t port, int size)
 {
-    (void)size;
+    uint64_t ovmf_val = 0;
+    if (ovmf_board_io_read(&g_ovmf_board, port, size, &ovmf_val)) {
+        return ovmf_val;
+    }
     if (port >= 0x3f8 && port <= 0x3ff) {
         uint32_t reg = port - 0x3f8u;
         switch (reg) {
@@ -289,7 +311,9 @@ uint64_t latx_platform_io_read(uint32_t port, int size)
 
 void latx_platform_io_write(uint32_t port, int size, uint64_t value)
 {
-    (void)size;
+    if (ovmf_board_io_write(&g_ovmf_board, port, size, value)) {
+        return;
+    }
     if (port >= 0x3f8 && port <= 0x3ff) {
         uint32_t reg = port - 0x3f8u;
         uint8_t v = (uint8_t)value;
@@ -458,6 +482,87 @@ static int g_bad_fetch;
  */
 static uint8_t host_page_201000_backup[4096] __attribute__((aligned(4096)));
 
+/* Dynamic real-hardware parameters (default values match QEMU ELF boot). */
+static uint64_t g_guest_ram_hpa = 0ULL;
+static uint64_t g_vmm_image_base = VMM_IMAGE_BASE;
+static uint64_t g_vmm_image_end = 0ULL;
+static uint64_t g_host_timer_hz = UINT64_C(100000000);
+
+static inline void *gpa_to_host_ptr(uint64_t gpa)
+{
+    return (void *)(uintptr_t)(g_guest_ram_hpa + gpa);
+}
+
+static inline uint64_t timer_ticks_1ms(void)
+{
+    uint64_t t = g_host_timer_hz / 1000ULL;
+    return t ? t : 100000ULL;
+}
+
+static inline void loongemu_sync_icache_range(uint64_t addr, uint64_t len)
+{
+    (void)addr;
+    (void)len;
+    __asm__ volatile("dbar 0\n ibar 0" ::: "memory");
+}
+
+/* ---------------- Generic MMIO Registry ---------------- */
+typedef uint64_t (*MmioReadCb)(void *opaque, uint64_t offset, unsigned size);
+typedef void (*MmioWriteCb)(void *opaque, uint64_t offset, uint64_t val, unsigned size);
+
+typedef struct MmioRegion {
+    uint64_t gpa_base;
+    uint64_t size;
+    MmioReadCb read_cb;
+    MmioWriteCb write_cb;
+    void *opaque;
+} MmioRegion;
+
+#define MAX_MMIO_REGIONS 32u
+static MmioRegion g_mmio_regions[MAX_MMIO_REGIONS];
+static uint32_t g_mmio_region_count;
+
+static int mmio_register(uint64_t gpa_base, uint64_t size,
+                         MmioReadCb read_cb, MmioWriteCb write_cb, void *opaque)
+{
+    for (uint32_t i = 0; i < g_mmio_region_count; i++) {
+        if (g_mmio_regions[i].gpa_base == gpa_base && g_mmio_regions[i].size == size) {
+            g_mmio_regions[i].read_cb = read_cb;
+            g_mmio_regions[i].write_cb = write_cb;
+            g_mmio_regions[i].opaque = opaque;
+            return 1;
+        }
+    }
+    if (g_mmio_region_count >= MAX_MMIO_REGIONS) {
+        return 0;
+    }
+    g_mmio_regions[g_mmio_region_count].gpa_base = gpa_base;
+    g_mmio_regions[g_mmio_region_count].size = size;
+    g_mmio_regions[g_mmio_region_count].read_cb = read_cb;
+    g_mmio_regions[g_mmio_region_count].write_cb = write_cb;
+    g_mmio_regions[g_mmio_region_count].opaque = opaque;
+    g_mmio_region_count++;
+    return 1;
+}
+
+static const MmioRegion *mmio_find_region(uint64_t gpa)
+{
+    for (uint32_t i = 0; i < g_mmio_region_count; i++) {
+        uint64_t base = g_mmio_regions[i].gpa_base;
+        if (gpa >= base && (gpa - base) < g_mmio_regions[i].size) {
+            return &g_mmio_regions[i];
+        }
+    }
+    return 0;
+}
+
+static uint64_t lapic_mmio_read_cb(void *opaque, uint64_t off, unsigned size);
+static void lapic_mmio_write_cb(void *opaque, uint64_t off, uint64_t val, unsigned size);
+static uint64_t ioapic_mmio_read_cb(void *opaque, uint64_t off, unsigned size);
+static void ioapic_mmio_write_cb(void *opaque, uint64_t off, uint64_t val, unsigned size);
+uint64_t latx_platform_phys_read(uint64_t pa, int size);
+void latx_platform_phys_write(uint64_t pa, int size, uint64_t value);
+
 static uint64_t vclock_read_host_rdtime(void *opaque)
 {
     uint64_t now;
@@ -468,25 +573,63 @@ static uint64_t vclock_read_host_rdtime(void *opaque)
 
 static void init_phys_mem_and_vclock(void)
 {
-    extern char _end[];
+    extern char _start[], _end[];
+    uint64_t img_start = (uint64_t)(uintptr_t)_start & LAPG_PAGE_MASK;
     uint64_t vmm_end = ((uint64_t)(uintptr_t)_end + LAPG_PAGE_SIZE - 1) & LAPG_PAGE_MASK;
+
+    g_vmm_image_base = img_start ? img_start : VMM_IMAGE_BASE;
+    g_vmm_image_end = vmm_end;
+    g_host_timer_hz = loongemu_host_timer_hz();
+    latx_host_timer_hz = g_host_timer_hz;
 
     loongemu_mem_map_init(&g_mem_map);
     /* Host-protected VMM image, code_cache, env, fast_jmp_cache, kstack */
-    loongemu_mem_map_add(&g_mem_map, VMM_IMAGE_BASE, vmm_end - VMM_IMAGE_BASE,
-                         VMM_IMAGE_BASE, LOONGEMU_MEM_RESERVED, "vmm_reserved");
-    /* Guest RAM [0, 128 MiB) -> 1:1 HPA */
+    loongemu_mem_map_add(&g_mem_map, g_vmm_image_base, g_vmm_image_end - g_vmm_image_base,
+                         g_vmm_image_base, LOONGEMU_MEM_RESERVED, "vmm_reserved");
+    /* Guest RAM [0, 128 MiB) -> g_guest_ram_hpa + GPA */
     loongemu_mem_map_add(&g_mem_map, GUEST_BASE, GUEST_RAM_SIZE,
-                         GUEST_BASE, LOONGEMU_MEM_RAM, "guest_ram");
+                         g_guest_ram_hpa, LOONGEMU_MEM_RAM, "guest_ram");
     /* MMIO windows (trapped, never mapped directly as host RAM) */
     loongemu_mem_map_add(&g_mem_map, LOONGEMU_IOAPIC_GPA, 0x1000ULL,
                          0, LOONGEMU_MEM_MMIO, "ioapic");
     loongemu_mem_map_add(&g_mem_map, APIC_MMIO_BASE, APIC_MMIO_SIZE,
                          0, LOONGEMU_MEM_MMIO, "lapic");
 
+    g_mmio_region_count = 0;
+    mmio_register(LOONGEMU_LAPIC_GPA, 0x1000ULL,
+                  lapic_mmio_read_cb, lapic_mmio_write_cb, 0);
+    mmio_register(LOONGEMU_IOAPIC_GPA, 0x1000ULL,
+                  ioapic_mmio_read_cb, ioapic_mmio_write_cb, 0);
+
+    /* OVMF board peripherals (CMOS/RTC, QEMU fw_cfg+DMA, 4GiB ROM & CFI pflash).
+     * Place ROM/flash backing buffers above g_vmm_image_end so VMM .bss stays isolated. */
+    {
+        uint64_t rom_hpa = (g_vmm_image_end + 0x10000ULL) & LAPG_PAGE_MASK;
+        uint64_t vars_hpa = rom_hpa + LOONGEMU_OVMF_DEFAULT_ROM_SZ;
+        g_ovmf_code_rom = (uint8_t *)(uintptr_t)rom_hpa;
+        g_ovmf_vars_flash = (uint8_t *)(uintptr_t)vars_hpa;
+        memset(g_ovmf_code_rom, 0x90, LOONGEMU_OVMF_DEFAULT_ROM_SZ);
+        memset(g_ovmf_vars_flash, 0xff, LOONGEMU_OVMF_DEFAULT_VARS_SZ);
+        /* Default 16-bit real-mode reset vector at GPA 0xFFFFFFF0 (CS.base=0xFFFF0000, IP=0xFFF0) */
+        static const uint8_t rv16[] = {
+            0xb8, 0x34, 0x12, /* mov ax, 0x1234 */
+            0x8e, 0xd8,       /* mov ds, ax     */
+            0xf4,             /* hlt            */
+        };
+        memcpy(&g_ovmf_code_rom[LOONGEMU_OVMF_DEFAULT_ROM_SZ - 16u], rv16, sizeof(rv16));
+    }
+    ovmf_board_init(&g_ovmf_board, (uint64_t)GUEST_RAM_SIZE, MAX_VCPUS,
+                    latx_platform_phys_read, latx_platform_phys_write);
+    ovmf_board_map_firmware(&g_ovmf_board, &g_mem_map,
+                            g_ovmf_code_rom, LOONGEMU_OVMF_DEFAULT_ROM_SZ,
+                            g_ovmf_vars_flash, LOONGEMU_OVMF_DEFAULT_VARS_SZ);
+    mmio_register(g_ovmf_board.vars_flash.gpa_base, g_ovmf_board.vars_flash.size,
+                  ovmf_pflash_mmio_read, ovmf_pflash_mmio_write,
+                  &g_ovmf_board.vars_flash);
+
     loongemu_vclock_init(&g_vclock, LOONGEMU_VCLOCK_HOST_MONO,
-                         UINT64_C(100000000), UINT64_C(100000000),
-                         UINT64_C(100000000), UINT64_C(62500000),
+                         g_host_timer_hz, g_host_timer_hz,
+                         g_host_timer_hz, UINT64_C(62500000),
                          vclock_read_host_rdtime, 0);
     loongemu_spin_init(&g_uart_lock);
     loongemu_spin_init(&g_lapic_lock);
@@ -592,15 +735,8 @@ int latx_platform_phys_atomic_or_u64(uint64_t pa, uint64_t bits,
 
 uint8_t latx_bare_ldub_code(uint64_t vaddr)
 {
-    /*
-     * No range check here.  This used to count fetches at or above
-     * GUEST_RAM_SIZE as out-of-image, which was true while the only thing
-     * fetched was the flat test image.  Once a kernel runs through its own
-     * page tables every fetch is a negative GVA (0xffffffff8...) and the
-     * check reported a bounds violation on every instruction.  A genuine
-     * out-of-range fetch is caught by the walker, which knows the tables.
-     */
-    return *(volatile uint8_t *)(uintptr_t)vaddr;
+    /* Route flat/unpaged fetches through g_mem_map so RAM and high-4GiB ROM work. */
+    return (uint8_t)latx_platform_phys_read(vaddr, 1);
 }
 
 /* ---------------- translator state ---------------- */
@@ -824,6 +960,7 @@ static uint64_t g_root;
 static volatile int g_probe_touched;
 static volatile uint64_t g_hw_tlb_fills;
 static volatile uint64_t g_hw_guest_pf;
+static volatile uint64_t g_hw_guest_gp;
 static uint64_t resolve_fault_x86_pc(uint64_t fault_pc)
 {
     if (g_current_tb_map != 0 &&
@@ -1440,9 +1577,8 @@ static int is_plv0_helper_entry(uint64_t addr)
      * translated block jump to code that was never a call target.
      */
     {
-        extern char _end[];
-        uint64_t img_start = VMM_IMAGE_BASE;
-        uint64_t img_end = (uint64_t)(uintptr_t)_end;
+        uint64_t img_start = g_vmm_image_base;
+        uint64_t img_end = g_vmm_image_end;
 
         return addr >= img_start && addr < img_end && !is_host_vmm_va(addr);
     }
@@ -1530,16 +1666,47 @@ static int lapic_has_irr(uint32_t cpu)
     return 0;
 }
 
+int cpu_get_apic_tpr(CPUX86State *e)
+{
+    (void)e;
+    return (int)((g_lapic[g_cur_vcpu].tpr >> 4) & 0xfu);
+}
+
+void cpu_set_apic_tpr(CPUX86State *e, uint8_t val)
+{
+    (void)e;
+    g_lapic[g_cur_vcpu].tpr = ((uint32_t)(val & 0xfu)) << 4;
+}
+
+static uint32_t lapic_highest_isr_prio(const LapicState *l)
+{
+    for (int i = 7; i >= 0; i--) {
+        uint32_t bits = l->isr[i];
+        if (bits != 0) {
+            for (int b = 31; b >= 0; b--) {
+                if (bits & (1u << b)) {
+                    uint32_t vec = (uint32_t)(i * 32 + b);
+                    return (vec >> 4) & 0xfu;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 static uint32_t lapic_pop_irr(uint32_t cpu)
 {
     LapicState *l = &g_lapic[cpu];
+    uint32_t tpr_prio = (l->tpr >> 4) & 0xfu;
+    uint32_t isr_prio = lapic_highest_isr_prio(l);
+    uint32_t min_prio = (tpr_prio > isr_prio) ? tpr_prio : isr_prio;
     for (int i = 7; i >= 0; i--) {
         uint32_t bits = l->irr[i];
         if (bits != 0) {
             for (int b = 31; b >= 0; b--) {
                 if (bits & (1u << b)) {
                     uint32_t vec = (uint32_t)(i * 32 + b);
-                    if (vec < 0x20u) {
+                    if (vec < 0x20u || ((vec >> 4) & 0xfu) <= min_prio) {
                         return 0;
                     }
                     l->irr[i] &= ~(1u << b);
@@ -1550,6 +1717,61 @@ static uint32_t lapic_pop_irr(uint32_t cpu)
         }
     }
     return 0;
+}
+
+/* Generic IOAPIC GSI interrupt assertion (shared by COM1 and all devices). */
+static int ioapic_assert_irq(uint32_t gsi)
+{
+    uint64_t red;
+    uint32_t vec, dest, dest_mode;
+    uint32_t self_pcpu = cur_pcpu();
+    int injected = 0;
+
+    if (gsi >= 24u) {
+        return 0;
+    }
+    loongemu_spin_lock(&g_ioapic_lock);
+    red = g_ioapic_redtbl[gsi];
+    loongemu_spin_unlock(&g_ioapic_lock);
+
+    if ((red & (1ULL << 16)) != 0 || (red & 0xffu) < 0x20u) {
+        if (gsi < 8u && (g_pic_imr[0] & (1u << gsi)) == 0) {
+            loongemu_spin_lock(&g_lapic_lock);
+            lapic_set_irr(0, g_pic_irq0_vec + gsi);
+            g_vcpu_halted[0] = 0;
+            loongemu_spin_unlock(&g_lapic_lock);
+            return 1;
+        }
+        return 0;
+    }
+
+    vec = (uint32_t)(red & 0xffu);
+    dest = (uint32_t)((red >> 56) & 0xffu);
+    dest_mode = (uint32_t)((red >> 11) & 1u);
+
+    loongemu_spin_lock(&g_lapic_lock);
+    for (uint32_t c = 0; c < MAX_VCPUS; c++) {
+        int match = 0;
+        if (dest_mode == 0u) {
+            match = (dest == 0xffu) ? (c == 0) : (c == dest);
+        } else {
+            uint32_t ldr_id = (g_lapic[c].ldr >> 24) & 0xffu;
+            if (ldr_id == 0u) {
+                ldr_id = (1u << c);
+            }
+            match = ((ldr_id & dest) != 0u);
+        }
+        if (match) {
+            lapic_set_irr(c, vec);
+            g_vcpu_halted[c] = 0;
+            injected = 1;
+            if (c != self_pcpu && __atomic_load_n(&g_pcpu_online[c], __ATOMIC_ACQUIRE)) {
+                loongemu_ipi_send(c, 0u);
+            }
+        }
+    }
+    loongemu_spin_unlock(&g_lapic_lock);
+    return injected;
 }
 
 static void lapic_eoi(uint32_t cpu)
@@ -1744,15 +1966,211 @@ static void ioapic_mmio_write(uint32_t off, uint32_t val)
     loongemu_spin_unlock(&g_ioapic_lock);
 }
 
+static uint64_t lapic_mmio_read_cb(void *opaque, uint64_t off, unsigned size)
+{
+    (void)opaque;
+    (void)size;
+    return lapic_mmio_read((uint32_t)off);
+}
+
+static void lapic_mmio_write_cb(void *opaque, uint64_t off, uint64_t val, unsigned size)
+{
+    (void)opaque;
+    (void)size;
+    lapic_mmio_write((uint32_t)off, (uint32_t)val);
+}
+
+static uint64_t ioapic_mmio_read_cb(void *opaque, uint64_t off, unsigned size)
+{
+    (void)opaque;
+    (void)size;
+    return ioapic_mmio_read((uint32_t)off);
+}
+
+static void ioapic_mmio_write_cb(void *opaque, uint64_t off, uint64_t val, unsigned size)
+{
+    (void)opaque;
+    (void)size;
+    ioapic_mmio_write((uint32_t)off, (uint32_t)val);
+}
+
+/* ---------------- KVM PV MSRs, Hyper-V MSRs & Hypercalls ---------------- */
+static uint64_t g_kvm_sys_time_msr[MAX_VCPUS];
+static uint64_t g_kvm_wall_clock_msr;
+static uint64_t g_kvm_pv_eoi_msr[MAX_VCPUS];
+static uint32_t g_kvm_pvclock_ver[MAX_VCPUS];
+static uint64_t g_hv_guest_os_id;
+static uint64_t g_hv_hypercall_msr;
+static uint64_t g_hv_apic_assist[MAX_VCPUS];
+
+static void kvm_update_pvclock(uint32_t cpu, uint64_t gpa)
+{
+    uint64_t hz = g_host_timer_hz ? g_host_timer_hz : UINT64_C(100000000);
+    uint64_t tsc = vclock_read_host_rdtime(0);
+    uint64_t sys_ns = loongemu_vclock_now_ns(&g_vclock);
+    int8_t shift = 0;
+    __uint128_t num = (__uint128_t)1000000000ULL << 32;
+    uint64_t denom = hz;
+    uint32_t mul;
+
+    while ((num / denom) > UINT64_C(0xffffffff) && shift < 31) {
+        denom <<= 1;
+        shift++;
+    }
+    while ((num / denom) < UINT64_C(0x80000000) && shift > -31 && (denom & 1u) == 0u) {
+        denom >>= 1;
+        shift--;
+    }
+    mul = (uint32_t)(num / denom);
+
+    g_kvm_pvclock_ver[cpu] += 2u;
+    uint32_t ver = g_kvm_pvclock_ver[cpu];
+    latx_platform_phys_write(gpa + 0u, 4, ver - 1u);
+    latx_platform_phys_write(gpa + 8u, 8, tsc);
+    latx_platform_phys_write(gpa + 16u, 8, sys_ns);
+    latx_platform_phys_write(gpa + 24u, 4, mul);
+    latx_platform_phys_write(gpa + 28u, 1, (uint8_t)shift);
+    latx_platform_phys_write(gpa + 29u, 1, 1u); /* PVCLOCK_TSC_STABLE_BIT */
+    latx_platform_phys_write(gpa + 30u, 2, 0u);
+    __asm__ volatile("dbar 0" ::: "memory");
+    latx_platform_phys_write(gpa + 0u, 4, ver);
+}
+
+void latx_platform_kvm_wrmsr(CPUX86State *e, uint32_t msr, uint64_t val)
+{
+    uint32_t cpu = g_cur_vcpu;
+    (void)e;
+    switch (msr) {
+    case 0x4b564d00u: /* MSR_KVM_WALL_CLOCK_NEW */
+        g_kvm_wall_clock_msr = val;
+        if (val != 0) {
+            latx_platform_phys_write(val + 0u, 4, 2u);
+            latx_platform_phys_write(val + 4u, 4, 1700000000u);
+            latx_platform_phys_write(val + 8u, 4, 0u);
+        }
+        break;
+    case 0x4b564d01u: /* MSR_KVM_SYSTEM_TIME_NEW */
+        g_kvm_sys_time_msr[cpu] = val;
+        if ((val & 1u) != 0) {
+            kvm_update_pvclock(cpu, val & ~UINT64_C(1));
+        }
+        break;
+    case 0x4b564d04u: /* MSR_KVM_PV_EOI_EN */
+        g_kvm_pv_eoi_msr[cpu] = val;
+        if ((val & 1u) != 0) {
+            latx_platform_phys_write(val & ~UINT64_C(1), 4, 0u);
+        }
+        break;
+    case 0x40000000u: /* HV_X64_MSR_GUEST_OS_ID */
+        g_hv_guest_os_id = val;
+        break;
+    case 0x40000001u: /* HV_X64_MSR_HYPERCALL */
+        g_hv_hypercall_msr = val;
+        break;
+    case 0x40000073u: /* HV_X64_MSR_APIC_ASSIST_PAGE */
+        g_hv_apic_assist[cpu] = val;
+        break;
+    default:
+        break;
+    }
+}
+
+int latx_platform_kvm_rdmsr(CPUX86State *e, uint32_t msr, uint64_t *val)
+{
+    uint32_t cpu = g_cur_vcpu;
+    (void)e;
+    switch (msr) {
+    case 0x4b564d00u:
+        *val = g_kvm_wall_clock_msr;
+        return 1;
+    case 0x4b564d01u:
+        *val = g_kvm_sys_time_msr[cpu];
+        return 1;
+    case 0x4b564d04u:
+        *val = g_kvm_pv_eoi_msr[cpu];
+        return 1;
+    case 0x40000000u:
+        *val = g_hv_guest_os_id;
+        return 1;
+    case 0x40000001u:
+        *val = g_hv_hypercall_msr;
+        return 1;
+    case 0x40000002u: /* HV_X64_MSR_VP_INDEX */
+        *val = (uint64_t)cpu;
+        return 1;
+    case 0x40000020u: /* HV_X64_MSR_TIME_REF_COUNT (100ns units) */
+        *val = loongemu_vclock_now_ns(&g_vclock) / 100ULL;
+        return 1;
+    case 0x40000073u: /* HV_X64_MSR_APIC_ASSIST_PAGE */
+        *val = g_hv_apic_assist[cpu];
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+void helper_hypercall(CPUX86State *e)
+{
+    uint64_t nr = e->regs[R_EAX];
+    uint64_t a0 = e->regs[R_EBX];
+    uint64_t a1 = e->regs[R_ECX];
+    uint64_t a2 = e->regs[R_EDX];
+    uint64_t a3 = e->regs[R_ESI];
+    uint32_t self_pcpu = cur_pcpu();
+
+    if (nr == 5u) { /* KVM_HC_KICK_CPU(flags, apic_id) */
+        uint32_t target = (uint32_t)a1;
+        if (target < MAX_VCPUS) {
+            g_vcpu_halted[target] = 0;
+            if (target != self_pcpu && __atomic_load_n(&g_pcpu_online[target], __ATOMIC_ACQUIRE)) {
+                loongemu_ipi_send(target, 0u);
+            }
+        }
+        e->regs[R_EAX] = 0;
+        return;
+    }
+    if (nr == 10u) { /* KVM_HC_SEND_IPI(lo_mask, hi_mask, min_apic, icr) */
+        uint32_t min_apic = (uint32_t)a2;
+        uint32_t icr = (uint32_t)a3;
+        uint32_t vec = icr & 0xffu;
+        uint32_t deliv = (icr >> 8) & 7u;
+        loongemu_spin_lock(&g_lapic_lock);
+        for (uint32_t b = 0; b < 64u && (min_apic + b) < MAX_VCPUS; b++) {
+            if ((a0 & (UINT64_C(1) << b)) == 0) {
+                continue;
+            }
+            uint32_t t = min_apic + b;
+            if (deliv == 4u) {
+                g_vcpu_nmi_pending[t] = 1;
+            } else {
+                lapic_set_irr(t, vec);
+            }
+            g_vcpu_halted[t] = 0;
+            if (t != self_pcpu && __atomic_load_n(&g_pcpu_online[t], __ATOMIC_ACQUIRE)) {
+                loongemu_ipi_send(t, 0u);
+            }
+        }
+        loongemu_spin_unlock(&g_lapic_lock);
+        e->regs[R_EAX] = 0;
+        return;
+    }
+    e->regs[R_EAX] = (uint64_t)(int64_t)-1000; /* -KVM_ENOSYS */
+}
+
 static int emulate_mmio_insn(uint64_t fault_pc, uint64_t gpa,
                              uint64_t *regs, int is_refill)
 {
+    const MmioRegion *reg = mmio_find_region(gpa);
     uint32_t insn = *(volatile uint32_t *)(uintptr_t)fault_pc;
     uint32_t major = (insn >> 26) & 0x3fu;
     uint32_t rd = insn & 0x1fu;
     int is_store = 0;
     int is_signed = 0;
     int size = 4;
+
+    if (reg == 0) {
+        return 0;
+    }
 
     if (major == 0x0au) {
         uint32_t op8 = (insn >> 24) & 0xffu;
@@ -1793,23 +2211,14 @@ static int emulate_mmio_insn(uint64_t fault_pc, uint64_t gpa,
         return 0;
     }
 
-    uint64_t gpa_page = gpa & LAPG_PAGE_MASK;
-    uint32_t off = (uint32_t)(gpa & 0xfffu);
+    uint64_t off = gpa - reg->gpa_base;
 
     if (is_store) {
-        uint32_t val = (uint32_t)regs[rd];
-        if (gpa_page == LOONGEMU_LAPIC_GPA) {
-            lapic_mmio_write(off, val);
-        } else if (gpa_page == LOONGEMU_IOAPIC_GPA) {
-            ioapic_mmio_write(off, val);
+        if (reg->write_cb != 0) {
+            reg->write_cb(reg->opaque, off, regs[rd], (unsigned)size);
         }
     } else {
-        uint64_t val = 0;
-        if (gpa_page == LOONGEMU_LAPIC_GPA) {
-            val = lapic_mmio_read(off);
-        } else if (gpa_page == LOONGEMU_IOAPIC_GPA) {
-            val = ioapic_mmio_read(off);
-        }
+        uint64_t val = reg->read_cb ? reg->read_cb(reg->opaque, off, (unsigned)size) : 0;
         if (rd != 0) {
             if (size == 1) {
                 val = is_signed ? (uint64_t)(int64_t)(int8_t)val : (val & 0xffu);
@@ -2496,6 +2905,20 @@ static void try_link_tb_slot(uint32_t from_slot, uint32_t to_slot)
     }
 }
 
+static inline uint64_t current_tb_cs_base(void)
+{
+    return (env.sys.codemode != LATX_DT_X64) ? env.segs[R_CS].base : 0ULL;
+}
+
+static inline uint8_t current_tb_mode_flags(void)
+{
+    uint8_t f = (uint8_t)(env.sys.codemode & 3u);
+    if (env.cr[0] & CR0_PE_MASK) f |= (1u << 2);
+    if (env.hflags & HF_CS32_MASK) f |= (1u << 3);
+    if (env.hflags & HF_CS64_MASK) f |= (1u << 4);
+    return f;
+}
+
 static void link_new_tb(uint32_t new_slot)
 {
     TbCacheEntry *e = &tb_entries[new_slot];
@@ -2504,8 +2927,8 @@ static void link_new_tb(uint32_t new_slot)
     /* 1. Outgoing edges from this newly translated TB to existing TBs. */
     for (int i = 0; i < 2; i++) {
         if (map->jmp_slot_off[i] >= 0) {
-            TbCacheEntry *dst = tbc_lookup(&tb_cache, map->jmp_target_pc[i],
-                                           0, e->cr3, e->cpl);
+            TbCacheEntry *dst = tbc_lookup_mode(&tb_cache, map->jmp_target_pc[i],
+                                                e->cs_base, e->cr3, e->cpl, e->mode_flags);
             if (dst != 0) {
                 try_link_tb_slot(new_slot, (uint32_t)(dst - tb_entries));
             }
@@ -2638,7 +3061,7 @@ static void run_ap_vcpu_loop(uint32_t pcpu)
     asid_activate(1);
     g_plv3_timer_preempt = 1;
     timer_ack();
-    timer_start(100000);
+    timer_start(timer_ticks_1ms());
 
     for (;;) {
         if (cur_shard->tlb_shootdown_pending) {
@@ -2653,19 +3076,22 @@ static void run_ap_vcpu_loop(uint32_t pcpu)
             smc_flush_local_shard(&prev_slot);
         }
         uint64_t before = env.eip;
+        uint64_t tb_cs_base = current_tb_cs_base();
+        uint8_t tb_mode = current_tb_mode_flags();
+        uint64_t fetch_lin = tb_cs_base + before;
         uint8_t cpl = (uint8_t)(env.hflags & HF_CPL_MASK);
-        uint64_t tb_cr3 = (cpl == 0 && (before >> 63) != 0) ? 0 : env.cr[3];
-        TbCacheEntry *e = tbc_lookup(&tb_cache, before, 0, tb_cr3, cpl);
+        uint64_t tb_cr3 = (cpl == 0 && (fetch_lin >> 63) != 0) ? 0 : env.cr[3];
+        TbCacheEntry *e = tbc_lookup_mode(&tb_cache, before, tb_cs_base, tb_cr3, cpl, tb_mode);
         uint32_t slot_idx;
 
         if (e == 0) {
             uint32_t fetch_acc = LATX_X86_ACCESS_EXEC |
                                  (cpl ? LATX_X86_ACCESS_USER : 0);
             LatxX86Translation tr_fetch;
-            LatxX86WalkResult fr = latx_x86_walk(&env, before, fetch_acc, &tr_fetch);
+            LatxX86WalkResult fr = latx_x86_walk(&env, fetch_lin, fetch_acc, &tr_fetch);
             if (fr != LATX_X86_WALK_OK && fr != LATX_X86_WALK_PAGING_OFF) {
-                latx_x86_tlb_flush_page(before);
-                env.cr[2] = before;
+                latx_x86_tlb_flush_page(fetch_lin);
+                env.cr[2] = fetch_lin;
                 env.exception_index = EXCP0E_PAGE;
                 env.error_code = (int)(tr_fetch.fault_error_code
                                            ? tr_fetch.fault_error_code
@@ -2688,7 +3114,7 @@ static void run_ap_vcpu_loop(uint32_t pcpu)
                 code_used = 0x2000;
                 __asm__ volatile("ibar 0" ::: "memory");
             }
-            e = tbc_insert(&tb_cache, before, 0, tb_cr3, cpl);
+            e = tbc_insert_mode(&tb_cache, before, tb_cs_base, tb_cr3, cpl, tb_mode);
             if (e == 0) {
                 tbc_flush_all(&tb_cache);
                 g_tb_highwater = 0;
@@ -2696,7 +3122,7 @@ static void run_ap_vcpu_loop(uint32_t pcpu)
                 prev_slot = -1;
                 memset(fast_jmp_cache, 0, sizeof(g_fast_jmp_cache[0]));
                 code_used = 0x2000;
-                e = tbc_insert(&tb_cache, before, 0, tb_cr3, cpl);
+                e = tbc_insert_mode(&tb_cache, before, tb_cs_base, tb_cr3, cpl, tb_mode);
             }
             slot_idx = (uint32_t)(e - tb_entries);
             if (slot_idx + 1 > g_tb_highwater) {
@@ -2740,8 +3166,8 @@ static void run_ap_vcpu_loop(uint32_t pcpu)
                     }
                 }
                 tb_code_len[slot_idx] = clen;
-                tb_code_hash[slot_idx] = hash_guest_code(before, clen);
-                mark_code_pages_ro(slot_idx, before, clen);
+                tb_code_hash[slot_idx] = hash_guest_code(fetch_lin, clen);
+                mark_code_pages_ro(slot_idx, fetch_lin, clen);
             }
             code_used += (((uint64_t)rc + 255) & ~UINT64_C(255));
             __asm__ volatile("ibar 0" ::: "memory");
@@ -2750,7 +3176,9 @@ static void run_ap_vcpu_loop(uint32_t pcpu)
 
         slot_idx = (uint32_t)(e - tb_entries);
         if (prev_slot >= 0 && tb_entries[prev_slot].cr3 == tb_cr3 &&
-            tb_entries[prev_slot].cpl == cpl) {
+            tb_entries[prev_slot].cpl == cpl &&
+            tb_entries[prev_slot].cs_base == tb_cs_base &&
+            tb_entries[prev_slot].mode_flags == tb_mode) {
             try_link_tb_slot((uint32_t)prev_slot, slot_idx);
         }
         {
@@ -2813,7 +3241,7 @@ static void run_ap_vcpu_loop(uint32_t pcpu)
                 if (deliver_kernel_timer_tick(irq_rip)) {
                     g_timer_irq_pending[pcpu] = 0;
                     g_vcpu_halted[pcpu] = 0;
-                    timer_start(100000);
+                    timer_start(timer_ticks_1ms());
                     prev_slot = -1;
                     continue;
                 }
@@ -2839,7 +3267,7 @@ static void run_ap_vcpu_loop(uint32_t pcpu)
                     if (deliver_kernel_timer_tick(env.eip + 1)) {
                         g_timer_irq_pending[pcpu] = 0;
                         timer_ack();
-                        timer_start(100000);
+                        timer_start(timer_ticks_1ms());
                         g_vcpu_halted[pcpu] = 0;
                         prev_slot = -1;
                     }
@@ -3009,7 +3437,7 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
     g_vcpu_preempt_needed = 0;
     g_plv3_timer_preempt = 1;
     timer_ack();
-    timer_start(100000);
+    timer_start(timer_ticks_1ms());
 
     while (ran < max_blocks) {
         for (uint32_t t = 1; t < MAX_VCPUS; t++) {
@@ -3028,15 +3456,18 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
             }
         }
         uint64_t before = env.eip;
+        uint64_t tb_cs_base = current_tb_cs_base();
+        uint8_t tb_mode = current_tb_mode_flags();
+        uint64_t fetch_lin = tb_cs_base + before;
         uint8_t cpl = (uint8_t)(env.hflags & HF_CPL_MASK);
-        uint64_t tb_cr3 = (cpl == 0 && (before >> 63) != 0) ? 0 : env.cr[3];
+        uint64_t tb_cr3 = (cpl == 0 && (fetch_lin >> 63) != 0) ? 0 : env.cr[3];
         TbCacheEntry *e;
         uint32_t slot_idx;
 
         g_recent_pcs[g_recent_count & 15] = before;
         g_recent_count++;
 
-        e = tbc_lookup(&tb_cache, before, 0, tb_cr3, cpl);
+        e = tbc_lookup_mode(&tb_cache, before, tb_cs_base, tb_cr3, cpl, tb_mode);
         if (e != 0) {
             g_run_tb_hits++;
         } else {
@@ -3045,11 +3476,11 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
             uint32_t fetch_acc = LATX_X86_ACCESS_EXEC |
                                  (cpl ? LATX_X86_ACCESS_USER : 0);
             LatxX86Translation tr_fetch;
-            LatxX86WalkResult fr = latx_x86_walk(&env, before, fetch_acc,
+            LatxX86WalkResult fr = latx_x86_walk(&env, fetch_lin, fetch_acc,
                                                  &tr_fetch);
             if (fr != LATX_X86_WALK_OK && fr != LATX_X86_WALK_PAGING_OFF) {
-                latx_x86_tlb_flush_page(before);
-                env.cr[2] = before;
+                latx_x86_tlb_flush_page(fetch_lin);
+                env.cr[2] = fetch_lin;
                 env.exception_index = EXCP0E_PAGE;
                 env.error_code = (int)(tr_fetch.fault_error_code
                                            ? tr_fetch.fault_error_code
@@ -3081,7 +3512,7 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
                 g_run_tb_flushes++;
                 __asm__ volatile("ibar 0" ::: "memory");
             }
-            e = tbc_insert(&tb_cache, before, 0, tb_cr3, cpl);
+            e = tbc_insert_mode(&tb_cache, before, tb_cs_base, tb_cr3, cpl, tb_mode);
             if (e == 0) {
                 tbc_flush_all(&tb_cache);
                 g_tb_highwater = 0;
@@ -3095,7 +3526,7 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
                 code_used = 0x2000;
                 g_run_tb_flushes++;
                 __asm__ volatile("ibar 0" ::: "memory");
-                e = tbc_insert(&tb_cache, before, 0, tb_cr3, cpl);
+                e = tbc_insert_mode(&tb_cache, before, tb_cs_base, tb_cr3, cpl, tb_mode);
             }
             if (e == 0) {
                 g_run_blocks_exit = RUN_EXIT_TRANSLATE_FAIL;
@@ -3155,8 +3586,8 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
                     }
                 }
                 tb_code_len[slot_idx] = clen;
-                tb_code_hash[slot_idx] = hash_guest_code(before, clen);
-                mark_code_pages_ro(slot_idx, before, clen);
+                tb_code_hash[slot_idx] = hash_guest_code(fetch_lin, clen);
+                mark_code_pages_ro(slot_idx, fetch_lin, clen);
             }
             code_used += (((uint64_t)rc + 255) & ~UINT64_C(255));
             __asm__ volatile("ibar 0" ::: "memory");
@@ -3165,7 +3596,9 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
 
         slot_idx = (uint32_t)(e - tb_entries);
         if (prev_slot >= 0 && tb_entries[prev_slot].cr3 == tb_cr3 &&
-            tb_entries[prev_slot].cpl == cpl) {
+            tb_entries[prev_slot].cpl == cpl &&
+            tb_entries[prev_slot].cs_base == tb_cs_base &&
+            tb_entries[prev_slot].mode_flags == tb_mode) {
             try_link_tb_slot((uint32_t)prev_slot, slot_idx);
         }
 
@@ -3336,7 +3769,7 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
                 if (deliver_kernel_timer_tick(irq_rip)) {
                     g_timer_irq_pending[g_cur_vcpu] = 0;
                     g_vcpu_halted[g_cur_vcpu] = 0;
-                    timer_start(100000);
+                    timer_start(timer_ticks_1ms());
                     stuck = 0;
                     prev_slot = -1;
                     continue;
@@ -3371,7 +3804,7 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
                 if (deliver_kernel_timer_tick(env.eip + 1)) {
                     g_timer_irq_pending[g_cur_vcpu] = 0;
                     timer_ack();
-                    timer_start(100000);
+                    timer_start(timer_ticks_1ms());
                     g_vcpu_halted[g_cur_vcpu] = 0;
                     stuck = 0;
                     prev_slot = -1;
@@ -3770,8 +4203,9 @@ static int deliver_x86_exception(uint32_t vec, uint64_t push_rip,
 
 void latx_platform_cpu_loop_exit(CPUState *cs)
 {
-    int vec = (cs != 0 && cs->exception_index > 0) ? cs->exception_index
-                                                   : env.exception_index;
+    CPUState *eff_cs = (cs != 0) ? cs : env_cpu(cur_env);
+    int vec = (eff_cs != 0 && eff_cs->exception_index >= 0) ? eff_cs->exception_index
+                                                            : env.exception_index;
     int is_int = env.exception_is_int;
     uint32_t err = (uint32_t)env.error_code;
     uint64_t fault_rip = resolve_fault_x86_pc(g_active_helper_ra);
@@ -3782,8 +4216,8 @@ void latx_platform_cpu_loop_exit(CPUState *cs)
     uint64_t tlbrera = csrrd(0x8a);
     int is_refill = (int)(tlbrera & 1u);
 
-    if (cs != 0) {
-        cs->exception_index = -1;
+    if (eff_cs != 0) {
+        eff_cs->exception_index = -1;
     }
     env.exception_index = -1;
     env.exception_is_int = 0;
@@ -4103,9 +4537,7 @@ void tb_sys_handle_trap(uint64_t *regs)
 
             if (x86_r == LATX_X86_WALK_OK ||
                 x86_r == LATX_X86_WALK_PAGING_OFF) {
-                uint64_t gpa_page = x86_tr.gpa & LAPG_PAGE_MASK;
-                if ((gpa_page == LOONGEMU_LAPIC_GPA ||
-                     gpa_page == LOONGEMU_IOAPIC_GPA) &&
+                if (mmio_find_region(x86_tr.gpa) != 0 &&
                     emulate_mmio_insn(fault_pc, x86_tr.gpa, regs, is_refill)) {
                     return;
                 }
@@ -4169,7 +4601,36 @@ void tb_sys_handle_trap(uint64_t *regs)
     }
 
     /*
-     * 4. Unhandled PLV3 trap (e.g. EXC_ADE=0x8, EXC_ALE=0x9, EXC_SYS=0xb,
+     * 3d. Non-canonical guest address / address error (EXC_ADE = 0x8):
+     *     On x86-64, accessing a non-canonical address raises #GP(0).
+     */
+    if (!is_refill && ecode == EXC_ADE) {
+        g_hw_guest_gp++;
+        sync_trap_regs_to_env(regs);
+        env.eip = resolve_fault_x86_pc(fault_pc);
+        g_plv3_exit.ecode = ecode;
+        g_plv3_exit.esubcode = (estat >> 22) & 0x1ffu;
+        g_plv3_exit.is_refill = 0;
+        g_plv3_exit.era = fault_pc;
+        g_plv3_exit.badv = badv;
+        if (deliver_x86_exception(13u, env.eip, 0u, 1)) {
+            g_plv3_exit.reason = PLV3_EXIT_GUEST_PF;
+            g_plv3_exit.guest_rip = env.eip;
+            sync_env_to_trap_regs(regs);
+        } else {
+            g_plv3_exit.reason = PLV3_EXIT_TRAP;
+            g_plv3_exit.guest_rip = env.eip;
+        }
+        {
+            uint64_t prmd = csrrd(0x1) & ~UINT64_C(0x7);
+            csrwr(0x1, prmd);
+            csrwr(0x6, (uint64_t)(uintptr_t)tb_sys_abort_plv0);
+        }
+        return;
+    }
+
+    /*
+     * 4. Unhandled PLV3 trap (e.g. EXC_ALE=0x9, EXC_SYS=0xb,
      *    EXC_BRK=0xc, EXC_GSPR=0xe outside tb_sys_plv3_done): record full
      *    diagnostic state and unwind cleanly to tb_sys_abort_plv0 so the PLV0
      *    caller can inspect g_plv3_exit instead of spinning.
@@ -4565,6 +5026,26 @@ void kmain(void)
             check(phys == 40 && virt == 48,
                   "CPUID.80000008 address widths are 40/48");
         }
+
+        /* Verify Hypervisor / RDRAND / RDSEED / Nehalem-or-Skylake CPUID leaves. */
+        cpu_x86_cpuid(&env, 0x0, 0, &a, &b, &c, &d);
+        check(latx_cpu_has_lasx() ? (a == 0x16u || a == 0x0du) : (a == 0x08u),
+              "CPUID.0 max leaf matches LSX(Nehalem 0x08)/LASX(Skylake 0x16)");
+        cpu_x86_cpuid(&env, 0x1, 0, &a, &b, &c, &d);
+        check((c & (1u << 31)) != 0, "CPUID.1:ECX[31] HYPERVISOR set");
+        check((c & (1u << 30)) != 0, "CPUID.1:ECX[30] RDRAND set");
+        cpu_x86_cpuid(&env, 0x7, 0, &a, &b, &c, &d);
+        check((b & (1u << 18)) != 0, "CPUID.7:EBX[18] RDSEED set");
+        cpu_x86_cpuid(&env, 0x40000000u, 0, &a, &b, &c, &d);
+        check(a == 0x40000010u && b == 0x4b4d564bu && c == 0x564b4d56u && d == 0x4du,
+              "CPUID.40000000 advertises KVMKVMKVM with max leaf 0x40000010");
+        cpu_x86_cpuid(&env, 0x40000001u, 0, &a, &b, &c, &d);
+        check((a & ((1u << 1) | (1u << 3) | (1u << 6) | (1u << 7) | (1u << 11) | (1u << 24))) ==
+              ((1u << 1) | (1u << 3) | (1u << 6) | (1u << 7) | (1u << 11) | (1u << 24)),
+              "CPUID.40000001 advertises KVM PV clock/EOI/unhalt/IPI");
+        cpu_x86_cpuid(&env, 0x40000010u, 0, &a, &b, &c, &d);
+        check(a == (uint32_t)(g_host_timer_hz / 1000ULL),
+              "CPUID.40000010 TSC kHz matches dynamic cpucfg rdtime freq");
     }
 
     /*
@@ -4642,11 +5123,13 @@ void kmain(void)
 
 
 
-        e = tbc_lookup(&tb_cache, pc, 0,
-                       env.cr[3], (uint8_t)(hflags & HF_CPL_MASK));
+        e = tbc_lookup_mode(&tb_cache, pc, current_tb_cs_base(),
+                            env.cr[3], (uint8_t)(hflags & HF_CPL_MASK),
+                            current_tb_mode_flags());
         if (e == 0) {
-            e = tbc_insert(&tb_cache, pc, 0, env.cr[3],
-                           (uint8_t)(hflags & HF_CPL_MASK));
+            e = tbc_insert_mode(&tb_cache, pc, current_tb_cs_base(), env.cr[3],
+                                (uint8_t)(hflags & HF_CPL_MASK),
+                                current_tb_mode_flags());
             if (e == 0) {
                 check(0, "tb cache full");
                 break;
@@ -5667,10 +6150,312 @@ void kmain(void)
                     uint32_t cmd_ptr = (uint32_t)cmdline_gpa;
 
                     latx_guest_nr_cpus = MAX_VCPUS;
-                    loongemu_acpi_build((uint8_t *)(uintptr_t)GUEST_BASE,
+                    loongemu_acpi_build((uint8_t *)gpa_to_host_ptr(GUEST_BASE),
                                         LOONGEMU_ACPI_RSDP_GPA,
                                         LOONGEMU_ACPI_TABLES_GPA,
                                         MAX_VCPUS, &acpi_info);
+                    {
+                        LoongemuSmbiosInfo smbios_info;
+                        LoongemuPlatformIdentity ident;
+                        loongemu_identity_default(&ident, 0);
+                        int sm_ok = loongemu_smbios_build(
+                            (uint8_t *)gpa_to_host_ptr(GUEST_BASE),
+                            LOONGEMU_SMBIOS_EP_GPA,
+                            LOONGEMU_SMBIOS_TABLE_GPA,
+                            MAX_VCPUS, (uint64_t)GUEST_RAM_SIZE,
+                            (uint32_t)(g_host_timer_hz / 1000000ULL),
+                            &smbios_info);
+                        check(sm_ok == 1 && smbios_info.table_length > 100u,
+                              "SMBIOS 3.0 tables built in guest RAM");
+                        check(ident.override_pci_ids == 0 && ident.nic_mac[0] == 0x00u,
+                              "platform identity defaults: Linux PCI untouched, non-virt OUI");
+                    }
+                    /* Verify IOAPIC generic GSI injection, APIC TPR/ISRV, KVM PV & RDRAND/RDSEED. */
+                    {
+                        lapic_reset_all();
+                        ioapic_reset();
+                        g_ioapic_redtbl[5] = 0x45ULL; /* unmasked, vec 0x45, dest CPU 0 */
+                        check(ioapic_assert_irq(5u) == 1, "ioapic_assert_irq injects GSI 5");
+                        cpu_set_apic_tpr(&env, 0x5u); /* TPR=0x50 masks vec 0x45 */
+                        check(lapic_pop_irr(0) == 0u, "APIC TPR (CR8=5) masks vector 0x45");
+                        cpu_set_apic_tpr(&env, 0x3u); /* TPR=0x30 allows vec 0x45 */
+                        check(lapic_pop_irr(0) == 0x45u, "APIC TPR (CR8=3) unmasks vector 0x45");
+                        lapic_set_irr(0, 0x42u); /* same prio class 4 blocked by ISRV=0x45 */
+                        check(lapic_pop_irr(0) == 0u, "APIC ISRV blocks equal/lower prio vector");
+                        lapic_eoi(0);
+                        check(lapic_pop_irr(0) == 0x42u, "APIC EOI unblocks queued vector 0x42");
+                        lapic_eoi(0);
+                        cpu_set_apic_tpr(&env, 0u);
+
+                        uint64_t hv_t0 = 0, hv_t1 = 0;
+                        latx_platform_kvm_wrmsr(&env, 0x4b564d01u, 0x00018001ULL);
+                        check((latx_platform_phys_read(0x00018000ULL, 4) & 1u) == 0u &&
+                              latx_platform_phys_read(0x00018000ULL + 24u, 4) != 0u,
+                              "KVM pvclock MSR populated valid time_info");
+                        check(latx_platform_kvm_rdmsr(&env, 0x40000020u, &hv_t0) == 1 &&
+                              latx_platform_kvm_rdmsr(&env, 0x40000020u, &hv_t1) == 1 &&
+                              hv_t1 >= hv_t0,
+                              "HV_X64_MSR_TIME_REF_COUNT monotonic");
+
+                        static const uint8_t rng_x86[] = {
+                            0x48, 0x0f, 0xc7, 0xf0, /* rdrand rax */
+                            0x48, 0x0f, 0xc7, 0xfb, /* rdseed rbx */
+                            0xf4,                   /* hlt        */
+                        };
+                        uint64_t rng_pc = 0x0000e800ULL;
+                        uint8_t *rng_code = code_cache + 0x12000;
+                        memcpy(gpa_to_host_ptr(rng_pc), rng_x86, sizeof(rng_x86));
+                        uint64_t saved_eip_r = env.eip;
+                        uint64_t saved_cr0_r = env.cr[0];
+                        env.cr[0] &= ~(uint64_t)CR0_PG_MASK;
+                        latx_x86_tlb_flush_all();
+                        int rc_rng = tb_harness_translate_at(rng_pc, rng_code, 4096);
+                        check(rc_rng > 0, "RDRAND/RDSEED block translates");
+                        if (rc_rng > 0) {
+                            loongemu_sync_icache_range((uint64_t)(uintptr_t)rng_code, (uint64_t)rc_rng);
+                            env.eip = rng_pc;
+                            env.regs[R_EAX] = 0;
+                            env.regs[R_EBX] = 0;
+                            env.eflags = 0x2;
+                            tb_sys_run_plv3((void *)(uintptr_t)pro_buf, rng_code, &env);
+                            check(env.regs[R_EAX] != 0 && env.regs[R_EBX] != 0 &&
+                                  env.regs[R_EAX] != env.regs[R_EBX] &&
+                                  (env.eflags & 1u) != 0u,
+                                  "RDRAND/RDSEED execute at PLV3 with CF=1 and distinct outputs");
+                        }
+
+                        /* Verify XGETBV / XSETBV + CR4.OSXSAVE CPUID linkage at PLV3. */
+                        if (latx_cpu_has_lasx()) {
+                            static const uint8_t xbv_x86[] = {
+                                0x31, 0xc9,                   /* xor ecx, ecx */
+                                0x0f, 0x01, 0xd0,             /* xgetbv       */
+                                0x89, 0xc3,                   /* mov ebx, eax */
+                                0xb8, 0x07, 0x00, 0x00, 0x00, /* mov eax, 7   */
+                                0x31, 0xd2,                   /* xor edx, edx */
+                                0x0f, 0x01, 0xd1,             /* xsetbv       */
+                                0x31, 0xc0,                   /* xor eax, eax */
+                                0x0f, 0x01, 0xd0,             /* xgetbv       */
+                                0xf4,                         /* hlt          */
+                            };
+                            uint64_t xbv_pc = 0x0000e840ULL;
+                            uint8_t *xbv_code = code_cache + 0x13000;
+                            uint64_t saved_cr4_x = env.cr[4];
+                            uint64_t saved_xcr0_x = env.xcr0;
+                            uint32_t xa, xb, xc, xd;
+
+                            env.xcr0 = XSTATE_FP_MASK;
+                            env.cr[4] = saved_cr4_x | CR4_OSXSAVE_MASK;
+                            cpu_x86_cpuid(&env, 0x1, 0, &xa, &xb, &xc, &xd);
+                            check((xc & (1u << 27)) != 0u,
+                                  "CR4.OSXSAVE sets CPUID.1:ECX[27]");
+                            memcpy(gpa_to_host_ptr(xbv_pc), xbv_x86, sizeof(xbv_x86));
+                            int rc_xbv = tb_harness_translate_at(xbv_pc, xbv_code, 4096);
+                            check(rc_xbv > 0, "XGETBV/XSETBV block translates");
+                            if (rc_xbv > 0) {
+                                loongemu_sync_icache_range((uint64_t)(uintptr_t)xbv_code, (uint64_t)rc_xbv);
+                                env.eip = xbv_pc;
+                                env.regs[R_EAX] = 0;
+                                env.regs[R_EBX] = 0;
+                                env.regs[R_ECX] = 0;
+                                env.regs[R_EDX] = 0;
+                                env.eflags = 0x2;
+                                tb_sys_run_plv3((void *)(uintptr_t)pro_buf, xbv_code, &env);
+                                check(env.regs[R_EBX] == 1u && env.regs[R_EAX] == 7u && env.xcr0 == 7u,
+                                      "XGETBV/XSETBV round-trip XCR0 1 -> 7 at PLV3");
+                                cpu_x86_cpuid(&env, 0xd, 0, &xa, &xb, &xc, &xd);
+                                check(xa == 7u && xb == 0x340u,
+                                      "CPUID.0D:EBX reflects enabled XCR0=7 size (0x340)");
+                            }
+                            env.cr[4] = saved_cr4_x;
+                            env.xcr0 = saved_xcr0_x;
+                        }
+
+                        /* Verify non-canonical address EXC_ADE -> guest #GP(0) delivery. */
+                        {
+                            static const uint8_t ade_x86[] = {
+                                0x48, 0xb8, 0x21, 0x01, 0x00, 0x00, 0x00, 0x00, 0xad, 0xde,
+                                0x48, 0x8b, 0x00, /* mov rax, [rax] -> EXC_ADE */
+                                0xf4,
+                            };
+                            uint64_t ade_pc = 0x0000e900ULL;
+                            uint64_t gp_isr = 0x0000e980ULL;
+                            uint64_t gp_idt = 0x0000ea00ULL;
+                            uint64_t gp_stk = 0x0000ef00ULL;
+                            uint8_t *ade_code = code_cache + 0x14000;
+                            uint64_t saved_idt_base = env.idt.base;
+                            uint32_t saved_idt_limit = env.idt.limit;
+                            uint64_t saved_rsp = env.regs[R_ESP];
+                            uint64_t gp_before = g_hw_guest_gp;
+                            uint64_t gate_lo = (gp_isr & 0xffffULL) |
+                                               ((uint64_t)0x08u << 16) |
+                                               ((uint64_t)0x8eu << 40) |
+                                               (((gp_isr >> 16) & 0xffffULL) << 48);
+                            uint64_t gate_hi = (gp_isr >> 32) & 0xffffffffULL;
+                            TbInsnMap ade_map;
+
+                            *(volatile uint64_t *)(uintptr_t)(gp_idt + 13u * 16u) = gate_lo;
+                            *(volatile uint64_t *)(uintptr_t)(gp_idt + 13u * 16u + 8u) = gate_hi;
+                            memcpy(gpa_to_host_ptr(ade_pc), ade_x86, sizeof(ade_x86));
+                            env.idt.base = gp_idt;
+                            env.idt.limit = 0xfffu;
+                            env.segs[R_CS].selector = 0x08u;
+                            env.segs[R_SS].selector = 0x10u;
+                            env.regs[R_ESP] = gp_stk;
+                            env.eip = ade_pc;
+                            env.eflags = 0x2;
+                            int rc_ade = tb_harness_translate_at_with_map(ade_pc, ade_code, 4096, &ade_map);
+                            check(rc_ade > 0, "non-canonical EXC_ADE test block translates");
+                            if (rc_ade > 0) {
+                                loongemu_sync_icache_range((uint64_t)(uintptr_t)ade_code, (uint64_t)rc_ade);
+                                g_current_tb_code = (uint64_t)(uintptr_t)ade_code;
+                                g_current_tb_size = (uint32_t)rc_ade;
+                                g_current_tb_pc = ade_pc;
+                                g_current_tb_map = &ade_map;
+                                tb_sys_run_plv3((void *)(uintptr_t)pro_buf, ade_code, &env);
+                                g_current_tb_code = 0;
+                                g_current_tb_size = 0;
+                                g_current_tb_pc = 0;
+                                g_current_tb_map = 0;
+                                check(g_hw_guest_gp == gp_before + 1u &&
+                                      g_plv3_exit.reason == PLV3_EXIT_GUEST_PF &&
+                                      env.eip == gp_isr &&
+                                      *(volatile uint64_t *)(uintptr_t)env.regs[R_ESP] == 0ULL &&
+                                      *(volatile uint64_t *)(uintptr_t)(env.regs[R_ESP] + 8u) == ade_pc + 10u,
+                                      "EXC_ADE delivers #GP(0) to guest IDT[13] with exact faulting RIP");
+                            }
+                            env.idt.base = saved_idt_base;
+                            env.idt.limit = saved_idt_limit;
+                            env.regs[R_ESP] = saved_rsp;
+                        }
+
+                        /* Verify 16-bit Real Mode (CS_MODE_16, seg.base=sel<<4, ljmp, 4GiB ROM reset vector) & tb_cache mode isolation. */
+                        {
+                            static CPUX86State saved_env_rm;
+                            uint8_t *rm_code = code_cache + 0x15000;
+                            saved_env_rm = env;
+
+                            /* 1. Reset vector at GPA 0xFFFFFFF0 (CS=0xF000, CS.base=0xFFFF0000, IP=0xFFF0). */
+                            latx_x86_reset_real_mode(&env);
+                            latx_x86_tlb_flush_all();
+                            check(env.sys.codemode == LATX_DT_X16 &&
+                                  env.segs[R_CS].selector == 0xf000u &&
+                                  env.segs[R_CS].base == UINT64_C(0xffff0000) &&
+                                  env.eip == 0xfff0u,
+                                  "latx_x86_reset_real_mode sets CS=0xF000/base=0xFFFF0000/IP=0xFFF0");
+
+                            int rc_rm = tb_harness_translate_at(env.eip, rm_code, 4096);
+                            check(rc_rm > 0, "16-bit real-mode OVMF reset vector at 0xFFFFFFF0 translates");
+                            if (rc_rm > 0) {
+                                loongemu_sync_icache_range((uint64_t)(uintptr_t)rm_code, (uint64_t)rc_rm);
+                                env.regs[R_EAX] = 0;
+                                env.segs[R_DS].selector = 0;
+                                env.segs[R_DS].base = 0;
+                                tb_sys_run_plv3((void *)(uintptr_t)pro_buf, rm_code, &env);
+                                check((env.regs[R_EAX] & 0xffffu) == 0x1234u &&
+                                      env.segs[R_DS].selector == 0x1234u &&
+                                      env.segs[R_DS].base == UINT64_C(0x12340),
+                                      "16-bit real-mode ROM executes mov ax,0x1234; mov ds,ax (ds.base=0x12340)");
+                            }
+
+                            /* 2. Direct far jump ljmp 0x0008:0x1000 in 16-bit real mode. */
+                            {
+                                static const uint8_t ljmp16[] = { 0xea, 0x00, 0x10, 0x08, 0x00 };
+                                uint64_t lj_pc = 0x00000600ULL;
+                                uint8_t *lj_code = code_cache + 0x16000;
+                                env.segs[R_CS].selector = 0;
+                                env.segs[R_CS].base = 0;
+                                env.eip = lj_pc;
+                                memcpy(gpa_to_host_ptr(lj_pc), ljmp16, sizeof(ljmp16));
+                                int rc_lj = tb_harness_translate_at(lj_pc, lj_code, 4096);
+                                check(rc_lj > 0, "16-bit real-mode direct ljmp translates");
+                                if (rc_lj > 0) {
+                                    loongemu_sync_icache_range((uint64_t)(uintptr_t)lj_code, (uint64_t)rc_lj);
+                                    tb_sys_run_plv3((void *)(uintptr_t)pro_buf, lj_code, &env);
+                                    check(env.segs[R_CS].selector == 0x0008u &&
+                                          env.segs[R_CS].base == 0x80u &&
+                                          env.eip == 0x1000u,
+                                          "16-bit ljmp updates CS=0x08, CS.base=0x80, IP=0x1000");
+                                }
+                            }
+
+                            /* 3. tb_cache mode_flags + cs_base isolation at identical PC. */
+                            {
+                                TbCacheEntry *e16 = tbc_insert_mode(&tb_cache, 0x1000ULL, 0x0ULL, 0ULL, 0u, 0x02u);
+                                TbCacheEntry *e64 = tbc_insert_mode(&tb_cache, 0x1000ULL, 0x0ULL, 0ULL, 0u, 0x15u);
+                                check(e16 != 0 && e64 != 0 && e16 != e64 &&
+                                      tbc_lookup_mode(&tb_cache, 0x1000ULL, 0x0ULL, 0ULL, 0u, 0x02u) == e16 &&
+                                      tbc_lookup_mode(&tb_cache, 0x1000ULL, 0x0ULL, 0ULL, 0u, 0x15u) == e64,
+                                      "tb_cache isolates 16-bit and 64-bit TBs at identical PC");
+                            }
+
+                            env = saved_env_rm;
+                        }
+
+                        /* Verify OVMF board peripherals: CMOS/RTC, QEMU fw_cfg PIO+DMA, and CFI pflash. */
+                        {
+                            /* CMOS/RTC memory sizing & SMP count */
+                            latx_platform_io_write(LOONGEMU_CMOS_INDEX_PORT, 1, 0x15u);
+                            uint32_t base_kb = (uint32_t)latx_platform_io_read(LOONGEMU_CMOS_DATA_PORT, 1);
+                            latx_platform_io_write(LOONGEMU_CMOS_INDEX_PORT, 1, 0x16u);
+                            base_kb |= ((uint32_t)latx_platform_io_read(LOONGEMU_CMOS_DATA_PORT, 1) << 8);
+                            latx_platform_io_write(LOONGEMU_CMOS_INDEX_PORT, 1, 0x34u);
+                            uint32_t ext64k = (uint32_t)latx_platform_io_read(LOONGEMU_CMOS_DATA_PORT, 1);
+                            latx_platform_io_write(LOONGEMU_CMOS_INDEX_PORT, 1, 0x35u);
+                            ext64k |= ((uint32_t)latx_platform_io_read(LOONGEMU_CMOS_DATA_PORT, 1) << 8);
+                            latx_platform_io_write(LOONGEMU_CMOS_INDEX_PORT, 1, 0x5fu);
+                            uint32_t cmos_smp = (uint32_t)latx_platform_io_read(LOONGEMU_CMOS_DATA_PORT, 1);
+                            check(base_kb == 640u && ext64k == ((GUEST_RAM_SIZE - 0x1000000u) / 65536u) &&
+                                  cmos_smp == (MAX_VCPUS - 1u),
+                                  "CMOS/RTC reports 640K base, above-16M RAM, and SMP count");
+
+                            /* fw_cfg PIO: signature, ID, NB_CPUS */
+                            latx_platform_io_write(LOONGEMU_FW_CFG_SEL_PORT, 2, FW_CFG_SIGNATURE);
+                            uint32_t fw_sig = (uint32_t)latx_platform_io_read(LOONGEMU_FW_CFG_DATA_PORT, 4);
+                            latx_platform_io_write(LOONGEMU_FW_CFG_SEL_PORT, 2, FW_CFG_ID);
+                            uint32_t fw_id = (uint32_t)latx_platform_io_read(LOONGEMU_FW_CFG_DATA_PORT, 4);
+                            latx_platform_io_write(LOONGEMU_FW_CFG_SEL_PORT, 2, FW_CFG_NB_CPUS);
+                            uint16_t fw_cpus = (uint16_t)latx_platform_io_read(LOONGEMU_FW_CFG_DATA_PORT, 2);
+                            check(fw_sig == 0x554d4551u && fw_id == 3u && fw_cpus == MAX_VCPUS,
+                                  "QEMU fw_cfg PIO returns QEMU signature, DMA ID=3, and NB_CPUS");
+
+                            /* fw_cfg DMA: SELECT(FW_CFG_SIGNATURE) | READ into guest RAM */
+                            uint64_t dma_desc = 0x00019000ULL;
+                            uint64_t dma_dst = 0x00019040ULL;
+                            uint32_t ctrl_be = __builtin_bswap32(((uint32_t)FW_CFG_SIGNATURE << 16) |
+                                                                 FW_CFG_DMA_CTL_SELECT |
+                                                                 FW_CFG_DMA_CTL_READ);
+                            uint32_t len_be = __builtin_bswap32(4u);
+                            uint64_t dst_be = __builtin_bswap64(dma_dst);
+                            latx_platform_phys_write(dma_dst, 4, 0u);
+                            latx_platform_phys_write(dma_desc + 0u, 4, ctrl_be);
+                            latx_platform_phys_write(dma_desc + 4u, 4, len_be);
+                            latx_platform_phys_write(dma_desc + 8u, 8, dst_be);
+                            latx_platform_io_write(LOONGEMU_FW_CFG_DMA_HI_PORT, 4, 0u);
+                            latx_platform_io_write(LOONGEMU_FW_CFG_DMA_LO_PORT, 4,
+                                                   __builtin_bswap32((uint32_t)dma_desc));
+                            check(latx_platform_phys_read(dma_desc, 4) == 0u &&
+                                  latx_platform_phys_read(dma_dst, 4) == 0x554d4551u,
+                                  "QEMU fw_cfg DMA READ|SELECT transfers QEMU signature cleanly");
+
+                            /* CFI pflash (OVMF_VARS.fd) query, erase, program, read-array */
+                            ovmf_pflash_mmio_write(&g_ovmf_board.vars_flash, 0u, 0x98u, 1u);
+                            uint8_t q = (uint8_t)ovmf_pflash_mmio_read(&g_ovmf_board.vars_flash, 0x10u, 1u);
+                            uint8_t r = (uint8_t)ovmf_pflash_mmio_read(&g_ovmf_board.vars_flash, 0x11u, 1u);
+                            uint8_t y = (uint8_t)ovmf_pflash_mmio_read(&g_ovmf_board.vars_flash, 0x12u, 1u);
+                            ovmf_pflash_mmio_write(&g_ovmf_board.vars_flash, 0u, 0x20u, 1u);
+                            ovmf_pflash_mmio_write(&g_ovmf_board.vars_flash, 0u, 0xd0u, 1u);
+                            ovmf_pflash_mmio_write(&g_ovmf_board.vars_flash, 0x10u, 0x40u, 1u);
+                            ovmf_pflash_mmio_write(&g_ovmf_board.vars_flash, 0x10u, 0x5au, 1u);
+                            ovmf_pflash_mmio_write(&g_ovmf_board.vars_flash, 0u, 0xffu, 1u);
+                            uint8_t pf_val = (uint8_t)ovmf_pflash_mmio_read(&g_ovmf_board.vars_flash, 0x10u, 1u);
+                            check(q == 'Q' && r == 'R' && y == 'Y' && pf_val == 0x5au,
+                                  "OVMF_VARS CFI pflash supports QRY query, erase, and program");
+                        }
+
+                        env.cr[0] = saved_cr0_r;
+                        env.eip = saved_eip_r;
+                        latx_x86_tlb_flush_all();
+                    }
                     memcpy((void *)(uintptr_t)initramfs_gpa, _initramfs_start,
                            initramfs_sz);
                     memset(bp, 0, 4096);

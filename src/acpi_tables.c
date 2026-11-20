@@ -226,6 +226,99 @@ int loongemu_acpi_build(uint8_t *guest_ram,
     return 1;
 }
 
+int loongemu_acpi_build_for_profile(uint8_t *guest_ram,
+                                    uint64_t rsdp_gpa,
+                                    uint64_t tables_gpa,
+                                    uint32_t nr_cpus,
+                                    LoongemuAcpiProfile profile,
+                                    const void *host_rsdp_ptr,
+                                    const char *oem_override_6,
+                                    LoongemuAcpiInfo *out_info)
+{
+    char oem[7] = { 'L', 'N', 'G', 'E', 'M', 'U', '\0' };
+
+    if (!loongemu_acpi_build(guest_ram, rsdp_gpa, tables_gpa, nr_cpus, out_info)) {
+        return 0;
+    }
+    if (profile == LOONGEMU_ACPI_PROFILE_LINUX && host_rsdp_ptr != 0) {
+        (void)loongemu_acpi_validate_rsdp(host_rsdp_ptr, 0, 0, oem);
+    } else if (profile == LOONGEMU_ACPI_PROFILE_WINDOWS && oem_override_6 != 0) {
+        for (int i = 0; i < 6 && oem_override_6[i] != '\0'; i++) {
+            oem[i] = oem_override_6[i];
+        }
+    }
+    {
+        AcpiRsdp *rsdp = (AcpiRsdp *)(guest_ram + rsdp_gpa);
+        mem_copy(rsdp->oem_id, oem, 6);
+        rsdp->checksum = 0;
+        rsdp->ext_checksum = 0;
+        rsdp->checksum = acpi_checksum(rsdp, 20);
+        rsdp->ext_checksum = acpi_checksum(rsdp, rsdp->length);
+    }
+    return 1;
+}
+
+int loongemu_acpi_find_spcr(const void *host_rsdp_ptr,
+                            const void *(*pa_to_ptr)(uint64_t pa),
+                            LoongemuAcpiSpcrInfo *out_spcr)
+{
+    uint8_t rev = 0;
+    uint64_t xsdt_pa = 0;
+    const AcpiSdtHeader *xsdt;
+    uint32_t entry_size, count;
+
+    if (host_rsdp_ptr == 0 || out_spcr == 0) {
+        return 0;
+    }
+    if (!loongemu_acpi_validate_rsdp(host_rsdp_ptr, &rev, &xsdt_pa, 0) ||
+        xsdt_pa == 0) {
+        return 0;
+    }
+    xsdt = (const AcpiSdtHeader *)(pa_to_ptr ? pa_to_ptr(xsdt_pa)
+                                             : (const void *)(uintptr_t)xsdt_pa);
+    if (xsdt == 0 || xsdt->length < sizeof(AcpiSdtHeader)) {
+        return 0;
+    }
+    entry_size = (rev >= 2) ? 8u : 4u;
+    count = (xsdt->length - (uint32_t)sizeof(AcpiSdtHeader)) / entry_size;
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t tbl_pa = 0;
+        const uint8_t *ent_ptr = (const uint8_t *)xsdt + sizeof(AcpiSdtHeader) +
+                                 (uint64_t)i * entry_size;
+        if (entry_size == 8u) {
+            for (int b = 7; b >= 0; b--) {
+                tbl_pa = (tbl_pa << 8) | ent_ptr[b];
+            }
+        } else {
+            for (int b = 3; b >= 0; b--) {
+                tbl_pa = (tbl_pa << 8) | ent_ptr[b];
+            }
+        }
+        if (tbl_pa == 0) {
+            continue;
+        }
+        const uint8_t *tbl = (const uint8_t *)(pa_to_ptr ? pa_to_ptr(tbl_pa)
+                                                         : (const void *)(uintptr_t)tbl_pa);
+        if (tbl[0] == 'S' && tbl[1] == 'P' && tbl[2] == 'C' && tbl[3] == 'R') {
+            const AcpiSdtHeader *sh = (const AcpiSdtHeader *)tbl;
+            if (sh->length >= 56 && acpi_checksum(tbl, sh->length) == 0) {
+                uint64_t addr = 0;
+                for (int b = 7; b >= 0; b--) {
+                    addr = (addr << 8) | tbl[44 + b];
+                }
+                out_spcr->interface_type = tbl[36];
+                out_spcr->addr_space = tbl[40];
+                out_spcr->reg_width = tbl[41];
+                out_spcr->access_size = tbl[43];
+                out_spcr->base_addr = addr;
+                out_spcr->baud_rate = tbl[52];
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 int loongemu_acpi_validate_rsdp(const void *rsdp_ptr,
                                 uint8_t *out_rev,
                                 uint64_t *out_xsdt_pa,

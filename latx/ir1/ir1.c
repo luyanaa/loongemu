@@ -112,7 +112,7 @@ extern int GPR_USEDEF_TO_SAVE;
 extern int FPR_USEDEF_TO_SAVE;
 extern int XMM_USEDEF_TO_SAVE;
 #endif
-csh handle[2];
+csh handle[3];
 
 #ifdef CONFIG_LATX_CAPSTONE_GIT
 int (*la_disa_v1)(const uint8_t *code, size_t code_size,
@@ -377,16 +377,18 @@ ADDRX ir1_disasm(IR1_INST *ir1, uint8_t *addr, ADDRX t_pc, int ir1_num,
         ir1->info = inv;
         return t_pc + 1;
     }
-    info = original_code ? ir1_hot_decode(
-        addr, t_pc, ir1_num, pir1_base, CODEIS64) : NULL;
+    int cmode = CODEMODE;
+    bool allow_fast_cache = original_code && (cmode != LATX_DT_X16);
+    info = allow_fast_cache ? ir1_hot_decode(
+        addr, t_pc, ir1_num, pir1_base, cmode) : NULL;
     bool hot_hit = info != NULL;
-    if (!hot_hit && original_code) {
+    if (!hot_hit && allow_fast_cache) {
         info = ir1_decode_template_lookup(addr, 15, t_pc, ir1_num,
-                                          pir1_base, CODEIS64);
+                                          pir1_base, cmode);
     }
     bool template_hit = !hot_hit && info != NULL;
     int count = info ? 1 : la_disa_v1(addr, 15, (uint64_t)t_pc,
-        1, &info, ir1_num, pir1_base, CODEIS64);
+        1, &info, ir1_num, pir1_base, cmode);
 
     ir1->info = info;
 
@@ -402,7 +404,7 @@ ADDRX ir1_disasm(IR1_INST *ir1, uint8_t *addr, ADDRX t_pc, int ir1_num,
         exit(-1);
     }
 
-    disassemble_trace_cmp(addr, 15, (uint64_t)t_pc, 1, info, CODEIS64);
+    disassemble_trace_cmp(addr, 15, (uint64_t)t_pc, 1, info, cmode);
 
     ir1->_eflag = 0;
 
@@ -420,8 +422,8 @@ ADDRX ir1_disasm(IR1_INST *ir1, uint8_t *addr, ADDRX t_pc, int ir1_num,
             }
         }
     }
-    if (original_code && !hot_hit && !template_hit) {
-        ir1_decode_template_insert(addr, 15, CODEIS64, info);
+    if (allow_fast_cache && !hot_hit && !template_hit) {
+        ir1_decode_template_insert(addr, 15, cmode, info);
     }
 #ifdef CONFIG_LATX_INSTS_PATTERN
     ir1->instptn.opc  = INSTPTN_OPC_NONE;
@@ -488,6 +490,13 @@ int ir1_get_opnd_size(IR1_INST *inst)
             return 4 << 3;
         }
 #else
+        if (CODEIS16) {
+            if (ir1_prefix_opnd_size(inst) != 0) {
+                return 4 << 3;
+            } else {
+                return 2 << 3;
+            }
+        }
         if (!CODEIS64) {
             if (ir1_prefix_opnd_size(inst) != 0) {
                 return 2 << 3;

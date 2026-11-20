@@ -77,6 +77,13 @@ typedef enum {
     MaxAllocateType = 3,
 } EFI_ALLOCATE_TYPE;
 
+typedef struct {
+    uint32_t Data1;
+    uint16_t Data2;
+    uint16_t Data3;
+    uint8_t  Data4[8];
+} EFI_GUID;
+
 /*
  * Only the members this VMM calls are given real prototypes; the rest are
  * opaque pointers that exist to keep the offsets right.  A function-pointer
@@ -113,7 +120,9 @@ typedef struct {
     void *InstallProtocolInterface;
     void *ReinstallProtocolInterface;
     void *UninstallProtocolInterface;
-    void *HandleProtocol;
+    EFI_STATUS (EFIAPI *HandleProtocol)(EFI_HANDLE Handle,
+                                        const EFI_GUID *Protocol,
+                                        void **Interface);
     void *Reserved;
     void *RegisterProtocolNotify;
     void *LocateHandle;
@@ -138,7 +147,9 @@ typedef struct {
     void *OpenProtocolInformation;
     void *ProtocolsPerHandle;
     void *LocateHandleBuffer;
-    void *LocateProtocol;
+    EFI_STATUS (EFIAPI *LocateProtocol)(const EFI_GUID *Protocol,
+                                        void *Registration,
+                                        void **Interface);
     void *InstallMultipleProtocolInterfaces;
     void *UninstallMultipleProtocolInterfaces;
     void *CalculateCrc32;
@@ -147,12 +158,56 @@ typedef struct {
     void *CreateEventEx;
 } EFI_BOOT_SERVICES;
 
+/* Loaded Image Protocol GUID: {5b1b31a1-9562-11d2-8e3f-00a0c969723b} */
+#define EFI_LOADED_IMAGE_PROTOCOL_GUID \
+    { 0x5b1b31a1u, 0x9562u, 0x11d2u, \
+      { 0x8eu, 0x3fu, 0x00u, 0xa0u, 0xc9u, 0x69u, 0x72u, 0x3bu } }
+
 typedef struct {
-    uint32_t Data1;
-    uint16_t Data2;
-    uint16_t Data3;
-    uint8_t  Data4[8];
-} EFI_GUID;
+    uint32_t Revision;
+    EFI_HANDLE ParentHandle;
+    void *SystemTable;
+    EFI_HANDLE DeviceHandle;
+    void *FilePath;
+    void *Reserved;
+    uint32_t LoadOptionsSize;
+    void *LoadOptions;
+    void *ImageBase;
+    uint64_t ImageSize;
+    EFI_MEMORY_TYPE ImageCodeType;
+    EFI_MEMORY_TYPE ImageDataType;
+    void *Unload;
+} EFI_LOADED_IMAGE_PROTOCOL;
+
+/* Graphics Output Protocol GUID: {9042a9de-23dc-4a38-96fb-7aded080516a} */
+#define EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID \
+    { 0x9042a9deu, 0x23dcu, 0x4a38u, \
+      { 0x96u, 0xfbu, 0x7au, 0xdeu, 0xd0u, 0x80u, 0x51u, 0x6au } }
+
+typedef struct {
+    uint32_t Version;
+    uint32_t HorizontalResolution;
+    uint32_t VerticalResolution;
+    uint32_t PixelFormat;
+    uint32_t PixelInformation[4];
+    uint32_t PixelsPerScanLine;
+} EFI_GRAPHICS_OUTPUT_MODE_INFORMATION;
+
+typedef struct {
+    uint32_t MaxMode;
+    uint32_t Mode;
+    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *Info;
+    UINTN SizeOfInfo;
+    EFI_PHYSICAL_ADDRESS FrameBufferBase;
+    UINTN FrameBufferSize;
+} EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE;
+
+typedef struct {
+    void *QueryMode;
+    void *SetMode;
+    void *Blt;
+    EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *Mode;
+} EFI_GRAPHICS_OUTPUT_PROTOCOL;
 
 typedef struct {
     EFI_GUID VendorGuid;

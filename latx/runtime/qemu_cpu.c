@@ -251,6 +251,69 @@ void cpu_sync_bndcs_hflags(CPUX86State *env)
     (void)env;
 }
 
+/* Reset vCPU into 16-bit x86 Real Mode (CS=0xF000, CS.base=0xFFFF0000, IP=0xFFF0). */
+void latx_x86_reset_real_mode(CPUX86State *env)
+{
+    env->cr[0] = 0x60000010u; /* CD | NW | ET, PE=0, PG=0 */
+    env->cr[3] = 0;
+    env->cr[4] = 0;
+    env->efer = 0;
+    env->hflags = 0;
+    env->sys.codemode = 2; /* LATX_DT_X16 */
+    for (int i = 0; i < 6; i++) {
+        env->segs[i].selector = 0;
+        env->segs[i].base = 0;
+        env->segs[i].limit = 0xffffu;
+        env->segs[i].flags = 0;
+    }
+    env->segs[R_CS].selector = 0xf000u;
+    env->segs[R_CS].base = 0xffff0000ULL;
+    env->segs[R_CS].limit = 0xffffu;
+    env->eip = 0xfff0ULL;
+    env->eflags = 0x2u;
+    env->xcr0 = 1ULL;
+}
+
+/* Far jump CS/mode transition helper (Real Mode / 32-bit PM / 64-bit LM). */
+void helper_ljmp_far(CPUX86State *env, uint32_t selector, uint64_t offset)
+{
+    uint16_t sel = (uint16_t)(selector & 0xffffu);
+    env->segs[R_CS].selector = sel;
+
+    if ((env->cr[0] & CR0_PE_MASK) == 0) {
+        env->segs[R_CS].base = ((uint64_t)sel) << 4;
+        env->segs[R_CS].limit = 0xffffu;
+        env->sys.codemode = 2; /* LATX_DT_X16 */
+        env->hflags &= ~(HF_CS32_MASK | HF_CS64_MASK | HF_LMA_MASK);
+        env->eip = offset & 0xffffULL;
+        return;
+    }
+
+    uint64_t dt_base = (sel & 4u) ? env->ldt.base : env->gdt.base;
+    uint32_t idx = sel & ~7u;
+    uint64_t desc = 0;
+    if (dt_base != 0 && idx != 0) {
+        desc = latx_platform_guest_read(dt_base + (uint64_t)idx, 8);
+    }
+    uint64_t base = ((desc >> 16) & 0xffffffULL) | (((desc >> 56) & 0xffULL) << 24);
+    int l_bit = (int)((desc >> 53) & 1u);
+    int d_bit = (int)((desc >> 54) & 1u);
+
+    env->segs[R_CS].base = base;
+    env->segs[R_CS].limit = 0xffffffffu;
+    if ((env->efer & MSR_EFER_LMA) && l_bit) {
+        env->sys.codemode = 1; /* LATX_DT_X64 */
+        env->hflags = (env->hflags & ~HF_CS32_MASK) | HF_CS64_MASK | HF_LMA_MASK;
+    } else if (d_bit || desc == 0) {
+        env->sys.codemode = 0; /* LATX_DT_X86 (32-bit) */
+        env->hflags = (env->hflags & ~HF_CS64_MASK) | HF_CS32_MASK;
+    } else {
+        env->sys.codemode = 2; /* LATX_DT_X16 (16-bit PM) */
+        env->hflags &= ~(HF_CS64_MASK | HF_CS32_MASK);
+    }
+    env->eip = offset;
+}
+
 /*
  * The feature words the MSR helpers consult.  They are derived from CPUID
  * rather than hand-written so the two can never disagree: a wrmsr of EFER.LME
@@ -261,6 +324,7 @@ void latx_x86_env_init_features(CPUX86State *env)
     uint32_t eax, ebx, ecx, edx;
 
     memset(env->features, 0, sizeof(env->features));
+    env->xcr0 = XSTATE_FP_MASK;
 
     cpu_x86_cpuid(env, 0x1, 0, &eax, &ebx, &ecx, &edx);
     env->features[FEAT_1_EDX] = edx;
@@ -319,13 +383,13 @@ __attribute__((weak)) uint32_t latx_platform_apic_id(void)
     return latx_guest_apic_id;
 }
 
-int cpu_get_apic_tpr(CPUX86State *env)
+__attribute__((weak)) int cpu_get_apic_tpr(CPUX86State *env)
 {
     (void)env;
     return apic_tpr_per_cpu[latx_platform_apic_id() & 63u];
 }
 
-void cpu_set_apic_tpr(CPUX86State *env, uint8_t val)
+__attribute__((weak)) void cpu_set_apic_tpr(CPUX86State *env, uint8_t val)
 {
     (void)env;
     apic_tpr_per_cpu[latx_platform_apic_id() & 63u] = val;
@@ -388,12 +452,64 @@ void tlb_flush_page(CPUState *cpu, uint64_t addr)
     latx_platform_tlb_flush_page(addr);
 }
 
+uint64_t latx_host_timer_hz = UINT64_C(100000000);
+/* 0 = KVM ("KVMKVMKVM\0\0\0"), 1 = Hyper-V ("Microsoft Hv"), 2 = LoongEMU */
+uint32_t latx_hv_vendor = 0u;
+/* 0 = Skylake (max leaf 0x16) on LASX, 1 = Ivy Bridge (max leaf 0x0D) on LASX */
+uint32_t latx_cpuid_lasx_ivybridge = 0u;
+
+static uint64_t g_rng_state = UINT64_C(0x9e3779b97f4a7c15);
+
+uint64_t latx_random_u64(void)
+{
+    uint64_t t = 0;
+    __asm__ volatile("rdtime.d %0, $zero" : "=r"(t) :: "memory");
+    uint64_t z = __atomic_fetch_add(&g_rng_state,
+                                    UINT64_C(0x9e3779b97f4a7c15) ^ (t << 1),
+                                    __ATOMIC_RELAXED);
+    z ^= t;
+    z = (z ^ (z >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)) * UINT64_C(0x94d049bb133111eb);
+    z ^= (z >> 31);
+    return z;
+}
+
+__attribute__((weak)) void helper_hypercall(CPUX86State *env)
+{
+    if (env != NULL) {
+        env->regs[R_EAX] = (uint64_t)(int64_t)-1000; /* -KVM_ENOSYS */
+    }
+}
+
+__attribute__((weak)) void latx_platform_kvm_wrmsr(CPUX86State *env,
+                                                   uint32_t msr, uint64_t val)
+{
+    (void)env;
+    (void)msr;
+    (void)val;
+}
+
+__attribute__((weak)) int latx_platform_kvm_rdmsr(CPUX86State *env,
+                                                  uint32_t msr, uint64_t *val)
+{
+    (void)env;
+    (void)msr;
+    (void)val;
+    return 0;
+}
+
 int qemu_guest_getrandom(void *buf, size_t len, void **errp)
 {
-    (void)buf;
-    (void)len;
+    uint8_t *out = (uint8_t *)buf;
+    size_t i = 0;
     (void)errp;
-    return -1; /* RDRAND reports failure instead of inventing entropy */
+    while (i < len) {
+        uint64_t r = latx_random_u64();
+        for (int b = 0; b < 8 && i < len; b++, i++) {
+            out[i] = (uint8_t)(r >> (b * 8));
+        }
+    }
+    return 0;
 }
 
 uint8_t options_to_save(void)
@@ -443,33 +559,33 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
                    uint32_t *eax, uint32_t *ebx, uint32_t *ecx,
                    uint32_t *edx)
 {
-    (void)env;
-    (void)count;
     *eax = *ebx = *ecx = *edx = 0;
 
     uint32_t apic_id = latx_platform_apic_id();
     uint32_t nr_cpus = latx_guest_nr_cpus ? latx_guest_nr_cpus : 1u;
+    uint64_t hz = latx_host_timer_hz ? latx_host_timer_hz : UINT64_C(100000000);
+    uint32_t tsc_khz = (uint32_t)(hz / 1000ULL);
+    int has_lasx = latx_cpu_has_lasx();
 
     switch (index) {
     case 0x0:
-        *eax = 0x15;
+        if (!has_lasx) {
+            *eax = 0x08u; /* Nehalem-based max basic leaf on LSX-only path */
+        } else {
+            *eax = latx_cpuid_lasx_ivybridge ? 0x0du : 0x16u; /* Ivy Bridge / Skylake */
+        }
         cpuid_vendor(ebx, edx, ecx);
         break;
     case 0x1: {
-        /* x86-64-v2 baseline: SSE4.2/POPCNT + HTT (when SMP) + Hypervisor bit. */
         uint32_t f_edx = (1u << 0)  | (1u << 4)  | (1u << 5)  | (1u << 6)
                        | (1u << 8)  | (1u << 9)  | (1u << 11) | (1u << 12)
                        | (1u << 13) | (1u << 14) | (1u << 15) | (1u << 16)
                        | (1u << 17) | (1u << 19) | (1u << 23) | (1u << 24)
                        | (1u << 25) | (1u << 26)
                        | (nr_cpus > 1u ? (1u << 28) : 0u); /* HTT */
-        uint32_t f_ecx = (1u << 31); /* HYPERVISOR */
+        uint32_t f_ecx = (1u << 30)  /* RDRAND     */
+                       | (1u << 31); /* HYPERVISOR */
 
-        /*
-         * x86-64-v2 on LSX.  These are the level's mandatory bits, and they are
-         * only claimed when the host can actually execute them: SSE* is
-         * implemented on LSX, so a host without LSX must not advertise them.
-         */
         if (latx_cpu_has_lsx()) {
             f_ecx |= (1u << 0)    /* SSE3        */
                    | (1u << 1)    /* PCLMULQDQ   */
@@ -480,30 +596,35 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
                    | (1u << 23);  /* POPCNT      */
         }
 
-        /* x86-64-v3 needs 256-bit vector state, i.e. LASX on the host. */
-        if (latx_cpu_has_lasx()) {
+        if (has_lasx) {
             f_ecx |= (1u << 12)   /* FMA      */
                    | (1u << 22)   /* MOVBE    */
                    | (1u << 26)   /* XSAVE    */
                    | (1u << 28)   /* AVX      */
                    | (1u << 29);  /* F16C     */
 
-            /*
-             * OSXSAVE is not a capability of the CPU: it reports whether the
-             * OS enabled the state-saving interface (CR4.OSXSAVE).  A guest
-             * reads it to decide whether XSAVE/XRSTOR are usable, so it has to
-             * follow the guest's own CR4 rather than be constant.
-             */
             if (env != NULL && (env->cr[4] & CR4_OSXSAVE_MASK)) {
                 f_ecx |= (1u << 27);  /* OSXSAVE */
             }
         }
-        *eax = 0x000306f2u;
+        /* Family 6h: Nehalem (0x106a5), Ivy Bridge (0x306a9), Skylake (0x506e3) */
+        if (!has_lasx) {
+            *eax = 0x000106a5u;
+        } else {
+            *eax = latx_cpuid_lasx_ivybridge ? 0x000306a9u : 0x000506e3u;
+        }
         *ebx = ((apic_id & 0xffu) << 24) | ((nr_cpus & 0xffu) << 16) | (8u << 8);
         *ecx = f_ecx;
         *edx = f_edx;
         break;
     }
+    case 0x2:
+        /* Compact TLB/cache descriptors (0xff defers cache sizing to leaf 0x04). */
+        *eax = 0x76036301u;
+        *ebx = 0x00f0b5ffu;
+        *ecx = 0x00000000u;
+        *edx = 0x00c30000u;
+        break;
     case 0x4: {
         uint32_t max_cores = (nr_cpus > 1u) ? (nr_cpus - 1u) : 0u;
         if (count == 0) { /* L1d: 32 KiB, 8-way, 64B line, 64 sets */
@@ -554,21 +675,22 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
     }
     case 0xd:
         if (count == 0) {
-            if (latx_cpu_has_lasx()) {
+            if (has_lasx) {
                 *eax = 0x7;      /* x87 | SSE | AVX */
-                *ebx = 0x340;    /* XSAVE area size for XCR0 = 7 */
-                *ecx = 0x340;    /* max XSAVE area size for all supported features */
+                *ebx = (env != NULL && (env->xcr0 & XSTATE_YMM_MASK))
+                           ? 0x340u : 0x240u;
+                *ecx = 0x340;
                 *edx = 0;
             }
         } else if (count == 1) {
-            if (latx_cpu_has_lasx()) {
+            if (has_lasx) {
                 *eax = 1;        /* XSAVEOPT */
                 *ebx = 0x340;
                 *ecx = 0;
                 *edx = 0;
             }
         } else if (count == 2) {
-            if (latx_cpu_has_lasx()) {
+            if (has_lasx) {
                 *eax = 0x100;    /* YMM_Hi128 size = 256 bytes */
                 *ebx = 0x240;    /* YMM_Hi128 offset = 576 bytes */
                 *ecx = 0;
@@ -577,37 +699,92 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
         }
         break;
     case 0x15:
-        /* TSC / Core Crystal Clock: 25 MHz * 4 / 1 = 100 MHz (matches rdtime.d). */
+        /* Dynamic TSC / Core Crystal Clock matching host rdtime.d (hz). */
         *eax = 1;
         *ebx = 4;
-        *ecx = 25000000u;
+        *ecx = (uint32_t)(hz / 4ULL);
         *edx = 0;
         break;
+    case 0x16: {
+        uint32_t base_mhz = (uint32_t)(hz / 1000000ULL);
+        if (base_mhz < 100u) {
+            base_mhz = 100u;
+        }
+        *eax = base_mhz;
+        *ebx = base_mhz;
+        *ecx = 100u;
+        *edx = 0;
+        break;
+    }
     case 0x6:
     case 0xa:
         break;
     case 0x7:
-        if (count == 0 && latx_cpu_has_lasx()) {
-            /* AVX2/BMI without any AVX-512 state. */
-            *ebx = (1u << 3)    /* BMI1  */
-                 | (1u << 5)    /* AVX2  */
-                 | (1u << 8);   /* BMI2  */
+        if (count == 0) {
+            *ebx = (1u << 18); /* RDSEED */
+            if (has_lasx) {
+                *ebx |= (1u << 3)    /* BMI1  */
+                      | (1u << 5)    /* AVX2  */
+                      | (1u << 8);   /* BMI2  */
+            }
         }
         break;
     case 0x40000000u:
-        /* Hypervisor CPUID leaf: "LoongEMUVMM\0" */
-        *eax = 0x40000010u;
-        *ebx = 0x6e6f6f4cu; /* "Loon" */
-        *ecx = 0x554d4567u; /* "gEMU" */
-        *edx = 0x004d4d56u; /* "VMM\0" */
+        if (latx_hv_vendor == 1u) {
+            /* "Microsoft Hv" (Hyper-V Enlightenment option for Windows) */
+            *eax = 0x40000010u;
+            *ebx = 0x7263694du; /* "Micr" */
+            *ecx = 0x666f736fu; /* "osof" */
+            *edx = 0x76482074u; /* "t Hv" */
+        } else if (latx_hv_vendor == 2u) {
+            /* "LoongEMUVMM\0" */
+            *eax = 0x40000010u;
+            *ebx = 0x6e6f6f4cu; /* "Loon" */
+            *ecx = 0x554d4567u; /* "gEMU" */
+            *edx = 0x004d4d56u; /* "VMM\0" */
+        } else {
+            /* Default Linux PV: "KVMKVMKVM\0\0\0" */
+            *eax = 0x40000010u;
+            *ebx = 0x4b4d564bu; /* "KVMK" */
+            *ecx = 0x564b4d56u; /* "VMKV" */
+            *edx = 0x0000004du; /* "M\0\0\0" */
+        }
         break;
     case 0x40000001u:
-        *eax = *ebx = *ecx = *edx = 0;
+        if (latx_hv_vendor == 1u) {
+            *eax = 0x31237648u; /* "Hv#1" */
+        } else if (latx_hv_vendor == 0u) {
+            /* KVM PV: NOP_IO_DELAY | CLOCKSOURCE2 | PV_EOI | PV_UNHALT | PV_SEND_IPI | STABLE */
+            *eax = (1u << 1) | (1u << 3) | (1u << 6) | (1u << 7) |
+                   (1u << 11) | (1u << 24);
+        }
+        break;
+    case 0x40000002u:
+        if (latx_hv_vendor == 1u) {
+            *eax = 0x00004a61u;
+            *ebx = 0x000a0000u;
+        }
+        break;
+    case 0x40000003u:
+        if (latx_hv_vendor == 1u) {
+            *eax = (1u << 1) | (1u << 4) | (1u << 5);
+        }
+        break;
+    case 0x40000004u:
+        if (latx_hv_vendor == 1u) {
+            *eax = (1u << 3) | (1u << 5);
+            *ebx = 0x00000fffu;
+        }
+        break;
+    case 0x40000005u:
+        if (latx_hv_vendor == 1u) {
+            *eax = nr_cpus;
+            *ebx = nr_cpus;
+        }
         break;
     case 0x40000010u:
-        /* Generic Timing Information Leaf: 100 MHz TSC & LAPIC bus (in kHz). */
-        *eax = 100000u;
-        *ebx = 100000u;
+        *eax = tsc_khz;
+        *ebx = tsc_khz;
         *ecx = 0;
         *edx = 0;
         break;
@@ -620,7 +797,7 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
         cpuid_vendor(ebx, edx, ecx);
     } else if (index == 0x80000001u) {
         *ecx = (1u << 0);            /* LAHF/SAHF */
-        if (latx_cpu_has_lasx()) {
+        if (has_lasx) {
             *ecx |= (1u << 5);       /* ABM (LZCNT) -- x86-64-v3 */
         }
         *edx = (1u << 11)            /* SYSCALL/SYSRET */
@@ -628,13 +805,6 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
              | (1u << 26)            /* 1 GiB pages */
              | (1u << 29);           /* long mode */
     } else if (index == 0x80000008u) {
-        /*
-         * [7:0] = physical address bits, [15:8] = virtual address bits, both
-         * reported directly (not as a "minus one").  The previous encoding
-         * had the two fields swapped and subtracted one from each, so lscpu
-         * printed "39 bits physical, 47 bits virtual" for a guest whose page
-         * walker is 40/48.
-         */
         *eax = (48u << 8) | 40u;
     } else if (index >= 0x80000002u && index <= 0x80000004u) {
         static const char brand[49] =

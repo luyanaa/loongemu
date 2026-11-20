@@ -51,32 +51,53 @@ void loongemu_vclock_advance_ns(LoongemuVClock *vc, uint64_t delta_ns)
     }
 }
 
+uint64_t loongemu_host_timer_hz(void)
+{
+#if defined(__loongarch__) || defined(__loongarch64)
+    uint32_t ccfreq = 0, ccinfo = 0;
+    uint64_t ccmul, ccdiv, hz;
+
+    __asm__ volatile("cpucfg %0, %1" : "=r"(ccfreq) : "r"(4));
+    __asm__ volatile("cpucfg %0, %1" : "=r"(ccinfo) : "r"(5));
+    ccmul = (uint64_t)(ccinfo & 0xffffu);
+    ccdiv = (uint64_t)((ccinfo >> 16) & 0xffffu);
+    if (ccfreq == 0 || ccmul == 0 || ccdiv == 0) {
+        return UINT64_C(100000000);
+    }
+    hz = ((uint64_t)ccfreq * ccmul) / ccdiv;
+    return hz ? hz : UINT64_C(100000000);
+#else
+    return UINT64_C(100000000);
+#endif
+}
+
 uint64_t loongemu_vclock_now_ns(LoongemuVClock *vc)
 {
-    uint64_t ns;
+    uint64_t ns, prev;
 
     if (vc == 0) {
         return 0;
     }
     if (vc->mode == LOONGEMU_VCLOCK_VIRTUAL_STEP || vc->read_host_ticks == 0) {
-        if (vc->virtual_ns > vc->last_ns) {
-            vc->last_ns = vc->virtual_ns;
-        }
-        return vc->last_ns;
-    }
-    {
+        ns = __atomic_load_n(&vc->virtual_ns, __ATOMIC_ACQUIRE);
+    } else {
         uint64_t now_ticks = vc->read_host_ticks(vc->opaque);
         uint64_t delta_ticks = (now_ticks >= vc->boot_host_ticks)
                                    ? (now_ticks - vc->boot_host_ticks)
                                    : 0;
         ns = mul_div_u64(delta_ticks, LOONGEMU_VCLOCK_NS_PER_SEC, vc->host_hz);
     }
-    if (ns < vc->last_ns) {
-        ns = vc->last_ns;
-    } else {
-        vc->last_ns = ns;
+    /* Cross-core strictly monotonic clamp via lock-free CAS. */
+    prev = __atomic_load_n(&vc->last_ns, __ATOMIC_ACQUIRE);
+    for (;;) {
+        if (ns <= prev) {
+            return prev;
+        }
+        if (__atomic_compare_exchange_n(&vc->last_ns, &prev, ns, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            return ns;
+        }
     }
-    return ns;
 }
 
 uint64_t loongemu_vclock_read_tsc(LoongemuVClock *vc)

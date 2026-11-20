@@ -40,7 +40,7 @@ QEMU_SRC := $(LATX)/qemu/fpu_helper.c $(LATX)/qemu/int_helper.c \
             $(LATX)/qemu/misc_helper.c $(LATX)/qemu/cc_helper.c \
             $(LATX)/qemu/softfloat.c $(LATX)/qemu/aes.c
 
-SRCS := ../src/x86_64_paging.c ../src/phys_mem.c ../src/vclock.c ../src/loongarch_smp.c $(LATX)/compat/miniglib.c $(LATX)/compat/libc_min.c $(LATX)/compat/ldmath.c $(LIBM_SRC) $(QEMU_SRC) $(RUNTIME_SRC) $(CAPSTONE_SRC) \
+SRCS := ../src/x86_64_paging.c ../src/phys_mem.c ../src/vclock.c ../src/loongarch_smp.c ../src/smbios_tables.c ../src/ovmf_board.c $(LATX)/compat/miniglib.c $(LATX)/compat/libc_min.c $(LATX)/compat/ldmath.c $(LIBM_SRC) $(QEMU_SRC) $(RUNTIME_SRC) $(CAPSTONE_SRC) \
         $(addprefix $(LATX)/translator/,$(addsuffix .c,$(TRANSLATOR))) \
         $(LATX)/ir1/ir1.c \
         $(LATX)/ir2/ir2.c $(LATX)/ir2/ir2-assemble.c $(LATX)/ir2/ir2-relocate.c \

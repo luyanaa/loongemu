@@ -74,6 +74,13 @@ uint32_t loongemu_vclock_lapic_current(LoongemuVClock *vc,
                                        int periodic,
                                        int *expired_out);
 
+/*
+ * Probe the LoongArch constant timer (rdtime.d) frequency in Hz via
+ * cpucfg 4 (CCFreq) and cpucfg 5 (CCMul/CCDiv). Falls back to 100 MHz
+ * on non-LoongArch hosts or if cpucfg reports 0.
+ */
+uint64_t loongemu_host_timer_hz(void);
+
 #ifdef __cplusplus
 }
 #endif

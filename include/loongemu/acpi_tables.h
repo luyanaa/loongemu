@@ -145,6 +145,20 @@ typedef struct LoongemuAcpiInfo {
     uint32_t nr_cpus;
 } LoongemuAcpiInfo;
 
+typedef enum LoongemuAcpiProfile {
+    LOONGEMU_ACPI_PROFILE_LINUX   = 0, /* Inherit/pass through host UEFI ACPI 6.5 metadata */
+    LOONGEMU_ACPI_PROFILE_WINDOWS = 1, /* Windows OEM override + HPET/MCFG hook */
+} LoongemuAcpiProfile;
+
+typedef struct LoongemuAcpiSpcrInfo {
+    uint64_t base_addr;
+    uint8_t  addr_space;   /* 0 = System Memory (MMIO), 1 = System I/O */
+    uint8_t  reg_width;    /* bits (8/32) */
+    uint8_t  access_size;  /* 1=byte, 2=word, 3=dword */
+    uint8_t  interface_type;
+    uint8_t  baud_rate;
+} LoongemuAcpiSpcrInfo;
+
 /*
  * Build complete x86-64 ACPI 2.0 tables (RSDP, RSDT, XSDT, FADT, DSDT, MADT)
  * inside guest RAM.  Returns 1 on success, 0 on invalid arguments.
@@ -156,6 +170,21 @@ int loongemu_acpi_build(uint8_t *guest_ram,
                         LoongemuAcpiInfo *out_info);
 
 /*
+ * Profile-aware ACPI builder:
+ *  - LOONGEMU_ACPI_PROFILE_LINUX: inherits host UEFI ACPI 6.5 OEM ID when
+ *    host_rsdp_ptr is provided (and keeps PCI/platform identity unmodified).
+ *  - LOONGEMU_ACPI_PROFILE_WINDOWS: allows OEM ID override for Windows HAL.
+ */
+int loongemu_acpi_build_for_profile(uint8_t *guest_ram,
+                                    uint64_t rsdp_gpa,
+                                    uint64_t tables_gpa,
+                                    uint32_t nr_cpus,
+                                    LoongemuAcpiProfile profile,
+                                    const void *host_rsdp_ptr,
+                                    const char *oem_override_6,
+                                    LoongemuAcpiInfo *out_info);
+
+/*
  * Validate a host UEFI ACPI RSDP pointer (passed via EFI_ACPI_20_TABLE_GUID)
  * and extract the OEM ID (6 bytes + NUL).  Returns 1 if valid ACPI 1.0/2.0 RSDP.
  */
@@ -163,6 +192,14 @@ int loongemu_acpi_validate_rsdp(const void *rsdp_ptr,
                                 uint8_t *out_rev,
                                 uint64_t *out_xsdt_pa,
                                 char out_oem_id[7]);
+
+/*
+ * Parse the host UEFI ACPI XSDT/RSDT to locate the SPCR (Serial Port Console
+ * Redirection) table and extract the real hardware UART MMIO/IO base address.
+ */
+int loongemu_acpi_find_spcr(const void *host_rsdp_ptr,
+                            const void *(*pa_to_ptr)(uint64_t pa),
+                            LoongemuAcpiSpcrInfo *out_spcr);
 
 #ifdef __cplusplus
 }

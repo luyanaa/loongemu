@@ -827,6 +827,10 @@ static bool (*translate_functions[])(IR1_INST *) = {
     TRANS_FUNC_GEN(LMSW, lmsw),
     TRANS_FUNC_GEN(RDMSR, rdmsr),
     TRANS_FUNC_GEN(WRMSR, wrmsr),
+    TRANS_FUNC_GEN(RDRAND, rdrand),
+    TRANS_FUNC_GEN(RDSEED, rdseed),
+    TRANS_FUNC_GEN(VMCALL, vmcall),
+    TRANS_FUNC_GEN(VMMCALL, vmmcall),
     TRANS_FUNC_GEN(INVLPG, invlpg),
     TRANS_FUNC_GEN(LGDT, lgdt),
     TRANS_FUNC_GEN(LIDT, lidt),
@@ -4901,7 +4905,7 @@ void tr_gen_call_to_helper_xgetbv(void)
     tr_gen_call_to_helper_prologue(0);
 
     /* load func_addr and jmp */
-    IR2_OPND func_addr_opnd = ra_alloc_dbt_arg2();
+    IR2_OPND func_addr_opnd = ra_alloc_itemp();
     aot_load_host_addr(func_addr_opnd, (ADDR)helper_xgetbv,
             LOAD_HELPER_XGETBV, 0);
     /* prologue, jmp and epilogue */
@@ -4913,6 +4917,7 @@ void tr_gen_call_to_helper_xgetbv(void)
 
     /* load func_addr and jmp */
     la_jirl(ra_ir2_opnd, func_addr_opnd, 0);
+    ra_free_temp(func_addr_opnd);
 
     /* CAUTION: make sure prologue/epilogue not saving/restore GPRs0-7 */
     /* Because we need eax/edx values used for insns after epliogue */
@@ -5174,9 +5179,10 @@ void tr_gen_call_to_helper_vfll(ADDR func, IR2_OPND arg1, IR2_OPND arg2,
     la_mov64(a2_ir2_opnd, arg2);
 
     /* load the helper addr */
-    IR2_OPND func_addr_opnd = ra_alloc_dbt_arg2();
+    IR2_OPND func_addr_opnd = ra_alloc_itemp();
     aot_load_host_addr(func_addr_opnd, (ADDR)func, REL_KIND, 0);
     la_jirl(ra_ir2_opnd, func_addr_opnd, 0);
+    ra_free_temp(func_addr_opnd);
 
     tr_gen_call_to_helper_epilogue(use_fp);
 }
