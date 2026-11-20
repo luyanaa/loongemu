@@ -59,6 +59,25 @@ int main(void)
            "tlbinv");
     expect(0x42000004, MIPS_OP_TLB, MIPS_TLB_TLBINVF, 16, 0, 0, -32768,
            "tlbinvf");
+    expect(0x70000010, MIPS_OP_LOONGSON, MIPS_LG_MULT, 0, 0, 0, -32768,
+           "gsmult");
+    expect(0x70000014, MIPS_OP_LOONGSON, MIPS_LG_DIV, 0, 0, 0, -32768,
+           "gsdiv");
+    expect(0x7000001c, MIPS_OP_LOONGSON, MIPS_LG_MOD, 0, 0, 0, -32768,
+           "gsmod");
+    expect(0xc8000020, MIPS_OP_LOONGSON_MEM, MIPS_LM_GSLQ, 0, 0, 0, 0,
+           "gslq");
+    expect(0xd8000000, MIPS_OP_LOONGSON_MEM, MIPS_LM_GSLBX, 0, 0, 0, 0,
+           "gslbx");
+    expect(0xf8000003, MIPS_OP_LOONGSON_MEM, MIPS_LM_GSSDX, 0, 0, 0, 0,
+           "gssdx");
+    expect(0xc8000014, MIPS_OP_LOONGSON_MEM, MIPS_LM_GSLWLE, 0, 0, 0, -32768,
+           "gslwle");
+    expect(0xC8000000u | (2u << 21) | (4u << 11) |
+           (4u << 6) | 0x18u, MIPS_OP_IOCSR, MIPS_IOCSR_RDCSR,
+           2, 0, 4, -32768, "rdcsr");
+    expect(0x7c00000fu, MIPS_OP_CRC, MIPS_CRC32B, 0, 0, 0, -32768,
+           "crc32b");
 
     printf("latm-decode: checks=%d fails=%d\n", checks, fails);
     return fails != 0;

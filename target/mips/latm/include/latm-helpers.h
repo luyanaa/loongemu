@@ -68,6 +68,17 @@ void latm_tlb_init(CPUMIPSState *env, CPUMIPSTLBContext *tlb, int nb_tlb);
 void latm_helper_tlb(CPUMIPSState *env, uint32_t op);
 void latm_jmp_cache_flush(void *cpu);
 uint64_t latm_helper_shadow_read(CPUMIPSState *env, uint32_t rd);
+uint64_t latm_helper_loongson_arith(CPUMIPSState *env, uint64_t op,
+                                   uint64_t a, uint64_t b);
+void latm_helper_loongson_mem(CPUMIPSState *env, uint32_t op,
+                              uint64_t base, uint64_t index, int32_t offset,
+                              uint32_t rt, uint32_t rt2);
+uint64_t latm_helper_iocsr_read(CPUMIPSState *env, uint64_t addr, unsigned size);
+void latm_helper_iocsr_write(CPUMIPSState *env, uint64_t addr, uint64_t val,
+                             unsigned size);
+uint64_t latm_helper_cpucfg(CPUMIPSState *env, uint32_t sel);
+uint64_t latm_helper_crc(CPUMIPSState *env, uint32_t op, uint64_t data,
+                         uint64_t crc);
 void latm_helper_shadow_write(CPUMIPSState *env, uint32_t rd, uint64_t val);
 void latm_helper_eret(CPUMIPSState *env);
 void latm_helper_wait(CPUMIPSState *env);

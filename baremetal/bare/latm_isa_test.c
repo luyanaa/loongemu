@@ -95,6 +95,17 @@ void latm_platform_smc_broadcast(uint64_t start, uint64_t end)
 
 /* daddiu $2,$0,5; daddiu $3,$0,7; daddu $4,$2,$3; dsubu $5,$4,$2;
  * dsll $6,$5,3; dsra $7,$6,1 */
+static uint32_t loongson_code[] __attribute__((aligned(4096))) = {
+    0x64080007, 0x64090006, 0x71095010, /* gsmult $10,$8,$9 = 42 */
+    0x640b0014, 0x640c0006, 0x716c6814, /* gsdiv $13,$11,$12 = 3 */
+    0x640e0014, 0x640f0006, 0x71cf801c, /* gsmod $16,$14,$15 = 2 */
+};
+static uint32_t loongson_mem_code[] __attribute__((aligned(4096))) = {
+    0x64080400, 0x64090011, 0x640a0022,
+    0xe909002a,                         /* gssq $9,$10,0($8) */
+    0xc90b002c,                         /* gslq $11,$12,0($8) */
+};
+
 static uint32_t arith_code[] __attribute__((aligned(4096))) = {
     0x64020005, 0x64030007, 0x0043202d, 0x0082282f, 0x000530f8, 0x0006387b,
 };
@@ -444,6 +455,14 @@ void kmain(void)
               "per-vCPU context-switch entry");
         latm_bind_env(&env);
     }
+
+    run_block(loongson_code, 9, "loongson");
+    check(env.active_tc.gpr[10], 42, "gsmult");
+    check(env.active_tc.gpr[13], 3, "gsdiv");
+    check(env.active_tc.gpr[16], 2, "gsmod");
+    run_block(loongson_mem_code, 5, "loongson-mem");
+    check(env.active_tc.gpr[11], 0x11, "gssq/gslq first");
+    check(env.active_tc.gpr[12], 0x22, "gssq/gslq second");
 
     run_block(arith_code, 6, "arith");
     check(env.active_tc.gpr[4], 12, "arith daddu");

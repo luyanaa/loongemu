@@ -1345,6 +1345,91 @@ static bool trans_break(DisasContext *s)
     return true;
 }
 
+static bool trans_loongson(DisasContext *s)
+{
+    IR2_OPND op = ir2_opnd_new(IR2_OPND_IMM, s->ir1.subop);
+    IR2_OPND a = alloc_gpr_src(s->ir1.rs);
+    IR2_OPND b = alloc_gpr_src(s->ir1.rt);
+    latm_set_pc(s);
+    IR2_OPND r = hcall3((uintptr_t)latm_helper_loongson_arith, op, a, b);
+    store_gpr_dst_f(s->ir1.rd, r);
+    free_gpr_temp(a, s->ir1.rs);
+    free_gpr_temp(b, s->ir1.rt);
+    return true;
+}
+
+static bool trans_loongson_mem(DisasContext *s)
+{
+    IR2_OPND op = ir2_opnd_new(IR2_OPND_IMM, s->ir1.subop);
+    IR2_OPND base = alloc_gpr_src(s->ir1.rs);
+    uint32_t index_reg = (s->ir1.subop == MIPS_LM_GSLQ ||
+                          s->ir1.subop == MIPS_LM_GSSQ) ? 0 : s->ir1.rd;
+    IR2_OPND index = index_reg ? alloc_gpr_src(index_reg) : zero_ir2_opnd;
+    IR2_OPND off = imm_opnd(s->ir1.simm);
+    IR2_OPND rt = ir2_opnd_new(IR2_OPND_IMM, s->ir1.rt);
+    IR2_OPND rt2 = ir2_opnd_new(IR2_OPND_IMM, s->ir1.aux);
+    latm_set_pc(s);
+    hcall6((uintptr_t)latm_helper_loongson_mem, op, base, index, off, rt, rt2);
+    if (index_reg && mips_la_map[index_reg] < 0) {
+        ra_free_itemp(index._reg_num);
+    }
+    free_gpr_temp(base, s->ir1.rs);
+    ra_free_itemp(off._reg_num);
+    return true;
+}
+
+static bool trans_iocsr(DisasContext *s)
+{
+    IR2_OPND addr;
+    IR2_OPND val;
+    IR2_OPND size;
+    IR2_OPND r;
+
+    latm_set_pc(s);
+    switch (s->ir1.subop) {
+    case MIPS_IOCSR_CPUCFG:
+        r = hcall2((uintptr_t)latm_helper_cpucfg,
+                   ir2_opnd_new(IR2_OPND_IMM, s->ir1.rs), zero_ir2_opnd);
+        store_gpr_dst_f(s->ir1.rd, r);
+        break;
+    case MIPS_IOCSR_RDCSR:
+    case MIPS_IOCSR_DRDCSR:
+        addr = alloc_gpr_src(s->ir1.rs);
+        size = ir2_opnd_new(IR2_OPND_IMM,
+                            s->ir1.subop == MIPS_IOCSR_DRDCSR ? 8 : 4);
+        r = hcall3((uintptr_t)latm_helper_iocsr_read, addr, size, zero_ir2_opnd);
+        store_gpr_dst_f(s->ir1.rd, r);
+        free_gpr_temp(addr, s->ir1.rs);
+        break;
+    case MIPS_IOCSR_WRCSR:
+    case MIPS_IOCSR_DWRCSR:
+        addr = alloc_gpr_src(s->ir1.rs);
+        val = alloc_gpr_src(s->ir1.rd);
+        size = ir2_opnd_new(IR2_OPND_IMM,
+                            s->ir1.subop == MIPS_IOCSR_DWRCSR ? 8 : 4);
+        hcall4((uintptr_t)latm_helper_iocsr_write, addr, val, size, zero_ir2_opnd);
+        free_gpr_temp(addr, s->ir1.rs);
+        free_gpr_temp(val, s->ir1.rd);
+        break;
+    default:
+        return false;
+    }
+    return true;
+}
+
+static bool trans_crc(DisasContext *s)
+{
+    IR2_OPND op = ir2_opnd_new(IR2_OPND_IMM, s->ir1.subop);
+    IR2_OPND a = alloc_gpr_src(s->ir1.rs);
+    IR2_OPND b = alloc_gpr_src(s->ir1.rd);
+    latm_set_pc(s);
+    IR2_OPND r = hcall3((uintptr_t)latm_helper_crc, op, a, b);
+    store_gpr_dst_f(s->ir1.rt, r);
+    free_gpr_temp(a, s->ir1.rs);
+    free_gpr_temp(b, s->ir1.rd);
+    return true;
+}
+
 /* ------------------------------------------------------------------ */
 /* IR1 table and TB loop                                               */
 
@@ -1385,6 +1470,10 @@ TranslateFn translate_functions[MIPS_OP__COUNT] = {
     [MIPS_OP_FPU_BC]    = trans_fpu_bc,
     [MIPS_OP_FPU_LDST]  = trans_fpu_ldst,
     [MIPS_OP_FPU_GPR]   = trans_fpu_gpr,
+    [MIPS_OP_LOONGSON]  = trans_loongson,
+    [MIPS_OP_LOONGSON_MEM] = trans_loongson_mem,
+    [MIPS_OP_IOCSR]     = trans_iocsr,
+    [MIPS_OP_CRC]       = trans_crc,
 };
 
 static void translate_one(DisasContext *s)

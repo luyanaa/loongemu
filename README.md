@@ -99,7 +99,7 @@ make -C baremetal all   # baremetal/build/liblatx_core.a  (x86-64 translator)
 make lata-all           # lata/build/liblata_core.a       (AArch64 translator)
 make lata-probe         # per-file syntax check
 make lata-check         # build LATA and verify its external-symbol allowlist
-make test-latm          # LATM decoder + TLB/vclock/timer/IRQ + MIPS64r2/board tests
+make test-latm          # LATM decoder + Loongson 3A4000 profile/system/uncore/PCI mock tests
 make latm-board-run     # synthetic MIPS64 board: RAM, 16550 + IRQ, FDT, precise exceptions
 ```
 

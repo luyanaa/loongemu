@@ -46,6 +46,11 @@ typedef enum {
     MIPS_OP_FPU_LDST,
     MIPS_OP_FPU_GPR,
     MIPS_OP_COP1X,
+    MIPS_OP_LOONGSON,
+    MIPS_OP_LOONGSON_MEM,
+    MIPS_OP_IOCSR,
+    MIPS_OP_AMO,
+    MIPS_OP_CRC,
     MIPS_OP_RI,
     MIPS_OP__COUNT
 } MIPS_OP;
@@ -126,6 +131,39 @@ enum {
     MIPS_CP0_MFHC0, MIPS_CP0_MTHC0, MIPS_CP0_RDPGPR, MIPS_CP0_WRPGPR,
 };
 
+/* Loongson EXT/EXT2 integer and memory operations. */
+enum {
+    MIPS_LG_MULT, MIPS_LG_MULTU, MIPS_LG_DMULT, MIPS_LG_DMULTU,
+    MIPS_LG_DIV, MIPS_LG_DIVU, MIPS_LG_DDIV, MIPS_LG_DDIVU,
+    MIPS_LG_MOD, MIPS_LG_MODU, MIPS_LG_DMOD, MIPS_LG_DMODU,
+    MIPS_LG_LE, MIPS_LG_GT,
+};
+
+enum {
+    MIPS_LM_GSLQ, MIPS_LM_GSSQ,
+    MIPS_LM_GSLBX, MIPS_LM_GSLHX, MIPS_LM_GSLWX, MIPS_LM_GSLDX,
+    MIPS_LM_GSSBX, MIPS_LM_GSSHX, MIPS_LM_GSSWX, MIPS_LM_GSSDX,
+    MIPS_LM_GSLBLE, MIPS_LM_GSLBGT, MIPS_LM_GSLHLE, MIPS_LM_GSLHGT,
+    MIPS_LM_GSLWLE, MIPS_LM_GSLWGT, MIPS_LM_GSLDLE, MIPS_LM_GSLDGT,
+    MIPS_LM_GSSBLE, MIPS_LM_GSSBGT, MIPS_LM_GSSHLE, MIPS_LM_GSSHGT,
+    MIPS_LM_GSSWLE, MIPS_LM_GSSWGT, MIPS_LM_GSSDLE, MIPS_LM_GSSDGT,
+};
+
+enum {
+    MIPS_IOCSR_CPUCFG, MIPS_IOCSR_RDCSR, MIPS_IOCSR_WRCSR,
+    MIPS_IOCSR_DRDCSR, MIPS_IOCSR_DWRCSR,
+};
+
+enum {
+    MIPS_AMO_ADD, MIPS_AMO_SWAP, MIPS_AMO_AND, MIPS_AMO_OR,
+    MIPS_AMO_XOR, MIPS_AMO_MIN, MIPS_AMO_MAX,
+};
+
+enum {
+    MIPS_CRC32B, MIPS_CRC32H, MIPS_CRC32W, MIPS_CRC32D,
+    MIPS_CRC32CB, MIPS_CRC32CH, MIPS_CRC32CW, MIPS_CRC32CD,
+};
+
 enum {
     MIPS_CP0OP_ERET, MIPS_CP0OP_DERET, MIPS_CP0OP_WAIT,
     MIPS_CP0OP_DI, MIPS_CP0OP_EI,
@@ -176,7 +214,7 @@ typedef struct MipsIR1 {
     MIPS_OP op;
     uint32_t insn;
     uint64_t pc;
-    uint8_t rs, rt, rd, sa, sel, fmt, cond;
+    uint8_t rs, rt, rd, sa, sel, fmt, cond, aux;
     uint16_t subop;
     int16_t simm;
     uint32_t target;
@@ -197,6 +235,7 @@ static inline void mips_ir1_init(MipsIR1 *ir1, uint32_t insn, uint64_t pc)
     ir1->sel = insn & 0x7;
     ir1->fmt = 0;
     ir1->cond = 0;
+    ir1->aux = 0;
     ir1->subop = 0;
     ir1->simm = (int16_t)insn;
     ir1->target = insn & 0x03ffffff;

@@ -790,3 +790,32 @@ FDT 已用 `dtc -I dtb -O dts` 反编译验证：无 `FDT_END` 缺失、无 rese
 8. **FPU 使能**：bare-metal QEMU 复位后 `EUEN.FPE=0`；执行 softfloat/C helper 中的浮点指令前必须置位 FPE（测试已显式使能）。
 9. **翻译器状态**：`ir1_list`/`db_rel`、寄存器分配、IR2 buffer、TB link cache、context-switch 入口均已移入 per-vCPU `TRANSLATION_DATA`/`CPUMIPSState`；`target_disasm()` 可按 CPU 绑定。`latm/Makefile` 的 `TLS=1` 把 `lsenv/tr_data` 编译为 `_Thread_local` 并去掉翻译锁，可并行翻译；默认 freestanding 构建仍使用串行锁。多 vCPU 初始化 prologue/epilogue 时必须使用 `lata_gen_prologue_env/epilogue_env`。
 10. **其它未覆盖**：MIPS16/microMIPS/MSA/R6、big-endian、完整系统态指令精确异常、MIPS SMP vCPU/IRQ 集成。TLBINV/TLBINVF 已覆盖；跨 vCPU 的 TLB shootdown 仍需平台通过 `tlb_flush` 广播。
+
+
+### 13.6 M0-M3 Loongson 3A4000 增量（2026-11-21）
+
+按用户确认的范围，首目标固定为 **3A4000 + DTB**；LEFI、3A3000、真实 7A 和真实硬件路径继续作为缺口。
+
+| 层 | 实现 |
+| --- | --- |
+| CPU profile | 新增 `latm_cpu_3a4000` / `latm_cpu_3a3000`；3A4000 `CP0_PRId=0x0014c004`，`Config0..6`、`CP0_Diag`、64 项 VTLB，首阶段 `Config6.VTLBONLY=1`（关闭 FTLB） |
+| LoongISA | EXT/EXT2 `gslq/gssq`、`gsl*bx/gss*bx`、`gslwle/gt` 等、`gsmult/gsdiv/gsmod`、`rdcsr/wrcsr/drcsr/dwcsr`、`crc32*` 已接入 IR1/IR2；AMO 的 MIPS 编码在当前 binutils/QEMU 参考中不可用，保留为显式缺口 |
+| System | `LatmMmioBus` 严格按 1/2/4/8-bit 宽度分发；`LatmMemoryLayout` 提供 3A4000 低 256 MiB + `0x90000000` 高 RAM、VMM/code-cache 保留区 |
+| DTB | 新增可复用 `LatmDtbBuilder` 和 3A4000 DTB：`loongson,loongson64v-4core-ls7a`、`gs464v`、low/high memory、`reserved-memory`、initrd、serial、PIC、PCI probe-only |
+| Uncore | 3A4000 MailBox（MMIO `0x3ff01000 + core*0x100`）、PCH-PIC 64 线、PCH-MSI、EXTIOI 256 路路由到 IP3..IP6；4-core host tests |
+| 7A mock | `LatmPci` 包装现有 `LoongemuPciHost`/LS7A backend；mock Split-CFG、DC/GPU blacklist、Boards MMIO exact-width；真实透传仍在 TODO |
+| 执行 | 最小 system board 组合 host-testable；真实 Linux 内核镜像不在仓库内，因此本轮只验证 DTB/内存/MMIO/uncore/PCI 组合，不宣称 Linux 已启动 |
+
+新增门禁：
+
+- `make test-latm-cpu`：9 项 profile/CP0/Diag/VTLB。
+- `make test-latm-loongson`：10 项 gs 算术与 CRC。
+- `make test-latm-system`：21 项 exact-width MMIO、内存布局、DTB 和 `fw_arg2`。
+- `make test-latm-uncore`：13 项 MailBox/PIC/MSI/EXTIOI 4-core 路由。
+- `make test-latm-pci`：7 项 7A mock blacklist + PCI BAR exact-width。
+- `make test-latm-board-system`：18 项 system composition + UART + DTB。
+- `latm-isa` 新增 `loongson`/`loongson-mem`：gs 算术、gslq/gssq 端到端通过；`test-latm-decode` 32 项。
+
+DTB 已由 host test 生成并用 `dtc -I dtb -O dts` 验证（3A4000 compatible、reserved-memory、initrd、serial/PIC、PCI 节点）。
+
+**仍为缺口**：真实 Linux 启动镜像与内核 ABI 实机验证、LEFI、3A3000/LIOINTC/HT、MMI/LSX/LASX、AMO 编码确认、真实 7A 透传/宿主中断/1:1 DMA、PLV3/TB 性能。

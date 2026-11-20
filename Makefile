@@ -382,6 +382,103 @@ test-latm-interrupts: build/test_latm_interrupts
 test-latm-insn-map: build/test_latm_insn_map
 	./build/test_latm_insn_map
 
+test-latm-cpu: build/test_latm_cpu
+	./build/test_latm_cpu
+
+test-latm-loongson: build/test_latm_loongson
+	./build/test_latm_loongson
+
+build/test_latm_loongson: tests/test_latm_loongson.c \
+                          target/mips/latm/helpers/loongson.c
+	@mkdir -p build
+	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
+	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
+	      -I latx/compat -I latx/upstream/include -I . \
+	      $(CFLAGS) -Wno-gnu-empty-struct \
+	      tests/test_latm_loongson.c target/mips/latm/helpers/loongson.c -o $@
+
+test-latm-system: build/test_latm_system
+	./build/test_latm_system
+
+test-latm-uncore: build/test_latm_uncore
+	./build/test_latm_uncore
+
+test-latm-pci: build/test_latm_pci
+	./build/test_latm_pci
+
+test-latm-board-system: build/test_latm_board_system
+	./build/test_latm_board_system
+
+build/test_latm_board_system: tests/test_latm_board_system.c \
+                              target/mips/latm/system/latm_system.c \
+                              target/mips/latm/system/latm_mmio.c \
+                              target/mips/latm/system/latm_memory.c \
+                              target/mips/latm/system/latm_dtb.c \
+                              target/mips/latm/system/latm_pci.c \
+                              target/mips/latm/system/latm_uart.c \
+                              target/mips/latm/uncore/latm_uncore.c \
+                              src/pci_host.c src/phys_mem.c src/acpi_tables.c
+	@mkdir -p build
+	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
+	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
+	      -I latx/compat -I latx/upstream/include -I . -Iinclude \
+	      $(CFLAGS) -Wno-gnu-empty-struct \
+	      tests/test_latm_board_system.c \
+	      target/mips/latm/system/latm_system.c \
+	      target/mips/latm/system/latm_mmio.c \
+	      target/mips/latm/system/latm_memory.c \
+	      target/mips/latm/system/latm_dtb.c \
+	      target/mips/latm/system/latm_pci.c \
+	      target/mips/latm/system/latm_uart.c \
+	      target/mips/latm/uncore/latm_uncore.c \
+	      src/pci_host.c src/phys_mem.c src/acpi_tables.c -o $@
+
+build/test_latm_pci: tests/test_latm_pci.c \
+                     target/mips/latm/system/latm_pci.c \
+                     target/mips/latm/system/latm_mmio.c \
+                     src/pci_host.c src/phys_mem.c src/acpi_tables.c
+	@mkdir -p build
+	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
+	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
+	      -I latx/compat -I latx/upstream/include -I . -Iinclude \
+	      $(CFLAGS) -Wno-gnu-empty-struct \
+	      tests/test_latm_pci.c target/mips/latm/system/latm_pci.c \
+	      target/mips/latm/system/latm_mmio.c src/pci_host.c \
+	      src/phys_mem.c src/acpi_tables.c -o $@
+
+build/test_latm_uncore: tests/test_latm_uncore.c \
+                        target/mips/latm/uncore/latm_uncore.c
+	@mkdir -p build
+	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
+	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
+	      -I latx/compat -I latx/upstream/include -I . \
+	      $(CFLAGS) -Wno-gnu-empty-struct \
+	      tests/test_latm_uncore.c target/mips/latm/uncore/latm_uncore.c -o $@
+
+build/test_latm_system: tests/test_latm_system.c \
+                        target/mips/latm/system/latm_mmio.c \
+                        target/mips/latm/system/latm_memory.c \
+                        target/mips/latm/system/latm_dtb.c
+	@mkdir -p build
+	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
+	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
+	      -I latx/compat -I latx/upstream/include -I . \
+	      $(CFLAGS) -Wno-gnu-empty-struct \
+	      tests/test_latm_system.c target/mips/latm/system/latm_mmio.c \
+	      target/mips/latm/system/latm_memory.c \
+	      target/mips/latm/system/latm_dtb.c -o $@
+
+build/test_latm_cpu: tests/test_latm_cpu.c \
+                    target/mips/latm/cpu/loongson-profile.c \
+                    target/mips/latm/helpers/cp0.c
+	@mkdir -p build
+	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
+	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
+	      -I latx/compat -I latx/upstream/include -I . \
+	      $(CFLAGS) -Wno-gnu-empty-struct \
+	      tests/test_latm_cpu.c target/mips/latm/cpu/loongson-profile.c \
+	      target/mips/latm/helpers/cp0.c -o $@
+
 build/test_latm_insn_map: tests/test_latm_insn_map.c \
                           target/mips/latm/tb_insn_map.c
 	@mkdir -p build
@@ -425,7 +522,7 @@ build/test_latm_decode: tests/test_latm_decode.c target/mips/latm/ir1/decode-mip
 
 # ---- LATM: MIPS64r2 -> LoongArch ----
 .PHONY: test-latm test-latm-decode test-latm-tlb test-latm-vclock latm-core latm-isa-image latm-isa-run latm-board-image latm-board-run
-test-latm: test-latm-decode test-latm-tlb test-latm-vclock test-latm-interrupts test-latm-insn-map latm-isa-run latm-board-run
+test-latm: test-latm-decode test-latm-tlb test-latm-vclock test-latm-interrupts test-latm-insn-map test-latm-cpu test-latm-loongson test-latm-system test-latm-uncore test-latm-pci test-latm-board-system latm-isa-run latm-board-run
 
 # ---- bare-metal MIPS64r2 (LATM) execution harness ----
 LATM_BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
@@ -442,7 +539,8 @@ latm-core:
 
 build/latm_isa_test.o: baremetal/bare/latm_isa_test.c \
                        target/mips/latm/include/latm.h \
-                       target/mips/latm/include/latm-platform.h
+                       target/mips/latm/include/latm-platform.h \
+                       target/mips/cpu.h target/mips/internal.h
 	@mkdir -p build
 	$(CLANG) $(LATM_BARE_CFLAGS) -c $< -o $@
 
@@ -462,7 +560,8 @@ latm-isa-image: latm-core build/bare_latm_isa.elf
 
 build/latm_board.o: baremetal/bare/latm_board.c \
                     target/mips/latm/include/latm.h \
-                    target/mips/latm/include/latm-platform.h
+                    target/mips/latm/include/latm-platform.h \
+                    target/mips/cpu.h target/mips/internal.h
 	@mkdir -p build
 	$(CLANG) $(LATM_BARE_CFLAGS) -Iinclude -c $< -o $@
 

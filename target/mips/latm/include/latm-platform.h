@@ -22,6 +22,9 @@ typedef struct LatmPlatform {
     void (*tlb_flush)(CPUMIPSState *env);
     void (*smc_broadcast)(CPUMIPSState *env, uint64_t start, uint64_t end);
     void (*request_interrupt)(CPUMIPSState *env, uint32_t cause_bits);
+    uint64_t (*iocsr_read)(CPUMIPSState *env, uint64_t addr, unsigned size);
+    void (*iocsr_write)(CPUMIPSState *env, uint64_t addr, uint64_t val,
+                        unsigned size);
     void *opaque;
 } LatmPlatform;
 

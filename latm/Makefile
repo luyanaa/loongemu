@@ -25,14 +25,14 @@ CFLAGS := $(BASE) $(INCS) $(DEFS)
 
 SHARED := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \
           $(LATA)/mem.c $(LATA)/translator/macro-helper.c
-CORE   := $(LATM)/latm.c $(LATM)/tb_insn_map.c $(LATM)/runtime.c $(LATM)/translator/reg-alloc.c \
+CORE   := $(LATM)/latm.c $(LATM)/tb_insn_map.c $(LATM)/cpu/loongson-profile.c $(LATM)/runtime.c $(LATM)/translator/reg-alloc.c \
           $(LATM)/ir1/decode-mips.c $(LATM)/translator/translate-mips.c \
           ../target/mips/fpu.c
 HELPERS := $(LATM)/helpers/qemu_fpu_helper.c $(LATM)/helpers/qemu_ldst_helper.c \
            $(LATM)/helpers/qemu_op_helper.c $(LATM)/helpers/fpu.c \
            $(LATM)/helpers/int.c $(LATM)/helpers/cp0.c \
            $(LATM)/helpers/exception.c $(LATM)/helpers/memory.c \
-           $(LATM)/helpers/math_stubs.c
+           $(LATM)/helpers/loongson.c $(LATM)/helpers/math_stubs.c
 FPU    := ../fpu/softfloat.c
 SRCS   := $(SHARED) $(CORE) $(HELPERS) $(FPU)
 

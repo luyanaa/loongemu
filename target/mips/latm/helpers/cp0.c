@@ -332,6 +332,7 @@ uint64_t latm_helper_cp0_read(CPUMIPSState *env, uint32_t reg, uint32_t sel)
     case 18: return env->CP0_WatchLo[0];
     case 19: return env->CP0_WatchHi[0];
     case 20: return env->CP0_XContext;
+    case 22: return env->CP0_Diag;
     case 23: return env->CP0_Debug;
     case 24: return env->CP0_DEPC;
     case 26: return env->CP0_ErrCtl;
@@ -441,6 +442,7 @@ void latm_helper_cp0_write(CPUMIPSState *env, uint32_t reg, uint32_t sel,
     case 18: env->CP0_WatchLo[0] = v; break;
     case 19: env->CP0_WatchHi[0] = v; break;
     case 20: env->CP0_XContext = v; break;
+    case 22: env->CP0_Diag = (uint32_t)v; break;
     case 23: env->CP0_Debug = v; break;
     case 24: env->CP0_DEPC = v; break;
     case 26: env->CP0_ErrCtl = v; break;

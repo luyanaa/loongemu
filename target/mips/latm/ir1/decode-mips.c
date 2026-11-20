@@ -39,6 +39,97 @@ static bool set_branch(MipsIR1 *ir1, unsigned subop, bool likely, bool link)
     return true;
 }
 
+static int32_t sextract_bits(uint32_t v, unsigned start, unsigned len)
+{
+    uint32_t x = (v >> start) & ((1u << len) - 1u);
+    if (x & (1u << (len - 1u))) {
+        x |= ~((1u << len) - 1u);
+    }
+    return (int32_t)x;
+}
+
+static bool decode_lcsr(MipsIR1 *ir1, uint32_t insn)
+{
+    unsigned op = (insn >> 16) & 0x1f;
+    if (((insn >> 6) & 0x1f) != 4 || (insn & 0x3f) != 0x18 || op > 8) {
+        return false;
+    }
+    ir1->op = MIPS_OP_IOCSR;
+    switch (op) {
+    case 0: ir1->subop = MIPS_IOCSR_RDCSR; break;
+    case 1: ir1->subop = MIPS_IOCSR_WRCSR; break;
+    case 2: ir1->subop = MIPS_IOCSR_DRDCSR; break;
+    case 3: ir1->subop = MIPS_IOCSR_DWRCSR; break;
+    case 8: ir1->subop = MIPS_IOCSR_CPUCFG; break;
+    default: return false;
+    }
+    return true;
+}
+
+static bool decode_gslq(MipsIR1 *ir1, uint32_t insn, bool store)
+{
+    ir1->op = MIPS_OP_LOONGSON_MEM;
+    ir1->subop = store ? MIPS_LM_GSSQ : MIPS_LM_GSLQ;
+    ir1->simm = (int16_t)(sextract_bits(insn, 6, 9) << 4);
+    ir1->aux = insn & 0x1f;
+    return true;
+}
+
+static bool decode_shifted_mem(MipsIR1 *ir1, uint32_t insn, bool store)
+{
+    unsigned op = insn & 0x3f;
+    static const uint16_t load_ops[] = {
+        MIPS_LM_GSLBLE, MIPS_LM_GSLBGT, MIPS_LM_GSLHLE, MIPS_LM_GSLHGT,
+        MIPS_LM_GSLWLE, MIPS_LM_GSLWGT, MIPS_LM_GSLDLE, MIPS_LM_GSLDGT,
+    };
+    static const uint16_t store_ops[] = {
+        MIPS_LM_GSSBLE, MIPS_LM_GSSBGT, MIPS_LM_GSSHLE, MIPS_LM_GSSHGT,
+        MIPS_LM_GSSWLE, MIPS_LM_GSSWGT, MIPS_LM_GSSDLE, MIPS_LM_GSSDGT,
+    };
+    if (op < 0x10 || op > 0x17) {
+        return false;
+    }
+    ir1->op = MIPS_OP_LOONGSON_MEM;
+    ir1->subop = store ? store_ops[op - 0x10] : load_ops[op - 0x10];
+    return true;
+}
+
+static bool decode_indexed_mem(MipsIR1 *ir1, uint32_t insn, bool store)
+{
+    unsigned op = insn & 0x7;
+    if (op > 3) {
+        return false;
+    }
+    ir1->op = MIPS_OP_LOONGSON_MEM;
+    ir1->subop = (store ? MIPS_LM_GSSBX : MIPS_LM_GSLBX) + op;
+    ir1->simm = (int16_t)sextract_bits(insn, 3, 8);
+    return true;
+}
+
+static bool decode_lwc2(MipsIR1 *ir1, uint32_t insn)
+{
+    if ((insn & 0xfc008020u) == 0xc8000020u) {
+        return decode_gslq(ir1, insn, false);
+    }
+    if ((insn & 0xfc0007ffu) >= 0xc8000010u &&
+        (insn & 0xfc0007ffu) <= 0xc8000017u) {
+        return decode_shifted_mem(ir1, insn, false);
+    }
+    return false;
+}
+
+static bool decode_swc2(MipsIR1 *ir1, uint32_t insn)
+{
+    if ((insn & 0xfc008020u) == 0xe8000020u) {
+        return decode_gslq(ir1, insn, true);
+    }
+    if ((insn & 0xfc0007ffu) >= 0xe8000010u &&
+        (insn & 0xfc0007ffu) <= 0xe8000017u) {
+        return decode_shifted_mem(ir1, insn, true);
+    }
+    return false;
+}
+
 static bool decode_special(MipsIR1 *ir1, uint32_t insn)
 {
     unsigned funct = insn & 0x3f;
@@ -277,6 +368,20 @@ static bool decode_special2(MipsIR1 *ir1, uint32_t insn)
     unsigned funct = insn & 0x3f;
 
     switch (funct) {
+    case 0x10: ir1->op = MIPS_OP_LOONGSON; ir1->subop = MIPS_LG_MULT; return true;
+    case 0x11: ir1->op = MIPS_OP_LOONGSON; ir1->subop = MIPS_LG_DMULT; return true;
+    case 0x12: ir1->op = MIPS_OP_LOONGSON; ir1->subop = MIPS_LG_MULTU; return true;
+    case 0x13: ir1->op = MIPS_OP_LOONGSON; ir1->subop = MIPS_LG_DMULTU; return true;
+    case 0x14: ir1->op = MIPS_OP_LOONGSON; ir1->subop = MIPS_LG_DIV; return true;
+    case 0x15: ir1->op = MIPS_OP_LOONGSON; ir1->subop = MIPS_LG_DDIV; return true;
+    case 0x16: ir1->op = MIPS_OP_LOONGSON; ir1->subop = MIPS_LG_DIVU; return true;
+    case 0x17: ir1->op = MIPS_OP_LOONGSON; ir1->subop = MIPS_LG_DDIVU; return true;
+    case 0x1c: ir1->op = MIPS_OP_LOONGSON; ir1->subop = MIPS_LG_MOD; return true;
+    case 0x1d: ir1->op = MIPS_OP_LOONGSON; ir1->subop = MIPS_LG_DMOD; return true;
+    case 0x1e: ir1->op = MIPS_OP_LOONGSON; ir1->subop = MIPS_LG_MODU; return true;
+    case 0x1f: ir1->op = MIPS_OP_LOONGSON; ir1->subop = MIPS_LG_DMODU; return true;
+    case 0x26: ir1->op = MIPS_OP_LOONGSON; ir1->subop = MIPS_LG_LE; return true;
+    case 0x27: ir1->op = MIPS_OP_LOONGSON; ir1->subop = MIPS_LG_GT; return true;
     case 0x00: ir1->op = MIPS_OP_MULDIV; ir1->subop = MIPS_MD_MADD; return true;
     case 0x01: ir1->op = MIPS_OP_MULDIV; ir1->subop = MIPS_MD_MADDU; return true;
     case 0x02: return set_alu(ir1, MIPS_ALU_MUL);
@@ -294,6 +399,18 @@ static bool decode_special2(MipsIR1 *ir1, uint32_t insn)
 static bool decode_special3(MipsIR1 *ir1, uint32_t insn)
 {
     unsigned funct = insn & 0x3f;
+
+    switch (insn & 0xfc00ffffu) {
+    case 0x7c00000fu: ir1->op = MIPS_OP_CRC; ir1->subop = MIPS_CRC32B; return true;
+    case 0x7c00004fu: ir1->op = MIPS_OP_CRC; ir1->subop = MIPS_CRC32H; return true;
+    case 0x7c00008fu: ir1->op = MIPS_OP_CRC; ir1->subop = MIPS_CRC32W; return true;
+    case 0x7c0000cfu: ir1->op = MIPS_OP_CRC; ir1->subop = MIPS_CRC32D; return true;
+    case 0x7c00010fu: ir1->op = MIPS_OP_CRC; ir1->subop = MIPS_CRC32CB; return true;
+    case 0x7c00014fu: ir1->op = MIPS_OP_CRC; ir1->subop = MIPS_CRC32CH; return true;
+    case 0x7c00018fu: ir1->op = MIPS_OP_CRC; ir1->subop = MIPS_CRC32CW; return true;
+    case 0x7c0001cfu: ir1->op = MIPS_OP_CRC; ir1->subop = MIPS_CRC32CD; return true;
+    default: break;
+    }
 
     switch (funct) {
     case 0x00: ir1->op = MIPS_OP_BITFIELD; ir1->subop = MIPS_BF_EXT; return true;
@@ -576,14 +693,33 @@ static bool decode_primary(MipsIR1 *ir1, uint32_t insn)
     case 0x2f: ir1->op = MIPS_OP_CACHE; return true;
     case 0x30: ir1->op = MIPS_OP_LOAD; ir1->subop = MIPS_MEM_LL; return true;
     case 0x31: ir1->op = MIPS_OP_FPU_LDST; ir1->subop = MIPS_FLDST_LWC1; return true;
+    case 0x32:
+        if (decode_lcsr(ir1, insn)) return true;
+        if (decode_lwc2(ir1, insn)) return true;
+        return ri(ir1);
     case 0x33: ir1->op = MIPS_OP_PREF; return true;
     case 0x34: ir1->op = MIPS_OP_LOAD; ir1->subop = MIPS_MEM_LLD; return true;
     case 0x35: ir1->op = MIPS_OP_FPU_LDST; ir1->subop = MIPS_FLDST_LDC1; return true;
+    case 0x36:
+        if ((insn & 0xfc000007u) <= 0xd8000003u &&
+            (insn & 0xfc000007u) >= 0xd8000000u) {
+            return decode_indexed_mem(ir1, insn, false);
+        }
+        return ri(ir1);
     case 0x37: ir1->op = MIPS_OP_LOAD; ir1->subop = MIPS_MEM_LD; return true;
     case 0x38: ir1->op = MIPS_OP_STORE; ir1->subop = MIPS_MEM_SC; return true;
     case 0x39: ir1->op = MIPS_OP_FPU_LDST; ir1->subop = MIPS_FLDST_SWC1; return true;
+    case 0x3a:
+        if (decode_swc2(ir1, insn)) return true;
+        return ri(ir1);
     case 0x3c: ir1->op = MIPS_OP_STORE; ir1->subop = MIPS_MEM_SCD; return true;
     case 0x3d: ir1->op = MIPS_OP_FPU_LDST; ir1->subop = MIPS_FLDST_SDC1; return true;
+    case 0x3e:
+        if ((insn & 0xfc000007u) <= 0xf8000003u &&
+            (insn & 0xfc000007u) >= 0xf8000000u) {
+            return decode_indexed_mem(ir1, insn, true);
+        }
+        return ri(ir1);
     case 0x3f: ir1->op = MIPS_OP_STORE; ir1->subop = MIPS_MEM_SD; return true;
     default:
         return ri(ir1);
