@@ -1797,6 +1797,10 @@ bool ir1_is_tb_ending(IR1_INST *ir1)
         return false;
     }
 
+    if (ir1_opcode(ir1) == dt_X86_INS_HLT) {
+        return true;
+    }
+
 #ifdef CONFIG_LATX_SYSCALL_TUNNEL
     return ir1_is_branch(ir1) || ir1_is_jump(ir1) || ir1_is_call(ir1) ||
            ir1_is_return(ir1);

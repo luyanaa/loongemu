@@ -902,6 +902,44 @@ static uint32_t classify_fault_access(uint64_t pc, uint64_t badv,
 
 static int g_use_sw_lbt;
 
+static void save_host_xmm_to_env(void)
+{
+    /*
+     * XMM0..XMM15 map to LoongArch $vr16..$vr31 / $xr16..$xr31.
+     * Emit raw vst/xvst encodings so tb_sys.c stays -mno-lsx -mno-lasx.
+     * $t0 = $r12 (rj = 12 -> rj << 5 = 0x180, si12 = 0).
+     */
+    if (option_enable_lasx) {
+#define SAVE_XR(i, word) do { \
+        void *p = &env.xmm_regs[(i)]; \
+        __asm__ volatile("move $t0, %0\n .word " #word "\n" :: "r"(p) : "t0", "memory"); \
+    } while (0)
+        SAVE_XR( 0, 0x2cc00190); SAVE_XR( 1, 0x2cc00191);
+        SAVE_XR( 2, 0x2cc00192); SAVE_XR( 3, 0x2cc00193);
+        SAVE_XR( 4, 0x2cc00194); SAVE_XR( 5, 0x2cc00195);
+        SAVE_XR( 6, 0x2cc00196); SAVE_XR( 7, 0x2cc00197);
+        SAVE_XR( 8, 0x2cc00198); SAVE_XR( 9, 0x2cc00199);
+        SAVE_XR(10, 0x2cc0019a); SAVE_XR(11, 0x2cc0019b);
+        SAVE_XR(12, 0x2cc0019c); SAVE_XR(13, 0x2cc0019d);
+        SAVE_XR(14, 0x2cc0019e); SAVE_XR(15, 0x2cc0019f);
+#undef SAVE_XR
+    } else {
+#define SAVE_VR(i, word) do { \
+        void *p = &env.xmm_regs[(i)]; \
+        __asm__ volatile("move $t0, %0\n .word " #word "\n" :: "r"(p) : "t0", "memory"); \
+    } while (0)
+        SAVE_VR( 0, 0x2c400190); SAVE_VR( 1, 0x2c400191);
+        SAVE_VR( 2, 0x2c400192); SAVE_VR( 3, 0x2c400193);
+        SAVE_VR( 4, 0x2c400194); SAVE_VR( 5, 0x2c400195);
+        SAVE_VR( 6, 0x2c400196); SAVE_VR( 7, 0x2c400197);
+        SAVE_VR( 8, 0x2c400198); SAVE_VR( 9, 0x2c400199);
+        SAVE_VR(10, 0x2c40019a); SAVE_VR(11, 0x2c40019b);
+        SAVE_VR(12, 0x2c40019c); SAVE_VR(13, 0x2c40019d);
+        SAVE_VR(14, 0x2c40019e); SAVE_VR(15, 0x2c40019f);
+#undef SAVE_VR
+    }
+}
+
 /*
  * Sync the interrupted PLV3 guest registers from the trap frame back into
  * CPUX86State before delivering an x86 exception or calling a C helper.
@@ -912,6 +950,7 @@ static void sync_trap_regs_to_env(const uint64_t *regs)
         int la_reg = reg_gpr_map[i];
         env.regs[i] = regs[la_reg];
     }
+    save_host_xmm_to_env();
     {
         uint32_t non_cc = (uint32_t)regs[reg_statics_map[S_EFLAGS]] & 0x702u;
         uint32_t cc = 0;
@@ -2418,7 +2457,7 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
 
 static int run_guest_idle_loop(int rounds)
 {
-    uint64_t code_addr = CODE_SCRATCH + 0x1c000;
+    uint8_t *code_addr = code_cache + 0x1c000;
     int i;
     int woke = 0;
 
@@ -2458,13 +2497,12 @@ static int run_guest_idle_loop(int rounds)
         int rc;
 
         /* 1. Run the halt.  RIP must not advance past it. */
-        rc = tb_harness_translate_at(env.eip, (uint8_t *)(uintptr_t)code_addr,
-                                     2048);
+        rc = tb_harness_translate_at(env.eip, code_addr, 2048);
         if (rc <= 0) {
             return -1;
         }
-        tb_sys_run_plv3((void *)(uintptr_t)pro_buf,
-                        (void *)(uintptr_t)code_addr, &env);
+        __asm__ volatile("ibar 0" ::: "memory");
+        tb_sys_run_plv3((void *)(uintptr_t)pro_buf, code_addr, &env);
         if (env.eip != HLT_PC_TEST) {
             return -2;
         }
@@ -2478,13 +2516,12 @@ static int run_guest_idle_loop(int rounds)
         }
 
         /* 3. Run the handler for real: inc dword [counter] ; iretq. */
-        rc = tb_harness_translate_at(env.eip, (uint8_t *)(uintptr_t)code_addr,
-                                     2048);
+        rc = tb_harness_translate_at(env.eip, code_addr, 2048);
         if (rc <= 0) {
             return -5;
         }
-        tb_sys_run_plv3((void *)(uintptr_t)pro_buf,
-                        (void *)(uintptr_t)code_addr, &env);
+        __asm__ volatile("ibar 0" ::: "memory");
+        tb_sys_run_plv3((void *)(uintptr_t)pro_buf, code_addr, &env);
 
         /* 4. iretq must have landed back on the halt. */
         if (env.eip != HLT_PC_TEST) {
@@ -3374,13 +3411,16 @@ void kmain(void)
         uint64_t euen, crmd;
         uint32_t cfg2 = 0;
 
+        __asm__ volatile("cpucfg %0, %1" : "=r"(cfg2) : "r"(2));
         euen = csrrd(0x2);
         euen |= 0x1 | 0x2 | 0x40 | 0x80;
+        if ((cfg2 & (1u << 7)) != 0) {
+            euen |= 0x4; /* ASXE: enable LASX 256-bit instructions */
+        }
         csrwr(0x2, euen);
         crmd = csrrd(0x0);
         crmd &= ~(uint64_t)0x4;
         csrwr(0x0, crmd);
-        __asm__ volatile("cpucfg %0, %1" : "=r"(cfg2) : "r"(2));
         if ((cfg2 & (1u << 18)) == 0) {
             g_use_sw_lbt = 1;
         }
@@ -3496,6 +3536,7 @@ void kmain(void)
      * accesses now go through the LoongArch 4 KiB hardware MMU/TLB at PLV3!
      */
     option_guest_paging = 0;
+    option_save_xmm = 0xff;
     option_lbt_jiscr = !g_use_sw_lbt;
     latx_bare_uart_puts("tb-sys: lbt_hw=");
     puthex((uint64_t)!g_use_sw_lbt);
@@ -3978,7 +4019,7 @@ void kmain(void)
          * driver is the instruction after the halt.
          */
         {
-            uint64_t code_addr = CODE_SCRATCH + 0x18000;
+            uint8_t *code_addr = code_cache + 0x18000;
             int rc;
 
             *(volatile uint8_t *)(uintptr_t)HLT_PC_TEST = 0xf4;  /* hlt */
@@ -3987,13 +4028,11 @@ void kmain(void)
             env.eflags = IF_MASK | 0x2;
             latx_x86_tlb_flush_all();
 
-            rc = tb_harness_translate_at(env.eip,
-                                         (uint8_t *)(uintptr_t)code_addr,
-                                         2048);
+            rc = tb_harness_translate_at(env.eip, code_addr, 2048);
             check(rc > 0, "hlt block translates");
             if (rc > 0) {
-                tb_sys_run_plv3((void *)(uintptr_t)pro_buf,
-                                (void *)(uintptr_t)code_addr, &env);
+                __asm__ volatile("ibar 0" ::: "memory");
+                tb_sys_run_plv3((void *)(uintptr_t)pro_buf, code_addr, &env);
             }
             check(env.eip == HLT_PC_TEST, "hlt leaves RIP on itself");
             latx_bare_uart_puts("tb-sys: hlt_eip=");
@@ -4181,8 +4220,7 @@ void kmain(void)
         int emitted;
 
         memcpy((void *)(uintptr_t)pc, ovmf_reset, sizeof(ovmf_reset));
-        emitted = tb_harness_translate_at(pc, (uint8_t *)(uintptr_t)
-                                          (CODE_SCRATCH + 0x8000), 4096);
+        emitted = tb_harness_translate_at(pc, code_cache + 0x8000, 4096);
         check(emitted > 0, "OVMF reset vector translates");
         latx_bare_uart_puts("tb-sys: ovmf_reset_bytes=");
         puthex((uint64_t)emitted);
@@ -4199,8 +4237,8 @@ void kmain(void)
         env.regs[R_EAX] = 0;
         env.eflags = 0x2;
         latx_x86_tlb_flush_all();
-        tb_sys_run_plv3((void *)(uintptr_t)pro_buf,
-                        (void *)(uintptr_t)(CODE_SCRATCH + 0x8000), &env);
+        __asm__ volatile("ibar 0" ::: "memory");
+        tb_sys_run_plv3((void *)(uintptr_t)pro_buf, code_cache + 0x8000, &env);
         check(env.regs[R_EAX] == 0x80000011u,
               "mov eax,cr0 read CR0 into EAX");
         check(env.eip == OVMF_RESET_PC + 7,
@@ -4688,12 +4726,17 @@ void kmain(void)
      */
     {
         uint64_t probe = GUEST_RAM_SIZE - 0x1000;
+        uint64_t saved_cr0 = env.cr[0];
         int emitted;
 
+        /* Disable paging for the flat physical RAM ceiling probe; saved_cr3
+         * only maps the low 2 MiB test window. */
+        env.cr[0] &= ~(uint64_t)CR0_PG_MASK;
+        latx_x86_tlb_flush_all();
         memset((void *)(uintptr_t)probe, 0x90, 256);   /* nop sled */
-        emitted = tb_harness_translate_at(probe,
-                                          (uint8_t *)(uintptr_t)(CODE_SCRATCH),
-                                          1024);
+        emitted = tb_harness_translate_at(probe, code_cache, 1024);
+        env.cr[0] = saved_cr0;
+        latx_x86_tlb_flush_all();
         check(emitted > 0, "guest RAM reaches 64 MiB");
         check(g_bad_fetch == 0, "no fetch outside guest RAM");
     }

@@ -300,6 +300,14 @@ build/lata_libc_min.o: latx/compat/libc_min.c
 	@mkdir -p build
 	$(CLANG) $(LATA_BARE_CFLAGS) -c $< -o $@
 
+build/lata_isa_test.o: baremetal/bare/lata_isa_test.c
+	@mkdir -p build
+	$(CLANG) $(LATA_BARE_CFLAGS) -c $< -o $@
+
+build/bare_lata_isa.elf: build/lata_isa_test.o build/lata_miniglib.o build/lata_libc_min.o lata/build/liblata_core.a baremetal/bare/bare.lds
+	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	   build/lata_isa_test.o build/lata_miniglib.o build/lata_libc_min.o lata/build/liblata_core.a -o $@
+
 build/bare_lata.elf: build/lata_smoke.o build/lata_miniglib.o build/lata_libc_min.o lata/build/liblata_core.a baremetal/bare/bare.lds
 	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T baremetal/bare/bare.lds -e _start \
 	   build/lata_smoke.o build/lata_miniglib.o build/lata_libc_min.o lata/build/liblata_core.a -o $@
@@ -314,6 +322,7 @@ build/lbt_smoke.elf: build/lbt_smoke.o baremetal/bare/bare.lds
 	/opt/homebrew/opt/lld/bin/ld.lld -T baremetal/bare/bare.lds -e _start $< -o $@
 
 QLVZ ?= $(HOME)/Documents/QEMU-LVZ/build/qemu-system-loongarch64
+QLVZ_REPO ?= $(CURDIR)/qemu-system-loongarch64
 lbt-smoke-run: build/lbt_smoke.elf
 	@rm -f build/lbt_smoke.log
 	@timeout 8 $(QLVZ) -M virt -cpu max -m 512M -kernel build/lbt_smoke.elf \
@@ -321,17 +330,27 @@ lbt-smoke-run: build/lbt_smoke.elf
 	@grep -a 'lbt-smoke:' build/lbt_smoke.log | tail -9
 	@grep -qa 'lbt-smoke: PASS' build/lbt_smoke.log
 
+lata-isa-image: build/bare_lata_isa.elf
+
+# Stage 1 regression: aarch64 constructs through the translator, checked in the
+# environment.  Same watchdog: the image finishes and then spins by design.
+lata-isa-run: lata-isa-image
+	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_lata_isa.elf" \
+	     QEMU_LOG="build/lata_isa.log" QEMU_DONE="lata-isa: done" \
+	     QEMU_TIMEOUT=60 CPU=la464 \
+	     bash scripts/run_qemu_lata.sh
+	@grep -aE 'lata-isa' build/lata_isa.log | head -30
+	@grep -qa 'lata-isa: PASS' build/lata_isa.log
+
 lata-smoke-image: build/bare_lata.elf
 
+# Run through the watchdog script: a bare QEMU launch leaves an orphan, because
+# the image finishes its test and then spins forever by design.
 lata-smoke-run: lata-smoke-image
-	@rm -f build/lata_smoke.log
-	@( qemu-system-loongarch64 -M virt -cpu la464 -m 512M -kernel build/bare_lata.elf \
-	     -display none -monitor none -serial file:build/lata_smoke.log -no-reboot & \
-	   echo $$! > build/qemu_lata.pid )
-	@i=0; while [ $$i -lt 50 ]; do \
-	     grep -qa 'lata-smoke: done' build/lata_smoke.log 2>/dev/null && break; \
-	     sleep 0.2; i=$$((i+1)); done
-	@kill $$(cat build/qemu_lata.pid) 2>/dev/null; true
+	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_lata.elf" \
+	     QEMU_LOG="build/lata_smoke.log" QEMU_DONE="lata-smoke: done" \
+	     QEMU_TIMEOUT=60 CPU=la464 \
+	     bash scripts/run_qemu_lata.sh
 	@grep -aE 'lata-smoke' build/lata_smoke.log | head -20
 	@grep -qa 'lata-smoke: PASS' build/lata_smoke.log
 

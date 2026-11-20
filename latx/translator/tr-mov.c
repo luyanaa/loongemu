@@ -1956,18 +1956,56 @@ bool translate_cmpxchg16b(IR1_INST *pir1)
         return translate_cmpxchg16b_scq(pir1);
     }
 
+    /*
+     * Non-SC.Q fallback (e.g. LA464 / 3A5000 / 2K2000).
+     *
+     * Upstream user-mode LATX deliberately executes `ll.d $zero, $zero, 4`
+     * to trigger SIGSEGV and emulate CMPXCHG16B inside the host signal
+     * handler.  In bare-metal system mode there is no user-mode SIGSEGV
+     * emulator (and `lat_lock[]` lives in VMM .bss, unmapped at PLV3), so
+     * emit the 128-bit compare-and-swap inline.  Preemption in the current
+     * single-host-thread SMP loop only happens at TB boundaries, so this
+     * sequence is atomic across guest vCPUs; true multi-host-thread SMP on
+     * !have_scq() hosts will need a PLV3-accessible lock or VMM helper.
+     */
     IR1_OPND *opnd0 = ir1_get_opnd(pir1, 0);
     IR2_OPND mem_opnd = convert_mem_no_offset(opnd0);
 
-    IR2_OPND zf_opnd = ra_alloc_itemp();
+    IR2_OPND rax_opnd = ra_alloc_gpr(eax_index);
+    IR2_OPND rdx_opnd = ra_alloc_gpr(edx_index);
+    IR2_OPND rcx_opnd = ra_alloc_gpr(ecx_index);
+    IR2_OPND rbx_opnd = ra_alloc_gpr(ebx_index);
 
-    la_ll_d(zero_ir2_opnd, zero_ir2_opnd, 4);
-    la_amswap_d(zf_opnd, zero_ir2_opnd, mem_opnd);
+    IR2_OPND label_unequal = ra_alloc_label();
+    IR2_OPND label_exit = ra_alloc_label();
 
-    generate_eflag_calculation(zf_opnd, zf_opnd, zf_opnd,
+    IR2_OPND mem_lo = ra_alloc_itemp();
+    IR2_OPND mem_hi = ra_alloc_itemp();
+
+    la_ld_d(mem_lo, mem_opnd, 0);
+    la_ld_d(mem_hi, mem_opnd, 8);
+    la_bne(mem_lo, rax_opnd, label_unequal);
+    la_bne(mem_hi, rdx_opnd, label_unequal);
+
+    /* equal */
+    la_st_d(rbx_opnd, mem_opnd, 0);
+    la_st_d(rcx_opnd, mem_opnd, 8);
+    la_dbar(0);
+    generate_eflag_calculation(zero_ir2_opnd, zero_ir2_opnd, zero_ir2_opnd,
                                 pir1, true);
+    la_b(label_exit);
 
-    ra_free_temp(zf_opnd);
+    /* unequal */
+    la_label(label_unequal);
+    la_dbar(0);
+    generate_eflag_calculation(mem_opnd, mem_opnd, zero_ir2_opnd,
+                                pir1, true);
+    la_or(rax_opnd, zero_ir2_opnd, mem_lo);
+    la_or(rdx_opnd, zero_ir2_opnd, mem_hi);
+
+    la_label(label_exit);
+    ra_free_temp(mem_lo);
+    ra_free_temp(mem_hi);
     return true;
 }
 
