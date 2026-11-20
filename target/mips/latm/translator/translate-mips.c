@@ -13,6 +13,7 @@
 #include "latm-helpers.h"
 #include "internal.h"
 #include "exec/helper-proto.h"
+#include "exec/cpu_ldst.h"
 
 TranslateFn translate_functions[MIPS_OP__COUNT];
 
@@ -241,6 +242,9 @@ static void gen_goto_tb_indirect(DisasContext *s, IR2_OPND target)
 static void translate_delay_slot(DisasContext *s)
 {
     DisasContext *d = s + 1;
+    TRANSLATION_DATA *td = lsenv->tr_data;
+    uint32_t start = (uint32_t)td->real_ir2_inst_num << 2;
+    uint32_t end;
 
     latm_set_delay_flag(s, true);
     if (mips_ir1_is_branch(&d->ir1)) {
@@ -249,6 +253,8 @@ static void translate_delay_slot(DisasContext *s)
         translate_one(d);
     }
     latm_set_delay_flag(s, false);
+    end = (uint32_t)td->real_ir2_inst_num << 2;
+    latm_tb_insn_map_add(td, d->ir1.pc, start, end, 1);
 }
 
 /* ------------------------------------------------------------------ */
@@ -732,6 +738,15 @@ static bool trans_load(DisasContext *s)
     latm_set_pc(s);
     emit_addr(addr, s->ir1.rs, s->ir1.simm);
 
+    if (latm_system_memory && op <= MIPS_MEM_LD) {
+        IR2_OPND a = imm_opnd(op);
+        IR2_OPND r = hcall2((uintptr_t)latm_helper_load, a, addr);
+        ra_free_itemp(a._reg_num);
+        store_gpr_dst_f(s->ir1.rt, r);
+        ra_free_itemp(addr._reg_num);
+        return true;
+    }
+
     switch (op) {
     case MIPS_MEM_LB:  rd = alloc_gpr_dst(s->ir1.rt); la_ldx_b(rd, addr, zero_ir2_opnd); store_gpr_dst_f(s->ir1.rt, rd); break;
     case MIPS_MEM_LBU: rd = alloc_gpr_dst(s->ir1.rt); la_ldx_bu(rd, addr, zero_ir2_opnd); store_gpr_dst_f(s->ir1.rt, rd); break;
@@ -772,6 +787,15 @@ static bool trans_store(DisasContext *s)
 
     latm_set_pc(s);
     emit_addr(addr, s->ir1.rs, s->ir1.simm);
+
+    if (latm_system_memory && op >= MIPS_MEM_SB && op <= MIPS_MEM_SD) {
+        IR2_OPND a = imm_opnd(op);
+        hcall3((uintptr_t)latm_helper_store, a, addr, rt);
+        ra_free_itemp(a._reg_num);
+        ra_free_itemp(addr._reg_num);
+        free_gpr_temp(rt, s->ir1.rt);
+        return true;
+    }
 
     switch (op) {
     case MIPS_MEM_SB:  la_stx_b(rt, addr, zero_ir2_opnd); break;
@@ -1375,6 +1399,10 @@ static void translate_one(DisasContext *s)
 
 __attribute__((weak)) uint32_t latm_guest_ldl(uint64_t addr)
 {
+    CPUMIPSState *env = lsenv ? lsenv->cpu_state : NULL;
+    if (env) {
+        return cpu_ldl_code(env, addr);
+    }
     return *(const uint32_t *)(uintptr_t)addr;
 }
 
@@ -1455,6 +1483,7 @@ bool tr_ir2_generate(TranslationBlock *tb)
     DisasContext *pir1 = (DisasContext *)tb->ir1;
 
     tr_init(tb);
+    latm_tb_insn_map_begin(lsenv->tr_data, tb->tc.ptr, 0);
     for (int i = 0; i < ir1_nr; i++) {
         if (pir1->ir1.delay_slot) {
             pir1++;
@@ -1464,7 +1493,13 @@ bool tr_ir2_generate(TranslationBlock *tb)
             tr_fini();
             return false;
         }
-        translate_one(pir1);
+        {
+            TRANSLATION_DATA *td = lsenv->tr_data;
+            uint32_t start = (uint32_t)td->real_ir2_inst_num << 2;
+            translate_one(pir1);
+            latm_tb_insn_map_add(td, pir1->ir1.pc, start,
+                                 (uint32_t)td->real_ir2_inst_num << 2, 0);
+        }
         if (tcg_ctx->gen_insn_data) {
             tcg_ctx->gen_insn_end_off[i] =
                 (lsenv->tr_data->real_ir2_inst_num) << 2;

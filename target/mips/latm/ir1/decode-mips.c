@@ -351,6 +351,8 @@ static bool decode_cop0(MipsIR1 *ir1, uint32_t insn)
         switch (MASK_C0(insn)) {
         case OPC_TLBR:  ir1->op = MIPS_OP_TLB; ir1->subop = MIPS_TLB_TLBR; return true;
         case OPC_TLBWI: ir1->op = MIPS_OP_TLB; ir1->subop = MIPS_TLB_TLBWI; return true;
+        case OPC_TLBINV: ir1->op = MIPS_OP_TLB; ir1->subop = MIPS_TLB_TLBINV; return true;
+        case OPC_TLBINVF: ir1->op = MIPS_OP_TLB; ir1->subop = MIPS_TLB_TLBINVF; return true;
         case OPC_TLBWR: ir1->op = MIPS_OP_TLB; ir1->subop = MIPS_TLB_TLBWR; return true;
         case OPC_TLBP:  ir1->op = MIPS_OP_TLB; ir1->subop = MIPS_TLB_TLBP; return true;
         case OPC_ERET:  ir1->op = MIPS_OP_CP0_OP; ir1->subop = MIPS_CP0OP_ERET; return true;

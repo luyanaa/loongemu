@@ -11,6 +11,7 @@
 #include "exec/helper-proto.h"
 #include "exec/exec-all.h"
 #include "latm-helpers.h"
+#include "latm-platform.h"
 
 static uint64_t get_tlb_pfn(uint64_t entrylo)
 {
@@ -142,6 +143,34 @@ static void r4k_tlbp(CPUMIPSState *env)
     env->CP0_Index = -1;
 }
 
+static void r4k_tlbinv(CPUMIPSState *env)
+{
+    bool mi = !!((env->CP0_Config5 >> CP0C5_MI) & 1);
+    uint16_t asid = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
+    uint32_t mmid = mi ? env->CP0_MemoryMapID : (uint32_t)asid;
+
+    if (!env->tlb) {
+        return;
+    }
+    for (unsigned i = 0; i < env->tlb->nb_tlb; i++) {
+        r4k_tlb_t *t = &env->tlb->mmu.r4k.tlb[i];
+        uint32_t tlb_mmid = mi ? t->MMID : (uint32_t)t->ASID;
+        if (!t->G && tlb_mmid == mmid) {
+            t->EHINV = 1;
+        }
+    }
+}
+
+static void r4k_tlbinvf(CPUMIPSState *env)
+{
+    if (!env->tlb) {
+        return;
+    }
+    for (unsigned i = 0; i < env->tlb->nb_tlb; i++) {
+        env->tlb->mmu.r4k.tlb[i].EHINV = 1;
+    }
+}
+
 static void r4k_tlbr(CPUMIPSState *env)
 {
     int idx = env->CP0_Index & 0xff;
@@ -197,7 +226,7 @@ void latm_tlb_init(CPUMIPSState *env, CPUMIPSTLBContext *tlb, int nb_tlb)
 void latm_helper_tlb(CPUMIPSState *env, uint32_t op)
 {
     if (!env->tlb) {
-        do_raise_exception(env, EXCP_RI, 0);
+        do_raise_exception(env, EXCP_RI, GETPC());
         return;
     }
     switch (op) {
@@ -205,9 +234,18 @@ void latm_helper_tlb(CPUMIPSState *env, uint32_t op)
     case MIPS_TLB_TLBWI: r4k_tlbwi(env); break;
     case MIPS_TLB_TLBWR: r4k_tlbwr(env); break;
     case MIPS_TLB_TLBP:  r4k_tlbp(env); break;
+    case MIPS_TLB_TLBINV: r4k_tlbinv(env); break;
+    case MIPS_TLB_TLBINVF: r4k_tlbinvf(env); break;
     }
     env->llvalid = 0;
     env->lladdr = UINT64_MAX;
+    latm_jmp_cache_flush(env);
+    {
+        const LatmPlatform *p = latm_platform_get();
+        if (p && p->tlb_flush) {
+            p->tlb_flush(env);
+        }
+    }
 }
 
 uint64_t latm_helper_cp0_read(CPUMIPSState *env, uint32_t reg, uint32_t sel)
@@ -256,7 +294,7 @@ uint64_t latm_helper_cp0_read(CPUMIPSState *env, uint32_t reg, uint32_t sel)
         }
     case 9:
         switch (sel) {
-        case 0: return env->CP0_Count;
+        case 0: return cpu_mips_get_count(env);
         default: return 0;
         }
     case 10: return env->CP0_EntryHi;
@@ -335,13 +373,48 @@ void latm_helper_cp0_write(CPUMIPSState *env, uint32_t reg, uint32_t sel,
         else if (sel == 6) env->CP0_PWCtl = v;
         break;
     case 7: env->CP0_HWREna = v; break;
-    case 9: if (sel == 0) env->CP0_Count = v; break;
-    case 10: env->CP0_EntryHi = v; break;
-    case 11: env->CP0_Compare = v; break;
+    case 9:
+        if (sel == 0) {
+            const LatmPlatform *p = latm_platform_get();
+            env->CP0_Count = v;
+            if (p && p->store_count) {
+                p->store_count(env, (uint32_t)v);
+            }
+        }
+        break;
+    case 10: {
+        uint16_t old_asid = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
+        env->CP0_EntryHi = v;
+        if (old_asid != (v & env->CP0_EntryHi_ASID_mask)) {
+            latm_jmp_cache_flush(env);
+            {
+                const LatmPlatform *p = latm_platform_get();
+                if (p && p->tlb_flush) {
+                    p->tlb_flush(env);
+                }
+            }
+        }
+        break;
+    }
+    case 11:
+        env->CP0_Compare = v;
+        env->CP0_Cause &= ~((1u << 30) |
+                            (1u << (8 + ((env->CP0_IntCtl >> 29) & 7))));
+        {
+            const LatmPlatform *p = latm_platform_get();
+            if (p && p->set_compare) {
+                p->set_compare(env, (uint32_t)v);
+            }
+        }
+        break;
     case 12:
         if (sel == 0) {
+            uint32_t old_mode = env->hflags & (MIPS_HFLAG_UM | MIPS_HFLAG_SM);
             env->CP0_Status = v & env->CP0_Status_rw_bitmask;
             compute_hflags(env);
+            if (old_mode != (env->hflags & (MIPS_HFLAG_UM | MIPS_HFLAG_SM))) {
+                latm_jmp_cache_flush(env);
+            }
         } else if (sel == 1) env->CP0_IntCtl = v;
         else if (sel == 2) env->CP0_SRSCtl = v;
         else if (sel == 3) env->CP0_SRSMap = v;
@@ -392,7 +465,25 @@ void latm_helper_shadow_write(CPUMIPSState *env, uint32_t rd, uint64_t val)
 
 uint32_t cpu_mips_get_count(CPUMIPSState *env)
 {
-    return (uint32_t)env->CP0_Count;
+    const LatmPlatform *p = latm_platform_get();
+    uint32_t count;
+
+    if (p && p->read_count && !(env->CP0_Cause & (1u << 27))) {
+        count = p->read_count(env, UINT64_C(50000000));
+    } else {
+        count = (uint32_t)env->CP0_Count;
+    }
+
+    /* Compare is a 32-bit free-running match.  Keep TI sticky until software
+     * writes Compare, and route the timer IRQ through IntCtl.IPTI. */
+    if (!(env->CP0_Cause & (1u << 27)) && env->CP0_Compare &&
+        !(env->CP0_Cause & (1u << 30)) &&
+        (int32_t)(count - env->CP0_Compare) >= 0) {
+        unsigned ipti = (env->CP0_IntCtl >> 29) & 7;
+        env->CP0_Cause |= (1u << 30) | (1u << (8 + ipti));
+    }
+    env->CP0_Count = count;
+    return count;
 }
 
 void latm_helper_eret(CPUMIPSState *env)

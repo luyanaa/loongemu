@@ -22,6 +22,8 @@ static inline unsigned latm_fcc_bit(unsigned cc)
 }
 
 void do_raise_exception(CPUMIPSState *env, uint32_t exception, uintptr_t pc);
+void latm_check_interrupts(CPUMIPSState *env);
+uint32_t cpu_mips_get_count(CPUMIPSState *env);
 void do_raise_exception_err(CPUMIPSState *env, uint32_t exception,
                             int error_code, uintptr_t pc);
 
@@ -56,11 +58,15 @@ uint64_t latm_helper_rdhwr(CPUMIPSState *env, uint32_t rd, uint32_t sel);
 uint64_t latm_helper_ll(CPUMIPSState *env, uint32_t op, uint64_t addr);
 uint64_t latm_helper_sc(CPUMIPSState *env, uint32_t op, uint64_t addr,
                         uint64_t val);
+uint64_t latm_helper_load(CPUMIPSState *env, uint32_t op, uint64_t addr);
+void latm_helper_store(CPUMIPSState *env, uint32_t op, uint64_t addr,
+                       uint64_t val);
 uint64_t latm_helper_cp0_read(CPUMIPSState *env, uint32_t reg, uint32_t sel);
 void latm_helper_cp0_write(CPUMIPSState *env, uint32_t reg, uint32_t sel,
                            uint64_t val);
 void latm_tlb_init(CPUMIPSState *env, CPUMIPSTLBContext *tlb, int nb_tlb);
 void latm_helper_tlb(CPUMIPSState *env, uint32_t op);
+void latm_jmp_cache_flush(void *cpu);
 uint64_t latm_helper_shadow_read(CPUMIPSState *env, uint32_t rd);
 void latm_helper_shadow_write(CPUMIPSState *env, uint32_t rd, uint64_t val);
 void latm_helper_eret(CPUMIPSState *env);

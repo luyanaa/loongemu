@@ -13,7 +13,7 @@
 
 static void raise_overflow(CPUMIPSState *env)
 {
-    do_raise_exception(env, EXCP_OVERFLOW, 0);
+    do_raise_exception(env, EXCP_OVERFLOW, GETPC());
 }
 
 uint64_t latm_helper_arith(CPUMIPSState *env, uint32_t op,
@@ -169,7 +169,7 @@ uint64_t latm_helper_ll(CPUMIPSState *env, uint32_t op, uint64_t addr)
     unsigned size = op == MIPS_MEM_LL ? 4 : 8;
 
     if (addr & (size - 1)) {
-        do_raise_exception(env, EXCP_AdEL, 0);
+        do_raise_exception(env, EXCP_AdEL, GETPC());
         return 0;
     }
     phys = cpu_mips_translate_address(env, addr, MMU_DATA_LOAD, 0);
@@ -195,7 +195,7 @@ uint64_t latm_helper_sc(CPUMIPSState *env, uint32_t op, uint64_t addr,
     bool ok = false;
 
     if (addr & (size - 1)) {
-        do_raise_exception(env, EXCP_AdES, 0);
+        do_raise_exception(env, EXCP_AdES, GETPC());
         return 0;
     }
     {
@@ -241,7 +241,7 @@ uint64_t latm_helper_rdhwr(CPUMIPSState *env, uint32_t rd, uint32_t sel)
     case 29:
         return env->active_tc.CP0_UserLocal;
     default:
-        do_raise_exception(env, EXCP_RI, 0);
+        do_raise_exception(env, EXCP_RI, GETPC());
         return 0;
     }
 }
@@ -253,13 +253,13 @@ void latm_helper_overflow(CPUMIPSState *env)
 
 void latm_helper_syscall(CPUMIPSState *env)
 {
-    do_raise_exception(env, EXCP_SYSCALL, 0);
+    do_raise_exception(env, EXCP_SYSCALL, GETPC());
 }
 
 void latm_helper_break(CPUMIPSState *env, uint32_t code)
 {
     env->error_code = code;
-    do_raise_exception(env, EXCP_BREAK, 0);
+    do_raise_exception(env, EXCP_BREAK, GETPC());
 }
 
 void latm_helper_trap(CPUMIPSState *env, uint32_t op, uint64_t a, uint64_t b,
@@ -277,6 +277,6 @@ void latm_helper_trap(CPUMIPSState *env, uint32_t op, uint64_t a, uint64_t b,
     }
     if (take) {
         env->error_code = code;
-        do_raise_exception(env, EXCP_TRAP, 0);
+        do_raise_exception(env, EXCP_TRAP, GETPC());
     }
 }

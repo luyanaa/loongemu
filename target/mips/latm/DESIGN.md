@@ -1,7 +1,7 @@
 # LATM: MIPS64r2 → LoongArch 转译设计研究
 
-状态：**stage-1 已实现并通过 bare-metal/QEMU 回归**。本文前半部分保留设计推导；
-实现入口与验证证据见 §13。范围：`mips64el`（little-endian）、MIPS64r2、FR=1（32 个 64-bit FPR）。
+状态：**stage-1 已实现并通过 bare-metal/QEMU 回归；极简系统板 bring-up 已加入**。本文前半部分保留设计推导；
+实现入口与验证证据见 §13，板级路径见 §13.4。范围：`mips64el`（little-endian）、MIPS64r2、FR=1（32 个 64-bit FPR）。
 不在本轮范围：DSP ASE、MIPS16/microMIPS、MSA、MIPS3D、Release 6 编码、big-endian guest。
 
 已实现：IR1 定长解码、整数 ALU/移位/位域/HI-LO、分支包与延迟槽、
@@ -703,7 +703,9 @@ SRCS   := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \
 
 ### 13.2 已通过的门禁
 
-- `make test-latm-decode`：21 条向量，覆盖 ALU/IMM、DMULTU、MFLO、ROTR、JAL/JR、BEQ/BEQL、LWL/SDR、SW/SD/LD、SYSCALL/BREAK、ERET/MFC0。
+- `make test-latm-decode`：23 条向量，覆盖 ALU/IMM、DMULTU、MFLO、ROTR、JAL/JR、BEQ/BEQL、LWL/SDR、SW/SD/LD、SYSCALL/BREAK、ERET/MFC0、TLBINV/TLBINVF。
+- `make test-latm-interrupts`：22 项，覆盖平台 Count、Compare→TI/IP7、cause 写清、WAIT halt/wake、Count 写回调。
+- `make test-latm-insn-map`：9 项，覆盖 native span、delay-slot 优先解析、越界/空 map 拒绝。
 - `make latm-isa-run`：QEMU-LVZ `-M virt -cpu la464`，72 项检查全部通过：
   - 整数 ALU、DSLL/DSRA、DMULTU/MFLO/MFHI、ROTR/DROTR；
   - 分支 taken/not-taken、BEQL taken/not-taken、JAL 链接值、JR 间接目标；
@@ -717,31 +719,74 @@ SRCS   := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \
   - 分支/JR/BC1 的延迟槽内执行 helper（LL）时，分支条件与间接目标经 `latm_spill[]` 保存/恢复；
   - `BC1T/BC1FL` 使用 `cc=(rt>>2)&7`、`tf=rt&1`、`likely=rt&2`，FCC2 测试通过；
   - LL/SC：无 LL 的 SC 失败、LL(A)->SC(B) 失败、普通 store 使 reservation 失效。
-- `make test-latm-tlb`：30 项主机检查，覆盖 kseg3 R4K TLB 映射、TLB-backed load、无效 V 位 fault、EPC/Cause/EXL/vector、延迟槽 Cause.BD。
+- `make test-latm-tlb`：36 项主机检查，覆盖 kseg3 R4K TLB 映射、TLB-backed load、无效 V 位 fault、EPC/Cause/EXL/vector、延迟槽 Cause.BD、TLBINVF、ASID 变更 flush。
 - `make -C latm probe`：全部 LATM/共享/softfloat 源文件语法检查通过。
 
-#### 13.4 整机 checklist 状态
+### 13.4 极简 MIPS64 系统板（2026-11-21）
+
+新增 `baremetal/bare/latm_board.c`，把 LATM 从单 TB ISA 回归推进到可运行的“板级”路径：
+
+| 项 | 实现 |
+| --- | --- |
+| 内存映射 | `LoongemuMemMap`：GPA 0 起 32 MiB RAM；GPA `0x1f000000` 起 0x100 UART MMIO。 |
+| 取指 | `cpu_ldl_code()` → `LatmPlatform::fetch32()` → RAM。 |
+| 数据访存 | `latm_helper_load/store()` 先做 R4000/段翻译，再调 `LatmPlatform::mem_read/mem_write()`；只有非 system 模式或平台未安装时回退到宿主指针。 |
+| 执行 | 每个 TB 走 `target_disasm()` → `tr_ir2_generate()` → `tr_ir2_assemble()` → `lata_gen_prologue_env()` 生成的 context-switch 入口；8 个 TB 后停止。 |
+| 串口 | 16550 寄存器模型：RBR/THR、IER、IIR/FCR、LCR（含 DLAB）、MCR、LSR（THRE/TEMT）、MSR、SCR、DLL/DLM；THR 写经 `0xbf000000`（kseg1）段翻译到 GPA `0x1f000000`。 |
+| IRQ | UART TX-empty 经 IER/IIR 产生 IRQ，映射到 MIPS IP2；定时器 Compare 映射到 `IntCtl.IPTI`（板级为 IP7）；`latm_check_interrupts()` 统一投递。 |
+| FDT | RAM `+0x100000` 的 flat device tree：root、`/memory@0`、`/cpus/cpu@0`（`mips,mips64r2`）、`/chosen`、`/interrupt-controller`（phandle 1）、`/soc/serial@1f000000`（`ns16550a`，interrupt-parent 1 / interrupts 2）；reserve map 为 16 字节终止项。 |
+| 镜像 | `make latm-board-image` 生成 `build/bare_latm_board.elf`；`make latm-board-run` 在 QEMU-LVZ `-M virt -cpu la464` 运行并检查 `latm-board: done`。 |
+
+实测输出（QEMU-LVZ，`build/latm_board.log`）：
+
+```text
+latm-board: begin
+LATM board
+
+latm-board: cache-hit=00000000dead0000 cache-after-asid=0000000000000000
+latm-board: uart-lsr=0000000000000060 uart-ier=0000000000000003 uart-rx=0000000000000052
+
+latm-board: timer-pc=ffffffff80000180 timer-exit=0000000000000001
+latm-board: uart-irq-pc=ffffffff80000180 uart-irq-exit=0000000000000001
+latm-board: break-epc=ffffffff80001000 break-cause=0000000000000009 break-exit=0000000000000001
+latm-board: delay-epc=ffffffff80002000 delay-bd=0000000000000001 delay-exit=0000000000000001
+latm-board: load-epc=ffffffff80004004 load-cause=0000000000000004 load-exit=0000000000000001
+latm-board: wait-halt=0000000000000001 wait-pc=ffffffff80000180 wait-exit=0000000000000001
+latm-board: uart=LATM board
+latm-board: fdt=00000000d00dfeed dtb-gpa=0000000000100000 dtb-len=000000000000035a
+latm-board: done
+```
+
+FDT 已用 `dtc -I dtb -O dts` 反编译验证：无 `FDT_END` 缺失、无 reserve-map 错位、字符串属性无尾随垃圾；`/soc/serial@1f000000` 的 `reg` 为 `<0 0x1f000000 0 0x100>`。
+
+**修复的集成缺口**：此前 `latm_helper_load/store()` 在 system-memory 模式下仍做宿主指针解引用，`mem.h` 的 `LatmPlatform` 只有取指回调；本轮把读写回调接入（并修正板级 `mem_read/mem_write/fetch32` 的签名），否则 `sb` 会写到宿主地址 `0x1f000000` 并触发 LoongArch Address Error、最终 PC=0。
+
+**边界**：这不是 Linux 启动。guest 镜像是手写 MIPS64 字节码，验证“取指→翻译→平台内存/MMIO→串口→退出”闭环，并额外验证 16550 寄存器、UART/定时器 IRQ、TB cache ASID 失效、TbInsnMap 精确异常。仍没有 EL/ERET 系统态 handler 镜像、initrd 或 vmlinux 加载器；FDT 的 `bootargs` 只是给后续 Linux 端口预留的接口。
+
+**本轮新增板级证据**：`uart-lsr=0x60`/`uart-ier=0x3`/`uart-rx=0x52`（guest `sb/lb` 经过 MMIO 模型与 RX FIFO）；`timer-pc=0xffffffff80000180`、`uart-irq-pc=0xffffffff80000180`；`break-epc=0xffffffff80001000`；delay-slot `delay-epc=0xffffffff80002000` 且 `delay-bd=1`；ASID 改变后 `cache-hit=0xdead0000` → `cache-after-asid=0`。FDT 追加 `/interrupt-controller`（phandle 1）与 serial 的 `interrupt-parent`/`interrupts`，已用 `dtc -I dtb -O dts` 验证。
+
+#### 13.5 整机 checklist 状态
 
 | 项目 | 当前状态 |
 | --- | --- |
 | per-core 翻译/IR1/寄存器分配/TB cache/prologue | 已完成，`TLS=1` 可并行；默认 freestanding 用串行锁 |
-| TB link cache | 512×2 组相联、LRU、per-vCPU、ASID/mode key；未接 ASID/TLB shootdown 全量失效 |
+| TB link cache | 512×2 组相联、LRU、per-vCPU、ASID/mode key；CP0 EntryHi ASID 变化、TLBWI/TLBWR/TLBINV/TLBINVF 均本地 flush，并调用 `LatmPlatform::tlb_flush` 供跨 vCPU 广播 |
 | LL/SC | 物理地址 reservation + 原子 CAS；异常/ERET/TLB 修改清除；`lladdr` 记录 GPA；跨核严格 generation/ABA 未做 |
 | SMC | `latm_platform_smc_broadcast()` 钩子已从 SYNCI/CACHE 调用；整机需实现为 `loongemu_ipi_send()` 适配器并处理目标 shard 失效 |
-| guest memory | R4000 TLB walk/段翻译已接；`LoongemuMemMap`/MMIO 解析尚未接入，直接 `ldx/stx` 与取指仍是宿主地址 |
-| 精确异常 | XTLB Refill +0x080 / TLB Refill +0x000 / generic +0x180 已分流；`cpu_loop_exit()` 有平台 unwind 钩子；TbInsnMap 反查未接 |
-| vclock / CP0 Count/Compare / 中断 | 尚未接入 LoongemuVClock、Compare deadline、TI/IP7、WAIT 唤醒 |
-| MIPS64 板级/DTB/vmlinux 直启 | 尚未实现 |
+| guest memory | R4000 TLB walk/段翻译已接；system-memory 模式下取指、load、store 均经 `LatmPlatform::fetch32/mem_read/mem_write` 走 `LoongemuMemMap`/MMIO；非 system 模式仍用 `ldx/stx` 宿主地址 |
+| 精确异常 | XTLB Refill +0x080 / TLB Refill +0x000 / generic +0x180 已分流；`TbInsnMap` 记录每 TB native span，`GETPC()` → guest PC（含 delay slot/BD）反查已接入；板级 BREAK 与 delay-slot BREAK 精确 EPC 已验证 |
+| vclock / CP0 Count/Compare / 中断 | 已接入 `LoongemuVClock`（50 MHz MIPS Count）；Compare 到期置 TI + `IntCtl.IPTI` 对应 IP；`WAIT` 由板级轮询唤醒；板级已验证 timer 与 UART IRQ |
+| MIPS64 板级/DTB/vmlinux 直启 | 极简合成板 + 有效 FDT 已实现（§13.4）；Linux/vmlinux 直启未实现 |
 
 ## 13.3 已知边界
 
 1. **TB 链接是 per-vCPU 2-way set-associative cache**：512 sets × 2 ways，LRU age；每个 `CPUMIPSState` 持有独立 cache。key = `ASID | (hflags mode << 8)`；间接跳转通过 C helper 查找，测试覆盖同 key 命中、不同 ASID/模式拒绝、2-way 冲突淘汰、`SYNCI/CACHE` 失效。仍无 ASID flush/TLB shootdown，且尚未接入主循环的 TB 分配器。
 2. **`jiscr1` 语义按 QEMU-LVZ 实现**：QEMU 的 `helper_lbt_jiscr` 对两个 jiscr 都用 SCR0 作为目标，`jiscr1` 额外把 host PC 写回 SCR0；LATM 的测试按此语义。若真实硬件遵循指南的 SCR1 目标语义，需要在 feature probe 后选择编码。
 3. **CPUMIPSState 位移**：`PC=512`、`hflags≈16116`，后者超出 LoongArch `si12`。`latm_env_ld/st_*` 对超界位移先用 `a0` 物化地址；`a0` 不映射任何 MIPS GPR（r4→a4）。
-4. **TLB 精度边界**：已实现 R4000 `map_address`、MIPS64 segment/SegCtl walk、TLB fault 的 BadVAddr/Context/EntryHi/Cause/EPC/BD；尚未实现 TLB shadow 页、TLBINV/TLBINVF 的全量失效语义，也未把 guest physical 与宿主物理内存解耦（测试直接把 PFN 指向宿主 buffer）。
+4. **TLB 精度边界**：已实现 R4000 `map_address`、MIPS64 segment/SegCtl walk、TLB fault 的 BadVAddr/Context/EntryHi/Cause/EPC/BD，以及 TLBINV/TLBINVF（按 ASID/MMID 与全表失效）；尚未实现 TLB shadow 页，也未把 guest physical 与宿主物理内存解耦（测试直接把 PFN 指向宿主 buffer）。
 5. **LL/SC SMP 边界**：`SC` 用 `__atomic_compare_exchange`，reservation 使用翻译后的物理地址；普通 store 按物理重叠清除，异常/ERET/TLB 修改也清除。已覆盖单核成功/失败、LL(A)->SC(B)、无 LL 的 SC、store 失效；尚未实现跨核 reservation 总线、写 generation/ABA 严格检测，也未做双核竞争计数器的 QEMU 多 vCPU 测试。
 6. **自修改代码边界**：`SYNCI/CACHE` 只清除 link cache 并执行 `ibar 0`；已发出的旧 TB 机器码不回收，正在执行的 TB 也不会被抢占。主循环接入 TB 分配器后需增加代码页回收。
 7. **COP1X 数值边界**：load/store 六个变体与四个 MADD 变体已通过。freestanding softfloat 的 `float64_mul` 路径会给出错误结果，因此 `latm_fpu_madd` 暂时使用宿主标量乘加（与 QEMU helper 的两步乘加语义一致）；FCR31 cause/enable/flags 的逐指令回填仍待 softfloat 修复后补齐，不能据此宣称完整 IEEE FMA 签核。
 8. **FPU 使能**：bare-metal QEMU 复位后 `EUEN.FPE=0`；执行 softfloat/C helper 中的浮点指令前必须置位 FPE（测试已显式使能）。
 9. **翻译器状态**：`ir1_list`/`db_rel`、寄存器分配、IR2 buffer、TB link cache、context-switch 入口均已移入 per-vCPU `TRANSLATION_DATA`/`CPUMIPSState`；`target_disasm()` 可按 CPU 绑定。`latm/Makefile` 的 `TLS=1` 把 `lsenv/tr_data` 编译为 `_Thread_local` 并去掉翻译锁，可并行翻译；默认 freestanding 构建仍使用串行锁。多 vCPU 初始化 prologue/epilogue 时必须使用 `lata_gen_prologue_env/epilogue_env`。
-10. **其它未覆盖**：MIPS16/microMIPS/MSA/R6、big-endian、TLBINV/TLBINVF、完整系统态指令精确异常、MIPS SMP vCPU/IRQ 集成。
+10. **其它未覆盖**：MIPS16/microMIPS/MSA/R6、big-endian、完整系统态指令精确异常、MIPS SMP vCPU/IRQ 集成。TLBINV/TLBINVF 已覆盖；跨 vCPU 的 TLB shootdown 仍需平台通过 `tlb_flush` 广播。

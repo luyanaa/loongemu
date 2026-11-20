@@ -12,6 +12,7 @@
 #include "latm.h"
 #include "translate.h"
 #include "fpu/softfloat.h"
+#include "latm-platform.h"
 
 #define UART0_THR ((volatile unsigned char *)0x1fe001e0)
 void latx_bare_uart_putc(int c) { *UART0_THR = (unsigned char)c; }
@@ -62,6 +63,28 @@ static uint8_t code_buf2[CODE_BUF_SIZE] __attribute__((aligned(4096)));
 
 static TranslationBlock tb;
 static CPUMIPSState env;
+
+static int platform_read(CPUMIPSState *cpu, uint64_t gpa, uint64_t *value,
+                         uint32_t size)
+{
+    (void)cpu;
+    *value = 0;
+    for (uint32_t i = 0; i < size; i++) {
+        *value |= (uint64_t)*(volatile uint8_t *)(uintptr_t)(gpa + i) << (8 * i);
+    }
+    return LATM_MEM_OK;
+}
+
+static int platform_write(CPUMIPSState *cpu, uint64_t gpa, uint64_t value,
+                          uint32_t size)
+{
+    (void)cpu;
+    for (uint32_t i = 0; i < size; i++) {
+        *(volatile uint8_t *)(uintptr_t)(gpa + i) = (uint8_t)(value >> (8 * i));
+    }
+    return LATM_MEM_OK;
+}
+
 static volatile uint64_t smc_broadcasts;
 void latm_platform_smc_broadcast(uint64_t start, uint64_t end)
 {
@@ -473,7 +496,15 @@ void kmain(void)
     check(env.active_tc.PC, (uint64_t)(uintptr_t)(likely_not_code + 4),
           "likely not-taken PC");
 
-    run_block(mem_code, 19, "memory");
+    {
+        LatmPlatform plat = { .mem_read = platform_read,
+                              .mem_write = platform_write };
+        latm_platform_set(&plat);
+        latm_set_system_memory(true);
+    }
+    run_block(mem_code, 19, "memory-system");
+    latm_set_system_memory(false);
+    latm_platform_set(NULL);
     check(env.active_tc.gpr[2], 0x400, "memory base");
     check(env.active_tc.gpr[3], 0x11223344u, "memory word source");
     check(env.active_tc.gpr[4], 0x11223344u, "lwl+lwr word");

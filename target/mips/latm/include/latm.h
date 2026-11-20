@@ -15,6 +15,21 @@
 #endif
 #define B_STUB_SIZE 4
 #define TARGET_INSN_START_WORDS 2
+#define LATM_TB_MAP_MAX TCG_MAX_INSNS
+
+typedef struct LatmTbInsnSpan {
+    uint64_t guest_pc;
+    uint32_t native_start;
+    uint32_t native_end;
+    uint8_t delay_slot;
+} LatmTbInsnSpan;
+
+typedef struct LatmTbInsnMap {
+    uintptr_t code_base;
+    uint32_t code_size;
+    uint16_t count;
+    LatmTbInsnSpan spans[LATM_TB_MAP_MAX];
+} LatmTbInsnMap;
 
 typedef struct TRANSLATION_DATA {
     void *curr_tb;
@@ -32,6 +47,7 @@ typedef struct TRANSLATION_DATA {
     void *ir1_list;
     void *db_rel;
     uint64_t cache_key;
+    LatmTbInsnMap insn_map;
     uint64_t cs_bt_to_native;
     uint64_t cs_native_to_bt_ret_0;
     uint64_t cs_native_to_bt;
@@ -82,6 +98,11 @@ void latm_jmp_cache_add(void *cpu, uint64_t guest_pc, uint64_t host_pc,
                         uint32_t guest_size);
 void latm_jmp_cache_flush(void *cpu);
 uint64_t latm_jmp_cache_lookup(void *cpu, uint64_t guest_pc);
+void latm_tb_insn_map_begin(void *trd, const void *code, uint32_t code_size);
+void latm_tb_insn_map_add(void *trd, uint64_t guest_pc, uint32_t native_start,
+                          uint32_t native_end, uint8_t delay_slot);
+int latm_tb_insn_map_resolve(void *trd, uintptr_t host_pc,
+                             uint64_t *guest_pc, uint8_t *delay_slot);
 void latm_tb_register(void *cpu, void *tb);
 void latm_platform_smc_broadcast(uint64_t start, uint64_t end);
 
@@ -99,6 +120,8 @@ extern const int mips_la_fmap[];
 extern LATM_TLS TRANSLATION_DATA *tr_data;
 extern LATM_TLS ENV *lsenv;
 extern bool lata_dump;
+extern bool latm_system_memory;
+void latm_set_system_memory(bool on);
 
 
 int lata_gen_prologue(TCGContext *tcg_ctx);

@@ -2,6 +2,7 @@
 #include "qemu/osdep.h"
 #include "latm.h"
 #include "exec/helper-proto.h"
+#include "latm-platform.h"
 
 #define LATM_WEAK __attribute__((weak))
 
@@ -27,8 +28,26 @@ LATM_WEAK void tcg_debug_assert_(int cond) { (void)cond; }
 LATM_WEAK void g_assert_not_reached(void) { for (;;) { } }
 LATM_WEAK void latm_tb_flush_range(void *cpu, uint64_t start, uint64_t end)
 { (void)cpu; (void)start; (void)end; }
+static const LatmPlatform *latm_platform;
+
+void latm_platform_set(const LatmPlatform *platform)
+{
+    __atomic_store_n(&latm_platform, platform, __ATOMIC_RELEASE);
+}
+
+const LatmPlatform *latm_platform_get(void)
+{
+    return __atomic_load_n(&latm_platform, __ATOMIC_ACQUIRE);
+}
+
 LATM_WEAK void latm_platform_smc_broadcast(uint64_t start, uint64_t end)
-{ (void)start; (void)end; }
+{
+    const LatmPlatform *p = latm_platform_get();
+    CPUMIPSState *env = lsenv ? lsenv->cpu_state : NULL;
+    if (p && p->smc_broadcast) {
+        p->smc_broadcast(env, start, end);
+    }
+}
 LATM_WEAK void qemu_spin_init(QemuSpin *s) { (void)s; }
 LATM_WEAK void tb_flush(struct CPUState *cpu) { (void)cpu; }
 LATM_WEAK TranslationBlock *tb_htable_lookup(struct CPUState *cpu, uint64_t pc,

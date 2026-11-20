@@ -159,6 +159,13 @@ uint64_t loongemu_vclock_read_hpet(LoongemuVClock *vc)
     return mul_div_u64(ns, LOONGEMU_VCLOCK_HPET_HZ, LOONGEMU_VCLOCK_NS_PER_SEC);
 }
 
+uint32_t loongemu_vclock_read_mips_count(LoongemuVClock *vc, uint64_t hz)
+{
+    uint64_t ns = loongemu_vclock_now_ns(vc);
+    return (uint32_t)mul_div_u64(ns, hz ? hz : UINT64_C(50000000),
+                                 LOONGEMU_VCLOCK_NS_PER_SEC);
+}
+
 uint64_t loongemu_vclock_read_arm_cntvct(LoongemuVClock *vc)
 {
     uint64_t ns = loongemu_vclock_now_ns(vc);

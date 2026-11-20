@@ -88,7 +88,11 @@ typedef struct IRQState *qemu_irq;
 static inline void qemu_irq_lower(qemu_irq irq) { (void)irq; }
 static inline void qemu_irq_raise(qemu_irq irq) { (void)irq; }
 extern struct CPUState *first_cpu;
+#if defined(CONFIG_LATM)
+#define GETPC() ((uintptr_t)__builtin_return_address(0))
+#else
 #define GETPC() ((uintptr_t)0)
+#endif
 
 typedef struct QemuMutex { int locked; } QemuMutex;
 typedef struct QemuSpin { int value; } QemuSpin;

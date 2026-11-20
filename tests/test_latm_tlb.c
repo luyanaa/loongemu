@@ -3,9 +3,25 @@
 #include "cpu.h"
 #include "internal.h"
 #include "latm-helpers.h"
+#include "latm-platform.h"
 #include "exec/cpu_ldst.h"
 
 static int fault_seen;
+
+static int cache_flushes;
+void latm_jmp_cache_flush(void *cpu) { (void)cpu; cache_flushes++; }
+
+int latm_tb_insn_map_resolve(void *trd, uintptr_t host_pc,
+                             uint64_t *guest_pc, uint8_t *delay_slot)
+{
+    (void)trd; (void)host_pc; (void)guest_pc; (void)delay_slot;
+    return 0;
+}
+
+
+
+const LatmPlatform *latm_platform_get(void) { return NULL; }
+void latm_platform_set(const LatmPlatform *p) { (void)p; }
 
 void cpu_loop_exit(struct CPUState *cs)
 {
@@ -45,6 +61,7 @@ int main(void)
     env.CP0_EntryLo1 = ((paddr >> 12) << 6) | 2 | 4;
     env.CP0_Index = 0;
     latm_helper_tlb(&env, MIPS_TLB_TLBWI);
+    check(cache_flushes > 0, 1, "TLBWI invalidates TB link cache");
     *(uint64_t *)(uintptr_t)buffer = value;
     fault_seen = 0;
     phys = cpu_mips_translate_address(&env, vaddr, MMU_DATA_LOAD, 0);
@@ -68,7 +85,7 @@ int main(void)
     check(fault_seen, 1, "invalid TLB entry raises");
     check(phys, 0, "failed translation returns zero");
     check(env.CP0_BadVAddr, 0xffffffffe0001000, "BadVAddr on TLB fault");
-    check((env.CP0_Cause >> 2) & 0x1f, EXCP_TLBL, "TLB fault Cause");
+    check((env.CP0_Cause >> 2) & 0x1f, 2, "TLB fault Cause");
 
     env.hflags = 0;
     env.active_tc.PC = 0xffffffffe0001000;
@@ -78,7 +95,7 @@ int main(void)
     do_raise_exception_err(&env, EXCP_TLBL, 0, 0);
     check(fault_seen, 1, "exception exited");
     check(env.CP0_EPC, 0xffffffffe0001000, "exception EPC");
-    check((env.CP0_Cause >> 2) & 0x1f, EXCP_TLBL, "Cause.ExcCode");
+    check((env.CP0_Cause >> 2) & 0x1f, 2, "Cause.ExcCode");
     check((env.CP0_Status >> CP0St_EXL) & 1, 1, "EXL");
     check(env.active_tc.PC, 0x80000180, "exception vector");
 
@@ -94,6 +111,7 @@ int main(void)
         static const uint32_t excs[] = {
             EXCP_SYSCALL, EXCP_BREAK, EXCP_OVERFLOW, EXCP_FPE
         };
+        static const uint32_t cause_codes[] = { 8, 9, 12, 15 };
         for (unsigned i = 0; i < sizeof(excs) / sizeof(excs[0]); i++) {
             env.hflags = MIPS_HFLAG_B;
             env.active_tc.PC = 0xffffffffe0001004;
@@ -103,7 +121,7 @@ int main(void)
             do_raise_exception_err(&env, excs[i], 0, 0);
             check(env.CP0_EPC, 0xffffffffe0001000, "delay exception EPC");
             check((env.CP0_Cause >> 31) & 1, 1, "delay exception BD");
-            check((env.CP0_Cause >> 2) & 0x1f, excs[i],
+            check((env.CP0_Cause >> 2) & 0x1f, cause_codes[i],
                   "delay exception cause");
         }
     }
@@ -124,6 +142,31 @@ int main(void)
     env.active_tc.PC = 0x1000;
     do_raise_exception_err(&env, EXCP_TLBL, EXCP_TLB_NOMATCH, 0);
     check(env.active_tc.PC, 0x80000000, "32-bit TLB refill vector");
+
+    /* TLBINVF invalidates all entries; TLBINV targets the current ASID. */
+    env.CP0_Status = 0;
+    env.CP0_EntryHi = vaddr;
+    env.CP0_EntryLo0 = ((paddr >> 12) << 6) | 2 | 4;
+    env.CP0_EntryLo1 = ((paddr >> 12) << 6) | 2 | 4;
+    env.CP0_Index = 0;
+    latm_helper_tlb(&env, MIPS_TLB_TLBWI);
+    fault_seen = 0;
+    check(cpu_mips_translate_address(&env, vaddr, MMU_DATA_LOAD, 0), paddr,
+          "reinstalled TLB entry");
+    check(fault_seen, 0, "reinstalled TLB valid");
+    latm_helper_tlb(&env, MIPS_TLB_TLBINVF);
+    fault_seen = 0;
+    check(cpu_mips_translate_address(&env, vaddr, MMU_DATA_LOAD, 0), 0,
+          "TLBINVF removes entry");
+    check(fault_seen, 1, "TLBINVF faults");
+
+    {
+        int before = cache_flushes;
+        env.CP0_EntryHi = (env.CP0_EntryHi & ~UINT64_C(0xff)) | 0x22;
+        latm_helper_cp0_write(&env, 10, 0,
+                              (env.CP0_EntryHi & ~UINT64_C(0xff)) | 0x55);
+        check(cache_flushes, before + 1, "ASID change invalidates cache");
+    }
 
     env.CP0_BadVAddr = 0x1000;
     env.CP0_Status = 1u << CP0St_EXL;

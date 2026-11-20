@@ -41,7 +41,7 @@ translation-block cache keyed by `(pc, cs_base, cr3, cpl)`.
 | `lata/`, `target/arm/lata/` | LATA AArch64 → LoongArch translator core. |
 | `latm/`, `target/mips/latm/` | LATM MIPS64r2 → LoongArch translator core (integer, LBT unaligned memory, FPU helpers). |
 | `target/i386/`, `target/arm/` | Target-side headers and sources consumed by the translators. |
-| `baremetal/bare/` | `-kernel` harnesses: single-TB, multi-TB loop, paging smoke, LATA/LBT smoke, and the long-mode `tb_sys` bring-up test. |
+| `baremetal/bare/` | `-kernel` harnesses: single-TB, multi-TB loop, paging smoke, LATA/LBT/LATM smoke, the synthetic LATM MIPS64 board (`latm_board.c`), and the long-mode `tb_sys` bring-up test. |
 | `baremetal/efi/` | UEFI applications: LBT fallback self-test, IR1 decode smoke test, LVZ probe, VMM entry. |
 | `baremetal/gen/` | Generated LATX headers (`ir2-opcode.h`, `ir2-name.h`, `format-table.h`, …). |
 | `firmware/` | Pinned EDK2 `QEMU_EFI.fd` / `QEMU_VARS.fd` and x86-64 kernel snippet binaries, checked by `SHA256SUMS.txt`. |
@@ -99,7 +99,8 @@ make -C baremetal all   # baremetal/build/liblatx_core.a  (x86-64 translator)
 make lata-all           # lata/build/liblata_core.a       (AArch64 translator)
 make lata-probe         # per-file syntax check
 make lata-check         # build LATA and verify its external-symbol allowlist
-make test-latm          # LATM decoder + bare-metal MIPS64r2 execution test
+make test-latm          # LATM decoder + TLB/vclock/timer/IRQ + MIPS64r2/board tests
+make latm-board-run     # synthetic MIPS64 board: RAM, 16550 + IRQ, FDT, precise exceptions
 ```
 
 The `check_bare_symbols.sh` and `check_lata_symbols.sh` tools compare each

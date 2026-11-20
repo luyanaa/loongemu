@@ -8,10 +8,15 @@
 #include "cpu.h"
 #include "internal.h"
 #include "exec/helper-proto.h"
+#include "latm.h"
 
 /* QEMU's generic debug/HALT exception numbers are host-side control
  * signals, not MIPS Cause.ExcCode values.  LATM uses the MIPS break and
  * interrupt codes for the freestanding harness. */
+#undef EXCP_DEBUG
+#undef EXCP_HLT
+#undef EXCP_SYSCALL
+#undef EXCP_INTERRUPT
 #define EXCP_DEBUG EXCP_BREAK
 #define EXCP_HLT   EXCP_EXT_INTERRUPT
 
@@ -28,20 +33,67 @@ target_ulong exception_resume_pc(CPUMIPSState *env)
     return bad_pc;
 }
 
+static int mips_cause_code(uint32_t exception)
+{
+    switch (exception) {
+    case EXCP_EXT_INTERRUPT: return 0;
+    case EXCP_LTLBL:         return 1;
+    case EXCP_TLBL:
+    case EXCP_TLBF:          return 2;
+    case EXCP_TLBS:          return 3;
+    case EXCP_AdEL:          return 4;
+    case EXCP_AdES:          return 5;
+    case EXCP_IBE:           return 6;
+    case EXCP_DBE:           return 7;
+    case EXCP_SYSCALL:       return 8;
+    case EXCP_BREAK:         return 9;
+    case EXCP_RI:            return 10;
+    case EXCP_CpU:           return 11;
+    case EXCP_OVERFLOW:      return 12;
+    case EXCP_TRAP:          return 13;
+    case EXCP_MSAFPE:        return 14;
+    case EXCP_FPE:           return 15;
+    case EXCP_C2E:           return 18;
+    case EXCP_TLBRI:         return 19;
+    case EXCP_TLBXI:         return 20;
+    case EXCP_MSADIS:        return 21;
+    case EXCP_MDMX:          return 22;
+    case EXCP_DWATCH:        return 23;
+    case EXCP_MCHECK:        return 24;
+    case EXCP_THREAD:        return 25;
+    case EXCP_DSPDIS:        return 26;
+    case EXCP_CACHE:         return 30;
+    default:                 return 0;
+    }
+}
+
 void do_raise_exception_err(CPUMIPSState *env, uint32_t exception,
                             int error_code, uintptr_t pc)
 {
     target_ulong epc = exception_resume_pc(env);
     bool was_exl = (env->CP0_Status & (1u << CP0St_EXL)) != 0;
+    bool in_delay = (env->hflags & MIPS_HFLAG_BMASK) != 0;
+    int cause = mips_cause_code(exception);
+    uint64_t guest_pc;
+    uint8_t delay_slot;
+
+    if (pc && latm_tb_insn_map_resolve(env->latm_tr_data, pc,
+                                       &guest_pc, &delay_slot)) {
+        epc = guest_pc;
+        in_delay = delay_slot != 0;
+        if (in_delay) {
+            epc -= 4;
+        }
+    }
 
     env->llvalid = 0;
     env->lladdr = UINT64_MAX;
     env->error_code = error_code;
     env->CP0_Cause = (env->CP0_Cause & ~(0x1f << 2)) |
-                     ((exception & 0x1f) << 2);
+                     ((uint32_t)cause << 2);
     env->CP0_EPC = epc;
     env->CP0_Status |= 1u << CP0St_EXL;
-    if (env->hflags & MIPS_HFLAG_BMASK) {
+    if (in_delay) {
         env->CP0_Cause |= 1u << 31;
     } else {
         env->CP0_Cause &= ~(1u << 31);
@@ -62,6 +114,10 @@ void do_raise_exception_err(CPUMIPSState *env, uint32_t exception,
     {
         target_ulong base = (env->CP0_Status & (1u << CP0St_BEV)) ?
                             0xbfc00000u : env->exception_base;
+        if (!(env->CP0_Status & (1u << CP0St_BEV)) &&
+            (env->CP0_EBase & ~UINT64_C(0xfff))) {
+            base = env->CP0_EBase & ~UINT64_C(0xfff);
+        }
         if (exception == EXCP_EXT_INTERRUPT &&
             (env->CP0_Cause & (1u << 23))) {
             env->active_tc.PC = base + 0x200;
@@ -92,15 +148,27 @@ void do_raise_exception(CPUMIPSState *env, uint32_t exception, uintptr_t pc)
     do_raise_exception_err(env, exception, 0, pc);
 }
 
+void latm_check_interrupts(CPUMIPSState *env)
+{
+    (void)cpu_mips_get_count(env);
+    if ((env->CP0_Status & (1u << CP0St_IE)) &&
+        !(env->CP0_Status & (1u << CP0St_EXL)) &&
+        !(env->CP0_Status & (1u << CP0St_ERL)) &&
+        ((env->CP0_Cause & env->CP0_Status) & 0xff00u)) {
+        env->active_tc.CP0_TCHalt = 0;
+        do_raise_exception_err(env, EXCP_EXT_INTERRUPT, 0, 0);
+    }
+}
+
 void helper_raise_exception_err(CPUMIPSState *env, uint32_t exception,
                                 int error_code)
 {
-    do_raise_exception_err(env, exception, error_code, 0);
+    do_raise_exception_err(env, exception, error_code, GETPC());
 }
 
 void helper_raise_exception(CPUMIPSState *env, uint32_t exception)
 {
-    do_raise_exception_err(env, exception, 0, 0);
+    do_raise_exception_err(env, exception, 0, GETPC());
 }
 
 void helper_raise_exception_debug(CPUMIPSState *env)

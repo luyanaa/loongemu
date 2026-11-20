@@ -70,6 +70,7 @@ uint32_t loongemu_vclock_read_acpi_pm24(LoongemuVClock *vc);
 uint16_t loongemu_vclock_read_pit16(LoongemuVClock *vc, uint16_t reload);
 uint64_t loongemu_vclock_read_hpet(LoongemuVClock *vc);
 uint64_t loongemu_vclock_read_arm_cntvct(LoongemuVClock *vc);
+uint32_t loongemu_vclock_read_mips_count(LoongemuVClock *vc, uint64_t hz);
 
 /*
  * LAPIC timer countdown from a virtual-nanosecond start timestamp.

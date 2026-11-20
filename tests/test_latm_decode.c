@@ -55,6 +55,10 @@ int main(void)
            "eret");
     expect(0x40026000, MIPS_OP_CP0_MOVE, MIPS_CP0_MFC0, 0, 2, 12, -32768,
            "mfc0");
+    expect(0x42000003, MIPS_OP_TLB, MIPS_TLB_TLBINV, 16, 0, 0, -32768,
+           "tlbinv");
+    expect(0x42000004, MIPS_OP_TLB, MIPS_TLB_TLBINVF, 16, 0, 0, -32768,
+           "tlbinvf");
 
     printf("latm-decode: checks=%d fails=%d\n", checks, fails);
     return fails != 0;

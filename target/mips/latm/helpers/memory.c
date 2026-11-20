@@ -13,6 +13,7 @@
 #include "exec/page-protection.h"
 #include "exec/helper-proto.h"
 #include "latm-helpers.h"
+#include "latm-platform.h"
 int latm_last_tlb_error;
 
 /* Segment translation for the LATM system-mode memory path.  This is the
@@ -185,7 +186,8 @@ int get_physical_address(CPUMIPSState *env, hwaddr *physical,
 }
 
 static void latm_raise_mmu_exception(CPUMIPSState *env, uint64_t address,
-                                     MMUAccessType access_type, int tlb_error)
+                                     MMUAccessType access_type, int tlb_error,
+                                     uintptr_t ra)
 {
     int exception;
     int error_code = access_type == MMU_INST_FETCH ? EXCP_INST_NOTAVAIL : 0;
@@ -228,7 +230,7 @@ static void latm_raise_mmu_exception(CPUMIPSState *env, uint64_t address,
                         (((address >> 62) & 3) << (env->SEGBITS - 9)) |
                         (((address >> 13) & ((1ULL << (env->SEGBITS - 13)) - 1))
                          << 4);
-    do_raise_exception_err(env, exception, error_code, 0);
+    do_raise_exception_err(env, exception, error_code, ra);
 }
 
 static uint64_t latm_translate(CPUMIPSState *env, uint64_t addr,
@@ -257,7 +259,7 @@ static uint64_t latm_translate(CPUMIPSState *env, uint64_t addr,
             return phys;
         }
     }
-    latm_raise_mmu_exception(env, addr, access_type, ret);
+    latm_raise_mmu_exception(env, addr, access_type, ret, ra);
     return 0;
 }
 
@@ -290,7 +292,17 @@ ST_FUNC(cpu_stq_mmuidx_ra, uint64_t)
 
 uint32_t cpu_ldl_code(CPUMIPSState *env, uint64_t addr)
 {
-    return cpu_ldl_mmuidx_ra(env, addr, 0, 0);
+    const LatmPlatform *plat = latm_platform_get();
+    uint64_t p = latm_translate(env, addr, MMU_INST_FETCH, 0);
+    uint32_t v;
+
+    if (plat && plat->fetch32) {
+        if (plat->fetch32(env, p, &v) != LATM_MEM_OK) {
+            do_raise_exception(env, EXCP_AdEL, GETPC());
+        }
+        return v;
+    }
+    return *(const uint32_t *)(uintptr_t)p;
 }
 
 uint64_t cpu_ldq_code(CPUMIPSState *env, uint64_t addr)
@@ -312,4 +324,76 @@ uint64_t cpu_mips_translate_address(CPUMIPSState *env, uint64_t address,
                                     MMUAccessType access_type, uintptr_t ra)
 {
     return latm_translate(env, address, access_type, ra);
+}
+
+uint64_t latm_helper_load(CPUMIPSState *env, uint32_t op, uint64_t addr)
+{
+    const LatmPlatform *plat = latm_platform_get();
+    uint64_t p;
+    uint64_t v = 0;
+    unsigned size;
+
+    if (plat && plat->mem_read) {
+        switch (op) {
+        case MIPS_MEM_LB: case MIPS_MEM_LBU: size = 1; break;
+        case MIPS_MEM_LH: case MIPS_MEM_LHU: size = 2; break;
+        case MIPS_MEM_LW: case MIPS_MEM_LWU: size = 4; break;
+        case MIPS_MEM_LD: size = 8; break;
+        default: return 0;
+        }
+        p = latm_translate(env, addr, MMU_DATA_LOAD, GETPC());
+        if (plat->mem_read(env, p, &v, size) != LATM_MEM_OK) {
+            do_raise_exception(env, EXCP_AdEL, GETPC());
+            return 0;
+        }
+        switch (op) {
+        case MIPS_MEM_LB: return (int8_t)v;
+        case MIPS_MEM_LBU: return (uint8_t)v;
+        case MIPS_MEM_LH: return (int16_t)v;
+        case MIPS_MEM_LHU: return (uint16_t)v;
+        case MIPS_MEM_LW: return (int32_t)v;
+        case MIPS_MEM_LWU: return (uint32_t)v;
+        default: return v;
+        }
+    }
+    switch (op) {
+    case MIPS_MEM_LB:  return (int8_t)cpu_ldub_mmuidx_ra(env, addr, 0, 0);
+    case MIPS_MEM_LBU: return cpu_ldub_mmuidx_ra(env, addr, 0, 0);
+    case MIPS_MEM_LH:  return (int16_t)cpu_lduw_mmuidx_ra(env, addr, 0, 0);
+    case MIPS_MEM_LHU: return cpu_lduw_mmuidx_ra(env, addr, 0, 0);
+    case MIPS_MEM_LW:  return (int32_t)cpu_ldl_mmuidx_ra(env, addr, 0, 0);
+    case MIPS_MEM_LWU: return cpu_ldl_mmuidx_ra(env, addr, 0, 0);
+    case MIPS_MEM_LD:  return cpu_ldq_mmuidx_ra(env, addr, 0, 0);
+    default: return 0;
+    }
+}
+
+void latm_helper_store(CPUMIPSState *env, uint32_t op, uint64_t addr,
+                       uint64_t val)
+{
+    const LatmPlatform *plat = latm_platform_get();
+    uint64_t p;
+    unsigned size;
+
+    switch (op) {
+    case MIPS_MEM_SB: size = 1; break;
+    case MIPS_MEM_SH: size = 2; break;
+    case MIPS_MEM_SW: size = 4; break;
+    case MIPS_MEM_SD: size = 8; break;
+    default: return;
+    }
+    p = latm_translate(env, addr, MMU_DATA_STORE, GETPC());
+    if (plat && plat->mem_write) {
+        if (plat->mem_write(env, p, val, size) != LATM_MEM_OK) {
+            do_raise_exception(env, EXCP_AdES, GETPC());
+        }
+        return;
+    }
+    switch (op) {
+    case MIPS_MEM_SB: *(uint8_t *)(uintptr_t)p = (uint8_t)val; break;
+    case MIPS_MEM_SH: *(uint16_t *)(uintptr_t)p = (uint16_t)val; break;
+    case MIPS_MEM_SW: *(uint32_t *)(uintptr_t)p = (uint32_t)val; break;
+    case MIPS_MEM_SD: *(uint64_t *)(uintptr_t)p = val; break;
+    default: break;
+    }
 }

@@ -55,7 +55,13 @@ LATM_TLS ENV *lsenv;
 LATM_TLS TRANSLATION_DATA *tr_data;
 
 bool lata_dump;
+bool latm_system_memory;
 static uint8_t latm_translation_lock_flag;
+
+void latm_set_system_memory(bool on)
+{
+    latm_system_memory = on;
+}
 
 static int global_register_init_state;
 
