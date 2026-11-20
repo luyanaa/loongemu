@@ -445,8 +445,6 @@ build/test_latm_board_system: tests/test_latm_board_system.c \
                               target/mips/latm/system/latm_uart.c \
                               target/mips/latm/uncore/latm_uncore.c \
                               src/pci_host.c src/phys_mem.c src/acpi_tables.c
-                              src/pci_host.c src/phys_mem.c src/acpi_tables.c \
-                              target/mips/latm/runtime.c
 	@mkdir -p build
 	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
 	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
