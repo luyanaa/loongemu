@@ -71,6 +71,10 @@ test-p0: build/p0_paging.elf
 	@grep -q 'value=0x1234abcd5678ef90' build/p0.log || \
 	  { echo "P0 WRONG DATA"; exit 1; }
 
+# This host's clang defaults to an SDK path that does not exist; xcrun knows the
+# real one.  Empty on a machine where the default already resolves.
+HOST_SYSROOT := $(shell xcrun --show-sdk-path 2>/dev/null | sed 's/^/-isysroot /')
+
 build/test_x86_64_paging: tests/test_x86_64_paging.c src/x86_64_paging.c include/loongemu/x86_64_paging.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) src/x86_64_paging.c tests/test_x86_64_paging.c -o $@
@@ -80,7 +84,7 @@ test-paging: build/test_x86_64_paging
 
 build/test_arm64_paging: tests/test_arm64_paging.c src/arm64_paging.c include/loongemu/arm64_paging.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) src/arm64_paging.c tests/test_arm64_paging.c -o $@
+	$(CC) $(CFLAGS) $(HOST_SYSROOT) src/arm64_paging.c tests/test_arm64_paging.c -o $@
 
 # ARMv8 Stage-1 4 KiB walker.  Pure host test: the walker takes a memory
 # callback, so the descriptor interpretation is checked without a machine.
