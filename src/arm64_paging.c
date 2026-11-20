@@ -9,7 +9,7 @@
  *   bits 11:2  attributes (MAIR index in 4:2, AP in 7:6, SH in 9:8, AF in 10)
  *   bit 10     AF -- an unfollowed access faults even on a valid entry
  *   bits 47:12 output address (block entries carry a size-aligned base)
- *   bit 54     UXN / XN at the block and page levels
+ *   bits 53:54 PXN / UXN at the block and page levels
  *
  * The walker is deliberately policy-free: it reports what the hardware would
  * do and leaves installing mappings, filling TLBs and raising exceptions to
@@ -34,6 +34,20 @@
 #define ARM64_PTE_UXN     (UINT64_C(1) << 54)   /* unprivileged execute-never */
 #define ARM64_PTE_ADDR_MASK UINT64_C(0x0000fffffffff000)
 
+/*
+ * Table descriptor attributes are accumulated over the walk (ARM DDI 0487
+ * D8.3.1.1). Bits 59:63 map to PXNTable, UXNTable, APTable[0], APTable[1],
+ * NSTable respectively; the first four propagate as restrictions, with zero
+ * meaning no effect.
+ */
+#define ARM64_TABLE_ATTR_SHIFT 59
+#define ARM64_TABLE_ATTR_MASK  UINT64_C(0x1f)
+#define ARM64_TABLE_PXN_SHIFT  0   /* descriptor bit 59 */
+#define ARM64_TABLE_UXN_SHIFT  1   /* descriptor bit 60 */
+#define ARM64_TABLE_AP_SHIFT   2   /* APTable[0], APTable[1] */
+
+#define ARM64_SCTLR_WXN   (UINT64_C(1) << 19)
+
 /* TCR_EL1 fields used here. */
 #define TCR_T0SZ_SHIFT  0
 #define TCR_EPD0        (UINT64_C(1) << 7)
@@ -41,6 +55,8 @@
 #define TCR_SH0_SHIFT   12
 #define TCR_T1SZ_SHIFT  16
 #define TCR_EPD1        (UINT64_C(1) << 23)
+#define TCR_HPD0       (UINT64_C(1) << 41)
+#define TCR_HPD1       (UINT64_C(1) << 42)
 #define TCR_TG1_SHIFT   30
 #define TCR_SH1_SHIFT   28
 
@@ -100,13 +116,15 @@ uint32_t arm64_fault_status(Arm64WalkResult result, uint32_t access)
     return iss;
 }
 
-Arm64WalkResult arm64_walk(const Arm64PagingMemory *memory,
-                           uint64_t ttbr0, uint64_t ttbr1, uint64_t tcr,
-                           uint64_t va, uint32_t access,
-                           Arm64Translation *out)
+Arm64WalkResult arm64_walk_ex(const Arm64PagingMemory *memory,
+                              uint64_t ttbr0, uint64_t ttbr1, uint64_t tcr,
+                              uint64_t sctlr, uint64_t va, uint32_t access,
+                              Arm64Translation *out)
 {
+    uint32_t tableattrs = 0;
     uint64_t ttbr, tsz;
     uint32_t tg;
+    bool hpd;
 
     if (out == NULL) {
         return ARM64_WALK_RESERVED;
@@ -121,6 +139,7 @@ Arm64WalkResult arm64_walk(const Arm64PagingMemory *memory,
             return ARM64_WALK_UNSUPPORTED;    /* table walks disabled */
         }
         ttbr = ttbr1;
+        hpd = (tcr & TCR_HPD1) != 0;
         tsz = (tcr >> TCR_T1SZ_SHIFT) & 0x3fu;
         tg = (uint32_t)((tcr >> TCR_TG1_SHIFT) & 0x3u);
         if (tg != ARM64_TG1_4K) {
@@ -131,6 +150,7 @@ Arm64WalkResult arm64_walk(const Arm64PagingMemory *memory,
             return ARM64_WALK_UNSUPPORTED;
         }
         ttbr = ttbr0;
+        hpd = (tcr & TCR_HPD0) != 0;
         tsz = (tcr >> TCR_T0SZ_SHIFT) & 0x3fu;
         tg = (uint32_t)((tcr >> TCR_TG0_SHIFT) & 0x3u);
         if (tg != ARM64_TG0_4K) {
@@ -154,6 +174,8 @@ Arm64WalkResult arm64_walk(const Arm64PagingMemory *memory,
         {
             uint64_t table = ttbr & ARM64_PTE_ADDR_MASK;
             uint32_t levels = (va_bits - 12u) / ARM64_VA_BITS_PER_LEVEL;
+
+            tableattrs = 0;
             int shift = (int)va_bits;
 
             for (uint32_t lvl = 0; lvl < levels; lvl++) {
@@ -194,8 +216,18 @@ Arm64WalkResult arm64_walk(const Arm64PagingMemory *memory,
                         if (lvl == levels - 1u) {
                             leaf_bits = 12u;              /* 4 KiB page */
                         } else {
+                            /*
+                             * A table: gather the attributes that propagate
+                             * downward unless HPD disables hierarchical
+                             * permissions for this TTBR range.
+                             */
+                            if (!hpd) {
+                                tableattrs |= (uint32_t)
+                                    ((desc >> ARM64_TABLE_ATTR_SHIFT) &
+                                     ARM64_TABLE_ATTR_MASK);
+                            }
                             table = desc & ARM64_PTE_ADDR_MASK;
-                            continue;                     /* table */
+                            continue;
                         }
                     } else {
                         return ARM64_WALK_RESERVED;       /* reserved 0b10 */
@@ -210,9 +242,8 @@ Arm64WalkResult arm64_walk(const Arm64PagingMemory *memory,
                         bool el1_writable;
 
                         /*
-                         * AP[2:1] is the whole permission model at this level
-                         * (ARM DDI 0487 D8.3.1, "Stage 1 memory access
-                         * permissions"):
+                         * AP[2:1] is the Stage-1 permission matrix (Arm DDI
+                         * 0487 D8.4.1):
                          *
                          *   AP   EL1   EL0
                          *   00   RW    none
@@ -220,23 +251,31 @@ Arm64WalkResult arm64_walk(const Arm64PagingMemory *memory,
                          *   10   RO    none
                          *   11   RO    RO
                          *
-                         * Readability is not universal: AP=00 and AP=10 deny
-                         * EL0 outright, so a user read must fault rather than
-                         * succeed with a read-only translation.  And AP=10/11
-                         * are read-only for EL1 as well -- only a privileged
-                         * write that the architecture routes through PAN/EPD
-                         * or a read-only memattr bypass can get past them, and
-                         * that is not a permission this walker may grant.
+                         * APTable is hierarchical (D8.4.1.2.2). QEMU's
+                         * target/arm/ptw.c folds accumulated APTable[0] into
+                         * AP[1] by clearing it, and APTable[1] into AP[2] by
+                         * setting it; apply that fold before this matrix.
                          */
+                        {
+                            uint32_t apt = (tableattrs >> ARM64_TABLE_AP_SHIFT) &
+                                           0x3u;
+
+                            if (apt & 1u) {
+                                ap &= ~1u;      /* APTable[0]=1 -> AP[1]=0 */
+                            }
+                            if (apt & 2u) {
+                                ap |= 2u;       /* APTable[1]=1 -> AP[2]=1 */
+                            }
+                        }
+
                         el0_readable = (ap == 1u || ap == 3u);
                         el0_writable = (ap == 1u);
                         el1_writable = (ap == 0u || ap == 1u);
 
                         if (user) {
-                            if (!el0_readable) {
-                                return ARM64_WALK_PROTECTION;
+                            if (el0_readable) {
+                                perm |= ARM64_ACCESS_READ;
                             }
-                            perm |= ARM64_ACCESS_READ;
                             if (el0_writable) {
                                 perm |= ARM64_ACCESS_WRITE;
                             }
@@ -247,15 +286,42 @@ Arm64WalkResult arm64_walk(const Arm64PagingMemory *memory,
                             }
                         }
 
+                        if ((access & ARM64_ACCESS_READ) &&
+                            !(perm & ARM64_ACCESS_READ)) {
+                            return ARM64_WALK_PROTECTION;
+                        }
                         if ((access & ARM64_ACCESS_WRITE) &&
                             !(perm & ARM64_ACCESS_WRITE)) {
                             return ARM64_WALK_PROTECTION;
                         }
-                        if (access & ARM64_ACCESS_EXEC) {
-                            if (user ? (desc & ARM64_PTE_UXN) :
-                                        (desc & ARM64_PTE_PXN)) {
-                                return ARM64_WALK_PROTECTION;
+
+                        {
+                            bool xn = user ? (desc & ARM64_PTE_UXN) != 0
+                                           : (desc & ARM64_PTE_PXN) != 0;
+                            bool table_xn =
+                                (tableattrs >> (user ? ARM64_TABLE_UXN_SHIFT :
+                                                       ARM64_TABLE_PXN_SHIFT)) & 1u;
+                            bool writable = user ? el0_writable : el1_writable;
+
+                            /*
+                             * In the EL1&0 regime, UnprivWrite removes
+                             * PrivExecute even with WXN clear (DDI 0487
+                             * D8.4.1.2.3). WXN separately removes execute
+                             * permission for the current privilege when its
+                             * data-write permission is present (D8.4.1.2.4).
+                             */
+                            if (!user && el0_writable) {
+                                xn = true;
                             }
+                            xn = xn || table_xn ||
+                                 ((sctlr & ARM64_SCTLR_WXN) && writable);
+                            if (!xn) {
+                                perm |= ARM64_ACCESS_EXEC;
+                            }
+                        }
+                        if ((access & ARM64_ACCESS_EXEC) &&
+                            !(perm & ARM64_ACCESS_EXEC)) {
+                            return ARM64_WALK_PROTECTION;
                         }
                         if (!(desc & ARM64_PTE_AF)) {
                             /*
@@ -266,9 +332,6 @@ Arm64WalkResult arm64_walk(const Arm64PagingMemory *memory,
                             return ARM64_WALK_NOT_PRESENT;
                         }
 
-                        perm |= access &
-                                (ARM64_ACCESS_READ | ARM64_ACCESS_WRITE |
-                                 ARM64_ACCESS_EXEC);
                         out->pa = (desc & ARM64_PTE_ADDR_MASK) |
                                   (va & ((UINT64_C(1) << leaf_bits) - 1u));
                         out->desc = desc;
@@ -281,4 +344,13 @@ Arm64WalkResult arm64_walk(const Arm64PagingMemory *memory,
             return ARM64_WALK_NOT_PRESENT;            /* ran out of levels */
         }
     }
+}
+
+Arm64WalkResult arm64_walk(const Arm64PagingMemory *memory,
+                           uint64_t ttbr0, uint64_t ttbr1, uint64_t tcr,
+                           uint64_t va, uint32_t access,
+                           Arm64Translation *out)
+{
+    /* Legacy API has no SCTLR input; treat WXN as disabled. */
+    return arm64_walk_ex(memory, ttbr0, ttbr1, tcr, 0, va, access, out);
 }

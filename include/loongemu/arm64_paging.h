@@ -54,7 +54,7 @@ typedef struct Arm64Translation {
     uint64_t pa;         /* guest physical address of the access */
     uint64_t desc;       /* the leaf descriptor that produced it */
     uint32_t page_bits;  /* 12, 21 or 30 */
-    uint32_t perm;       /* the same bits as the access mask */
+    uint32_t perm;       /* effective R/W/X rights, using the access-mask bits */
 } Arm64Translation;
 
 /*
@@ -62,8 +62,9 @@ typedef struct Arm64Translation {
  *
  * `ttbr` is the base register for the half of the address space the VA lives
  * in (TTBR0_EL1 below 2^48/2, TTBR1_EL1 above), selected exactly as the
- * hardware does: bit 55 of the VA.  `tcr` supplies T0SZ/T1SZ, TG0/TG1 and the
- * EPD disable bits.
+ * hardware does: bit 55 of the VA.  `tcr` supplies T0SZ/T1SZ, TG0/TG1, EPD,
+ * and HPD0/HPD1; HPD disables hierarchical table-descriptor attributes for
+ * the selected half.
  *
  * Returns ARM64_WALK_UNSUPPORTED when the configuration is one this walker
  * does not model (MMU disabled, 16 KiB/64 KiB granule, or a disabled table
@@ -73,6 +74,19 @@ Arm64WalkResult arm64_walk(const Arm64PagingMemory *memory,
                            uint64_t ttbr0, uint64_t ttbr1, uint64_t tcr,
                            uint64_t va, uint32_t access,
                            Arm64Translation *out);
+
+/*
+ * As arm64_walk(), but with SCTLR_EL1 supplied so WXN can be honoured.
+ * Models the EL1&0 Direct-permission rules in Arm DDI 0487: AP/APTable,
+ * PXN/UXN and table restrictions, AF, and WXN. Effective UnprivWrite also
+ * removes PrivExecute, independent of WXN. PAN and indirect permissions are
+ * outside this API's model.
+ * arm64_walk() passes zero, so its compatibility behavior assumes WXN clear.
+ */
+Arm64WalkResult arm64_walk_ex(const Arm64PagingMemory *memory,
+                              uint64_t ttbr0, uint64_t ttbr1, uint64_t tcr,
+                              uint64_t sctlr, uint64_t va, uint32_t access,
+                              Arm64Translation *out);
 
 /* The ESR_EL1 fault status class / ISS this walk would raise, or 0 for OK. */
 uint32_t arm64_fault_status(Arm64WalkResult result, uint32_t access);
