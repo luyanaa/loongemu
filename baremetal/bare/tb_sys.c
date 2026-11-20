@@ -884,8 +884,7 @@ static void sync_trap_regs_to_env(const uint64_t *regs)
         env.regs[i] = regs[la_reg];
     }
     {
-        uint32_t non_cc = ((uint32_t)regs[reg_statics_map[S_EFLAGS]] & 0x502u) |
-                          (env.eflags & IF_MASK);
+        uint32_t non_cc = (uint32_t)regs[reg_statics_map[S_EFLAGS]] & 0x702u;
         uint32_t cc = 0;
 
         if (g_use_sw_lbt) {
@@ -1328,14 +1327,8 @@ static void switch_vcpu(uint32_t next_id)
     if (next_id >= MAX_VCPUS || next_id == g_cur_vcpu) {
         return;
     }
-    if (g_use_sw_lbt) {
-        cc = sw_lbt.eflags;
-    } else {
-        __asm__ volatile(".word 0x005cfc0c\n" /* x86mfflag $t0, 0x3f */
-                         "move %0, $t0"
-                         : "=r"(cc) :: "t0");
-    }
-    env.eflags = (env.eflags & ~0x8d5u) | (cc & 0x8d5u) | 0x2u;
+    /* env.eflags is already authoritative from epi_buf / sync_trap_regs_to_env;
+     * do not overwrite it with hardware LBT flags on vCPU switch. */
     g_vcpu_save[g_cur_vcpu] = env;
     env = g_vcpu_save[next_id];
     cc = (uint32_t)(env.eflags & 0x8d5u);
@@ -1643,27 +1636,16 @@ static int deliver_tick_to_guest(void)
 static int resolve_exact_insn_boundary_x86_pc(uint64_t fault_pc,
                                               uint64_t *out_x86_pc)
 {
+    /* Only preempt at TB entry (off == 0) where flag_reduction and IR2
+     * optimizations have materialized all architectural EFLAGS and GPRs. */
     for (uint32_t i = 0; i < g_tb_highwater; i++) {
         if (!tb_entries[i].used) {
             continue;
         }
-        if (fault_pc < tb_entries[i].code ||
-            fault_pc >= tb_entries[i].code + (uint64_t)tb_entries[i].code_size) {
-            continue;
-        }
-        uint64_t off = fault_pc - tb_entries[i].code;
-        const TbInsnMap *map = &tb_insn_maps[i];
-        if (off == 0) {
+        if (fault_pc == tb_entries[i].code) {
             *out_x86_pc = tb_entries[i].pc;
             return 1;
         }
-        for (uint32_t k = 0; k + 1 < map->count; k++) {
-            if (off == (uint64_t)map->spans[k].native_end_off) {
-                *out_x86_pc = map->spans[k + 1].x86_pc;
-                return 1;
-            }
-        }
-        return 0;
     }
     return 0;
 }
@@ -2787,6 +2769,7 @@ void tb_sys_handle_trap(uint64_t *regs)
                 }
                 if (resolve_exact_insn_boundary_x86_pc(fault_pc, &exact_rip)) {
                     sync_trap_regs_to_env(regs);
+                    can_irq = ((env.eflags & IF_MASK) != 0 && env.idt.base != 0);
                     if (can_irq && deliver_kernel_timer_tick(exact_rip)) {
                         g_timer_irq_pending[g_cur_vcpu] = 0;
                         timer_start(250000);
@@ -2812,6 +2795,9 @@ void tb_sys_handle_trap(uint64_t *regs)
                 } else {
                     if (can_irq) {
                         g_timer_irq_pending[g_cur_vcpu] = 1;
+                    }
+                    if (smp_yield) {
+                        g_vcpu_preempt_needed = 1;
                     }
                     timer_start(5003);
                 }

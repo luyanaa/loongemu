@@ -1168,6 +1168,7 @@ bool translate_iretq(IR1_INST *pir1)
         la_x86mtflag(eflags_opnd, 0x3f);
         la_bstrpick_d(rflags_tmp, eflags_opnd, 31, 0);
         la_st_d(rflags_tmp, env_ir2_opnd, lsenv_offset_of_eflags(lsenv));
+        la_andi(eflags_opnd, eflags_opnd, 0x702);
         ra_free_temp(rflags_tmp);
     }
     /* rsp */
