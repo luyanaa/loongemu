@@ -51,16 +51,18 @@ typedef struct ENV {
     TRANSLATION_DATA *tr_data;
 } ENV;
 
-#define LATM_JMP_CACHE_BITS 10
-#define LATM_JMP_CACHE_SIZE (1u << LATM_JMP_CACHE_BITS)
-#define LATM_JMP_CACHE_MASK (LATM_JMP_CACHE_SIZE - 1)
+#define LATM_JMP_CACHE_WAYS 2
+#define LATM_JMP_CACHE_SETS 512
+#define LATM_JMP_CACHE_SIZE (LATM_JMP_CACHE_SETS * LATM_JMP_CACHE_WAYS)
+#define LATM_JMP_CACHE_SET_MASK (LATM_JMP_CACHE_SETS - 1)
 
-/* Each slot is 32 bytes so generated code can index it with alsl.d. */
+/* 32-byte entries: set-associative lookup is performed in C. */
 typedef struct LatmJmpCacheEntry {
     uint64_t guest_pc;
     uint64_t host_pc;
-    uint64_t guest_size;
     uint64_t key;          /* ASID | (hflags mode << 8) */
+    uint32_t guest_size;
+    uint32_t age;
 } LatmJmpCacheEntry;
 
 extern bool latm_have_lbt;
@@ -97,9 +99,6 @@ extern LATM_TLS TRANSLATION_DATA *tr_data;
 extern LATM_TLS ENV *lsenv;
 extern bool lata_dump;
 
-extern uint64_t context_switch_bt_to_native;
-extern uint64_t context_switch_native_to_bt_ret_0;
-extern uint64_t context_switch_native_to_bt;
 
 int lata_gen_prologue(TCGContext *tcg_ctx);
 int lata_gen_epilogue(TCGContext *tcg_ctx);

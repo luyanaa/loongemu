@@ -219,54 +219,23 @@ static void gen_goto_tb(DisasContext *s, int n, uint64_t dest)
 
 static void gen_goto_tb_indirect(DisasContext *s, IR2_OPND target)
 {
-    IR2_OPND slot = ra_alloc_itemp();
-    IR2_OPND cached = ra_alloc_itemp();
-    IR2_OPND miss0 = ir2_opnd_new_type(IR2_OPND_LABEL);
-    IR2_OPND miss1 = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND miss = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND host;
 
-    /* a0 = this vCPU's cache; slot = cache + ((target >> 2) & MASK) * 32 */
-    latm_env_ld_d(a0_ir2_opnd,
-                  offsetof(CPUMIPSState, latm_jmp_cache));
-    la_beqz(a0_ir2_opnd, miss0);
-    la_srli_d(slot, target, 2);
-    la_andi(slot, slot, LATM_JMP_CACHE_MASK);
-    la_slli_d(slot, slot, 5);
-    la_add_d(slot, slot, a0_ir2_opnd);
-    la_ld_d(cached, slot, 0);
-    la_bne(target, cached, miss0);
-
-    /* PC is now safe to publish; reuse target as a key temp. */
     latm_env_st_d(target, env_offset_pc());
-    la_ld_d(cached, slot, 24);
-
-    latm_env_ld_w(a0_ir2_opnd, env_offset_hflags());
-    la_andi(a0_ir2_opnd, a0_ir2_opnd,
-            MIPS_HFLAG_UM | MIPS_HFLAG_SM);
-    la_slli_d(a0_ir2_opnd, a0_ir2_opnd, 8);
-    la_mov64(target, a0_ir2_opnd);
-    latm_env_ld_d(a0_ir2_opnd, offsetof(CPUMIPSState, CP0_EntryHi));
-    la_andi(a0_ir2_opnd, a0_ir2_opnd, 0xff);
-    la_or(a0_ir2_opnd, target, a0_ir2_opnd);
-    la_bne(cached, a0_ir2_opnd, miss1);
-
-    la_ld_d(cached, slot, 8);
-    la_beqz(cached, miss1);
+    host = hcall1((uintptr_t)latm_jmp_cache_lookup, target);
+    la_beqz(host, miss);
     if (latm_link_use_jiscr1) {
-        la_gr2scr(scr0_ir2_opnd, cached);
+        la_gr2scr(scr0_ir2_opnd, host);
         la_jiscr1(0);
     } else if (latm_have_lbt) {
-        la_gr2scr(scr0_ir2_opnd, cached);
+        la_gr2scr(scr0_ir2_opnd, host);
         la_jiscr0(0);
     } else {
-        la_jirl(zero_ir2_opnd, cached, 0);
+        la_jirl(zero_ir2_opnd, host, 0);
     }
-
-    la_label(miss0);
-    latm_env_st_d(target, env_offset_pc());
-    la_label(miss1);
+    la_label(miss);
     lata_gen_exit_tb_ret_0(s);
-    ra_free_itemp(slot._reg_num);
-    ra_free_itemp(cached._reg_num);
 }
 
 static void translate_delay_slot(DisasContext *s)

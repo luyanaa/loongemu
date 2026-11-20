@@ -56,9 +56,6 @@ LATM_TLS TRANSLATION_DATA *tr_data;
 
 bool lata_dump;
 static uint8_t latm_translation_lock_flag;
-uint64_t context_switch_bt_to_native;
-uint64_t context_switch_native_to_bt_ret_0;
-uint64_t context_switch_native_to_bt;
 
 static int global_register_init_state;
 
@@ -377,19 +374,13 @@ int lata_gen_epilogue_env(void *cpu, TCGContext *tcg_ctx)
 int lata_gen_prologue(TCGContext *tcg_ctx)
 {
     void *cpu = lsenv ? lsenv->cpu_state : NULL;
-    int n = lata_gen_prologue_env(cpu, tcg_ctx);
-    context_switch_bt_to_native = lsenv->tr_data->cs_bt_to_native;
-    return n;
+    return lata_gen_prologue_env(cpu, tcg_ctx);
 }
 
 int lata_gen_epilogue(TCGContext *tcg_ctx)
 {
     void *cpu = lsenv ? lsenv->cpu_state : NULL;
-    int n = lata_gen_epilogue_env(cpu, tcg_ctx);
-    context_switch_native_to_bt_ret_0 =
-        lsenv->tr_data->cs_native_to_bt_ret_0;
-    context_switch_native_to_bt = lsenv->tr_data->cs_native_to_bt;
-    return n;
+    return lata_gen_epilogue_env(cpu, tcg_ctx);
 }
 
 void lata_gen_call_helper_prologue(TCGContext *tcg_ctx)
@@ -609,9 +600,9 @@ void lata_env_vst(IR2_OPND vector, int offset)
 bool latm_have_lbt = true;
 bool latm_link_use_jiscr1;
 
-static inline uint32_t latm_jmp_slot(uint64_t guest_pc)
+static inline uint32_t latm_jmp_set(uint64_t guest_pc)
 {
-    return (uint32_t)((guest_pc >> 2) & LATM_JMP_CACHE_MASK);
+    return (uint32_t)((guest_pc >> 2) & LATM_JMP_CACHE_SET_MASK);
 }
 
 static LatmJmpCacheEntry *latm_jmp_entries(void *cpu)
@@ -623,17 +614,37 @@ static void latm_jmp_cache_add_key(void *cpu, uint64_t key,
                                    uint64_t guest_pc, uint64_t host_pc,
                                    uint32_t guest_size)
 {
+    CPUMIPSState *env = cpu;
     LatmJmpCacheEntry *cache = latm_jmp_entries(cpu);
-    LatmJmpCacheEntry *e;
+    LatmJmpCacheEntry *set;
+    LatmJmpCacheEntry *victim = NULL;
+    uint32_t age = ++env->latm_jmp_generation;
 
     if (!cache) {
         return;
     }
-    e = &cache[latm_jmp_slot(guest_pc)];
-    e->guest_pc = guest_pc;
-    e->host_pc = host_pc;
-    e->guest_size = guest_size;
-    e->key = key;
+    set = &cache[latm_jmp_set(guest_pc) * LATM_JMP_CACHE_WAYS];
+    for (unsigned way = 0; way < LATM_JMP_CACHE_WAYS; way++) {
+        LatmJmpCacheEntry *e = &set[way];
+        if (e->host_pc && e->guest_pc == guest_pc && e->key == key) {
+            e->host_pc = host_pc;
+            e->guest_size = guest_size;
+            e->age = age;
+            return;
+        }
+        if (!e->host_pc) {
+            victim = e;
+            break;
+        }
+        if (!victim || e->age < victim->age) {
+            victim = e;
+        }
+    }
+    victim->guest_pc = guest_pc;
+    victim->host_pc = host_pc;
+    victim->guest_size = guest_size;
+    victim->key = key;
+    victim->age = age;
 }
 
 void latm_jmp_cache_add(void *cpu, uint64_t guest_pc, uint64_t host_pc,
@@ -656,14 +667,22 @@ void latm_jmp_cache_flush(void *cpu)
 uint64_t latm_jmp_cache_lookup(void *cpu, uint64_t guest_pc)
 {
     CPUMIPSState *env = cpu;
-    LatmJmpCacheEntry *e;
+    LatmJmpCacheEntry *set;
 
     if (!env || !env->latm_jmp_cache) {
         return 0;
     }
-    e = &((LatmJmpCacheEntry *)env->latm_jmp_cache)[latm_jmp_slot(guest_pc)];
-    return e->guest_pc == guest_pc && e->key == latm_cache_key(env) ?
-           e->host_pc : 0;
+    set = &((LatmJmpCacheEntry *)env->latm_jmp_cache)
+          [latm_jmp_set(guest_pc) * LATM_JMP_CACHE_WAYS];
+    for (unsigned way = 0; way < LATM_JMP_CACHE_WAYS; way++) {
+        LatmJmpCacheEntry *e = &set[way];
+        if (e->host_pc && e->guest_pc == guest_pc &&
+            e->key == latm_cache_key(env)) {
+            e->age = ++env->latm_jmp_generation;
+            return e->host_pc;
+        }
+    }
+    return 0;
 }
 
 void latm_tb_register(void *cpu, void *tb_ptr)

@@ -704,7 +704,7 @@ SRCS   := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \
 ### 13.2 已通过的门禁
 
 - `make test-latm-decode`：21 条向量，覆盖 ALU/IMM、DMULTU、MFLO、ROTR、JAL/JR、BEQ/BEQL、LWL/SDR、SW/SD/LD、SYSCALL/BREAK、ERET/MFC0。
-- `make latm-isa-run`：QEMU-LVZ `-M virt -cpu la464`，68 项检查全部通过：
+- `make latm-isa-run`：QEMU-LVZ `-M virt -cpu la464`，71 项检查全部通过：
   - 整数 ALU、DSLL/DSRA、DMULTU/MFLO/MFHI、ROTR/DROTR；
   - 分支 taken/not-taken、BEQL taken/not-taken、JAL 链接值、JR 间接目标；
   - `lwl+lwr`、`ldl+ldr`、`sdr+ld` 以及普通 `sw/sd/ld`；
@@ -722,7 +722,7 @@ SRCS   := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \
 
 ### 13.3 已知边界
 
-1. **TB 链接是 per-vCPU 直接映射缓存**：每个 `CPUMIPSState` 持有 1024×32 B cache；key = `ASID | (hflags mode << 8)`，生成代码同时比较 guest PC、ASID 与 mode。测试覆盖同 key 命中、不同 ASID/模式拒绝、`SYNCI/CACHE` 失效。仍无容量/代际管理、ASID flush/TLB shootdown，且尚未接入主循环的 TB 分配器。
+1. **TB 链接是 per-vCPU 2-way set-associative cache**：512 sets × 2 ways，LRU age；每个 `CPUMIPSState` 持有独立 cache。key = `ASID | (hflags mode << 8)`；间接跳转通过 C helper 查找，测试覆盖同 key 命中、不同 ASID/模式拒绝、2-way 冲突淘汰、`SYNCI/CACHE` 失效。仍无 ASID flush/TLB shootdown，且尚未接入主循环的 TB 分配器。
 2. **`jiscr1` 语义按 QEMU-LVZ 实现**：QEMU 的 `helper_lbt_jiscr` 对两个 jiscr 都用 SCR0 作为目标，`jiscr1` 额外把 host PC 写回 SCR0；LATM 的测试按此语义。若真实硬件遵循指南的 SCR1 目标语义，需要在 feature probe 后选择编码。
 3. **CPUMIPSState 位移**：`PC=512`、`hflags≈16116`，后者超出 LoongArch `si12`。`latm_env_ld/st_*` 对超界位移先用 `a0` 物化地址；`a0` 不映射任何 MIPS GPR（r4→a4）。
 4. **TLB 精度边界**：已实现 R4000 `map_address`、MIPS64 segment/SegCtl walk、TLB fault 的 BadVAddr/Context/EntryHi/Cause/EPC/BD；尚未实现 TLB shadow 页、TLBINV/TLBINVF 的全量失效语义，也未把 guest physical 与宿主物理内存解耦（测试直接把 PFN 指向宿主 buffer）。

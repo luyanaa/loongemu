@@ -210,7 +210,6 @@ extern int tr_ir2_assemble(const void *code_start_addr);
 extern bool tr_ir2_generate(TranslationBlock *tb);
 extern void tr_init(void *tb);
 extern void tr_fini(void);
-extern uint64_t context_switch_bt_to_native;
 
 static int assemble_block(uint32_t *guest, int insns, uint8_t *host)
 {
@@ -556,6 +555,16 @@ void kmain(void)
                   &env, (uint64_t)(uintptr_t)chain_target_code), 0,
               "cache key rejects different mode");
         env.hflags = 0;
+        /* Same 2-way set: third insert must evict the oldest. */
+        latm_jmp_cache_add(&env, 0x1000, 0x11110000, 8);
+        latm_jmp_cache_add(&env, 0x1800, 0x22220000, 8);
+        latm_jmp_cache_add(&env, 0x2000, 0x33330000, 8);
+        check(latm_jmp_cache_lookup(&env, 0x1000), 0,
+              "2-way cache evicts oldest");
+        check(latm_jmp_cache_lookup(&env, 0x1800), 0x22220000,
+              "2-way cache keeps middle");
+        check(latm_jmp_cache_lookup(&env, 0x2000), 0x33330000,
+              "2-way cache keeps newest");
         for (unsigned i = 0; i < sizeof(flush_ops) / sizeof(flush_ops[0]); i++) {
             cache_code[2] = flush_ops[i];
             latm_jmp_cache_add(&env, (uint64_t)(uintptr_t)chain_target_code,

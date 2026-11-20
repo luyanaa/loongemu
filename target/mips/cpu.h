@@ -1198,6 +1198,7 @@ typedef struct CPUArchState {
     void *latm_env;
     void *latm_tr_data;
     void *latm_jmp_cache;
+    uint32_t latm_jmp_generation;
 } CPUMIPSState;
 
 /* Exceptions (copied from QEMU target/mips/cpu.h). */
