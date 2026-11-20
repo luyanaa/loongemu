@@ -63,6 +63,22 @@ int main(void)
     uint64_t code;
     check(latm_system_mmio_read(&sys, 0x1000, 2, &code), 1, "ELF code");
     check(code, 0xbbaa, "ELF bytes");
+
+    uint8_t helf[64 + 56 + 8];
+    memcpy(helf, elf, sizeof(helf));
+    uint64_t h = 0xffffffff80200000ull;
+    for (unsigned i = 0; i < 8; i++) {
+        helf[24 + i] = (uint8_t)(h >> (8 * i));
+        helf[64 + 16 + i] = (uint8_t)(h >> (8 * i));
+        helf[64 + 24 + i] = (uint8_t)(h >> (8 * i));
+    }
+    uint64_t hentry = 0;
+    check(latm_system_load_elf(&sys, helf, sizeof(helf), &hentry), 1,
+          "KSEG0 vmlinux load");
+    check(hentry, h, "KSEG0 entry");
+    check(latm_system_mmio_read(&sys, 0x200000, 2, &code), 1,
+          "KSEG0 translated GPA");
+    check(code, 0xbbaa, "KSEG0 bytes");
     {
         CPUMIPSState benv;
         memset(&benv, 0, sizeof(benv));
