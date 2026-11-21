@@ -25,6 +25,9 @@ typedef struct TestMemory {
     unsigned char bytes[TEST_MEMORY_SIZE];
     unsigned read_count;
     unsigned update_count;
+    int fail_once;
+    uint64_t replacement_addr;
+    uint64_t replacement_value;
 } TestMemory;
 
 static int memory_read_u64(void *opaque, uint64_t address, uint64_t *value)
@@ -50,6 +53,33 @@ static int memory_atomic_or_u64(void *opaque, uint64_t address,
     memcpy(new_value, memory->bytes + address, sizeof(*new_value));
     *new_value |= bits;
     memcpy(memory->bytes + address, new_value, sizeof(*new_value));
+    memory->update_count++;
+    return 0;
+}
+
+static int memory_cmpxchg_u64(void *opaque, uint64_t address,
+                              uint64_t *expected, uint64_t desired)
+{
+    TestMemory *memory = opaque;
+    uint64_t current;
+
+    if (address > sizeof(memory->bytes) - sizeof(current) || address % 8 != 0 ||
+        expected == NULL) {
+        return -1;
+    }
+    if (memory->fail_once && address == memory->replacement_addr) {
+        memory->fail_once = 0;
+        memcpy(memory->bytes + address, &memory->replacement_value,
+               sizeof(memory->replacement_value));
+        *expected = memory->replacement_value;
+        return 1;
+    }
+    memcpy(&current, memory->bytes + address, sizeof(current));
+    if (current != *expected) {
+        *expected = current;
+        return 1;
+    }
+    memcpy(memory->bytes + address, &desired, sizeof(desired));
     memory->update_count++;
     return 0;
 }
@@ -382,6 +412,47 @@ static void test_physical_read_failures_are_not_guest_page_faults(void)
     assert(fault.error_code == UINT32_MAX);
 }
 
+static void test_ad_cmpxchg_restarts_from_cr3(void)
+{
+    TestMemory memory;
+    X86PagingState state = default_state();
+    X86Translation translation;
+    X86PageFault fault;
+    X86PagingMemory ops = {
+        .opaque = &memory,
+        .read_u64 = memory_read_u64,
+        .cmpxchg_u64 = memory_cmpxchg_u64,
+    };
+    const uint64_t alt_pdpt = 0x6000;
+    const uint64_t alt_pd = 0x7000;
+    const uint64_t alt_pt = 0x8000;
+    const uint64_t alt_page = 0x9000;
+
+    install_four_level_map(&memory,
+                           TEST_PDPT | PTE_PRESENT | PTE_WRITE | PTE_USER,
+                           TEST_PD | PTE_PRESENT | PTE_WRITE | PTE_USER,
+                           TEST_PT | PTE_PRESENT | PTE_WRITE | PTE_USER,
+                           TEST_PAGE | PTE_PRESENT | PTE_WRITE | PTE_USER);
+    store_entry(&memory, alt_pdpt,
+                alt_pd | PTE_PRESENT | PTE_WRITE | PTE_USER);
+    store_entry(&memory, alt_pd,
+                alt_pt | PTE_PRESENT | PTE_WRITE | PTE_USER);
+    store_entry(&memory, alt_pt + 8,
+                alt_page | PTE_PRESENT | PTE_WRITE | PTE_USER);
+    memory.fail_once = 1;
+    memory.replacement_addr = TEST_PML4;
+    memory.replacement_value =
+        alt_pdpt | PTE_PRESENT | PTE_WRITE | PTE_USER;
+
+    assert(x86_64_walk_page_tables(&state, &ops, 0x1234, X86_PAGING_READ,
+                                   &translation, &fault) == X86_PAGING_OK);
+    assert(translation.guest_physical_address == alt_page + 0x234);
+    assert((load_entry(&memory, TEST_PML4) & ~PTE_ACCESSED) ==
+           memory.replacement_value);
+    assert(load_entry(&memory, alt_pdpt) & PTE_ACCESSED);
+    assert(load_entry(&memory, alt_pd) & PTE_ACCESSED);
+}
+
 int main(void)
 {
     test_four_level_translation_and_ad_bits();
@@ -392,6 +463,7 @@ int main(void)
     test_reserved_bits_and_key_permissions();
     test_noncanonical_la57_and_cr3_states();
     test_physical_read_failures_are_not_guest_page_faults();
+    test_ad_cmpxchg_restarts_from_cr3();
     puts("x86_64 page walker: all tests passed");
     return 0;
 }
