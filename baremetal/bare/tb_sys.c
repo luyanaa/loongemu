@@ -7782,7 +7782,7 @@ void kmain(void)
             cpu_x86_update_cr3(&env,
                                UINT64_C(0x3000) | (UINT64_C(1) << 63) | 1u);
             check(g_cur_asid == asid_a && g_asid_hits > hits_before &&
-                  env.tb_jmp_cache_ptr == (uint64_t)(uintptr_t)fast_jmp_cache,
+                  env.tb_jmp_cache_ptr == (void *)(uintptr_t)fast_jmp_cache,
                   "PCID bank reuses ASID and its fast-jump root");
             env.cr[3] = saved_cr3;
             env.cr[4] = saved_cr4;
