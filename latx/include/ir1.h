@@ -95,8 +95,14 @@ typedef dt_x86_insn_group IR1_OPCODE_TYPE;
 
 #define MAX_IR1_NUM_PER_TB TCG_MAX_INSNS
 
+#define IR1_EA_SEG_UNKNOWN 0u
+#define IR1_EA_SEG_NOT_SS  1u
+#define IR1_EA_SEG_SS      2u
+
 typedef struct IR1_INST {
     struct la_dt_insn *info;
+    uint8_t ea_seg_class : 2; /* IR1_EA_SEG_*; UNKNOWN without one unambiguous fault class */
+    uint8_t ea_segment_prefix; /* Effective segment override byte, or zero */
     /**
      * @brief Current inst eflag information
      *
@@ -327,6 +333,10 @@ ADDRX ir1_addr(IR1_INST *ir1);
 ADDRX ir1_addr_next(IR1_INST *ir1);
 ADDRX ir1_target_addr(IR1_INST *ir1);
 IR1_OPCODE ir1_opcode(const IR1_INST *ir1);
+static inline uint8_t ir1_ea_seg_class(const IR1_INST *ir1)
+{
+    return ir1 != NULL ? ir1->ea_seg_class : IR1_EA_SEG_UNKNOWN;
+}
 
 int ir1_is_branch(IR1_INST *ir1);
 int ir1_is_jump(IR1_INST *ir1);

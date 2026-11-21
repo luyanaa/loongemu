@@ -23,6 +23,19 @@ typedef enum LoongemuMemKind {
     LOONGEMU_MEM_RESERVED,
 } LoongemuMemKind;
 
+/* LoongArch PTE Memory Access Type (MAT bits [5:4]) */
+typedef enum LoongemuHostMat {
+    LOONGEMU_MAT_SUC = 0, /* Strongly-ordered UnCached (MMIO / safe 7A fallback) */
+    LOONGEMU_MAT_CC  = 1, /* Coherent Cached (normal RAM / VMM fallback FB) */
+    LOONGEMU_MAT_WUC = 2, /* Weakly-ordered UnCached (Write-Combining VRAM) */
+} LoongemuHostMat;
+
+typedef enum LoongemuFbOwner {
+    LOONGEMU_FB_OWNER_NONE      = 0,
+    LOONGEMU_FB_OWNER_HOST_GOP  = 1, /* Host UEFI GOP linear framebuffer handover */
+    LOONGEMU_FB_OWNER_VMM_ALLOC = 2, /* Dedicated VMM physical page fallback pool */
+} LoongemuFbOwner;
+
 #define LOONGEMU_MEM_MAX_REGIONS 32
 
 typedef struct LoongemuMemRegion {
@@ -30,6 +43,8 @@ typedef struct LoongemuMemRegion {
     uint64_t size;
     uint64_t hpa_base;
     LoongemuMemKind kind;
+    uint8_t host_mat; /* LoongemuHostMat */
+    uint8_t reserved[3];
     const char *name;
 } LoongemuMemRegion;
 
@@ -40,6 +55,8 @@ typedef struct LoongemuMemMap {
 
 typedef struct LoongemuMemLookup {
     LoongemuMemKind kind;
+    uint8_t host_mat; /* LoongemuHostMat */
+    uint8_t reserved[3];
     uint64_t hpa;
     uint64_t offset;
     uint64_t avail;
@@ -49,8 +66,9 @@ typedef struct LoongemuMemLookup {
 void loongemu_mem_map_init(LoongemuMemMap *map);
 
 /*
- * Register a physical region. Returns 1 on success, 0 if full, zero-sized,
- * overflowing, or overlapping an existing region.
+ * Register a physical region (default MAT: CC for RAM/ROM, SUC for MMIO/RESERVED).
+ * Returns 1 on success, 0 if full, zero-sized, overflowing, or overlapping an
+ * existing region.
  */
 int loongemu_mem_map_add(LoongemuMemMap *map,
                          uint64_t gpa_base,
@@ -58,6 +76,18 @@ int loongemu_mem_map_add(LoongemuMemMap *map,
                          uint64_t hpa_base,
                          LoongemuMemKind kind,
                          const char *name);
+
+/* Register a physical region with an explicit LoongemuHostMat attribute. */
+int loongemu_mem_map_add_mat(LoongemuMemMap *map,
+                             uint64_t gpa_base,
+                             uint64_t size,
+                             uint64_t hpa_base,
+                             LoongemuMemKind kind,
+                             uint8_t host_mat,
+                             const char *name);
+
+/* Unregister an existing region by exact gpa_base. Returns 1 if removed. */
+int loongemu_mem_map_remove(LoongemuMemMap *map, uint64_t gpa_base);
 
 /*
  * Resolve [gpa, gpa + size) into a region lookup.

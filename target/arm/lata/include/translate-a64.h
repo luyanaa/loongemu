@@ -36,7 +36,7 @@ static inline int vec_full_reg_size(DisasContext *s)
 static inline int vec_full_reg_offset(DisasContext *s, int regno)
 {
     assert_fp_access_checked(s);
-    return offsetof(CPUARMState, vfp.zregs[regno]);
+    return offsetof(CPUARMState, sve.zregs[regno]);
 }
 
 #endif /* TARGET_ARM_TRANSLATE_A64_H */

@@ -20,3 +20,4 @@ qemu_ir1.pid
 firmware/busybox
 firmware/initramfs.cpio.gz
 
+.slim/deepwork/

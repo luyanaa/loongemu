@@ -61,6 +61,11 @@ extern "C" {
 #define LAPG_PTE_PLV0    (UINT64_C(0) << LAPG_PTE_PLV_SHIFT)
 #define LAPG_PTE_PLV1    (UINT64_C(1) << LAPG_PTE_PLV_SHIFT)
 #define LAPG_PTE_PLV3    (UINT64_C(3) << LAPG_PTE_PLV_SHIFT)
+#define LAPG_PTE_MAT_SHIFT 4
+#define LAPG_PTE_MAT_MASK  (UINT64_C(3) << LAPG_PTE_MAT_SHIFT)
+#define LAPG_MAT_SUC       0u
+#define LAPG_MAT_CC        1u
+#define LAPG_MAT_WUC       2u
 #define LAPG_PTE_MAT     (UINT64_C(0) << 4)
 #define LAPG_PTE_G       (UINT64_C(1) << 6)
 #define LAPG_PTE_PPN_SHIFT 12
@@ -127,6 +132,7 @@ uint64_t lapg_stlbps_value(void);
 
 /* Encode a leaf entry.  ppn is a physical page number, not an address. */
 uint64_t lapg_make_leaf(uint64_t ppn, uint32_t perm);
+uint64_t lapg_make_leaf_mat(uint64_t ppn, uint32_t perm, uint32_t mat);
 
 /* Encode a non-leaf entry pointing at the next level. */
 uint64_t lapg_make_table(uint64_t next_table_phys);
@@ -141,6 +147,8 @@ void lapg_zero_page(void *page);
  */
 LapgResult lapg_map(LapgMemory *memory, LapgPagePool *pool, uint64_t root,
                     uint64_t va, uint64_t pa, uint32_t perm);
+LapgResult lapg_map_mat(LapgMemory *memory, LapgPagePool *pool, uint64_t root,
+                        uint64_t va, uint64_t pa, uint32_t perm, uint32_t mat);
 
 /*
  * Walk a virtual address.  On LAPG_OK the translation holds the host

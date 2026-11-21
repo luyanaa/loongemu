@@ -8,7 +8,7 @@ LATX    := ../latx
 
 INCS := -Icompat -I.. -I$(LATA)/include -I$(LATA) -I$(LATX)/compat -I$(LATX)/upstream/include \
          -isystem $(RESINC)
-DEFS := -DTARGET_AARCH64 -DCONFIG_LATA -DCONFIG_LATA_TU -D__WORDSIZE=64 \
+DEFS := -DTARGET_AARCH64 -DCONFIG_LATA -DCONFIG_LATA_TU -DCONFIG_LATA_STANDALONE -D__WORDSIZE=64 \
         -DCONFIG_LATX -D__thread=
 BASE := --target=$(TARGET) -ffreestanding -nostdinc -fno-builtin \
         -fno-stack-protector -O2 -g -mno-lsx -mno-lasx -fno-vectorize \
@@ -16,11 +16,13 @@ BASE := --target=$(TARGET) -ffreestanding -nostdinc -fno-builtin \
 CFLAGS := $(BASE) $(INCS) $(DEFS)
 
 SRCS := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \
-        $(LATA)/mem.c $(LATA)/lata.c runtime.c \
+        $(LATA)/mem.c $(LATA)/pvir.c $(LATA)/lata.c runtime.c \
         $(LATA)/optimization/clear-high.c $(LATA)/optimization/insts-pattern.c \
         $(LATA)/optimization/tu.c glib_tree.c \
-        $(LATA)/ir1/ir1.c \
+        $(LATA)/ir1/ir1.c $(LATA)/ir1/sve-decode.c $(LATA)/ir1/sve-pvir.c \
+        $(LATX)/runtime/cpu_features.c \
         $(LATA)/translator/reg-alloc.c $(LATA)/translator/macro-helper.c \
+        $(LATA)/translator/sve-lasx-lower.c \
         $(LATA)/translator/translate-a64.c
 
 .PHONY: all probe clean

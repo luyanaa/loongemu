@@ -78,6 +78,8 @@ uint32_t latx_x86_fault_error_code(const struct CPUX86State *env,
 #define LATX_X86_TLB_ENTRIES 64
 
 void latx_x86_tlb_flush_all(void);
+/* Caller must ensure that this vCPU is not concurrently using its cache. */
+void latx_x86_tlb_flush_cpu(uint32_t cpu);
 void latx_x86_tlb_flush_non_global(void);
 void latx_x86_tlb_flush_pcid(uint16_t pcid);
 void latx_x86_tlb_flush_page(uint64_t va);

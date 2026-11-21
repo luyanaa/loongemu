@@ -126,10 +126,17 @@ make efi-boot              # 在非 LBT 处理器上启动：17/17 项检查通�
 make efi-ir1-smoke         # 在 LoongArch 上进行 IR1 解码
 make efi-lvz-probe         # 特权级 / LVZ CSR 探测
 make vmm-efi && make vmm-boot
+
+# 集成宿主 UEFI -> System VMM，需要 x86-64 OVMF CODE 和 VARS
+make vmm-integrated OVMF_CODE=/path/to/OVMF_CODE.fd OVMF_VARS=/path/to/OVMF_VARS.fd
+make vmm-integrated-boot OVMF_CODE=/path/to/OVMF_CODE.fd OVMF_VARS=/path/to/OVMF_VARS.fd
 ```
 
 QEMU 运行都有时间限制（recipe 中使用 `timeout` 或固定等待后结束客户机），日志写入
 `build/` 目录。
+集成 QEMU 冒烟测试检查交接、`tb_sys` 自检及 x86 OVMF 的持续执行；它不证明 OVMF
+已完成启动，也不证明客户机操作系统已启动。
+
 
 ## 两套后端的验证
 
@@ -152,6 +159,12 @@ make test-loongarch-fallback  # objdump：确认 fallback 中完全没有 LBT �
 
 - 这是一个启动 / 验证用的代码树，不是生产级 Hypervisor；除少量桩实现（串口、PIT、
   PCI、APIC）外没有设备模型。
+- x86 `tb_sys` 的 PLV3 影子映射**不是不可信客户机的隔离边界**：客户机有效地址可能
+  与翻译后宿主代码及 VMM 状态映射发生碰撞。仅运行可信测试客户机；软件检查路径尚未
+  覆盖全部内存操作。
+- 没有可用宿主 GOP 显存时，Bochs fallback 仅提供客户机可见 RAM，不会输出到宿主显示器。
+- 未显式提供宿主读写回调时，物理 7A PCI 配置直通处于关闭状态；黑名单和 errata 处理
+  不能替代 DMA 隔离或 IOMMU 配置。
 - Makefile 中的工具链路径固定为 Homebrew LLVM 布局，在其他系统上需要覆盖。
 - QEMU 不执行 LBT 指令，因此裸机程序对其进行模拟；硬件路径只能在真实的
   3A6000 系列处理器上验证。

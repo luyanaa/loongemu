@@ -13,11 +13,25 @@
 #include "loongemu/vmm_handoff.h"
 #include "efi_min.h"
 
-#define VMM_GUEST_RAM_PAGES  256      /* 1 MiB  */
-#define VMM_CODE_CACHE_PAGES 64       /* 256 KiB */
-#define VMM_POOL_PAGES       0x1000   /* 16 MiB */
-#define VMM_KSTACK_PAGES     16       /* 64 KiB dedicated VMM stack */
+#ifdef VMM_STANDALONE_PROBE
+#define VMM_GUEST_RAM_PAGES    256    /* 1 MiB standalone paging probe */
+#define VMM_CODE_CACHE_PAGES   64     /* 256 KiB */
+#define VMM_POOL_PAGES         0x1000 /* 16 MiB */
+#else
+#define VMM_GUEST_RAM_PAGES    32768  /* 128 MiB: matches the System VMM guest map */
+#define VMM_FB_FALLBACK_PAGES  1024   /* 4 MiB isolated Bochs framebuffer pool */
+#endif
+#define VMM_KSTACK_PAGES       16     /* 64 KiB dedicated VMM stack */
 
+#define VMM_PAGE_ALIGN_UP(v) \
+    (((v) + LAPG_PAGE_SIZE - 1u) & ~(uint64_t)(LAPG_PAGE_SIZE - 1u))
+
+#ifndef VMM_STANDALONE_PROBE
+extern const uint8_t _ovmf_code_start[], _ovmf_code_end[];
+extern const uint8_t _ovmf_vars_start[], _ovmf_vars_end[];
+#endif
+
+#ifdef VMM_STANDALONE_PROBE
 /* Where the probe lands in the guest address space. */
 #define VMM_PROBE_VA         0x40000000ULL
 
@@ -31,6 +45,7 @@
 #define EXC_PNR  0x9
 #define EXC_IPE  0x0d
 #define EXC_INT  0x0
+#endif
 
 /*
  * Split direct-map windows (LoongArch Reference Manual):
@@ -45,8 +60,15 @@
 /* ---- state that must outlive the firmware ---------------------------- */
 
 static EFI_PHYSICAL_ADDRESS g_guest_ram;
+static uint64_t g_guest_ram_bytes;
+#ifdef VMM_STANDALONE_PROBE
 static EFI_PHYSICAL_ADDRESS g_code_cache;
 static EFI_PHYSICAL_ADDRESS g_pool;
+#else
+static EFI_PHYSICAL_ADDRESS g_fb_fallback;
+static EFI_PHYSICAL_ADDRESS g_ovmf_code;
+static EFI_PHYSICAL_ADDRESS g_ovmf_vars;
+#endif
 static EFI_PHYSICAL_ADDRESS g_kstack_base;
 static uint64_t g_image_base;
 static uint64_t g_image_size;
@@ -71,6 +93,7 @@ const LoongemuVmmHandoff *loongemu_vmm_get_handoff(void)
     return &g_vmm_handoff;
 }
 
+#ifdef VMM_STANDALONE_PROBE
 static inline void *phys_to_cached(uint64_t phys)
 {
     if (!g_paging_on) {
@@ -78,6 +101,7 @@ static inline void *phys_to_cached(uint64_t phys)
     }
     return (void *)(uintptr_t)(VMM_DMW0_BASE | (phys & UINT64_C(0x0000ffffffffffff)));
 }
+#endif
 
 static inline void *phys_to_mmio(uint64_t phys)
 {
@@ -162,6 +186,114 @@ static void puthex(uint64_t v)
 
 #define LOG(msg) do { puts_("vmm: "); puts_(msg); puts_("\n"); } while (0)
 
+static int range_valid(uint64_t base, uint64_t size)
+{
+    return size != 0 && base <= UINT64_MAX - size;
+}
+
+static int ranges_overlap(uint64_t a, uint64_t as, uint64_t b, uint64_t bs)
+{
+    return range_valid(a, as) && range_valid(b, bs) &&
+           a < b + bs && b < a + as;
+}
+
+static int page_range_valid(uint64_t base, uint64_t size)
+{
+    return base != 0 && range_valid(base, size) &&
+           (base & (LAPG_PAGE_SIZE - 1u)) == 0 &&
+           (size & (LAPG_PAGE_SIZE - 1u)) == 0;
+}
+
+static uint64_t page_round_up(uint64_t size)
+{
+    if (size == 0 || size > UINT64_MAX - (LAPG_PAGE_SIZE - 1u)) {
+        return 0;
+    }
+    return VMM_PAGE_ALIGN_UP(size);
+}
+
+static void copy_and_fill(uint64_t dst, const uint8_t *src,
+                          uint64_t src_size, uint64_t dst_size,
+                          uint8_t fill)
+{
+    volatile uint8_t *out = (volatile uint8_t *)(uintptr_t)dst;
+    uint64_t i;
+
+    for (i = 0; i < src_size; i++) {
+        out[i] = src[i];
+    }
+    for (; i < dst_size; i++) {
+        out[i] = fill;
+    }
+}
+
+static int vmm_allocations_disjoint(uint64_t map_buf, uint64_t map_size)
+{
+    uint64_t bases[8];
+    uint64_t sizes[8];
+    uint32_t count = 0;
+
+    if (!page_range_valid(g_image_base, g_image_size) ||
+        !page_range_valid(g_guest_ram, g_guest_ram_bytes) ||
+        !page_range_valid(g_kstack_base,
+                          (uint64_t)VMM_KSTACK_PAGES * LAPG_PAGE_SIZE)) {
+        return 0;
+    }
+    bases[count] = g_image_base;
+    sizes[count++] = g_image_size;
+    bases[count] = g_guest_ram;
+    sizes[count++] = g_guest_ram_bytes;
+#ifdef VMM_STANDALONE_PROBE
+    if (!page_range_valid(g_code_cache,
+                          (uint64_t)VMM_CODE_CACHE_PAGES * LAPG_PAGE_SIZE) ||
+        !page_range_valid(g_pool, (uint64_t)VMM_POOL_PAGES * LAPG_PAGE_SIZE)) {
+        return 0;
+    }
+    bases[count] = g_code_cache;
+    sizes[count++] = (uint64_t)VMM_CODE_CACHE_PAGES * LAPG_PAGE_SIZE;
+    bases[count] = g_pool;
+    sizes[count++] = (uint64_t)VMM_POOL_PAGES * LAPG_PAGE_SIZE;
+#else
+    if (!page_range_valid(g_fb_fallback,
+                          (uint64_t)VMM_FB_FALLBACK_PAGES * LAPG_PAGE_SIZE) ||
+        !page_range_valid(g_ovmf_code, g_vmm_handoff.ovmf_code_size) ||
+        !page_range_valid(g_ovmf_vars, g_vmm_handoff.ovmf_vars_size)) {
+        return 0;
+    }
+    bases[count] = g_fb_fallback;
+    sizes[count++] = (uint64_t)VMM_FB_FALLBACK_PAGES * LAPG_PAGE_SIZE;
+    bases[count] = g_ovmf_code;
+    sizes[count++] = g_vmm_handoff.ovmf_code_size;
+    bases[count] = g_ovmf_vars;
+    sizes[count++] = g_vmm_handoff.ovmf_vars_size;
+#endif
+    if (g_gop_handover.valid) {
+        uint64_t gop_map_size = page_round_up(g_gop_handover.fb_size);
+        if (!page_range_valid(g_gop_handover.fb_hpa, gop_map_size)) {
+            return 0;
+        }
+        bases[count] = g_gop_handover.fb_hpa;
+        sizes[count++] = gop_map_size;
+    }
+    bases[count] = g_kstack_base;
+    sizes[count++] = (uint64_t)VMM_KSTACK_PAGES * LAPG_PAGE_SIZE;
+    if (map_buf != 0 || map_size != 0) {
+        if (!range_valid(map_buf, map_size)) {
+            return 0;
+        }
+        bases[count] = map_buf;
+        sizes[count++] = map_size;
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        for (uint32_t j = i + 1u; j < count; j++) {
+            if (ranges_overlap(bases[i], sizes[i], bases[j], sizes[j])) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
 static int efi_guid_eq(const EFI_GUID *a, const EFI_GUID *b)
 {
     if (a->Data1 != b->Data1 || a->Data2 != b->Data2 || a->Data3 != b->Data3) {
@@ -196,6 +328,7 @@ static const void *uefi_find_acpi_rsdp(const EFI_SYSTEM_TABLE *st)
     return v1_fallback;
 }
 
+#ifdef VMM_STANDALONE_PROBE
 static LapgPagePool g_lapg_pool;
 static uint64_t g_root_table;
 
@@ -229,6 +362,7 @@ static LapgMemory g_memory = {
     .read_u64 = vmm_read_u64,
     .write_u64 = vmm_write_u64,
 };
+#endif /* VMM_STANDALONE_PROBE */
 
 /* ---- CSR access ------------------------------------------------------ */
 
@@ -264,6 +398,7 @@ static inline void csr_write(unsigned int num, uint64_t value)
     }
 }
 
+#ifdef VMM_STANDALONE_PROBE
 /* ---- exception entry ------------------------------------------------- */
 
 extern void vmm_trap_entry(void *frame);
@@ -431,12 +566,11 @@ static uint64_t vmm_probe_load(void)
     volatile uint64_t *p = (volatile uint64_t *)(uintptr_t)VMM_PROBE_VA;
     return *p;
 }
+#endif /* VMM_STANDALONE_PROBE */
 
 /* Post-ExitBootServices entry running on our own allocated kstack. */
-static void __attribute__((noreturn)) vmm_post_ebs_main(void)
+static void __attribute__((used, noreturn)) vmm_post_ebs_main(void)
 {
-    int ok;
-
     /* 1. Immediately quiesce all firmware interrupts and timers. */
     csr_write(0x0, csr_read(0x0) & ~UINT64_C(0x4)); /* CRMD.IE = 0 */
     csr_write(0x41, 0);                             /* CSR.TCFG = 0 */
@@ -466,25 +600,31 @@ static void __attribute__((noreturn)) vmm_post_ebs_main(void)
     }
     puts_("\n");
 
+#ifndef VMM_STANDALONE_PROBE
+    puts_("vmm: entering System VMM (tb_sys_vmm_main)\n");
+    tb_sys_vmm_main(&g_vmm_handoff);
+#else
     if (!vmm_build_tables()) {
         LOG("page table build failed");
         for (;;) {}
     }
 
     /* Map only the relocated VMM image, our kstack, pool, code_cache, and guest_ram. */
-    ok = vmm_map_identity(g_image_base, g_image_size,
-                          LAPG_PERM_READ | LAPG_PERM_WRITE | LAPG_PERM_EXEC);
-    ok = ok && vmm_map_identity(g_kstack_base, (uint64_t)VMM_KSTACK_PAGES * LAPG_PAGE_SIZE,
-                                LAPG_PERM_READ | LAPG_PERM_WRITE);
-    ok = ok && vmm_map_identity(g_pool, (uint64_t)VMM_POOL_PAGES * LAPG_PAGE_SIZE,
-                                LAPG_PERM_READ | LAPG_PERM_WRITE);
-    ok = ok && vmm_map_identity(g_code_cache, (uint64_t)VMM_CODE_CACHE_PAGES * LAPG_PAGE_SIZE,
-                                LAPG_PERM_READ | LAPG_PERM_WRITE | LAPG_PERM_EXEC);
-    ok = ok && vmm_map_identity(g_guest_ram, (uint64_t)VMM_GUEST_RAM_PAGES * LAPG_PAGE_SIZE,
-                                LAPG_PERM_READ | LAPG_PERM_WRITE | LAPG_PERM_EXEC);
-    if (!ok) {
-        LOG("identity map failed");
-        for (;;) {}
+    {
+        int ok = vmm_map_identity(g_image_base, g_image_size,
+                                  LAPG_PERM_READ | LAPG_PERM_WRITE | LAPG_PERM_EXEC);
+        ok = ok && vmm_map_identity(g_kstack_base, (uint64_t)VMM_KSTACK_PAGES * LAPG_PAGE_SIZE,
+                                    LAPG_PERM_READ | LAPG_PERM_WRITE);
+        ok = ok && vmm_map_identity(g_pool, (uint64_t)VMM_POOL_PAGES * LAPG_PAGE_SIZE,
+                                    LAPG_PERM_READ | LAPG_PERM_WRITE);
+        ok = ok && vmm_map_identity(g_code_cache, (uint64_t)VMM_CODE_CACHE_PAGES * LAPG_PAGE_SIZE,
+                                    LAPG_PERM_READ | LAPG_PERM_WRITE | LAPG_PERM_EXEC);
+        ok = ok && vmm_map_identity(g_guest_ram, g_guest_ram_bytes,
+                                    LAPG_PERM_READ | LAPG_PERM_WRITE | LAPG_PERM_EXEC);
+        if (!ok) {
+            LOG("identity map failed");
+            for (;;) {}
+        }
     }
 
     /* Install 4 KiB paging CSRs and VMM trap vectors. */
@@ -531,6 +671,7 @@ static void __attribute__((noreturn)) vmm_post_ebs_main(void)
     for (;;) {
         __asm__ volatile("dbar 0x700" ::: "memory");
     }
+#endif /* VMM_STANDALONE_PROBE */
 }
 
 static void __attribute__((noreturn)) switch_stack_and_enter(uint64_t new_sp)
@@ -561,18 +702,21 @@ int efi_main(void *image, void *systab)
         return 1;
     }
 
-    /* Probe relocated image bounds via EFI_LOADED_IMAGE_PROTOCOL. */
+    /* Refuse an unknown image extent; guessing could overwrite host memory. */
     {
         static const EFI_GUID li_guid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
         EFI_LOADED_IMAGE_PROTOCOL *li = 0;
-        if (bs->HandleProtocol != 0 &&
-            !EFI_ERROR(bs->HandleProtocol(image, &li_guid, (void **)&li)) &&
-            li != 0 && li->ImageBase != 0 && li->ImageSize != 0) {
-            g_image_base = (uint64_t)(uintptr_t)li->ImageBase;
-            g_image_size = li->ImageSize;
-        } else {
-            g_image_base = (uint64_t)(uintptr_t)efi_main & ~UINT64_C(0xfffff);
-            g_image_size = 0x200000ULL;
+        if (bs->HandleProtocol == 0 ||
+            EFI_ERROR(bs->HandleProtocol(image, &li_guid, (void **)&li)) ||
+            li == 0 || li->ImageBase == 0 || li->ImageSize == 0) {
+            LOG("loaded image bounds unavailable");
+            return 1;
+        }
+        g_image_base = (uint64_t)(uintptr_t)li->ImageBase;
+        g_image_size = page_round_up(li->ImageSize);
+        if (!page_range_valid(g_image_base, g_image_size)) {
+            LOG("invalid loaded image bounds");
+            return 1;
         }
     }
 
@@ -584,27 +728,59 @@ int efi_main(void *image, void *systab)
             !EFI_ERROR(bs->LocateProtocol(&gop_guid, 0, (void **)&gop)) &&
             gop != 0 && gop->Mode != 0 && gop->Mode->Info != 0 &&
             gop->Mode->FrameBufferBase != 0) {
-            g_gop_fb_phys = gop->Mode->FrameBufferBase;
-            g_gop_width = gop->Mode->Info->HorizontalResolution;
-            g_gop_height = gop->Mode->Info->VerticalResolution;
-            g_gop_stride = gop->Mode->Info->PixelsPerScanLine;
-            g_gop_handover.fb_hpa = gop->Mode->FrameBufferBase;
-            g_gop_handover.fb_size = (uint64_t)gop->Mode->FrameBufferSize;
-            if (g_gop_handover.fb_size == 0) {
-                g_gop_handover.fb_size = (uint64_t)g_gop_stride * (uint64_t)g_gop_height * 4ULL;
+            uint64_t fb_hpa = gop->Mode->FrameBufferBase;
+            uint64_t fb_size = (uint64_t)gop->Mode->FrameBufferSize;
+            uint64_t visible_size = 0;
+            uint32_t width = gop->Mode->Info->HorizontalResolution;
+            uint32_t height = gop->Mode->Info->VerticalResolution;
+            uint32_t stride = gop->Mode->Info->PixelsPerScanLine;
+            uint32_t pixel_format = gop->Mode->Info->PixelFormat;
+            int geometry_ok = width != 0 && height != 0 && stride >= width &&
+                              (uint64_t)stride <= UINT64_MAX / height / 4u;
+
+            if (geometry_ok) {
+                visible_size = (uint64_t)stride * height * 4u;
+                if (fb_size == 0) {
+                    fb_size = visible_size;
+                }
             }
-            g_gop_handover.width = g_gop_width;
-            g_gop_handover.height = g_gop_height;
-            g_gop_handover.stride_px = g_gop_stride;
-            g_gop_handover.bpp = 32u;
-            g_gop_handover.pixel_format = gop->Mode->Info->PixelFormat;
-            g_gop_handover.valid = 1u;
+            if (geometry_ok && pixel_format <= 1u &&
+                fb_size >= visible_size && fb_hpa <= UINT64_MAX - fb_size &&
+                page_range_valid(fb_hpa, page_round_up(fb_size))) {
+                g_gop_fb_phys = fb_hpa;
+                g_gop_width = width;
+                g_gop_height = height;
+                g_gop_stride = stride;
+                g_gop_handover.fb_hpa = fb_hpa;
+                g_gop_handover.fb_size = fb_size;
+                g_gop_handover.width = width;
+                g_gop_handover.height = height;
+                g_gop_handover.stride_px = stride;
+                g_gop_handover.bpp = 32u;
+                g_gop_handover.pixel_format = pixel_format;
+                g_gop_handover.valid = 1u;
+                g_gop_handover.owner = (uint8_t)LOONGEMU_FB_OWNER_HOST_GOP;
+                g_gop_handover.host_mat = (uint8_t)LOONGEMU_MAT_WUC;
+            }
         }
+    }
+    if (g_gop_handover.valid &&
+        ranges_overlap(g_gop_handover.fb_hpa,
+                       page_round_up(g_gop_handover.fb_size),
+                       g_image_base, g_image_size)) {
+        g_gop_handover = (LoongemuGopHandover){0};
+        g_gop_fb_phys = 0;
+        g_gop_width = 0;
+        g_gop_height = 0;
+        g_gop_stride = 0;
+        LOG("GOP overlaps the protected VMM image; GOP disabled");
     }
 
     /* Capture host UEFI ACPI 2.0 RSDP and probe SPCR UART + MCFG 7A Split-CFG base. */
     g_vmm_handoff.magic = LOONGEMU_VMM_HANDOFF_MAGIC;
     g_vmm_handoff.version = LOONGEMU_VMM_HANDOFF_VERSION;
+    g_vmm_handoff.vmm_image_base = g_image_base;
+    g_vmm_handoff.vmm_image_size = g_image_size;
     g_vmm_handoff.gop = g_gop_handover;
     g_vmm_handoff.hide_host_dc_gpu = g_gop_handover.valid ? 1u : 0u;
     g_vmm_handoff.ls7a_cfg_type0_base = LOONGSON_7A_CFG_TYPE0_BASE;
@@ -640,12 +816,14 @@ int efi_main(void *image, void *systab)
     g_vmm_handoff.host_uart_phys = g_uart_phys;
     g_vmm_handoff.host_uart_reg_shift = g_uart_reg_shift;
 
-    /* Allocate all VMM memory before the ExitBootServices loop. */
+    /* Allocate every handoff buffer before ExitBootServices. */
     addr = 0;
+#ifdef VMM_STANDALONE_PROBE
     status = bs->AllocatePages(AllocateAnyPages, EfiLoaderData,
                                VMM_GUEST_RAM_PAGES, &addr);
     if (EFI_ERROR(status)) { LOG("guest RAM alloc failed"); return 1; }
     g_guest_ram = addr;
+    g_guest_ram_bytes = (uint64_t)VMM_GUEST_RAM_PAGES * LAPG_PAGE_SIZE;
 
     addr = 0;
     status = bs->AllocatePages(AllocateAnyPages, EfiLoaderCode,
@@ -658,22 +836,98 @@ int efi_main(void *image, void *systab)
                                VMM_POOL_PAGES, &addr);
     if (EFI_ERROR(status)) { LOG("pool alloc failed"); return 1; }
     g_pool = addr;
+#else
+    uint64_t ovmf_code_file_size =
+        (uint64_t)(_ovmf_code_end - _ovmf_code_start);
+    uint64_t ovmf_vars_file_size =
+        (uint64_t)(_ovmf_vars_end - _ovmf_vars_start);
+    uint64_t ovmf_code_size = page_round_up(ovmf_code_file_size);
+    uint64_t ovmf_vars_size = page_round_up(ovmf_vars_file_size);
+
+    if (ovmf_code_size == 0 || ovmf_vars_size == 0) {
+        LOG("invalid OVMF payload sizes");
+        return 1;
+    }
+
+    status = bs->AllocatePages(AllocateAnyPages, EfiLoaderData,
+                               VMM_GUEST_RAM_PAGES, &addr);
+    if (EFI_ERROR(status)) { LOG("guest RAM alloc failed"); return 1; }
+    g_guest_ram = addr;
+    g_guest_ram_bytes = (uint64_t)VMM_GUEST_RAM_PAGES * LAPG_PAGE_SIZE;
+
+    addr = 0;
+    status = bs->AllocatePages(AllocateAnyPages, EfiLoaderData,
+                               VMM_FB_FALLBACK_PAGES, &addr);
+    if (EFI_ERROR(status)) { LOG("fb fallback alloc failed"); return 1; }
+    g_fb_fallback = addr;
+
+    addr = 0;
+    status = bs->AllocatePages(AllocateAnyPages, EfiLoaderData,
+                               (UINTN)(ovmf_code_size / LAPG_PAGE_SIZE), &addr);
+    if (EFI_ERROR(status)) { LOG("OVMF code alloc failed"); return 1; }
+    g_ovmf_code = addr;
+
+    addr = 0;
+    status = bs->AllocatePages(AllocateAnyPages, EfiLoaderData,
+                               (UINTN)(ovmf_vars_size / LAPG_PAGE_SIZE), &addr);
+    if (EFI_ERROR(status)) { LOG("OVMF vars alloc failed"); return 1; }
+    g_ovmf_vars = addr;
+
+    g_vmm_handoff.guest_ram_hpa = g_guest_ram;
+    g_vmm_handoff.guest_ram_size = g_guest_ram_bytes;
+    g_vmm_handoff.fb_fallback_hpa = g_fb_fallback;
+    g_vmm_handoff.fb_fallback_size =
+        (uint64_t)VMM_FB_FALLBACK_PAGES * LAPG_PAGE_SIZE;
+    g_vmm_handoff.ovmf_code_hpa = g_ovmf_code;
+    g_vmm_handoff.ovmf_code_size = ovmf_code_size;
+    g_vmm_handoff.ovmf_vars_hpa = g_ovmf_vars;
+    g_vmm_handoff.ovmf_vars_size = ovmf_vars_size;
+
+#endif
 
     addr = 0;
     status = bs->AllocatePages(AllocateAnyPages, EfiLoaderData,
                                VMM_KSTACK_PAGES, &addr);
     if (EFI_ERROR(status)) { LOG("kstack alloc failed"); return 1; }
     g_kstack_base = addr;
+    if (!vmm_allocations_disjoint(0, 0)) {
+        LOG("VMM allocations overlap or have invalid geometry");
+        return 1;
+    }
 
-    /* Pre-allocate generous memory map buffer before entering tight EBS retry loop. */
+    /* Reserve enough map descriptors, then validate the final owned pool. */
     map_size = 0;
-    bs->GetMemoryMap(&map_size, 0, &map_key, &desc_size, &desc_ver);
+    status = bs->GetMemoryMap(&map_size, 0, &map_key, &desc_size, &desc_ver);
+    if (status != EFI_BUFFER_TOO_SMALL && EFI_ERROR(status)) {
+        LOG("initial memory map query failed");
+        return 1;
+    }
     if (desc_size < sizeof(EFI_MEMORY_DESCRIPTOR)) {
         desc_size = sizeof(EFI_MEMORY_DESCRIPTOR);
     }
-    map_cap = map_size + desc_size * 16;
+    if (desc_size > UINT64_MAX / 16u ||
+        map_size > UINT64_MAX - desc_size * 16u) {
+        LOG("memory map size overflow");
+        return 1;
+    }
+    map_cap = map_size + desc_size * 16u;
     status = bs->AllocatePool(EfiLoaderData, map_cap, &map_buf);
     if (EFI_ERROR(status)) { LOG("memory map pool alloc failed"); return 1; }
+    if (map_buf == 0 ||
+        !vmm_allocations_disjoint((uint64_t)(uintptr_t)map_buf, map_cap)) {
+        LOG("memory map buffer overlaps VMM allocations");
+        return 1;
+    }
+    /* All owned ranges are validated before writing to any allocated HPA. */
+    copy_and_fill(g_guest_ram, 0, 0, g_guest_ram_bytes, 0);
+#ifndef VMM_STANDALONE_PROBE
+    copy_and_fill(g_fb_fallback, 0, 0,
+                  (uint64_t)VMM_FB_FALLBACK_PAGES * LAPG_PAGE_SIZE, 0);
+    copy_and_fill(g_ovmf_code, _ovmf_code_start, ovmf_code_file_size,
+                  g_vmm_handoff.ovmf_code_size, 0xffu);
+    copy_and_fill(g_ovmf_vars, _ovmf_vars_start, ovmf_vars_file_size,
+                  g_vmm_handoff.ovmf_vars_size, 0xffu);
+#endif
 
     /*
      * Tight ExitBootServices retry loop: ZERO UEFI allocations, ZERO console
@@ -685,8 +939,22 @@ int efi_main(void *image, void *systab)
                                   &map_key, &desc_size, &desc_ver);
         if (EFI_ERROR(status)) {
             if (status == EFI_BUFFER_TOO_SMALL) {
-                map_cap = map_size + desc_size * 16;
+                if (desc_size < sizeof(EFI_MEMORY_DESCRIPTOR)) {
+                    desc_size = sizeof(EFI_MEMORY_DESCRIPTOR);
+                }
+                if (desc_size > UINT64_MAX / 16u ||
+                    map_size > UINT64_MAX - desc_size * 16u) {
+                    LOG("memory map size overflow");
+                    return 1;
+                }
+                map_cap = map_size + desc_size * 16u;
                 if (EFI_ERROR(bs->AllocatePool(EfiLoaderData, map_cap, &map_buf))) {
+                    return 1;
+                }
+                if (map_buf == 0 ||
+                    !vmm_allocations_disjoint((uint64_t)(uintptr_t)map_buf,
+                                              map_cap)) {
+                    LOG("resized memory map buffer overlaps VMM allocations");
                     return 1;
                 }
                 continue;

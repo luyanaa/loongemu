@@ -798,16 +798,18 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
              * Hypercall MSR + Dispatcher (5) | VP Index (6).
              */
             *eax = (1u << 1) | (1u << 4) | (1u << 5) | (1u << 6);
+            *edx = (1u << 4); /* XMM fast hypercall input */
         }
         break;
     case 0x40000004u:
         if (latx_hv_vendor == 1u) {
             /*
              * Hyper-V implementation recommendations (each backed by live code):
-             * Local TLB flush (1) | Remote TLB flush (2) | APIC MSRs (3) |
-             * Relaxed timing (5) | Synthetic cluster IPI (10).
+             * Local/remote TLB flush, APIC MSRs, relaxed timing,
+             * SyntheticClusterIpi and extended processor masks.
              */
-            *eax = (1u << 1) | (1u << 2) | (1u << 3) | (1u << 5) | (1u << 10);
+            *eax = (1u << 1) | (1u << 2) | (1u << 3) | (1u << 5) |
+                   (1u << 10) | (1u << 11);
             *ebx = 0x00000fffu; /* Recommended spinlock retry limit */
         }
         break;

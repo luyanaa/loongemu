@@ -334,9 +334,298 @@ static void __attribute__((__constructor__)) x86tomisp_ir1_init(void)
 #endif
 };
 
+static uint8_t ir1_effective_segment_prefix(const struct la_dt_insn *info,
+                                            int mode)
+{
+    uint8_t last_prefix = 0;
+    uint8_t last_effective_prefix = 0;
+
+    /*
+     * Capstone's prefix[1] retains only one segment prefix. Scan the encoded
+     * prefix run instead: in 64-bit mode CS/DS/ES/SS are ignored, but an
+     * earlier FS/GS remains effective (for example, 64 3e ...).
+     */
+    for (unsigned i = 0; i < info->size && i < sizeof(info->bytes); i++) {
+        uint8_t byte = info->bytes[i];
+        switch (byte) {
+        case dt_X86_PREFIX_CS:
+        case dt_X86_PREFIX_SS:
+        case dt_X86_PREFIX_DS:
+        case dt_X86_PREFIX_ES:
+        case dt_X86_PREFIX_FS:
+        case dt_X86_PREFIX_GS:
+            last_prefix = byte;
+            if (mode != LATX_DT_X64 ||
+                byte == dt_X86_PREFIX_FS ||
+                byte == dt_X86_PREFIX_GS) {
+                last_effective_prefix = byte;
+            }
+            continue;
+        case dt_X86_PREFIX_LOCK:
+        case dt_X86_PREFIX_REP:
+        case dt_X86_PREFIX_REPNE:
+        case dt_X86_PREFIX_OPSIZE:
+        case dt_X86_PREFIX_ADDRSIZE:
+            continue;
+        default:
+            if (mode == LATX_DT_X64 && byte >= 0x40 && byte <= 0x4f) {
+                continue;
+            }
+            return mode == LATX_DT_X64 ? last_effective_prefix : last_prefix;
+        }
+    }
+    return mode == LATX_DT_X64 ? last_effective_prefix : last_prefix;
+}
+static dt_x86_reg ir1_segment_reg_from_prefix(uint8_t prefix)
+{
+    switch (prefix) {
+    case dt_X86_PREFIX_CS:
+        return dt_X86_REG_CS;
+    case dt_X86_PREFIX_SS:
+        return dt_X86_REG_SS;
+    case dt_X86_PREFIX_DS:
+        return dt_X86_REG_DS;
+    case dt_X86_PREFIX_ES:
+        return dt_X86_REG_ES;
+    case dt_X86_PREFIX_FS:
+        return dt_X86_REG_FS;
+    case dt_X86_PREFIX_GS:
+        return dt_X86_REG_GS;
+    default:
+        return dt_X86_REG_INVALID;
+    }
+}
+
+
+static uint8_t ir1_segment_override_class(const struct la_dt_insn *info,
+                                         int mode, uint8_t default_class)
+{
+    switch (ir1_effective_segment_prefix(info, mode)) {
+    case dt_X86_PREFIX_SS:
+        return mode == LATX_DT_X64 ? default_class : IR1_EA_SEG_SS;
+    case dt_X86_PREFIX_CS:
+    case dt_X86_PREFIX_DS:
+    case dt_X86_PREFIX_ES:
+        return mode == LATX_DT_X64 ? default_class : IR1_EA_SEG_NOT_SS;
+    case dt_X86_PREFIX_FS:
+    case dt_X86_PREFIX_GS:
+        return IR1_EA_SEG_NOT_SS;
+    default:
+        return default_class;
+    }
+}
+
+static uint8_t ir1_memory_ea_seg_class(const struct la_dt_insn *info,
+                                      const dt_x86_op_mem *mem, int mode)
+{
+    uint8_t class =
+        ir1_segment_override_class(info, mode, IR1_EA_SEG_UNKNOWN);
+
+    if (class != IR1_EA_SEG_UNKNOWN) {
+        return class;
+    }
+
+    /*
+     * The default segment follows the decoded base register, not its low
+     * three-bit encoding: only SP/BP (and their width aliases) select SS.
+     * Thus R12/R13 select DS despite sharing the low bits of SP/BP. Prefer
+     * the decoded base over default_segment when both are available.
+     */
+    switch (mem->base) {
+    case dt_X86_REG_SP:
+    case dt_X86_REG_BP:
+    case dt_X86_REG_ESP:
+    case dt_X86_REG_EBP:
+    case dt_X86_REG_RSP:
+    case dt_X86_REG_RBP:
+        return IR1_EA_SEG_SS;
+    default:
+        break;
+    }
+    if (mem->base != dt_X86_REG_INVALID) {
+        return IR1_EA_SEG_NOT_SS;
+    }
+    if (mem->default_segment != dt_X86_REG_INVALID) {
+        return mem->default_segment == dt_X86_REG_SS
+                   ? IR1_EA_SEG_SS : IR1_EA_SEG_NOT_SS;
+    }
+    return IR1_EA_SEG_NOT_SS;
+}
+
+static void ir1_add_ea_seg_class(uint8_t *class, bool *has_ea,
+                                uint8_t next_class)
+{
+    if (!*has_ea) {
+        *class = next_class;
+        *has_ea = true;
+    } else if (*class != next_class) {
+        *class = IR1_EA_SEG_UNKNOWN;
+    }
+}
+
+static bool ir1_has_implicit_stack_ea(dt_x86_insn id)
+{
+    switch (id) {
+    case dt_X86_INS_PUSH:
+    case dt_X86_INS_PUSHAW:
+    case dt_X86_INS_PUSHAL:
+    case dt_X86_INS_PUSHF:
+    case dt_X86_INS_PUSHFD:
+    case dt_X86_INS_PUSHFQ:
+    case dt_X86_INS_POP:
+    case dt_X86_INS_POPAW:
+    case dt_X86_INS_POPAL:
+    case dt_X86_INS_POPF:
+    case dt_X86_INS_POPFD:
+    case dt_X86_INS_POPFQ:
+    case dt_X86_INS_CALL:
+    case dt_X86_INS_LCALL:
+    case dt_X86_INS_RET:
+    case dt_X86_INS_RETF:
+    case dt_X86_INS_RETFQ:
+    case dt_X86_INS_ENTER:
+    case dt_X86_INS_LEAVE:
+    case dt_X86_INS_IRET:
+    case dt_X86_INS_IRETD:
+    case dt_X86_INS_IRETQ:
+        return true;
+    default:
+        return false;
+    }
+}
+static bool ir1_has_implicit_data_ea(dt_x86_insn id)
+{
+    switch (id) {
+    case dt_X86_INS_XLATB:
+    case dt_X86_INS_MASKMOVDQU:
+    case dt_X86_INS_MASKMOVQ:
+    case dt_X86_INS_VMASKMOVDQU:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool ir1_is_two_ea_string_op(const struct la_dt_insn *info,
+                                    int mem_count)
+{
+    switch (info->id) {
+    case dt_X86_INS_CMPSB:
+    case dt_X86_INS_CMPSQ:
+    case dt_X86_INS_CMPSW:
+    case dt_X86_INS_MOVSB:
+    case dt_X86_INS_MOVSQ:
+    case dt_X86_INS_MOVSW:
+        return true;
+    case dt_X86_INS_CMPSD:
+        /* CMPSD also names scalar SSE; the string opcode is A7. */
+        return mem_count > 1 || info->x86.opcode[0] == 0xa7;
+    case dt_X86_INS_MOVSD:
+        /* MOVSD also names scalar SSE; the string opcode is A5. */
+        return mem_count > 1 || info->x86.opcode[0] == 0xa5;
+    default:
+        return false;
+    }
+}
+
+static bool ir1_is_source_string_op(dt_x86_insn id)
+{
+    switch (id) {
+    case dt_X86_INS_LODSB:
+    case dt_X86_INS_LODSD:
+    case dt_X86_INS_LODSQ:
+    case dt_X86_INS_LODSW:
+    case dt_X86_INS_OUTSB:
+    case dt_X86_INS_OUTSD:
+    case dt_X86_INS_OUTSW:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool ir1_is_destination_string_op(dt_x86_insn id)
+{
+    switch (id) {
+    case dt_X86_INS_INSB:
+    case dt_X86_INS_INSD:
+    case dt_X86_INS_INSW:
+    case dt_X86_INS_SCASB:
+    case dt_X86_INS_SCASD:
+    case dt_X86_INS_SCASQ:
+    case dt_X86_INS_SCASW:
+    case dt_X86_INS_STOSB:
+    case dt_X86_INS_STOSD:
+    case dt_X86_INS_STOSQ:
+    case dt_X86_INS_STOSW:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static uint8_t ir1_compute_ea_seg_class(const struct la_dt_insn *info,
+                                       int mode)
+{
+    uint8_t class = IR1_EA_SEG_UNKNOWN;
+    bool has_ea = false;
+    int mem_count = 0;
+
+    if (info == NULL || info->id == dt_X86_INS_LEA) {
+        return IR1_EA_SEG_UNKNOWN;
+    }
+    for (int i = 0; i < info->x86.op_count; i++) {
+        if (info->x86.operands[i].type == dt_X86_OP_MEM) {
+            mem_count++;
+        }
+    }
+
+    /*
+     * String instructions can perform distinct source and destination
+     * accesses under one native instruction span.  Their destination is
+     * always ES-based (non-SS); only the source honors a segment override.
+     * An SS override therefore makes MOVS/CMPS ambiguous rather than turning
+     * every fault from the instruction into #SS.
+     */
+    if (ir1_is_two_ea_string_op(info, mem_count)) {
+        uint8_t source_class =
+            ir1_segment_override_class(info, mode, IR1_EA_SEG_NOT_SS);
+        return source_class == IR1_EA_SEG_SS
+                   ? IR1_EA_SEG_UNKNOWN : IR1_EA_SEG_NOT_SS;
+    }
+    if (ir1_is_source_string_op(info->id)) {
+        return ir1_segment_override_class(info, mode, IR1_EA_SEG_NOT_SS);
+    }
+    if (ir1_is_destination_string_op(info->id)) {
+        return IR1_EA_SEG_NOT_SS;
+    }
+
+    for (int i = 0; i < info->x86.op_count; i++) {
+        const dt_cs_x86_op *operand = &info->x86.operands[i];
+
+        if (operand->type == dt_X86_OP_MEM) {
+            ir1_add_ea_seg_class(&class, &has_ea,
+                                 ir1_memory_ea_seg_class(info,
+                                                         &operand->mem,
+                                                         mode));
+        }
+    }
+    if (ir1_has_implicit_stack_ea(info->id)) {
+        ir1_add_ea_seg_class(&class, &has_ea, IR1_EA_SEG_SS);
+    }
+    if (ir1_has_implicit_data_ea(info->id)) {
+        ir1_add_ea_seg_class(&class, &has_ea,
+                             ir1_segment_override_class(
+                                 info, mode, IR1_EA_SEG_NOT_SS));
+    }
+    return has_ea ? class : IR1_EA_SEG_UNKNOWN;
+}
+
 ADDRX ir1_disasm(IR1_INST *ir1, uint8_t *addr, ADDRX t_pc, int ir1_num,
                  void *pir1_base)
 {
+    ir1->ea_seg_class = IR1_EA_SEG_UNKNOWN;
+    ir1->ea_segment_prefix = 0;
     struct la_dt_insn *info;
     bool original_code = true;
     uint8_t nop[15] = { 0x0f, 0x1f, 0x40, 0 };
@@ -407,21 +696,37 @@ ADDRX ir1_disasm(IR1_INST *ir1, uint8_t *addr, ADDRX t_pc, int ir1_num,
     disassemble_trace_cmp(addr, 15, (uint64_t)t_pc, 1, info, cmode);
 
     ir1->_eflag = 0;
+    {
+        uint8_t capstone_prefix = info->x86.prefix[1];
+        uint8_t effective_prefix =
+            ir1_effective_segment_prefix(info, cmode);
+        dt_x86_reg capstone_segment =
+            ir1_segment_reg_from_prefix(capstone_prefix);
+        dt_x86_reg effective_segment =
+            ir1_segment_reg_from_prefix(effective_prefix);
 
-    // xtm treat opnd with default seg(without segment-override prefix) as a mem
-    // opnd so, we make it invalid
-    if (info->x86.prefix[1] != dt_X86_PREFIX_CS &&
-        info->x86.prefix[1] != dt_X86_PREFIX_DS &&
-        info->x86.prefix[1] != dt_X86_PREFIX_SS &&
-        info->x86.prefix[1] != dt_X86_PREFIX_ES &&
-        info->x86.prefix[1] != dt_X86_PREFIX_FS &&
-        info->x86.prefix[1] != dt_X86_PREFIX_GS) {
+        /*
+         * Normalize Capstone's last-prefix result before translator helpers
+         * consume either prefix[1] or mem.segment. In 64-bit mode an ignored
+         * DS/SS/etc. prefix must not hide an earlier effective FS/GS prefix.
+         */
+        info->x86.prefix[1] = effective_prefix;
         for (int i = 0; i < info->x86.op_count; i++) {
-            if (info->x86.operands[i].type == dt_X86_OP_MEM) {
+            if (info->x86.operands[i].type != dt_X86_OP_MEM) {
+                continue;
+            }
+            if (info->x86.operands[i].mem.segment == capstone_segment &&
+                capstone_segment != dt_X86_REG_INVALID) {
+                info->x86.operands[i].mem.segment = effective_segment;
+            }
+            /* xtm treats default-segment operands as explicit otherwise. */
+            if (effective_segment == dt_X86_REG_INVALID) {
                 info->x86.operands[i].mem.segment = dt_X86_REG_INVALID;
             }
         }
     }
+    ir1->ea_seg_class = ir1_compute_ea_seg_class(info, cmode);
+    ir1->ea_segment_prefix = ir1_effective_segment_prefix(info, cmode);
     if (allow_fast_cache && !hot_hit && !template_hit) {
         ir1_decode_template_insert(addr, 15, cmode, info);
     }

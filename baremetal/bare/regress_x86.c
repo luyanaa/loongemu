@@ -24,6 +24,8 @@
 #include "loongemu/tb_cache.h"
 #include "lbt_emu.h"
 #include "tb_harness.h"
+int tb_harness_test_ir1_ea_classification(uint8_t *native_code,
+                                          uint64_t native_limit);
 
 #define UART0_THR ((volatile unsigned char *)0x1fe001e0)
 
@@ -1356,6 +1358,9 @@ void kmain(void)
     __asm__ volatile("invtlb 0x0, $zero, $zero" ::: "memory");
 
     test_cpuid_abi(lvl);
+    check(tb_harness_test_ir1_ea_classification(
+              code_cache + code_used, CODE_CACHE_SIZE - code_used) == 0,
+          "ir1: #GP/#SS EA metadata and native spans");
     test_v2_translation();
     if (lvl >= 3) {
         test_v3_translation();

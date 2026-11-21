@@ -44,7 +44,13 @@ void loongemu_ipi_clear(uint32_t mask)
 
 void loongemu_ipi_send(uint32_t target_cpu, uint32_t action_bit)
 {
-    uint32_t val = (1u << 31) | ((target_cpu & 0x3ffu) << 16) | (action_bit & 0x1fu);
+    /*
+     * Call sites pass a bit index (0 wake, 1 TLB, 2 SMC), while IOCSR
+     * carries a one-hot action mask.  Passing the index through made a TLB
+     * shootdown arrive as action 2 and be handled as an SMC broadcast.
+     */
+    uint32_t val = (1u << 31) | ((target_cpu & 0x3ffu) << 16) |
+                   (1u << (action_bit & 0x1fu));
     iocsrwr_w(val, LOONGEMU_IOCSR_IPI_SEND);
 }
 

@@ -107,7 +107,7 @@ uint64_t lapg_stlbps_value(void)
     return (uint64_t)LAPG_PAGE_BITS;   /* CSR.STLBPS.PS := 12 for 4 KiB */
 }
 
-uint64_t lapg_make_leaf(uint64_t ppn, uint32_t perm)
+uint64_t lapg_make_leaf_mat(uint64_t ppn, uint32_t perm, uint32_t mat)
 {
     uint64_t pte;
 
@@ -137,10 +137,19 @@ uint64_t lapg_make_leaf(uint64_t ppn, uint32_t perm)
     } else {
         pte |= LAPG_PTE_PLV0;
     }
+    if (mat > LAPG_MAT_WUC) {
+        mat = LAPG_MAT_CC;
+    }
+    pte |= ((uint64_t)(mat & 3u)) << LAPG_PTE_MAT_SHIFT;
     if (perm & LAPG_PERM_GLOBAL) {
         pte |= LAPG_PTE_G;
     }
     return pte;
+}
+
+uint64_t lapg_make_leaf(uint64_t ppn, uint32_t perm)
+{
+    return lapg_make_leaf_mat(ppn, perm, LAPG_MAT_CC);
 }
 
 uint64_t lapg_make_table(uint64_t next_table_phys)
@@ -182,8 +191,8 @@ static int entry_is_table(uint64_t entry)
     return (entry & LAPG_PTE_V) != 0;
 }
 
-LapgResult lapg_map(LapgMemory *memory, LapgPagePool *pool, uint64_t root,
-                    uint64_t va, uint64_t pa, uint32_t perm)
+LapgResult lapg_map_mat(LapgMemory *memory, LapgPagePool *pool, uint64_t root,
+                        uint64_t va, uint64_t pa, uint32_t perm, uint32_t mat)
 {
     uint64_t table = root;
     int level;
@@ -229,13 +238,19 @@ LapgResult lapg_map(LapgMemory *memory, LapgPagePool *pool, uint64_t root,
     {
         unsigned idx = va_index(va, LAPG_LEVELS - 1);
         uint64_t slot = table + (uint64_t)idx * sizeof(uint64_t);
-        uint64_t entry = lapg_make_leaf(pa >> LAPG_PAGE_BITS, perm);
+        uint64_t entry = lapg_make_leaf_mat(pa >> LAPG_PAGE_BITS, perm, mat);
 
         if (!write_phys(memory, slot, entry)) {
             return LAPG_FAULT_MEMORY;
         }
     }
     return LAPG_OK;
+}
+
+LapgResult lapg_map(LapgMemory *memory, LapgPagePool *pool, uint64_t root,
+                    uint64_t va, uint64_t pa, uint32_t perm)
+{
+    return lapg_map_mat(memory, pool, root, va, pa, perm, LAPG_MAT_CC);
 }
 
 LapgResult lapg_walk(LapgMemory *memory, uint64_t root, uint64_t va,

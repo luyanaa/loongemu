@@ -89,6 +89,14 @@ void label_dispose(void);
 void lata_gen_call_helper_prologue(TCGContext *tcg_ctx);
 void lata_gen_call_helper_epilogue(TCGContext *tcg_ctx);
 
+/* Environment vector accesses materialize offsets outside the signed SI12 range. */
+void lata_env_vld(IR2_OPND vector, int offset);
+void lata_env_vst(IR2_OPND vector, int offset);
+void lata_env_xvld(IR2_OPND vector, int offset);
+void lata_env_xvst(IR2_OPND vector, int offset);
+void lata_env_ld_wu(IR2_OPND scalar, int offset);
+void lata_env_st_b(IR2_OPND scalar, int offset);
+
 IR2_OPND alloc_gpr_src(int i);
 IR2_OPND alloc_gpr_src_sp(int i);
 IR2_OPND alloc_gpr_dst(int i);

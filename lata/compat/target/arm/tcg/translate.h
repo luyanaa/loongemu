@@ -40,6 +40,7 @@ typedef enum {
 } DisasJumpType;
 
 typedef struct CPUARMTBFlags { uint32_t flags[2]; } CPUARMTBFlags;
+struct A64SVEPvirBuilder;
 
 typedef struct DisasContextBase {
     TranslationBlock *tb;
@@ -61,7 +62,7 @@ typedef struct DisasContext {
     union a64_u arg;
     uint64_t tbid;
     void *cp_regs;
-    void *isar;
+    ARMISAState *isar;
     uint64_t *features;
     uint32_t dcz_blocksize;
     int user, aarch64, thumb, sctlr_b, be_data;
@@ -75,6 +76,7 @@ typedef struct DisasContext {
     bool mte_active[2], tbii, tcma, pauth_active, unpriv, ata, pstate_il;
     bool fgt_active, fgt_svc, fgt_eret;
     int bt, btype, vec_len, vec_stride, naa, lse2;
+    struct A64SVEPvirBuilder *sve_pvir_builder;
 } DisasContext;
 
 #define LOG2_TAG_GRANULE 4

@@ -266,6 +266,13 @@ void latx_x86_tlb_flush_all(void)
     memset(cur_cpu_tlb(), 0, sizeof(latx_x86_tlb[0]));
 }
 
+void latx_x86_tlb_flush_cpu(uint32_t cpu)
+{
+    if (cpu < LATX_MAX_PCPU) {
+        memset(latx_x86_tlb[cpu], 0, sizeof(latx_x86_tlb[cpu]));
+    }
+}
+
 void latx_x86_tlb_flush_all_cpus(void)
 {
     memset(latx_x86_tlb, 0, sizeof(latx_x86_tlb));

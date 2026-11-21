@@ -14,6 +14,7 @@
  * is worse than declining to start.
  */
 #include "qemu/osdep.h"
+#include "../compat/qemu/cpu-features.h"
 
 #if defined(__loongarch__)
 static uint32_t cpucfg2(void)

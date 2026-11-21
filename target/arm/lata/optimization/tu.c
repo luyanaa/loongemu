@@ -542,6 +542,8 @@ void translate_tu(TranslationBlock **tb_list)
 
 }
 
+/* QEMU builds retain TU diagnostics; standalone images omit the runtime hook. */
+#ifndef CONFIG_LATA_STANDALONE
 /* print tu if open in_asm/out_asm debug mode */
 static void print_tu(CPUState *cpu, TranslationBlock **tb_list){
     uint32_t tb_num_in_tu = tu_data->tb_num;
@@ -581,6 +583,7 @@ static void print_tu(CPUState *cpu, TranslationBlock **tb_list){
         }
     }
 }
+#endif
 
 static void register_tu(TranslationBlock **tb_list,
 		CPUState *cpu, int cflags)
@@ -629,7 +632,9 @@ TranslationBlock *tu_gen_code(CPUState *cpu,
     translate_tu(tb_list);
     /* 3.Insert TBs in TU to QHT */
     register_tu(tb_list, cpu, cflags);
+#ifndef CONFIG_LATA_STANDALONE
     print_tu(cpu, tb_list);
+#endif
     tu_trees_reset();
     return entry;
 }

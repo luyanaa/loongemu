@@ -32,12 +32,6 @@ static inline void wr32_le(uint8_t *p, uint32_t v)
     p[3] = (uint8_t)((v >> 24) & 0xffu);
 }
 
-static inline uint32_t rd32_le(const uint8_t *p)
-{
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
 /* Build a valid 128-byte EDID 1.4 block advertising the Host GOP native mode. */
 static void build_gop_edid(uint8_t edid[128], uint32_t width, uint32_t height)
 {
@@ -144,6 +138,51 @@ static LoongemuPciDev *pci_find_dev(LoongemuPciHost *host,
     }
     return 0;
 }
+static void bochs_sync_fb_capacity(LoongemuPciHost *host,
+                                   LoongemuPciDev *dev)
+{
+    uint16_t vendor;
+    uint16_t device;
+    uint64_t mem64k;
+
+    if (!host || !dev) {
+        return;
+    }
+    vendor = (uint16_t)dev->cfg[0x00] | ((uint16_t)dev->cfg[0x01] << 8);
+    device = (uint16_t)dev->cfg[0x02] | ((uint16_t)dev->cfg[0x03] << 8);
+    if (vendor != 0x1234u || device != 0x1111u) {
+        return;
+    }
+    mem64k = host->display.fb_mapped_size / UINT64_C(65536);
+    if (mem64k > UINT16_MAX) {
+        mem64k = UINT16_MAX;
+    }
+    host->display.dispi_regs[VBE_DISPI_INDEX_VIDEO_MEMORY_64K] =
+        (uint16_t)mem64k;
+}
+static int pci_call_bar_map(LoongemuPciHost *host, LoongemuPciDev *dev,
+                            uint32_t bar_idx, uint64_t gpa,
+                            uint64_t size, int enabled)
+{
+    if (!dev || !dev->bar_map_cb ||
+        !dev->bar_map_cb(dev->bar_opaque, bar_idx, gpa, size, enabled)) {
+        return !dev || !dev->bar_map_cb;
+    }
+    if (bar_idx == 0u) {
+        bochs_sync_fb_capacity(host, dev);
+    }
+    return 1;
+}
+
+static uint64_t bochs_fb_capacity(const LoongemuBochsDisplay *display)
+{
+    if (!display) {
+        return 0;
+    }
+    return display->fb_mapped_size & ~UINT64_C(0xfff);
+}
+
+
 
 static void pci_set_bar(LoongemuPciDev *d, uint32_t idx,
                         uint64_t gpa, uint32_t size, uint32_t flags)
@@ -207,8 +246,20 @@ void loongemu_pci_host_init(LoongemuPciHost *host,
 
     /* Configure Bochs Display state from Host UEFI GOP handover */
     LoongemuBochsDisplay *disp = &host->display;
-    if (gop && gop->valid && gop->width > 0 && gop->height > 0) {
+    if (gop && (gop->valid || gop->owner != (uint8_t)LOONGEMU_FB_OWNER_NONE) &&
+        gop->width > 0 && gop->height > 0) {
         disp->gop = *gop;
+        if (disp->gop.owner == (uint8_t)LOONGEMU_FB_OWNER_NONE) {
+            disp->gop.owner = (uint8_t)LOONGEMU_FB_OWNER_HOST_GOP;
+        }
+        if (disp->gop.owner == (uint8_t)LOONGEMU_FB_OWNER_HOST_GOP &&
+            disp->gop.host_mat != (uint8_t)LOONGEMU_MAT_WUC &&
+            disp->gop.host_mat != (uint8_t)LOONGEMU_MAT_SUC) {
+            disp->gop.host_mat = (uint8_t)LOONGEMU_MAT_WUC;
+        } else if (disp->gop.owner == (uint8_t)LOONGEMU_FB_OWNER_VMM_ALLOC &&
+                   disp->gop.host_mat > (uint8_t)LOONGEMU_MAT_WUC) {
+            disp->gop.host_mat = (uint8_t)LOONGEMU_MAT_CC;
+        }
     } else {
         disp->gop.fb_hpa = 0;
         disp->gop.fb_size = LOONGEMU_BOCHS_FB_DEFAULT_SIZE;
@@ -218,14 +269,24 @@ void loongemu_pci_host_init(LoongemuPciHost *host,
         disp->gop.bpp = 32u;
         disp->gop.pixel_format = 1u; /* BGRX */
         disp->gop.valid = 0u;
+        disp->gop.owner = (uint8_t)LOONGEMU_FB_OWNER_NONE;
+        disp->gop.host_mat = (uint8_t)LOONGEMU_MAT_CC;
     }
     uint32_t fb_sz = (uint32_t)LOONGEMU_BOCHS_FB_DEFAULT_SIZE;
-    if (disp->gop.fb_size > fb_sz && disp->gop.fb_size <= (64u * 1024u * 1024u)) {
-        /* Round up to power-of-two BAR size */
-        fb_sz = 1u;
-        while (fb_sz < (uint32_t)disp->gop.fb_size) {
-            fb_sz <<= 1;
+    if (disp->gop.fb_size > 0 && gop &&
+        (gop->valid || gop->owner != (uint8_t)LOONGEMU_FB_OWNER_NONE)) {
+        uint64_t target = disp->gop.fb_size;
+        if (target < (UINT64_C(4) * 1024u * 1024u)) {
+            target = UINT64_C(4) * 1024u * 1024u;
         }
+        if (target > (UINT64_C(64) * 1024u * 1024u)) {
+            target = UINT64_C(64) * 1024u * 1024u;
+        }
+        uint32_t p2 = 4u * 1024u * 1024u;
+        while ((uint64_t)p2 < target && p2 < (64u * 1024u * 1024u)) {
+            p2 <<= 1;
+        }
+        fb_sz = p2;
     }
     disp->dispi_regs[VBE_DISPI_INDEX_ID] = VBE_DISPI_ID5;
     disp->dispi_regs[VBE_DISPI_INDEX_XRES] = (uint16_t)disp->gop.width;
@@ -234,7 +295,20 @@ void loongemu_pci_host_init(LoongemuPciHost *host,
     disp->dispi_regs[VBE_DISPI_INDEX_ENABLE] = 0x0041u; /* ENABLED | LFB_ENABLED */
     disp->dispi_regs[VBE_DISPI_INDEX_VIRT_WIDTH] = (uint16_t)disp->gop.stride_px;
     disp->dispi_regs[VBE_DISPI_INDEX_VIRT_HEIGHT] = (uint16_t)disp->gop.height;
-    disp->dispi_regs[VBE_DISPI_INDEX_VIDEO_MEMORY_64K] = (uint16_t)(fb_sz >> 16);
+    {
+        uint64_t mapped = 0;
+        if (disp->gop.valid && disp->gop.fb_size != 0) {
+            mapped = disp->gop.fb_size & ~UINT64_C(0xfff);
+        } else {
+            mapped = UINT64_C(4) * 1024u * 1024u;
+        }
+        if (mapped > fb_sz) {
+            mapped = fb_sz;
+        }
+        disp->fb_mapped_size = mapped;
+        disp->dispi_regs[VBE_DISPI_INDEX_VIDEO_MEMORY_64K] =
+            (uint16_t)(mapped / UINT64_C(65536));
+    }
     build_gop_edid(disp->edid, disp->gop.width, disp->gop.height);
 
     /* 00:02.0 QEMU Standard VGA / Bochs Display (1234:1111, rev 2) */
@@ -252,8 +326,12 @@ void loongemu_pci_host_init(LoongemuPciHost *host,
         disp->fb_gpa = LOONGEMU_BOCHS_FB_DEFAULT_GPA;
         disp->mmio_gpa = LOONGEMU_BOCHS_MMIO_DEFAULT_GPA;
         if (disp_bar_cb) {
-            disp_bar_cb(disp_bar_opaque, 0, disp->fb_gpa, fb_sz, 1);
-            disp_bar_cb(disp_bar_opaque, 2, disp->mmio_gpa, LOONGEMU_BOCHS_MMIO_SIZE, 1);
+            if (!disp_bar_cb(disp_bar_opaque, 0, disp->fb_gpa, fb_sz, 1)) {
+                disp->fb_mapped_size = 0;
+            }
+            (void)disp_bar_cb(disp_bar_opaque, 2, disp->mmio_gpa,
+                              LOONGEMU_BOCHS_MMIO_SIZE, 1);
+            bochs_sync_fb_capacity(host, vga);
         }
     }
 }
@@ -263,7 +341,7 @@ void loongemu_pci_host_attach_ls7a(LoongemuPciHost *host,
                                    uint64_t cfg_type1_base,
                                    int hide_host_dc_gpu,
                                    uint32_t (*hw_read32)(uint64_t),
-                                   void (*hw_write32)(uint64_t, uint32_t))
+                                   LoongemuLs7aConfigWriteFn hw_write_config)
 {
     if (!host) {
         return;
@@ -272,7 +350,7 @@ void loongemu_pci_host_attach_ls7a(LoongemuPciHost *host,
     host->ls7a.cfg_type1_base = cfg_type1_base ? cfg_type1_base : LOONGSON_7A_CFG_TYPE1_BASE;
     host->ls7a.hide_host_dc_gpu = hide_host_dc_gpu ? 1 : 0;
     host->ls7a.hw_read32 = hw_read32;
-    host->ls7a.hw_write32 = hw_write32;
+    host->ls7a.hw_write_config = hw_write_config;
     host->ls7a.enabled = (hw_read32 != 0) ? 1 : 0;
 }
 
@@ -312,6 +390,213 @@ int loongemu_ls7a_is_internal_bridge(uint16_t vendor_id, uint16_t device_id)
     return ((device_id & 0xff0fu) == 0x7a09u) && (((device_id >> 4) & 0x0fu) <= 6u);
 }
 
+static uint32_t ls7a_read_dw(const LoongemuLs7aBackend *ls7a,
+                             uint8_t bus, uint8_t dev, uint8_t fn, uint16_t reg)
+{
+    uint64_t addr = loongemu_ls7a_cfg_addr(ls7a->cfg_type0_base,
+                                           ls7a->cfg_type1_base,
+                                           bus, dev, fn, (uint16_t)(reg & ~3u));
+    return ls7a->hw_read32(addr);
+}
+
+/*
+ * FLAG_DEV_FIX aliases config reads for nonzero device numbers on a
+ * downstream bus. Apply the workaround only when bus 0 contains an actual
+ * 7A internal PCIe Root Port whose secondary bus is the requested bus.
+ */
+static int ls7a_is_phantom_dev(LoongemuPciHost *host, uint8_t bus, uint8_t dev)
+{
+    const LoongemuLs7aBackend *ls7a = &host->ls7a;
+    if (bus == 0u || dev == 0u || !ls7a->hw_read32) {
+        return 0;
+    }
+    for (uint8_t d = 0; d < 32u; d++) {
+        for (uint8_t f = 0; f < 8u; f++) {
+            if (pci_find_dev(host, 0u, d, f) != 0) {
+                if (f == 0u) {
+                    break;
+                }
+                continue;
+            }
+            uint32_t id = ls7a_read_dw(ls7a, 0u, d, f, 0x00u);
+            uint16_t vid = (uint16_t)(id & 0xffffu);
+            uint16_t did = (uint16_t)(id >> 16);
+            if (vid == 0xffffu) {
+                if (f == 0u) {
+                    break;
+                }
+                continue;
+            }
+            uint32_t bist_hdr = ls7a_read_dw(ls7a, 0u, d, f, 0x0cu);
+            uint8_t hdr_type = (uint8_t)(bist_hdr >> 16);
+            if (loongemu_ls7a_is_internal_bridge(vid, did) &&
+                (hdr_type & 0x7fu) == 1u) {
+                uint32_t class_rev = ls7a_read_dw(ls7a, 0u, d, f, 0x08u);
+                uint8_t sub_class = (uint8_t)(class_rev >> 16);
+                uint8_t base_class = (uint8_t)(class_rev >> 24);
+                uint32_t bus_nums = ls7a_read_dw(ls7a, 0u, d, f, 0x18u);
+                uint8_t primary_bus = (uint8_t)bus_nums;
+                uint8_t secondary_bus = (uint8_t)(bus_nums >> 8);
+                uint8_t subordinate_bus = (uint8_t)(bus_nums >> 16);
+                if (base_class == 0x06u && sub_class == 0x04u &&
+                    primary_bus == 0u && secondary_bus == bus &&
+                    subordinate_bus >= secondary_bus) {
+                    return 1;
+                }
+            }
+            if (f == 0u && (hdr_type & 0x80u) == 0u) {
+                break;
+            }
+        }
+    }
+    return 0;
+}
+
+static int ls7a_find_pcie_devctl_off(const LoongemuLs7aBackend *ls7a,
+                                     uint8_t bus, uint8_t dev, uint8_t fn,
+                                     uint16_t *out_off)
+{
+    if (!ls7a || !ls7a->hw_read32 || !out_off) {
+        return 0;
+    }
+    uint32_t cmd_sts = ls7a_read_dw(ls7a, bus, dev, fn, 0x04u);
+    uint16_t status = (uint16_t)(cmd_sts >> 16);
+    if ((status & 0x0010u) == 0u) {
+        return 0;
+    }
+    uint32_t cap_reg = ls7a_read_dw(ls7a, bus, dev, fn, 0x34u);
+    uint16_t cap_off = (uint16_t)(cap_reg & 0xfcu);
+    uint64_t visited = 0;
+    for (unsigned hop = 0; hop < 48u && cap_off >= 0x40u; hop++) {
+        if (cap_off > 0xfcu) {
+            break;
+        }
+        unsigned bit = cap_off >> 2;
+        uint64_t bit_mask = UINT64_C(1) << bit;
+        if ((visited & bit_mask) != 0u) {
+            break;
+        }
+        visited |= bit_mask;
+        uint32_t cap_hdr = ls7a_read_dw(ls7a, bus, dev, fn, cap_off);
+        uint8_t cap_id = (uint8_t)cap_hdr;
+        if (cap_id == 0xffu) {
+            break;
+        }
+        if (cap_id == 0x10u) {
+            if ((uint32_t)cap_off + 0x0au > 0x100u) {
+                return 0;
+            }
+            *out_off = (uint16_t)(cap_off + 0x08u);
+            return 1;
+        }
+        cap_off = (uint16_t)((cap_hdr >> 8) & 0xfcu);
+    }
+    return 0;
+}
+
+static uint32_t ls7a_read_config(const LoongemuLs7aBackend *ls7a,
+                                 uint8_t bus, uint8_t dev, uint8_t fn,
+                                 uint16_t reg, unsigned size)
+{
+    unsigned byte_off = reg & 3u;
+    uint64_t value = ls7a_read_dw(ls7a, bus, dev, fn, reg);
+    if (byte_off + size > 4u) {
+        uint16_t next_reg = (uint16_t)((reg & 0xfffcu) + 4u);
+        value |= (uint64_t)ls7a_read_dw(ls7a, bus, dev, fn, next_reg) << 32;
+    }
+    value >>= byte_off * 8u;
+    uint32_t mask = (size == 4u) ? UINT32_MAX : ((1u << (size * 8u)) - 1u);
+    return (uint32_t)value & mask;
+}
+
+static int ls7a_cfg_byte_is_read_only(uint16_t reg)
+{
+    return reg < 0x04u || (reg >= 0x08u && reg < 0x0cu) || reg == 0x0eu;
+}
+
+/* Use native config cycles so partial writes never replay untouched W1C bits. */
+static void ls7a_write_config(const LoongemuLs7aBackend *ls7a,
+                              uint8_t bus, uint8_t dev, uint8_t fn,
+                              uint16_t reg, uint32_t val, unsigned size,
+                              uint16_t devctl_off, int clamp_mrrs)
+{
+    uint32_t access_end = (uint32_t)reg + size;
+    uint32_t byte_reg = reg;
+    while (byte_reg < access_end) {
+        if (ls7a_cfg_byte_is_read_only((uint16_t)byte_reg)) {
+            byte_reg++;
+            continue;
+        }
+
+        unsigned chunk_size = 1u;
+        for (unsigned candidate = 4u; candidate > 1u; candidate >>= 1u) {
+            if ((byte_reg & (candidate - 1u)) != 0u ||
+                byte_reg + candidate > access_end ||
+                (byte_reg & 3u) + candidate > 4u) {
+                continue;
+            }
+            int writable = 1;
+            for (unsigned i = 0; i < candidate; i++) {
+                if (ls7a_cfg_byte_is_read_only((uint16_t)(byte_reg + i))) {
+                    writable = 0;
+                    break;
+                }
+            }
+            if (writable) {
+                chunk_size = candidate;
+                break;
+            }
+        }
+
+        uint32_t mask = (chunk_size == 4u)
+                            ? UINT32_MAX
+                            : ((1u << (chunk_size * 8u)) - 1u);
+        unsigned value_shift = (unsigned)(byte_reg - reg) * 8u;
+        uint32_t chunk_val = (val >> value_shift) & mask;
+        if (clamp_mrrs && devctl_off != UINT16_MAX) {
+            uint32_t mrrs_byte = (uint32_t)devctl_off + 1u;
+            if (mrrs_byte >= byte_reg && mrrs_byte < byte_reg + chunk_size) {
+                unsigned mrrs_shift =
+                    (unsigned)(mrrs_byte - byte_reg) * 8u + 4u;
+                uint32_t mrrs = (chunk_val >> mrrs_shift) & 0x7u;
+                if (mrrs > 1u) {
+                    chunk_val = (chunk_val & ~(0x7u << mrrs_shift)) |
+                                (1u << mrrs_shift);
+                }
+            }
+        }
+
+        uint64_t addr = loongemu_ls7a_cfg_addr(
+            ls7a->cfg_type0_base, ls7a->cfg_type1_base,
+            bus, dev, fn, (uint16_t)byte_reg);
+        ls7a->hw_write_config(addr, chunk_val, chunk_size);
+        byte_reg += chunk_size;
+    }
+}
+
+/* A read-only backend cannot expose a downstream function with MRRS > 256 B. */
+static int ls7a_prepare_mrrs(const LoongemuLs7aBackend *ls7a,
+                             uint8_t bus, uint8_t dev, uint8_t fn,
+                             uint16_t devctl_off)
+{
+    uint32_t devctl_dw = ls7a_read_dw(ls7a, bus, dev, fn, devctl_off);
+    uint32_t mrrs = (devctl_dw >> 12) & 0x7u;
+    if (mrrs <= 1u) {
+        return 1;
+    }
+    if (!ls7a->hw_write_config) {
+        return 0;
+    }
+    uint32_t new_control = (devctl_dw & 0x0000ffffu & ~(0x7u << 12)) |
+                           (1u << 12);
+    uint64_t addr = loongemu_ls7a_cfg_addr(
+        ls7a->cfg_type0_base, ls7a->cfg_type1_base,
+        bus, dev, fn, devctl_off);
+    ls7a->hw_write_config(addr, new_control, 2u);
+    return 1;
+}
+
+
 uint32_t loongemu_pci_cfg_read(LoongemuPciHost *host,
                                uint8_t bus, uint8_t dev, uint8_t fn,
                                uint16_t reg, unsigned size)
@@ -333,35 +618,25 @@ uint32_t loongemu_pci_cfg_read(LoongemuPciHost *host,
 
     /* Optional Loongson 7A1000/7A2000 physical passthrough */
     if (host->ls7a.enabled && host->ls7a.hw_read32) {
-        if (bus > 0 && dev > 0) {
-            /* Conservative FLAG_DEV_FIX guard on direct root-port secondary buses */
-            uint64_t probe0 = loongemu_ls7a_cfg_addr(
-                host->ls7a.cfg_type0_base, host->ls7a.cfg_type1_base,
-                bus, 0, 0, 0);
-            if (host->ls7a.hw_read32(probe0) == 0xffffffffu) {
+        if ((uint32_t)reg + size > 0x1000u ||
+            ls7a_is_phantom_dev(host, bus, dev)) {
+            return 0xffffffffu;
+        }
+        uint32_t id = ls7a_read_dw(&host->ls7a, bus, dev, fn, 0x00u);
+        uint16_t vid = (uint16_t)(id & 0xffffu);
+        uint16_t did = (uint16_t)(id >> 16);
+        if (vid == 0xffffu || loongemu_ls7a_is_display_or_gpu(vid, did)) {
+            return 0xffffffffu;
+        }
+        if (bus > 0u) {
+            uint16_t devctl_off;
+            if (ls7a_find_pcie_devctl_off(&host->ls7a, bus, dev, fn,
+                                          &devctl_off) &&
+                !ls7a_prepare_mrrs(&host->ls7a, bus, dev, fn, devctl_off)) {
                 return 0xffffffffu;
             }
         }
-        uint64_t id_addr = loongemu_ls7a_cfg_addr(
-            host->ls7a.cfg_type0_base, host->ls7a.cfg_type1_base,
-            bus, dev, fn, 0);
-        uint32_t id = host->ls7a.hw_read32(id_addr);
-        uint16_t vid = (uint16_t)(id & 0xffffu);
-        uint16_t did = (uint16_t)((id >> 16) & 0xffffu);
-        if (vid == 0xffffu) {
-            return 0xffffffffu;
-        }
-        if (host->ls7a.hide_host_dc_gpu &&
-            loongemu_ls7a_is_display_or_gpu(vid, did)) {
-            return 0xffffffffu;
-        }
-        uint64_t addr = loongemu_ls7a_cfg_addr(
-            host->ls7a.cfg_type0_base, host->ls7a.cfg_type1_base,
-            bus, dev, fn, (uint16_t)(reg & ~3u));
-        uint32_t dw = host->ls7a.hw_read32(addr);
-        uint32_t shift = (uint32_t)(reg & 3u) * 8u;
-        uint32_t mask = (size == 4u) ? 0xffffffffu : ((1u << (size * 8u)) - 1u);
-        return (dw >> shift) & mask;
+        return ls7a_read_config(&host->ls7a, bus, dev, fn, reg, size);
     }
 
     return 0xffffffffu;
@@ -397,13 +672,21 @@ void loongemu_pci_cfg_write(LoongemuPciHost *host,
                 wr32_le(&d->cfg[reg], mask | d->bar_flags[bar_idx]);
                 return;
             }
+            uint32_t old_cfg = (uint32_t)d->cfg[reg] |
+                               ((uint32_t)d->cfg[reg + 1] << 8) |
+                               ((uint32_t)d->cfg[reg + 2] << 16) |
+                               ((uint32_t)d->cfg[reg + 3] << 24);
+            uint64_t old_base = d->bar_gpa[bar_idx];
             uint32_t new_base = val & mask;
+            uint16_t cmd;
             wr32_le(&d->cfg[reg], new_base | d->bar_flags[bar_idx]);
             d->bar_gpa[bar_idx] = (uint64_t)new_base;
-            if (d->bar_map_cb) {
-                uint16_t cmd = (uint16_t)d->cfg[0x04] | ((uint16_t)d->cfg[0x05] << 8);
-                d->bar_map_cb(d->bar_opaque, bar_idx, (uint64_t)new_base,
-                              (uint64_t)bsz, (cmd & 0x0002u) != 0);
+            cmd = (uint16_t)d->cfg[0x04] | ((uint16_t)d->cfg[0x05] << 8);
+            if (!pci_call_bar_map(host, d, bar_idx, (uint64_t)new_base,
+                                  (uint64_t)bsz, (cmd & 0x0002u) != 0)) {
+                d->bar_gpa[bar_idx] = old_base;
+                wr32_le(&d->cfg[reg], old_cfg);
+                bochs_sync_fb_capacity(host, d);
             }
             return;
         }
@@ -419,40 +702,57 @@ void loongemu_pci_cfg_write(LoongemuPciHost *host,
         if (reg <= 0x05u && d->bar_map_cb) {
             uint16_t new_cmd = (uint16_t)d->cfg[0x04] | ((uint16_t)d->cfg[0x05] << 8);
             if (((old_cmd ^ new_cmd) & 0x0002u) != 0) {
+                int ok = 1;
                 for (uint32_t b = 0; b < LOONGEMU_PCI_NUM_BARS; b++) {
-                    if (d->bar_size[b] != 0u) {
-                        d->bar_map_cb(d->bar_opaque, b, d->bar_gpa[b],
-                                      (uint64_t)d->bar_size[b],
-                                      (new_cmd & 0x0002u) != 0);
+                    if (d->bar_size[b] != 0u &&
+                        !pci_call_bar_map(host, d, b, d->bar_gpa[b],
+                                          (uint64_t)d->bar_size[b],
+                                          (new_cmd & 0x0002u) != 0)) {
+                        ok = 0;
+                        break;
                     }
+                }
+                if (!ok) {
+                    wr16_le(&d->cfg[0x04], old_cmd);
+                    for (uint32_t b = 0; b < LOONGEMU_PCI_NUM_BARS; b++) {
+                        if (d->bar_size[b] != 0u) {
+                            (void)pci_call_bar_map(
+                                host, d, b, d->bar_gpa[b],
+                                (uint64_t)d->bar_size[b],
+                                (old_cmd & 0x0002u) != 0);
+                        }
+                    }
+                    bochs_sync_fb_capacity(host, d);
                 }
             }
         }
         return;
     }
 
-    if (host->ls7a.enabled && host->ls7a.hw_read32 && host->ls7a.hw_write32) {
-        uint64_t id_addr = loongemu_ls7a_cfg_addr(
-            host->ls7a.cfg_type0_base, host->ls7a.cfg_type1_base,
-            bus, dev, fn, 0);
-        uint32_t id = host->ls7a.hw_read32(id_addr);
-        uint16_t vid = (uint16_t)(id & 0xffffu);
-        uint16_t did = (uint16_t)((id >> 16) & 0xffffu);
-        if (vid == 0xffffu ||
-            (host->ls7a.hide_host_dc_gpu && loongemu_ls7a_is_display_or_gpu(vid, did))) {
+    if (host->ls7a.enabled && host->ls7a.hw_read32 &&
+        host->ls7a.hw_write_config) {
+        if ((uint32_t)reg + size > 0x1000u ||
+            ls7a_is_phantom_dev(host, bus, dev)) {
             return;
         }
-        uint64_t addr = loongemu_ls7a_cfg_addr(
-            host->ls7a.cfg_type0_base, host->ls7a.cfg_type1_base,
-            bus, dev, fn, (uint16_t)(reg & ~3u));
-        if (size == 4u && (reg & 3u) == 0u) {
-            host->ls7a.hw_write32(addr, val);
-        } else {
-            uint32_t shift = (uint32_t)(reg & 3u) * 8u;
-            uint32_t mask = ((1u << (size * 8u)) - 1u) << shift;
-            uint32_t cur = host->ls7a.hw_read32(addr);
-            host->ls7a.hw_write32(addr, (cur & ~mask) | ((val << shift) & mask));
+        uint32_t id = ls7a_read_dw(&host->ls7a, bus, dev, fn, 0x00u);
+        uint16_t vid = (uint16_t)(id & 0xffffu);
+        uint16_t did = (uint16_t)(id >> 16);
+        if (vid == 0xffffu || loongemu_ls7a_is_display_or_gpu(vid, did)) {
+            return;
         }
+        uint16_t devctl_off = UINT16_MAX;
+        int has_pcie_cap = 0;
+        if (bus > 0u || (reg < 0x100u && (uint32_t)reg + size > 0x48u)) {
+            has_pcie_cap = ls7a_find_pcie_devctl_off(
+                &host->ls7a, bus, dev, fn, &devctl_off);
+        }
+        if (bus > 0u && has_pcie_cap &&
+            !ls7a_prepare_mrrs(&host->ls7a, bus, dev, fn, devctl_off)) {
+            return;
+        }
+        ls7a_write_config(&host->ls7a, bus, dev, fn, reg, val, size,
+                          devctl_off, bus > 0u && has_pcie_cap);
     }
 }
 
@@ -466,6 +766,11 @@ int loongemu_pci_io_read(LoongemuPciHost *host, uint32_t port, int size, uint64_
         return 1;
     }
     if (port >= LOONGEMU_PCI_CFG_DATA_PORT && port <= LOONGEMU_PCI_CFG_DATA_PORT + 3u) {
+        if ((size != 1 && size != 2 && size != 4) ||
+            (unsigned)size > 4u - (port - LOONGEMU_PCI_CFG_DATA_PORT)) {
+            *out = 0xffffffffu;
+            return 1;
+        }
         if ((host->cfg_addr & 0x80000000u) == 0u) {
             *out = 0xffffffffu;
             return 1;
@@ -494,6 +799,89 @@ int loongemu_pci_io_read(LoongemuPciHost *host, uint32_t port, int size, uint64_
     return 0;
 }
 
+static int bochs_dispi_validate_geometry(const LoongemuBochsDisplay *display,
+                                         uint32_t xres, uint32_t yres,
+                                         uint32_t bpp, uint32_t virt_w,
+                                         uint32_t x_offset, uint32_t y_offset)
+{
+    uint64_t bytes_per_pixel;
+    uint64_t eff_w;
+    uint64_t stride;
+    uint64_t total_lines;
+    uint64_t valid_bytes;
+
+    if (!display) {
+        return 0;
+    }
+    if (bpp != 8u && bpp != 15u && bpp != 16u && bpp != 24u && bpp != 32u) {
+        return 0;
+    }
+    bytes_per_pixel = (bpp + 7u) / 8u;
+    eff_w = (virt_w > xres) ? (uint64_t)virt_w : (uint64_t)xres;
+    if (eff_w == 0 || xres == 0 || yres == 0) {
+        return 0;
+    }
+    if ((uint64_t)x_offset + (uint64_t)xres > eff_w) {
+        return 0;
+    }
+    stride = eff_w * bytes_per_pixel;
+    total_lines = (uint64_t)y_offset + (uint64_t)yres;
+    valid_bytes = bochs_fb_capacity(display);
+    if (bytes_per_pixel == 0 || stride == 0 || total_lines == 0) {
+        return 0;
+    }
+    if (stride > valid_bytes || total_lines > (valid_bytes / stride)) {
+        return 0;
+    }
+    return 1;
+}
+
+static void bochs_dispi_write_reg(LoongemuBochsDisplay *d, uint16_t idx, uint16_t val)
+{
+    if (!d || idx >= 16u || idx == VBE_DISPI_INDEX_ID ||
+        idx == VBE_DISPI_INDEX_VIDEO_MEMORY_64K) {
+        return;
+    }
+    uint32_t xres = d->dispi_regs[VBE_DISPI_INDEX_XRES];
+    uint32_t yres = d->dispi_regs[VBE_DISPI_INDEX_YRES];
+    uint32_t bpp = d->dispi_regs[VBE_DISPI_INDEX_BPP];
+    uint32_t virt_w = d->dispi_regs[VBE_DISPI_INDEX_VIRT_WIDTH];
+    uint32_t x_off = d->dispi_regs[VBE_DISPI_INDEX_X_OFFSET];
+    uint32_t y_off = d->dispi_regs[VBE_DISPI_INDEX_Y_OFFSET];
+
+    if (idx == VBE_DISPI_INDEX_XRES) {
+        xres = val;
+    } else if (idx == VBE_DISPI_INDEX_YRES) {
+        yres = val;
+    } else if (idx == VBE_DISPI_INDEX_BPP) {
+        bpp = val;
+    } else if (idx == VBE_DISPI_INDEX_VIRT_WIDTH) {
+        virt_w = val;
+    } else if (idx == VBE_DISPI_INDEX_X_OFFSET) {
+        x_off = val;
+    } else if (idx == VBE_DISPI_INDEX_Y_OFFSET) {
+        y_off = val;
+    } else if (idx == VBE_DISPI_INDEX_BANK) {
+        uint64_t valid_bytes = bochs_fb_capacity(d);
+        if ((uint64_t)val * UINT64_C(65536) >= valid_bytes && val != 0u) {
+            return;
+        }
+        d->dispi_regs[idx] = val;
+        return;
+    }
+
+    if (idx == VBE_DISPI_INDEX_XRES || idx == VBE_DISPI_INDEX_YRES ||
+        idx == VBE_DISPI_INDEX_BPP || idx == VBE_DISPI_INDEX_VIRT_WIDTH ||
+        idx == VBE_DISPI_INDEX_X_OFFSET || idx == VBE_DISPI_INDEX_Y_OFFSET ||
+        (idx == VBE_DISPI_INDEX_ENABLE && (val & 0x0001u) != 0u)) {
+        if (!bochs_dispi_validate_geometry(d, xres, yres, bpp,
+                                           virt_w, x_off, y_off)) {
+            return;
+        }
+    }
+    d->dispi_regs[idx] = val;
+}
+
 int loongemu_pci_io_write(LoongemuPciHost *host, uint32_t port, int size, uint64_t val)
 {
     if (!host) {
@@ -504,6 +892,10 @@ int loongemu_pci_io_write(LoongemuPciHost *host, uint32_t port, int size, uint64
         return 1;
     }
     if (port >= LOONGEMU_PCI_CFG_DATA_PORT && port <= LOONGEMU_PCI_CFG_DATA_PORT + 3u) {
+        if ((size != 1 && size != 2 && size != 4) ||
+            (unsigned)size > 4u - (port - LOONGEMU_PCI_CFG_DATA_PORT)) {
+            return 1;
+        }
         if ((host->cfg_addr & 0x80000000u) == 0u) {
             return 1;
         }
@@ -519,11 +911,7 @@ int loongemu_pci_io_write(LoongemuPciHost *host, uint32_t port, int size, uint64
         return 1;
     }
     if (port == LOONGEMU_BOCHS_DISPI_DATA || port == LOONGEMU_BOCHS_DISPI_DATA2) {
-        uint16_t idx = host->display.dispi_index;
-        if (idx < 16u && idx != VBE_DISPI_INDEX_ID &&
-            idx != VBE_DISPI_INDEX_VIDEO_MEMORY_64K) {
-            host->display.dispi_regs[idx] = (uint16_t)val;
-        }
+        bochs_dispi_write_reg(&host->display, host->display.dispi_index, (uint16_t)val);
         return 1;
     }
     if (port >= 0x03c0u && port <= 0x03dfu) {
@@ -533,9 +921,19 @@ int loongemu_pci_io_write(LoongemuPciHost *host, uint32_t port, int size, uint64
     return 0;
 }
 
+static int pci_ecam_access_valid(uint64_t offset, unsigned size)
+{
+    return (size == 1u || size == 2u || size == 4u) &&
+           offset < LOONGEMU_PCI_ECAM_SIZE &&
+           (uint64_t)size <= LOONGEMU_PCI_ECAM_SIZE - offset;
+}
+
 uint64_t loongemu_pci_ecam_read(void *opaque, uint64_t offset, unsigned size)
 {
     LoongemuPciHost *host = (LoongemuPciHost *)opaque;
+    if (!pci_ecam_access_valid(offset, size)) {
+        return 0xffffffffu;
+    }
     uint8_t bus = (uint8_t)((offset >> 20) & 0xffu);
     uint8_t dev = (uint8_t)((offset >> 15) & 0x1fu);
     uint8_t fn  = (uint8_t)((offset >> 12) & 0x07u);
@@ -546,6 +944,9 @@ uint64_t loongemu_pci_ecam_read(void *opaque, uint64_t offset, unsigned size)
 void loongemu_pci_ecam_write(void *opaque, uint64_t offset, uint64_t val, unsigned size)
 {
     LoongemuPciHost *host = (LoongemuPciHost *)opaque;
+    if (!pci_ecam_access_valid(offset, size)) {
+        return;
+    }
     uint8_t bus = (uint8_t)((offset >> 20) & 0xffu);
     uint8_t dev = (uint8_t)((offset >> 15) & 0x1fu);
     uint8_t fn  = (uint8_t)((offset >> 12) & 0x07u);
@@ -600,11 +1001,8 @@ void loongemu_bochs_mmio_write(void *opaque, uint64_t offset, uint64_t val, unsi
         return;
     }
     if (offset >= 0x0500u && offset < 0x0520u) {
-        uint32_t idx = (uint32_t)((offset - 0x0500u) >> 1);
-        if (idx < 16u && idx != VBE_DISPI_INDEX_ID &&
-            idx != VBE_DISPI_INDEX_VIDEO_MEMORY_64K) {
-            d->dispi_regs[idx] = (uint16_t)val;
-        }
+        uint16_t idx = (uint16_t)((offset - 0x0500u) >> 1);
+        bochs_dispi_write_reg(d, idx, (uint16_t)val);
         return;
     }
 }

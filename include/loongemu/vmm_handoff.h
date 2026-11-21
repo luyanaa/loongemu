@@ -10,15 +10,14 @@ extern "C" {
 #endif
 
 #define LOONGEMU_VMM_HANDOFF_MAGIC   0x4c474d56u /* "LGMV" */
-#define LOONGEMU_VMM_HANDOFF_VERSION 1u
+#define LOONGEMU_VMM_HANDOFF_VERSION 2u
 
 /*
  * Shared Host LoongArch UEFI -> Guest x86 VMM (tb_sys) handoff block.
  *
  * Populated by baremetal/efi/vmm_entry.c before ExitBootServices() using
  * EFI_GRAPHICS_OUTPUT_PROTOCOL and Host ACPI 2.0 tables (SPCR + MCFG), then
- * consumed by tb_sys.c to bind Bochs Display BAR0 zero-copy to the Host GOP
- * framebuffer HPA and configure Loongson 7A1000/7A2000 Split-CFG + DC hiding.
+ * consumed by tb_sys.c via tb_sys_vmm_main() after ExitBootServices().
  */
 typedef struct LoongemuVmmHandoff {
     uint32_t magic;
@@ -43,6 +42,20 @@ typedef struct LoongemuVmmHandoff {
     uint32_t ls7a_mcfg_valid;
     uint32_t hide_host_dc_gpu;
     uint32_t reserved1;
+
+    /* Allocated host physical windows handed from UEFI loader to System VMM */
+    uint64_t vmm_image_base;
+    uint64_t vmm_image_size;
+    uint64_t guest_ram_hpa;
+    uint64_t guest_ram_size;
+    uint64_t code_cache_hpa;
+    uint64_t code_cache_size;
+    uint64_t fb_fallback_hpa;
+    uint64_t fb_fallback_size;
+    uint64_t ovmf_code_hpa;
+    uint64_t ovmf_code_size;
+    uint64_t ovmf_vars_hpa;
+    uint64_t ovmf_vars_size;
 } LoongemuVmmHandoff;
 
 /* Exported by baremetal/efi/vmm_entry.c */
@@ -50,6 +63,7 @@ const LoongemuVmmHandoff *loongemu_vmm_get_handoff(void);
 
 /* Consumed by baremetal/bare/tb_sys.c */
 void tb_sys_set_vmm_handoff(const LoongemuVmmHandoff *handoff);
+void tb_sys_vmm_main(const LoongemuVmmHandoff *handoff) __attribute__((noreturn));
 
 #ifdef __cplusplus
 }

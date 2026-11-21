@@ -139,10 +139,17 @@ make efi-boot              # boot it on a non-LBT core: 17/17 checks
 make efi-ir1-smoke         # IR1 decoding on LoongArch
 make efi-lvz-probe         # privileged/LVZ CSR probe
 make vmm-efi && make vmm-boot
+# Integrated host UEFI -> System VMM; requires x86-64 OVMF CODE and VARS
+make vmm-integrated OVMF_CODE=/path/to/OVMF_CODE.fd OVMF_VARS=/path/to/OVMF_VARS.fd
+make vmm-integrated-boot OVMF_CODE=/path/to/OVMF_CODE.fd OVMF_VARS=/path/to/OVMF_VARS.fd
 ```
 
 QEMU runs are time-bounded (the recipes use `timeout` or a fixed sleep and then
 kill the guest), and logs are written under `build/`.
+The integrated QEMU smoke test checks the handoff, `tb_sys` self-tests and
+continued execution of x86 OVMF. It does not establish that OVMF completes
+boot or that a guest operating system starts.
+
 
 ## Verification of the two back ends
 
@@ -168,6 +175,15 @@ the host test suites are the stable entry point.
 
 - This is a bring-up/testbed tree, not a production hypervisor; there is no
   device model beyond a few stubs (serial, PIT, PCI, APIC).
+- The x86 `tb_sys` PLV3 shadow mapping is **not an isolation boundary for
+  untrusted guests**: guest effective addresses can collide with mappings for
+  translated host code and VMM state. Run only trusted test guests. The
+  software checked-access path does not yet cover every memory operation.
+- When no suitable host GOP framebuffer is available, the Bochs fallback is
+  guest-visible RAM only; it is not a host display output.
+- Physical 7A PCI configuration passthrough is disabled unless host read/write
+  callbacks are explicitly supplied. The blacklist and errata handling do not
+  replace DMA isolation or IOMMU configuration.
 - Toolchain paths in the Makefiles are pinned to a Homebrew LLVM layout and
   need overriding on other systems.
 - QEMU does not execute LBT instructions, so the bare-metal harness emulates

@@ -46,6 +46,7 @@
 
 #include "latx-options.h"
 #include "latx-x86-paging.h"
+#include "loongemu/hyperv.h"
 
 #include "loongemu/loongarch_paging.h"
 #include "loongemu/acpi_tables.h"
@@ -61,17 +62,24 @@
 #include "lbt_emu.h"
 #include "tb_harness.h"
 
+extern void helper_outb(CPUX86State *env, uint32_t port, uint32_t data);
+extern void helper_outw(CPUX86State *env, uint32_t port, uint32_t data);
+extern void helper_outl(CPUX86State *env, uint32_t port, uint32_t data);
 extern void latx_x86_reset_real_mode(CPUX86State *env);
 extern uint32_t latx_guest_nr_cpus;
 extern uint32_t latx_guest_apic_id;
 extern uint64_t latx_host_timer_hz;
 extern uint32_t latx_hv_vendor;
 extern uint64_t latx_random_u64(void);
+#define GUEST_RAM_SIZE (128u * 1024u * 1024u)
+#define BOCHS_FB_FALLBACK_SIZE (4u * 1024u * 1024u)
+
 
 static uint64_t g_uart_base = 0x1fe001e0ULL;
-#define UART0_THR ((volatile unsigned char *)(uintptr_t)(g_uart_base + 0u))
-#define UART0_RBR ((volatile unsigned char *)(uintptr_t)(g_uart_base + 0u))
-#define UART0_LSR ((volatile unsigned char *)(uintptr_t)(g_uart_base + 5u))
+static uint8_t g_uart_reg_shift;
+#define UART0_THR ((volatile unsigned char *)(uintptr_t)(g_uart_base + (0u << g_uart_reg_shift)))
+#define UART0_RBR ((volatile unsigned char *)(uintptr_t)(g_uart_base + (0u << g_uart_reg_shift)))
+#define UART0_LSR ((volatile unsigned char *)(uintptr_t)(g_uart_base + (5u << g_uart_reg_shift)))
 
 /*
  * Called from latx_runtime_init() when the host cannot run the ABI it would
@@ -190,6 +198,7 @@ static uint16_t g_acpi_pm1_cnt;
 static volatile uint32_t g_pcpu_online[MAX_VCPUS];
 static volatile uint32_t g_phys_cpus_online = 1u;
 static volatile uint32_t g_pcpu_vcpu[MAX_VCPUS];
+static volatile uint32_t g_vp_owner[MAX_VCPUS];
 static volatile int g_vcpu_online[MAX_VCPUS];
 static volatile int g_vcpu_halted[MAX_VCPUS];
 static volatile int g_vcpu_kicked[MAX_VCPUS];
@@ -219,7 +228,11 @@ static volatile int g_vcpu_preempt_needed_arr[MAX_VCPUS];
 #define g_vcpu_preempt_needed (g_vcpu_preempt_needed_arr[cur_pcpu()])
 static int deliver_x86_exception(uint32_t vec, uint64_t push_rip,
                                  uint32_t error_code, int has_err);
-
+void helper_hypercall(CPUX86State *e);
+uint64_t hv_request_flush_all(void);
+int hv_flush_barrier_ready(uint64_t ticket);
+int hv_release_flush_barrier(uint64_t ticket);
+void hv_cancel_flush_barrier(uint64_t ticket);
 static LoongemuMemMap g_mem_map;
 static LoongemuVClock g_vclock;
 static OvmfBoard g_ovmf_board;
@@ -228,11 +241,52 @@ static LoongemuVmmHandoff g_vmm_handoff;
 static uint8_t *g_ovmf_code_rom;
 static uint8_t *g_ovmf_vars_flash;
 static uint64_t g_bochs_fb_fallback_hpa;
+static uint64_t g_bochs_fb_bar_gpa;
+static uint64_t g_bochs_fb_bar_size;
+static uint64_t g_bochs_fb_valid_size;
+static uint64_t g_bochs_fb_sink_gpa;
+static uint64_t g_bochs_fb_sink_size;
+static uint64_t g_bochs_mmio_bar_gpa;
+static uint64_t g_bochs_mmio_bar_size;
+typedef struct BochsBarPending {
+    uint64_t gpa;
+    uint64_t size;
+    uint32_t owner_vcpu;
+    uint8_t enabled;
+    uint8_t valid;
+    uint8_t reserved[2];
+} BochsBarPending;
+static BochsBarPending g_bochs_bar_pending[2];
+static volatile int g_bochs_mmio_bar_write;
+static int bochs_bar_pending_present(void);
+static int bochs_helper_context(void);
+static void bochs_set_helper_bar_pending(uint32_t pending);
+static void switch_vcpu(uint32_t next_id);
+static int bochs_process_pending_bar_maps(void);
+static uint64_t g_guest_ram_size = GUEST_RAM_SIZE;
+static int g_guest_ram_external;
+static int g_ovmf_storage_external;
+static int g_phys_mem_initialized;
+#ifndef LOONGEMU_BOOT_OVMF
+static uint8_t g_fb_fallback_pool[BOCHS_FB_FALLBACK_SIZE]
+    __attribute__((aligned(4096), section(".fb_fallback")));
+static uint8_t g_default_ovmf_code[LOONGEMU_OVMF_DEFAULT_ROM_SZ]
+    __attribute__((aligned(4096), section(".ovmf_store")));
+static uint8_t g_default_ovmf_vars[LOONGEMU_OVMF_DEFAULT_VARS_SZ]
+    __attribute__((aligned(4096), section(".ovmf_store")));
+#endif
+static LoongemuSpinLock g_bochs_bar_lock;
 static LoongemuSpinLock g_lapic_lock;
 static LoongemuSpinLock g_ioapic_lock;
 static LoongemuSpinLock g_pic_lock;
 static LoongemuSpinLock g_translate_lock;
 static LoongemuSpinLock g_code_page_lock;
+static LoongemuSpinLock g_hv_barrier_lock;
+static volatile uint64_t g_hv_barrier_generation;
+static volatile uint64_t g_hv_barrier_active;
+static volatile uint64_t g_hv_barrier_released;
+static volatile uint64_t g_hv_barrier_targets;
+static volatile uint32_t g_hv_barrier_coordinator;
 static volatile uint64_t g_isolation_violations;
 static volatile uint64_t g_tlb_shootdowns;
 static volatile uint64_t g_ipi_shootdowns_handled;
@@ -456,8 +510,7 @@ int latx_platform_apic_mmio(uint64_t gpa, int is_write, uint64_t *value)
 
 /* ---------------- guest memory ---------------- */
 
-/* Guest-visible RAM: the whole area below the VMM's load base. */
-#define GUEST_RAM_SIZE (128 * 1024 * 1024)
+/* Guest-visible RAM matches the external UEFI allocation and Linux boot map. */
 
 /* The kernel text the harness carries, linked for 0xffffffff81000000. */
 #define KERNEL_TEXT_SIZE 0x1619ea0ULL
@@ -508,6 +561,169 @@ static inline void *gpa_to_host_ptr(uint64_t gpa)
     return (void *)(uintptr_t)(g_guest_ram_hpa + gpa);
 }
 
+static int vmm_handoff_range_valid(uint64_t base, uint64_t size)
+{
+    return base != 0 && size != 0 && base <= UINT64_MAX - size &&
+           (base & (LAPG_PAGE_SIZE - 1u)) == 0 &&
+           (size & (LAPG_PAGE_SIZE - 1u)) == 0;
+}
+
+static int vmm_handoff_ranges_overlap(uint64_t a, uint64_t as,
+                                      uint64_t b, uint64_t bs)
+{
+    return a < b + bs && b < a + as;
+}
+
+static int vmm_handoff_valid(const LoongemuVmmHandoff *handoff)
+{
+    uint64_t gop_span = 0;
+
+    if (handoff == 0 || handoff->magic != LOONGEMU_VMM_HANDOFF_MAGIC ||
+        handoff->version != LOONGEMU_VMM_HANDOFF_VERSION ||
+        handoff->guest_ram_size < GUEST_RAM_SIZE ||
+        handoff->host_timer_hz == 0 || handoff->host_uart_phys == 0 ||
+        handoff->host_uart_reg_shift > 2u ||
+        !vmm_handoff_range_valid(handoff->vmm_image_base,
+                                 handoff->vmm_image_size) ||
+        !vmm_handoff_range_valid(handoff->guest_ram_hpa,
+                                 handoff->guest_ram_size) ||
+        !vmm_handoff_range_valid(handoff->fb_fallback_hpa,
+                                 handoff->fb_fallback_size) ||
+        handoff->fb_fallback_size < BOCHS_FB_FALLBACK_SIZE ||
+        !vmm_handoff_range_valid(handoff->ovmf_code_hpa,
+                                 handoff->ovmf_code_size) ||
+        !vmm_handoff_range_valid(handoff->ovmf_vars_hpa,
+                                 handoff->ovmf_vars_size)) {
+        return 0;
+    }
+
+    if (handoff->gop.valid) {
+        const LoongemuGopHandover *gop = &handoff->gop;
+        uint64_t visible_size;
+
+        if (gop->owner != (uint8_t)LOONGEMU_FB_OWNER_HOST_GOP ||
+            (gop->host_mat != (uint8_t)LOONGEMU_MAT_WUC &&
+             gop->host_mat != (uint8_t)LOONGEMU_MAT_SUC) ||
+            gop->bpp != 32u || gop->pixel_format > 1u ||
+            gop->width == 0 || gop->height == 0 ||
+            gop->stride_px < gop->width ||
+            (uint64_t)gop->stride_px >
+                UINT64_MAX / gop->height / 4u ||
+            gop->fb_hpa == 0 || gop->fb_size == 0 ||
+            gop->fb_hpa > UINT64_MAX - gop->fb_size ||
+            gop->fb_size > UINT64_MAX - (LAPG_PAGE_SIZE - 1u)) {
+            return 0;
+        }
+        visible_size = (uint64_t)gop->stride_px * gop->height * 4u;
+        gop_span = (gop->fb_size + LAPG_PAGE_SIZE - 1u) &
+                   ~(uint64_t)(LAPG_PAGE_SIZE - 1u);
+        if (visible_size > gop->fb_size ||
+            !vmm_handoff_range_valid(gop->fb_hpa, gop_span)) {
+            return 0;
+        }
+    }
+
+    if (vmm_handoff_ranges_overlap(handoff->vmm_image_base,
+                                   handoff->vmm_image_size,
+                                   handoff->guest_ram_hpa,
+                                   handoff->guest_ram_size) ||
+        vmm_handoff_ranges_overlap(handoff->vmm_image_base,
+                                   handoff->vmm_image_size,
+                                   handoff->fb_fallback_hpa,
+                                   handoff->fb_fallback_size) ||
+        vmm_handoff_ranges_overlap(handoff->vmm_image_base,
+                                   handoff->vmm_image_size,
+                                   handoff->ovmf_code_hpa,
+                                   handoff->ovmf_code_size) ||
+        vmm_handoff_ranges_overlap(handoff->vmm_image_base,
+                                   handoff->vmm_image_size,
+                                   handoff->ovmf_vars_hpa,
+                                   handoff->ovmf_vars_size) ||
+        vmm_handoff_ranges_overlap(handoff->guest_ram_hpa,
+                                   handoff->guest_ram_size,
+                                   handoff->fb_fallback_hpa,
+                                   handoff->fb_fallback_size) ||
+        vmm_handoff_ranges_overlap(handoff->guest_ram_hpa,
+                                   handoff->guest_ram_size,
+                                   handoff->ovmf_code_hpa,
+                                   handoff->ovmf_code_size) ||
+        vmm_handoff_ranges_overlap(handoff->guest_ram_hpa,
+                                   handoff->guest_ram_size,
+                                   handoff->ovmf_vars_hpa,
+                                   handoff->ovmf_vars_size) ||
+        vmm_handoff_ranges_overlap(handoff->fb_fallback_hpa,
+                                   handoff->fb_fallback_size,
+                                   handoff->ovmf_code_hpa,
+                                   handoff->ovmf_code_size) ||
+        vmm_handoff_ranges_overlap(handoff->fb_fallback_hpa,
+                                   handoff->fb_fallback_size,
+                                   handoff->ovmf_vars_hpa,
+                                   handoff->ovmf_vars_size) ||
+        vmm_handoff_ranges_overlap(handoff->ovmf_code_hpa,
+                                   handoff->ovmf_code_size,
+                                   handoff->ovmf_vars_hpa,
+                                   handoff->ovmf_vars_size)) {
+        return 0;
+    }
+    if (gop_span != 0 &&
+        (vmm_handoff_ranges_overlap(handoff->gop.fb_hpa, gop_span,
+                                    handoff->vmm_image_base,
+                                    handoff->vmm_image_size) ||
+         vmm_handoff_ranges_overlap(handoff->gop.fb_hpa, gop_span,
+                                    handoff->guest_ram_hpa,
+                                    handoff->guest_ram_size) ||
+         vmm_handoff_ranges_overlap(handoff->gop.fb_hpa, gop_span,
+                                    handoff->fb_fallback_hpa,
+                                    handoff->fb_fallback_size) ||
+         vmm_handoff_ranges_overlap(handoff->gop.fb_hpa, gop_span,
+                                    handoff->ovmf_code_hpa,
+                                    handoff->ovmf_code_size) ||
+         vmm_handoff_ranges_overlap(handoff->gop.fb_hpa, gop_span,
+                                    handoff->ovmf_vars_hpa,
+                                    handoff->ovmf_vars_size))) {
+        return 0;
+    }
+    return 1;
+}
+
+void kmain(void);
+extern unsigned char kstack[][65536];
+
+static void __attribute__((noreturn)) vmm_switch_stack_and_run(void)
+{
+    uint64_t sp = (uint64_t)(uintptr_t)&kstack[0][sizeof(kstack[0])];
+
+    sp &= ~UINT64_C(15);
+    /* kmain never returns; abandon the EFI stack before any PLV3 entry. */
+    __asm__ volatile("move $sp, %0\n bl kmain\n1: b 1b"
+                     :: "r"(sp) : "memory");
+    __builtin_unreachable();
+}
+
+void tb_sys_vmm_main(const LoongemuVmmHandoff *handoff)
+{
+    if (!vmm_handoff_valid(handoff)) {
+        latx_platform_refuse("invalid UEFI VMM handoff geometry");
+    }
+
+    g_vmm_handoff = *handoff;
+    g_vmm_image_base = handoff->vmm_image_base;
+    g_vmm_image_end = handoff->vmm_image_base + handoff->vmm_image_size;
+    g_guest_ram_hpa = handoff->guest_ram_hpa;
+    g_guest_ram_size = handoff->guest_ram_size;
+    g_guest_ram_external = 1;
+    g_bochs_fb_fallback_hpa = handoff->fb_fallback_hpa;
+    g_ovmf_code_rom = (uint8_t *)(uintptr_t)handoff->ovmf_code_hpa;
+    g_ovmf_vars_flash = (uint8_t *)(uintptr_t)handoff->ovmf_vars_hpa;
+    g_ovmf_storage_external = 1;
+    g_host_timer_hz = handoff->host_timer_hz;
+    g_uart_base = handoff->host_uart_phys;
+    g_uart_reg_shift = handoff->host_uart_reg_shift;
+    latx_host_timer_hz = g_host_timer_hz;
+    tb_sys_set_vmm_handoff(handoff);
+    vmm_switch_stack_and_run();
+}
+
 static inline uint64_t timer_ticks_1ms(void)
 {
     uint64_t t = g_host_timer_hz / 1000ULL;
@@ -541,11 +757,11 @@ static int mmio_register(uint64_t gpa_base, uint64_t size,
                          MmioReadCb read_cb, MmioWriteCb write_cb, void *opaque)
 {
     for (uint32_t i = 0; i < g_mmio_region_count; i++) {
-        if (g_mmio_regions[i].gpa_base == gpa_base && g_mmio_regions[i].size == size) {
-            g_mmio_regions[i].read_cb = read_cb;
-            g_mmio_regions[i].write_cb = write_cb;
-            g_mmio_regions[i].opaque = opaque;
-            return 1;
+        if (g_mmio_regions[i].gpa_base == gpa_base &&
+            g_mmio_regions[i].size == size) {
+            return g_mmio_regions[i].read_cb == read_cb &&
+                   g_mmio_regions[i].write_cb == write_cb &&
+                   g_mmio_regions[i].opaque == opaque;
         }
     }
     if (g_mmio_region_count >= MAX_MMIO_REGIONS) {
@@ -571,64 +787,728 @@ static const MmioRegion *mmio_find_region(uint64_t gpa)
     return 0;
 }
 
-static int mem_map_upsert_named(LoongemuMemMap *map, const char *name,
-                                uint64_t gpa_base, uint64_t size,
-                                uint64_t hpa_base, LoongemuMemKind kind)
+static int mem_map_range_available_except(const LoongemuMemMap *map,
+                                          uint64_t base, uint64_t size,
+                                          const char *owner_name,
+                                          uint64_t owner_base)
 {
+    uint64_t end;
+
+    if (size == 0 || base > UINT64_MAX - size) {
+        return 0;
+    }
+    end = base + size;
     for (uint32_t i = 0; i < map->count; i++) {
-        if (map->regions[i].name != 0 && strcmp(map->regions[i].name, name) == 0) {
-            map->regions[i].gpa_base = gpa_base;
-            map->regions[i].size = size;
-            map->regions[i].hpa_base = hpa_base;
-            map->regions[i].kind = kind;
+        const LoongemuMemRegion *region = &map->regions[i];
+        uint64_t other_end;
+
+        if (owner_name != 0 && region->gpa_base == owner_base &&
+            region->name != 0 && strcmp(region->name, owner_name) == 0) {
+            continue;
+        }
+        if (region->size == 0 || region->gpa_base > UINT64_MAX - region->size) {
+            return 0;
+        }
+        other_end = region->gpa_base + region->size;
+        if (base < other_end && region->gpa_base < end) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int mem_map_remove_owned(LoongemuMemMap *map, const char *name,
+                                uint64_t base)
+{
+    if (!map || !name) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < map->count; i++) {
+        if (map->regions[i].gpa_base != base ||
+            map->regions[i].name == 0 ||
+            strcmp(map->regions[i].name, name) != 0) {
+            continue;
+        }
+        for (uint32_t j = i + 1u; j < map->count; j++) {
+            map->regions[j - 1u] = map->regions[j];
+        }
+        map->count--;
+        return 1;
+    }
+    return 0;
+}
+
+static int mmio_range_available_except(uint64_t base, uint64_t size,
+                                       MmioReadCb owner_read,
+                                       void *owner_opaque)
+{
+    uint64_t end;
+
+    if (size == 0 || base > UINT64_MAX - size) {
+        return 0;
+    }
+    end = base + size;
+    for (uint32_t i = 0; i < g_mmio_region_count; i++) {
+        const MmioRegion *region = &g_mmio_regions[i];
+        if (region->read_cb == owner_read &&
+            region->opaque == owner_opaque) {
+            continue;
+        }
+        if (region->size == 0 || region->gpa_base > UINT64_MAX - region->size ||
+            (base < region->gpa_base + region->size && region->gpa_base < end)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+
+static int mem_map_find_owned(const LoongemuMemMap *map, const char *name,
+                              uint64_t base, LoongemuMemRegion *out)
+{
+    if (!map || !name) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < map->count; i++) {
+        if (map->regions[i].gpa_base == base &&
+            map->regions[i].name != 0 &&
+            strcmp(map->regions[i].name, name) == 0) {
+            if (out) {
+                *out = map->regions[i];
+            }
             return 1;
         }
     }
-    return loongemu_mem_map_add(map, gpa_base, size, hpa_base, kind, name);
+    return 0;
 }
 
-static int mmio_upsert_by_cb(uint64_t gpa_base, uint64_t size,
-                             MmioReadCb read_cb, MmioWriteCb write_cb, void *opaque)
+
+static int mmio_unregister_by_cb(MmioReadCb read_cb, void *opaque)
+{
+    int removed = 0;
+    for (uint32_t i = 0; i < g_mmio_region_count;) {
+        if (g_mmio_regions[i].read_cb == read_cb && g_mmio_regions[i].opaque == opaque) {
+            for (uint32_t j = i + 1u; j < g_mmio_region_count; j++) {
+                g_mmio_regions[j - 1u] = g_mmio_regions[j];
+            }
+            g_mmio_region_count--;
+            removed = 1;
+        } else {
+            i++;
+        }
+    }
+    return removed;
+}
+static int mmio_unregister_exact(MmioReadCb read_cb, void *opaque,
+                                 uint64_t gpa_base, uint64_t size)
 {
     for (uint32_t i = 0; i < g_mmio_region_count; i++) {
-        if (g_mmio_regions[i].read_cb == read_cb && g_mmio_regions[i].opaque == opaque) {
-            g_mmio_regions[i].gpa_base = gpa_base;
-            g_mmio_regions[i].size = size;
-            g_mmio_regions[i].write_cb = write_cb;
+        if (g_mmio_regions[i].read_cb == read_cb &&
+            g_mmio_regions[i].opaque == opaque &&
+            g_mmio_regions[i].gpa_base == gpa_base &&
+            g_mmio_regions[i].size == size) {
+            for (uint32_t j = i + 1u; j < g_mmio_region_count; j++) {
+                g_mmio_regions[j - 1u] = g_mmio_regions[j];
+            }
+            g_mmio_region_count--;
             return 1;
         }
     }
-    return mmio_register(gpa_base, size, read_cb, write_cb, opaque);
+    return 0;
 }
 
-static void bochs_display_bar_map_cb(void *opaque, uint32_t bar_idx,
-                                     uint64_t new_gpa, uint64_t size, int enabled)
+static uint64_t bochs_oob_sink_read(void *opaque, uint64_t off, unsigned size)
 {
     (void)opaque;
-    if (!enabled || new_gpa == 0 || size == 0) {
-        return;
+    (void)off;
+    (void)size;
+    return 0;
+}
+
+static void bochs_oob_sink_write(void *opaque, uint64_t off,
+                                 uint64_t val, unsigned size)
+{
+    (void)opaque;
+    (void)off;
+    (void)val;
+    (void)size;
+}
+
+static int bochs_fb_hpa_allowed(uint64_t hpa, uint64_t size, uint8_t owner)
+{
+    uint64_t end;
+
+    if (hpa == 0 || size == 0 || hpa > UINT64_MAX - size ||
+        (hpa & (LAPG_PAGE_SIZE - 1u)) != 0) {
+        return 0;
+    }
+    end = hpa + size;
+    if (g_guest_ram_external) {
+        const LoongemuVmmHandoff *h = &g_vmm_handoff;
+        uint64_t owner_base;
+        uint64_t owner_size;
+
+        if (!vmm_handoff_valid(h)) {
+            return 0;
+        }
+        if (owner == (uint8_t)LOONGEMU_FB_OWNER_HOST_GOP) {
+            owner_base = h->gop.fb_hpa;
+            owner_size = h->gop.fb_size;
+        } else if (owner == (uint8_t)LOONGEMU_FB_OWNER_VMM_ALLOC) {
+            owner_base = h->fb_fallback_hpa;
+            owner_size = h->fb_fallback_size;
+        } else {
+            return 0;
+        }
+        if (owner_base == 0 || owner_size == 0 ||
+            owner_base > UINT64_MAX - owner_size ||
+            hpa < owner_base || end > owner_base + owner_size) {
+            return 0;
+        }
+        if (vmm_handoff_ranges_overlap(hpa, size, h->vmm_image_base,
+                                       h->vmm_image_size) ||
+            vmm_handoff_ranges_overlap(hpa, size, h->guest_ram_hpa,
+                                       h->guest_ram_size) ||
+            vmm_handoff_ranges_overlap(hpa, size, h->ovmf_code_hpa,
+                                       h->ovmf_code_size) ||
+            vmm_handoff_ranges_overlap(hpa, size, h->ovmf_vars_hpa,
+                                       h->ovmf_vars_size) ||
+            (owner != (uint8_t)LOONGEMU_FB_OWNER_VMM_ALLOC &&
+             vmm_handoff_ranges_overlap(hpa, size, h->fb_fallback_hpa,
+                                        h->fb_fallback_size))) {
+            return 0;
+        }
+        return 1;
+    }
+    if (owner == (uint8_t)LOONGEMU_FB_OWNER_HOST_GOP) {
+        const LoongemuGopHandover *gop = &g_pci_host.display.gop;
+        return gop->valid && gop->fb_hpa != 0 && gop->fb_size != 0 &&
+               gop->fb_hpa <= UINT64_MAX - gop->fb_size &&
+               hpa >= gop->fb_hpa &&
+               end <= gop->fb_hpa + gop->fb_size;
+    }
+#ifndef LOONGEMU_BOOT_OVMF
+    return owner == (uint8_t)LOONGEMU_FB_OWNER_VMM_ALLOC &&
+           hpa == (uint64_t)(uintptr_t)g_fb_fallback_pool &&
+           size <= sizeof(g_fb_fallback_pool);
+#else
+    return 0;
+#endif
+}
+
+static uint64_t bochs_fb_get_backing(uint64_t bar_size, uint64_t *hpa_out,
+                                     uint8_t *mat_out)
+{
+    const LoongemuGopHandover *gop = &g_pci_host.display.gop;
+    uint64_t hpa = 0;
+    uint64_t available = 0;
+    uint8_t owner = (uint8_t)LOONGEMU_FB_OWNER_NONE;
+    uint8_t mat = (uint8_t)LOONGEMU_MAT_CC;
+
+    if (gop->valid && gop->fb_hpa != 0 &&
+        (gop->owner == (uint8_t)LOONGEMU_FB_OWNER_HOST_GOP ||
+         gop->owner == (uint8_t)LOONGEMU_FB_OWNER_VMM_ALLOC)) {
+        hpa = gop->fb_hpa;
+        available = gop->fb_size & ~UINT64_C(0xfff);
+        owner = gop->owner;
+        mat = gop->host_mat;
+        if (owner == (uint8_t)LOONGEMU_FB_OWNER_HOST_GOP &&
+            mat != (uint8_t)LOONGEMU_MAT_WUC &&
+            mat != (uint8_t)LOONGEMU_MAT_SUC) {
+            mat = (uint8_t)LOONGEMU_MAT_WUC;
+        } else if (owner == (uint8_t)LOONGEMU_FB_OWNER_VMM_ALLOC) {
+            mat = (uint8_t)LOONGEMU_MAT_CC;
+        }
+    }
+    if (available == 0 || !bochs_fb_hpa_allowed(hpa, available, owner)) {
+        hpa = g_bochs_fb_fallback_hpa;
+        available = (hpa != 0) ? BOCHS_FB_FALLBACK_SIZE : 0;
+        owner = (uint8_t)LOONGEMU_FB_OWNER_VMM_ALLOC;
+        mat = (uint8_t)LOONGEMU_MAT_CC;
+    }
+    if (available > bar_size) {
+        available = bar_size;
+    }
+    available &= ~UINT64_C(0xfff);
+    if (available == 0 || !bochs_fb_hpa_allowed(hpa, available, owner)) {
+        hpa = 0;
+        available = 0;
+    }
+    *hpa_out = hpa;
+    *mat_out = mat;
+    return available;
+}
+
+static int bochs_bar_map_can_apply(uint32_t bar_idx, uint64_t new_gpa,
+                                   uint64_t size, int enabled)
+{
+    const char *map_name;
+    uint64_t old_base;
+
+    if (!enabled) {
+        return 1;
+    }
+    if (size == 0 || (size & (LAPG_PAGE_SIZE - 1u)) != 0 ||
+        (new_gpa & (LAPG_PAGE_SIZE - 1u)) != 0 ||
+        new_gpa > UINT64_MAX - size) {
+        return 0;
+    }
+    if (bar_idx == 0u) {
+        uint64_t fb_hpa;
+        uint64_t valid_size;
+        uint8_t mat;
+        uint64_t sink_gpa;
+        uint64_t sink_size;
+        int map_exists;
+        int sink_exists = 0;
+
+        map_name = "bochs_fb";
+        old_base = g_bochs_fb_bar_gpa;
+        valid_size = bochs_fb_get_backing(size, &fb_hpa, &mat);
+        if (valid_size == 0 ||
+            !mem_map_range_available_except(&g_mem_map, new_gpa, size,
+                                            map_name, old_base) ||
+            !mmio_range_available_except(new_gpa, size,
+                                         bochs_oob_sink_read, 0)) {
+            return 0;
+        }
+        map_exists = mem_map_find_owned(&g_mem_map, map_name, new_gpa, 0);
+        if (g_mem_map.count + (map_exists ? 0u : 1u) >
+            LOONGEMU_MEM_MAX_REGIONS) {
+            return 0;
+        }
+        sink_size = size - valid_size;
+        sink_gpa = new_gpa + valid_size;
+        if (sink_size != 0) {
+            for (uint32_t i = 0; i < g_mmio_region_count; i++) {
+                if (g_mmio_regions[i].read_cb == bochs_oob_sink_read &&
+                    g_mmio_regions[i].opaque == 0 &&
+                    g_mmio_regions[i].gpa_base == sink_gpa &&
+                    g_mmio_regions[i].size == sink_size) {
+                    sink_exists = 1;
+                    break;
+                }
+            }
+        }
+        return g_mmio_region_count +
+                   ((sink_size != 0 && !sink_exists) ? 1u : 0u) <=
+               MAX_MMIO_REGIONS;
+    }
+    if (bar_idx == 2u) {
+        int map_exists;
+        int mmio_exists = 0;
+
+        map_name = "bochs_mmio";
+        old_base = g_bochs_mmio_bar_gpa;
+        if (!mem_map_range_available_except(&g_mem_map, new_gpa, size,
+                                            map_name, old_base) ||
+            !mmio_range_available_except(new_gpa, size,
+                                         loongemu_bochs_mmio_read,
+                                         &g_pci_host.display)) {
+            return 0;
+        }
+        map_exists = mem_map_find_owned(&g_mem_map, map_name, new_gpa, 0);
+        if (g_mem_map.count + (map_exists ? 0u : 1u) >
+            LOONGEMU_MEM_MAX_REGIONS) {
+            return 0;
+        }
+        for (uint32_t i = 0; i < g_mmio_region_count; i++) {
+            if (g_mmio_regions[i].read_cb == loongemu_bochs_mmio_read &&
+                g_mmio_regions[i].opaque == &g_pci_host.display &&
+                g_mmio_regions[i].gpa_base == new_gpa &&
+                g_mmio_regions[i].size == size) {
+                mmio_exists = 1;
+                break;
+            }
+        }
+        return g_mmio_region_count + (mmio_exists ? 0u : 1u) <=
+               MAX_MMIO_REGIONS;
+    }
+    return 1;
+}
+
+static int bochs_bar_matches_live(uint32_t bar_idx, uint64_t gpa,
+                                  uint64_t size, int enabled)
+{
+    if (bar_idx == 0u) {
+        return enabled
+                   ? (g_bochs_fb_bar_gpa == gpa &&
+                      g_bochs_fb_bar_size == size)
+                   : (g_bochs_fb_bar_gpa == 0);
+    }
+    if (bar_idx == 2u) {
+        return enabled
+                   ? (g_bochs_mmio_bar_gpa == gpa &&
+                      g_bochs_mmio_bar_size == size)
+                   : (g_bochs_mmio_bar_gpa == 0);
+    }
+    return 1;
+}
+
+static int bochs_bar_map_apply(uint32_t bar_idx, uint64_t new_gpa,
+                               uint64_t size, int enabled)
+{
+    if (!bochs_bar_map_can_apply(bar_idx, new_gpa, size, enabled)) {
+        return 0;
+    }
+    if (bar_idx == 0u) {
+        LoongemuMemRegion old_region;
+        int had_region = mem_map_find_owned(&g_mem_map, "bochs_fb",
+                                            g_bochs_fb_bar_gpa, &old_region);
+        uint64_t old_bar_gpa = g_bochs_fb_bar_gpa;
+        uint64_t old_sink_gpa = g_bochs_fb_sink_gpa;
+        uint64_t old_sink_size = g_bochs_fb_sink_size;
+        uint64_t fb_hpa = 0;
+        uint8_t mat = (uint8_t)LOONGEMU_MAT_CC;
+        uint64_t valid_size = enabled
+                                  ? bochs_fb_get_backing(size, &fb_hpa, &mat)
+                                  : 0;
+        uint64_t sink_gpa = enabled ? new_gpa + valid_size : 0;
+        uint64_t sink_size = enabled ? size - valid_size : 0;
+        int replaced_region = 0;
+        int added_region = 0;
+        int added_sink = 0;
+        int same_sink = sink_size != 0 &&
+                        sink_gpa == old_sink_gpa &&
+                        sink_size == old_sink_size;
+
+        if (enabled) {
+            if (valid_size == 0) {
+                return 0;
+            }
+            if (had_region && old_bar_gpa == new_gpa) {
+                for (uint32_t i = 0; i < g_mem_map.count; i++) {
+                    LoongemuMemRegion *region = &g_mem_map.regions[i];
+                    if (region->gpa_base == new_gpa &&
+                        region->name != 0 &&
+                        strcmp(region->name, "bochs_fb") == 0) {
+                        region->size = valid_size;
+                        region->hpa_base = fb_hpa;
+                        region->kind = LOONGEMU_MEM_RAM;
+                        region->host_mat = mat;
+                        replaced_region = 1;
+                        break;
+                    }
+                }
+            } else {
+                if (!loongemu_mem_map_add_mat(&g_mem_map, new_gpa, valid_size,
+                                              fb_hpa, LOONGEMU_MEM_RAM, mat,
+                                              "bochs_fb")) {
+                    return 0;
+                }
+                added_region = 1;
+            }
+            if (sink_size != 0 && !same_sink) {
+                if (!mmio_register(sink_gpa, sink_size,
+                                   bochs_oob_sink_read,
+                                   bochs_oob_sink_write, 0)) {
+                    if (added_region) {
+                        mem_map_remove_owned(&g_mem_map, "bochs_fb", new_gpa);
+                    } else if (replaced_region) {
+                        for (uint32_t i = 0; i < g_mem_map.count; i++) {
+                            if (g_mem_map.regions[i].gpa_base == old_region.gpa_base &&
+                                g_mem_map.regions[i].name != 0 &&
+                                strcmp(g_mem_map.regions[i].name, "bochs_fb") == 0) {
+                                g_mem_map.regions[i] = old_region;
+                                break;
+                            }
+                        }
+                    }
+                    return 0;
+                }
+                added_sink = 1;
+            }
+        }
+
+        if (had_region && (!enabled || old_bar_gpa != new_gpa)) {
+            mem_map_remove_owned(&g_mem_map, "bochs_fb", old_bar_gpa);
+        }
+        if (old_sink_size != 0 && !same_sink) {
+            (void)mmio_unregister_exact(bochs_oob_sink_read, 0,
+                                        old_sink_gpa, old_sink_size);
+        }
+        (void)added_sink;
+        g_bochs_fb_bar_gpa = enabled ? new_gpa : 0;
+        g_bochs_fb_bar_size = enabled ? size : 0;
+        g_bochs_fb_valid_size = enabled ? valid_size : 0;
+        g_bochs_fb_sink_gpa = sink_size != 0 ? sink_gpa : 0;
+        g_bochs_fb_sink_size = sink_size;
+        g_pci_host.display.fb_gpa = new_gpa;
+        g_pci_host.display.fb_mapped = enabled && valid_size != 0;
+        g_pci_host.display.fb_mapped_size = enabled ? valid_size : 0;
+        {
+            uint64_t mem64k = g_pci_host.display.fb_mapped_size /
+                             UINT64_C(65536);
+            g_pci_host.display.dispi_regs[0x0a] =
+                mem64k > UINT16_MAX ? UINT16_MAX : (uint16_t)mem64k;
+        }
+        return 1;
+    }
+    if (bar_idx == 2u) {
+        LoongemuMemRegion old_region;
+        int had_region = mem_map_find_owned(&g_mem_map, "bochs_mmio",
+                                            g_bochs_mmio_bar_gpa, &old_region);
+        uint64_t old_bar_gpa = g_bochs_mmio_bar_gpa;
+        uint64_t old_bar_size = g_bochs_mmio_bar_size;
+        int replaced_region = 0;
+        int added_region = 0;
+        int mmio_exists = 0;
+
+        if (enabled) {
+            if (had_region && old_bar_gpa == new_gpa) {
+                for (uint32_t i = 0; i < g_mem_map.count; i++) {
+                    LoongemuMemRegion *region = &g_mem_map.regions[i];
+                    if (region->gpa_base == new_gpa &&
+                        region->name != 0 &&
+                        strcmp(region->name, "bochs_mmio") == 0) {
+                        region->size = size;
+                        region->hpa_base = 0;
+                        region->kind = LOONGEMU_MEM_MMIO;
+                        region->host_mat = (uint8_t)LOONGEMU_MAT_SUC;
+                        replaced_region = 1;
+                        break;
+                    }
+                }
+            } else {
+                if (!loongemu_mem_map_add(&g_mem_map, new_gpa, size, 0,
+                                          LOONGEMU_MEM_MMIO, "bochs_mmio")) {
+                    return 0;
+                }
+                added_region = 1;
+            }
+            for (uint32_t i = 0; i < g_mmio_region_count; i++) {
+                if (g_mmio_regions[i].read_cb == loongemu_bochs_mmio_read &&
+                    g_mmio_regions[i].opaque == &g_pci_host.display &&
+                    g_mmio_regions[i].gpa_base == new_gpa &&
+                    g_mmio_regions[i].size == size) {
+                    mmio_exists = 1;
+                    break;
+                }
+            }
+            if (!mmio_register(new_gpa, size, loongemu_bochs_mmio_read,
+                               loongemu_bochs_mmio_write,
+                               &g_pci_host.display)) {
+                if (added_region) {
+                    mem_map_remove_owned(&g_mem_map, "bochs_mmio", new_gpa);
+                } else if (replaced_region) {
+                    for (uint32_t i = 0; i < g_mem_map.count; i++) {
+                        if (g_mem_map.regions[i].gpa_base == old_region.gpa_base &&
+                            g_mem_map.regions[i].name != 0 &&
+                            strcmp(g_mem_map.regions[i].name, "bochs_mmio") == 0) {
+                            g_mem_map.regions[i] = old_region;
+                            break;
+                        }
+                    }
+                }
+                return 0;
+            }
+        }
+        if (had_region && (!enabled || old_bar_gpa != new_gpa)) {
+            mem_map_remove_owned(&g_mem_map, "bochs_mmio", old_bar_gpa);
+        }
+        if (old_bar_gpa != 0 &&
+            (!enabled || old_bar_gpa != new_gpa || old_bar_size != size)) {
+            (void)mmio_unregister_exact(loongemu_bochs_mmio_read,
+                                        &g_pci_host.display,
+                                        old_bar_gpa, old_bar_size);
+        }
+        (void)mmio_exists;
+        g_bochs_mmio_bar_gpa = enabled ? new_gpa : 0;
+        g_bochs_mmio_bar_size = enabled ? size : 0;
+        g_pci_host.display.mmio_gpa = new_gpa;
+        g_pci_host.display.mmio_mapped = enabled != 0;
+        return 1;
+    }
+    return 1;
+}
+
+static int bochs_display_bar_map_cb(void *opaque, uint32_t bar_idx,
+                                    uint64_t new_gpa, uint64_t size, int enabled)
+{
+    uint32_t slot;
+    (void)opaque;
+
+    if (bar_idx == 0u) {
+        slot = 0;
+    } else if (bar_idx == 2u) {
+        slot = 1;
+    } else {
+        return 1;
+    }
+    if (!g_phys_mem_initialized) {
+        return 1;
+    }
+    if (bochs_helper_context() || g_bochs_mmio_bar_write != 0) {
+        uint32_t other = slot ^ 1u;
+
+        loongemu_spin_lock(&g_bochs_bar_lock);
+        if (!bochs_bar_map_can_apply(bar_idx, new_gpa, size, enabled)) {
+            loongemu_spin_unlock(&g_bochs_bar_lock);
+            return 0;
+        }
+        if (g_bochs_bar_pending[slot].valid &&
+            g_bochs_bar_pending[slot].owner_vcpu != g_cur_vcpu) {
+            loongemu_spin_unlock(&g_bochs_bar_lock);
+            return 0;
+        }
+        if (bochs_bar_matches_live(bar_idx, new_gpa, size, enabled)) {
+            g_bochs_bar_pending[slot].valid = 0;
+            if (bochs_helper_context()) {
+                bochs_set_helper_bar_pending(
+                    g_bochs_bar_pending[other].valid &&
+                    g_bochs_bar_pending[other].owner_vcpu == g_cur_vcpu);
+            }
+            loongemu_spin_unlock(&g_bochs_bar_lock);
+            return 1;
+        }
+        if (g_bochs_bar_pending[other].valid &&
+            enabled && g_bochs_bar_pending[other].enabled &&
+            new_gpa < g_bochs_bar_pending[other].gpa +
+                          g_bochs_bar_pending[other].size &&
+            g_bochs_bar_pending[other].gpa < new_gpa + size) {
+            loongemu_spin_unlock(&g_bochs_bar_lock);
+            return 0;
+        }
+        g_bochs_bar_pending[slot].gpa = new_gpa;
+        g_bochs_bar_pending[slot].size = size;
+        g_bochs_bar_pending[slot].enabled = enabled != 0;
+        g_bochs_bar_pending[slot].owner_vcpu = g_cur_vcpu;
+        g_bochs_bar_pending[slot].valid = 1;
+        if (bochs_helper_context()) {
+            bochs_set_helper_bar_pending(1);
+        }
+        loongemu_spin_unlock(&g_bochs_bar_lock);
+        return 1;
+    }
+    if (!bochs_bar_map_can_apply(bar_idx, new_gpa, size, enabled)) {
+        return 0;
     }
 #ifdef LOONGEMU_BOOT_OVMF
-    latx_bare_uart_puts("ovmf_pci: bochs BAR");
-    puthex((uint64_t)bar_idx);
-    latx_bare_uart_puts(" gpa=");
-    puthex(new_gpa);
-    latx_bare_uart_puts(" sz=");
-    puthex(size);
-    latx_bare_uart_puts("\n");
-#endif
-    if (bar_idx == 0u) {
-        uint64_t fb_hpa = (g_pci_host.display.gop.valid && g_pci_host.display.gop.fb_hpa != 0)
-                              ? g_pci_host.display.gop.fb_hpa
-                              : g_bochs_fb_fallback_hpa;
-        if (fb_hpa != 0) {
-            mem_map_upsert_named(&g_mem_map, "bochs_fb", new_gpa, size, fb_hpa, LOONGEMU_MEM_RAM);
-        }
-    } else if (bar_idx == 2u) {
-        mem_map_upsert_named(&g_mem_map, "bochs_mmio", new_gpa, size, 0, LOONGEMU_MEM_MMIO);
-        mmio_upsert_by_cb(new_gpa, size, loongemu_bochs_mmio_read,
-                          loongemu_bochs_mmio_write, &g_pci_host.display);
+    if (bar_idx == 0u && enabled) {
+        latx_bare_uart_puts("ovmf_pci: bochs BAR");
+        puthex((uint64_t)bar_idx);
+        latx_bare_uart_puts(" gpa=");
+        puthex(new_gpa);
+        latx_bare_uart_puts(" sz=");
+        puthex(size);
+        latx_bare_uart_puts("\n");
     }
+#endif
+    return bochs_bar_map_apply(bar_idx, new_gpa, size, enabled);
+}
+
+static int bochs_process_pending_bar_maps(void)
+{
+    BochsBarPending ops[2];
+    uint64_t ticket;
+    uint32_t map_additions = 0;
+    uint32_t mmio_additions = 0;
+    int pending = 0;
+
+    loongemu_spin_lock(&g_bochs_bar_lock);
+    pending = g_bochs_bar_pending[0].valid ||
+              g_bochs_bar_pending[1].valid;
+    loongemu_spin_unlock(&g_bochs_bar_lock);
+    if (!pending) {
+        return 0;
+    }
+    if (bochs_helper_context()) {
+        return -1;
+    }
+    ticket = hv_request_flush_all();
+    if (ticket == 0) {
+        return -1;
+    }
+    while (!hv_flush_barrier_ready(ticket)) {
+        __asm__ volatile("dbar 0x700" ::: "memory");
+    }
+
+    loongemu_spin_lock(&g_bochs_bar_lock);
+    for (uint32_t i = 0; i < 2u; i++) {
+        ops[i] = g_bochs_bar_pending[i];
+        g_bochs_bar_pending[i].valid = 0;
+    }
+    bochs_set_helper_bar_pending(0);
+    loongemu_spin_unlock(&g_bochs_bar_lock);
+
+    if (ops[0].valid && ops[1].valid &&
+        ops[0].enabled && ops[1].enabled &&
+        ops[0].gpa < ops[1].gpa + ops[1].size &&
+        ops[1].gpa < ops[0].gpa + ops[0].size) {
+        latx_platform_refuse("overlapping pending Bochs BAR mappings");
+    }
+    for (uint32_t i = 0; i < 2u; i++) {
+        if (!ops[i].valid) {
+            continue;
+        }
+        uint32_t bar_idx = i == 0u ? 0u : 2u;
+        if (!bochs_bar_map_can_apply(bar_idx, ops[i].gpa,
+                                     ops[i].size, ops[i].enabled)) {
+            latx_platform_refuse("Bochs BAR remap became unsafe before commit");
+        }
+        if (!ops[i].enabled) {
+            continue;
+        }
+        if (!mem_map_find_owned(&g_mem_map,
+                                bar_idx == 0u ? "bochs_fb" : "bochs_mmio",
+                                ops[i].gpa, 0)) {
+            map_additions++;
+        }
+        if (bar_idx == 0u) {
+            uint64_t fb_hpa;
+            uint8_t mat;
+            uint64_t backed = bochs_fb_get_backing(ops[i].size,
+                                                   &fb_hpa, &mat);
+            uint64_t sink_size = ops[i].size - backed;
+            uint64_t sink_gpa = ops[i].gpa + backed;
+            int sink_exists = 0;
+            if (sink_size != 0) {
+                for (uint32_t j = 0; j < g_mmio_region_count; j++) {
+                    if (g_mmio_regions[j].read_cb == bochs_oob_sink_read &&
+                        g_mmio_regions[j].opaque == 0 &&
+                        g_mmio_regions[j].gpa_base == sink_gpa &&
+                        g_mmio_regions[j].size == sink_size) {
+                        sink_exists = 1;
+                        break;
+                    }
+                }
+                if (!sink_exists) {
+                    mmio_additions++;
+                }
+            }
+        } else {
+            int mmio_exists = 0;
+            for (uint32_t j = 0; j < g_mmio_region_count; j++) {
+                if (g_mmio_regions[j].read_cb == loongemu_bochs_mmio_read &&
+                    g_mmio_regions[j].opaque == &g_pci_host.display &&
+                    g_mmio_regions[j].gpa_base == ops[i].gpa &&
+                    g_mmio_regions[j].size == ops[i].size) {
+                    mmio_exists = 1;
+                    break;
+                }
+            }
+            if (!mmio_exists) {
+                mmio_additions++;
+            }
+        }
+    }
+    if (g_mem_map.count + map_additions > LOONGEMU_MEM_MAX_REGIONS ||
+        g_mmio_region_count + mmio_additions > MAX_MMIO_REGIONS) {
+        latx_platform_refuse("Bochs BAR remap exceeds mapping capacity");
+    }
+    for (uint32_t i = 0; i < 2u; i++) {
+        if (ops[i].valid) {
+            uint32_t bar_idx = i == 0u ? 0u : 2u;
+            if (!bochs_bar_map_apply(bar_idx, ops[i].gpa,
+                                     ops[i].size, ops[i].enabled)) {
+                latx_platform_refuse("Bochs BAR remap commit failed");
+            }
+        }
+    }
+    if (!hv_release_flush_barrier(ticket)) {
+        latx_platform_refuse("Bochs BAR remap flush release failed");
+    }
+    return 1;
 }
 
 void tb_sys_set_vmm_handoff(const LoongemuVmmHandoff *handoff)
@@ -666,23 +1546,38 @@ static uint64_t vclock_read_host_rdtime(void *opaque)
     return now;
 }
 
+static void hv_init_shard_locks(void);
 static void init_phys_mem_and_vclock(void)
 {
+#ifdef LOONGEMU_BOOT_OVMF
+    g_vmm_image_base = g_vmm_handoff.vmm_image_base;
+    g_vmm_image_end = g_vmm_handoff.vmm_image_base +
+                       g_vmm_handoff.vmm_image_size;
+#else
     extern char _start[], _end[];
     uint64_t img_start = (uint64_t)(uintptr_t)_start & LAPG_PAGE_MASK;
     uint64_t vmm_end = ((uint64_t)(uintptr_t)_end + LAPG_PAGE_SIZE - 1) & LAPG_PAGE_MASK;
-
     g_vmm_image_base = img_start ? img_start : VMM_IMAGE_BASE;
     g_vmm_image_end = vmm_end;
-    g_host_timer_hz = loongemu_host_timer_hz();
+#endif
+    if (!g_guest_ram_external) {
+        g_host_timer_hz = loongemu_host_timer_hz();
+    }
     latx_host_timer_hz = g_host_timer_hz;
 
     loongemu_mem_map_init(&g_mem_map);
-    /* Host-protected VMM image, code_cache, env, fast_jmp_cache, kstack */
-    loongemu_mem_map_add(&g_mem_map, g_vmm_image_base, g_vmm_image_end - g_vmm_image_base,
-                         g_vmm_image_base, LOONGEMU_MEM_RESERVED, "vmm_reserved");
-    /* Guest RAM [0, 128 MiB) -> g_guest_ram_hpa + GPA */
-    loongemu_mem_map_add(&g_mem_map, GUEST_BASE, GUEST_RAM_SIZE,
+    /* Reserve host image addresses only when they do not overlap guest GPA RAM. */
+    if (!g_guest_ram_external ||
+        !vmm_handoff_ranges_overlap(g_vmm_image_base,
+                                    g_vmm_image_end - g_vmm_image_base,
+                                    GUEST_BASE, g_guest_ram_size)) {
+        loongemu_mem_map_add(&g_mem_map, g_vmm_image_base,
+                             g_vmm_image_end - g_vmm_image_base,
+                             g_vmm_image_base, LOONGEMU_MEM_RESERVED,
+                             "vmm_reserved");
+    }
+    /* Guest RAM GPA is backed by the dedicated UEFI allocation when handed off. */
+    loongemu_mem_map_add(&g_mem_map, GUEST_BASE, g_guest_ram_size,
                          g_guest_ram_hpa, LOONGEMU_MEM_RAM, "guest_ram");
     /* MMIO windows (trapped, never mapped directly as host RAM) */
     loongemu_mem_map_add(&g_mem_map, LOONGEMU_IOAPIC_GPA, 0x1000ULL,
@@ -696,43 +1591,39 @@ static void init_phys_mem_and_vclock(void)
     mmio_register(LOONGEMU_IOAPIC_GPA, 0x1000ULL,
                   ioapic_mmio_read_cb, ioapic_mmio_write_cb, 0);
 
-    /* OVMF board peripherals (CMOS/RTC, QEMU fw_cfg+DMA, 4GiB ROM & CFI pflash).
-     * Place ROM/flash backing buffers above g_vmm_image_end so VMM .bss stays isolated. */
-    uint64_t rom_sz = LOONGEMU_OVMF_DEFAULT_ROM_SZ;
-    uint64_t vars_sz = LOONGEMU_OVMF_DEFAULT_VARS_SZ;
-    {
-        uint64_t rom_hpa = (g_vmm_image_end + 0x10000ULL) & LAPG_PAGE_MASK;
+    /* OVMF storage is UEFI-allocated and handed over; the ELF test uses owned image buffers. */
+    uint64_t rom_sz;
+    uint64_t vars_sz;
 #ifdef LOONGEMU_BOOT_OVMF
-        extern const uint8_t _ovmf_code_start[], _ovmf_code_end[];
-        extern const uint8_t _ovmf_vars_start[], _ovmf_vars_end[];
-        rom_sz = (uint64_t)(_ovmf_code_end - _ovmf_code_start);
-        vars_sz = (uint64_t)(_ovmf_vars_end - _ovmf_vars_start);
-        uint64_t vars_hpa = (rom_hpa + rom_sz + LAPG_PAGE_SIZE - 1u) & LAPG_PAGE_MASK;
-        g_ovmf_code_rom = (uint8_t *)(uintptr_t)rom_hpa;
-        g_ovmf_vars_flash = (uint8_t *)(uintptr_t)vars_hpa;
-        memcpy(g_ovmf_code_rom, _ovmf_code_start, (size_t)rom_sz);
-        memcpy(g_ovmf_vars_flash, _ovmf_vars_start, (size_t)vars_sz);
+    if (!g_ovmf_storage_external) {
+        latx_platform_refuse("missing UEFI OVMF backing buffers");
+    }
+    rom_sz = g_vmm_handoff.ovmf_code_size;
+    vars_sz = g_vmm_handoff.ovmf_vars_size;
 #else
-        uint64_t vars_hpa = rom_hpa + rom_sz;
-        g_ovmf_code_rom = (uint8_t *)(uintptr_t)rom_hpa;
-        g_ovmf_vars_flash = (uint8_t *)(uintptr_t)vars_hpa;
-        memset(g_ovmf_code_rom, 0x90, (size_t)rom_sz);
-        memset(g_ovmf_vars_flash, 0xff, (size_t)vars_sz);
-        /* Default 16-bit real-mode reset vector at GPA 0xFFFFFFF0 (CS.base=0xFFFF0000, IP=0xFFF0) */
+    rom_sz = LOONGEMU_OVMF_DEFAULT_ROM_SZ;
+    vars_sz = LOONGEMU_OVMF_DEFAULT_VARS_SZ;
+    g_ovmf_code_rom = g_default_ovmf_code;
+    g_ovmf_vars_flash = g_default_ovmf_vars;
+    memset(g_ovmf_code_rom, 0x90, (size_t)rom_sz);
+    memset(g_ovmf_vars_flash, 0xff, (size_t)vars_sz);
+    /* Minimal reset stub is confined to the non-UEFI ELF self-test image. */
+    {
         static const uint8_t rv16[] = {
-            0xb8, 0x34, 0x12, /* mov ax, 0x1234 */
-            0x8e, 0xd8,       /* mov ds, ax     */
-            0xf4,             /* hlt            */
+            0xb8, 0x34, 0x12,
+            0x8e, 0xd8,
+            0xf4,
         };
         memcpy(&g_ovmf_code_rom[rom_sz - 16u], rv16, sizeof(rv16));
-#endif
-        g_bochs_fb_fallback_hpa = (vars_hpa + vars_sz + 0xfffffULL) & ~UINT64_C(0xfffff);
     }
+    g_bochs_fb_fallback_hpa =
+        (uint64_t)(uintptr_t)g_fb_fallback_pool;
+#endif
     loongemu_vclock_init(&g_vclock, LOONGEMU_VCLOCK_HOST_MONO,
                          g_host_timer_hz, g_host_timer_hz,
                          g_host_timer_hz, UINT64_C(62500000),
                          vclock_read_host_rdtime, 0);
-    ovmf_board_init(&g_ovmf_board, (uint64_t)GUEST_RAM_SIZE, MAX_VCPUS,
+    ovmf_board_init(&g_ovmf_board, g_guest_ram_size, MAX_VCPUS,
                     guest_phys_read_checked, guest_phys_write_checked);
     ovmf_board_set_wall_clock(&g_ovmf_board, vclock_wall_sec_cb, &g_vclock);
     ovmf_board_map_firmware(&g_ovmf_board, &g_mem_map,
@@ -746,7 +1637,8 @@ static void init_phys_mem_and_vclock(void)
                          0, LOONGEMU_MEM_MMIO, "pci_ecam");
     mmio_register(LOONGEMU_PCI_ECAM_GPA, LOONGEMU_PCI_ECAM_SIZE,
                   loongemu_pci_ecam_read, loongemu_pci_ecam_write, &g_pci_host);
-    if (g_vmm_handoff.magic == LOONGEMU_VMM_HANDOFF_MAGIC && g_vmm_handoff.gop.valid) {
+    g_phys_mem_initialized = 1;
+    if (g_vmm_handoff.magic == LOONGEMU_VMM_HANDOFF_MAGIC) {
         tb_sys_set_vmm_handoff(&g_vmm_handoff);
     } else {
         loongemu_pci_host_init(&g_pci_host, 0, bochs_display_bar_map_cb, 0);
@@ -757,6 +1649,9 @@ static void init_phys_mem_and_vclock(void)
     loongemu_spin_init(&g_pic_lock);
     loongemu_spin_init(&g_translate_lock);
     loongemu_spin_init(&g_code_page_lock);
+    loongemu_spin_init(&g_hv_barrier_lock);
+    loongemu_spin_init(&g_bochs_bar_lock);
+    hv_init_shard_locks();
 }
 
 uint64_t latx_platform_phys_read(uint64_t pa, int size)
@@ -998,6 +1893,13 @@ typedef struct PerCoreShard {
     volatile int smc_dirty_overflow;
     volatile int smc_dirty;
     volatile int tlb_shootdown_pending;
+    LoongemuSpinLock hv_flush_lock;
+    volatile uint64_t hv_flush_pending_vps;
+    volatile uint64_t hv_flush_requested;
+    volatile uint64_t hv_flush_completed;
+    volatile uint64_t hv_barrier_pending;
+    volatile uint64_t hv_barrier_parked;
+    volatile uint32_t hv_recycle_pending;
     volatile uint64_t current_tb_code;
     volatile uint32_t current_tb_size;
     volatile uint64_t current_tb_pc;
@@ -1006,6 +1908,7 @@ typedef struct PerCoreShard {
     volatile uint64_t active_helper_a1;
     volatile uint64_t active_helper_a2;
     volatile uint64_t active_helper_ra;
+    volatile uint32_t active_helper_bar_pending;
     AsidSlot asid_slots[ASID_SLOTS];
     uint16_t next_asid;
     uint16_t cur_asid;
@@ -1017,6 +1920,13 @@ typedef struct PerCoreShard {
 } PerCoreShard;
 
 static PerCoreShard g_shard[MAX_VCPUS];
+
+static void hv_init_shard_locks(void)
+{
+    for (uint32_t pcpu = 0; pcpu < MAX_VCPUS; pcpu++) {
+        loongemu_spin_init(&g_shard[pcpu].hv_flush_lock);
+    }
+}
 #define cur_shard (&g_shard[cur_pcpu()])
 #define code_used (cur_shard->code_used)
 #define tb_entries (cur_shard->tb_entries)
@@ -1042,6 +1952,7 @@ static PerCoreShard g_shard[MAX_VCPUS];
 #define g_active_helper_a1 (cur_shard->active_helper_a1)
 #define g_active_helper_a2 (cur_shard->active_helper_a2)
 #define g_active_helper_ra (cur_shard->active_helper_ra)
+#define g_active_helper_bar_pending (cur_shard->active_helper_bar_pending)
 #define g_asid_slots (cur_shard->asid_slots)
 #define g_next_asid (cur_shard->next_asid)
 #define g_cur_asid (cur_shard->cur_asid)
@@ -1050,6 +1961,41 @@ static PerCoreShard g_shard[MAX_VCPUS];
 #define g_cur_asid_pcid (cur_shard->cur_asid_pcid)
 #define g_cur_asid_cpl (cur_shard->cur_asid_cpl)
 #define g_cur_asid_mmu_flags (cur_shard->cur_asid_mmu_flags)
+static void bochs_set_helper_bar_pending(uint32_t pending)
+{
+    g_active_helper_bar_pending = pending;
+}
+static int bochs_helper_context(void)
+{
+    return g_active_helper_fn != 0;
+}
+static int bochs_helper_is_pci_cfg_out(void)
+{
+    uint64_t fn = g_active_helper_fn;
+    uint32_t port = (uint32_t)g_active_helper_a1;
+
+    return (fn == (uint64_t)(uintptr_t)helper_outb ||
+            fn == (uint64_t)(uintptr_t)helper_outw ||
+            fn == (uint64_t)(uintptr_t)helper_outl) &&
+           port >= LOONGEMU_PCI_CFG_DATA_PORT &&
+           port <= LOONGEMU_PCI_CFG_DATA_PORT + 3u;
+}
+static int bochs_bar_pending_present(void)
+{
+    int pending;
+
+    loongemu_spin_lock(&g_bochs_bar_lock);
+    pending = g_bochs_bar_pending[0].valid ||
+              g_bochs_bar_pending[1].valid;
+    loongemu_spin_unlock(&g_bochs_bar_lock);
+    return pending;
+}
+static int bochs_helper_requires_tb_exit(void)
+{
+    return g_active_helper_bar_pending &&
+           bochs_helper_is_pci_cfg_out() &&
+           bochs_bar_pending_present();
+}
 
 static uint64_t g_code_page_bitmap[CODE_PAGE_MAX_PFN / 64];
 static volatile uint64_t g_smc_granular_evicts;
@@ -1086,8 +2032,22 @@ static void smc_record_dirty_pfn(uint32_t pfn)
     loongemu_spin_unlock(&g_code_page_lock);
 }
 
+#define PLV3_HOST_ALIAS_BASE UINT64_C(0x9000000000000000)
+#define PLV3_HOST_ALIAS_PREFIX_MASK UINT64_C(0xffff000000000000)
+#define PLV3_HOST_ALIAS_PHYS_MASK UINT64_C(0x0000ffffffffffff)
+
+static uint64_t plv3_code_pc_to_phys(uint64_t code_pc)
+{
+    if ((code_pc & PLV3_HOST_ALIAS_PREFIX_MASK) ==
+        PLV3_HOST_ALIAS_BASE) {
+        return code_pc & PLV3_HOST_ALIAS_PHYS_MASK;
+    }
+    return code_pc;
+}
+
 static int find_tb_slot_by_code_pc(uint64_t fault_pc)
 {
+    fault_pc = plv3_code_pc_to_phys(fault_pc);
     uint32_t lo = 0, hi = g_tb_by_code_count;
     while (lo < hi) {
         uint32_t mid = lo + ((hi - lo) >> 1);
@@ -1160,6 +2120,7 @@ static volatile uint64_t g_hw_guest_pf;
 static volatile uint64_t g_hw_guest_gp;
 static uint64_t resolve_fault_x86_pc(uint64_t fault_pc)
 {
+    fault_pc = plv3_code_pc_to_phys(fault_pc);
     if (g_current_tb_map != 0 &&
         fault_pc >= g_current_tb_code &&
         fault_pc < g_current_tb_code + (uint64_t)g_current_tb_size) {
@@ -1292,7 +2253,7 @@ static inline uint64_t csrrd(unsigned int n)
 #define R(x) case x: __asm__ volatile("csrrd %0, " #x : "=r"(v)); break;
     R(0x0) R(0x1) R(0x2) R(0x4) R(0x5) R(0x6) R(0x7) R(0xc)
     R(0x10) R(0x11) R(0x12) R(0x13) R(0x18) R(0x1c) R(0x1d) R(0x1e)
-    R(0x88) R(0x89) R(0x8a) R(0x8f) R(0x180) R(0x181)
+    R(0x88) R(0x89) R(0x8a) R(0x8f) R(0x180) R(0x181) R(0x182) R(0x183)
 #undef R
     default:
         break;
@@ -1307,7 +2268,7 @@ static inline void csrwr(unsigned int n, uint64_t v)
     case x: __asm__ volatile("move $r12,%0\n csrwr $r12," #x :: "r"(v) : "r12", "memory"); break;
     W(0x0) W(0x1) W(0x2) W(0x4) W(0x6) W(0xc)
     W(0x10) W(0x11) W(0x12) W(0x13) W(0x18) W(0x1c) W(0x1d) W(0x1e)
-    W(0x88) W(0x8a) W(0x8c) W(0x8d) W(0x8e) W(0x8f) W(0x180) W(0x181)
+    W(0x88) W(0x8a) W(0x8c) W(0x8d) W(0x8e) W(0x8f) W(0x180) W(0x181) W(0x182) W(0x183)
 #undef W
     default:
         break;
@@ -1530,6 +2491,344 @@ static void asid_activate(int force_flush)
     csrwr(0x18, (uint64_t)asid);
 }
 
+static uint32_t hv_vp_owner_pcpu(uint32_t vp)
+{
+    uint32_t owner;
+
+    if (vp >= MAX_VCPUS) {
+        return 0;
+    }
+    owner = __atomic_load_n(&g_vp_owner[vp], __ATOMIC_ACQUIRE);
+    if (owner < MAX_VCPUS &&
+        __atomic_load_n(&g_pcpu_online[owner], __ATOMIC_ACQUIRE)) {
+        return owner;
+    }
+    return 0;
+}
+
+/*
+ * TLB requests may invalidate this shard while a PLV3 helper continuation
+ * still returns through its translated TB.  The TB index is cut over before
+ * ACK; code storage is recycled only after the helper has left PLV3.
+ */
+static int hv_recycle_tb_shard(void)
+{
+    if (!__atomic_load_n(&cur_shard->hv_recycle_pending, __ATOMIC_ACQUIRE) ||
+        g_active_helper_fn != 0) {
+        return 0;
+    }
+    if (!__atomic_exchange_n(&cur_shard->hv_recycle_pending, 0,
+                             __ATOMIC_ACQ_REL)) {
+        return 0;
+    }
+    code_used = 0x2000;
+    g_current_tb_code = 0;
+    g_current_tb_size = 0;
+    g_current_tb_pc = 0;
+    g_current_tb_map = 0;
+    __asm__ volatile("dbar 0x700\n ibar 0" ::: "memory");
+    return 1;
+}
+
+static uint64_t hv_publish_flush_request(uint32_t pcpu, uint64_t vp_mask,
+                                         uint64_t barrier_ticket)
+{
+    PerCoreShard *shard = &g_shard[pcpu];
+    uint64_t ticket;
+
+    /* Order guest page-table stores before publishing this mailbox request. */
+    __asm__ volatile("dbar 0x700" ::: "memory");
+    loongemu_spin_lock(&shard->hv_flush_lock);
+    shard->hv_flush_pending_vps |= vp_mask;
+    if (barrier_ticket != 0) {
+        shard->hv_barrier_pending = barrier_ticket;
+    }
+    ticket = ++shard->hv_flush_requested;
+    loongemu_spin_unlock(&shard->hv_flush_lock);
+    return ticket;
+}
+
+/*
+ * Called only from a dispatcher-safe point, or from the terminal VMCALL /
+ * VMMCALL helper.  An IPI handler only leaves the mailbox pending: an
+ * arbitrary interrupted TB must finish through the PLV0 epilogue first.
+ */
+static int hv_service_flush_requests(void)
+{
+    PerCoreShard *shard = cur_shard;
+    uint64_t vp_mask;
+    uint64_t ticket;
+    uint64_t barrier_ticket;
+    uint32_t self = cur_pcpu();
+
+    if (g_active_helper_fn != 0 &&
+        g_active_helper_fn != (uint64_t)(uintptr_t)helper_hypercall) {
+        return 0;
+    }
+
+    loongemu_spin_lock(&shard->hv_flush_lock);
+    vp_mask = shard->hv_flush_pending_vps;
+    ticket = shard->hv_flush_requested;
+    barrier_ticket = shard->hv_barrier_pending;
+    shard->hv_flush_pending_vps = 0;
+    shard->hv_barrier_pending = 0;
+    loongemu_spin_unlock(&shard->hv_flush_lock);
+    if (vp_mask == 0) {
+        return 0;
+    }
+
+    for (uint32_t vp = 0; vp < MAX_VCPUS; vp++) {
+        if (vp_mask & (UINT64_C(1) << vp)) {
+            latx_x86_tlb_flush_cpu(vp);
+        }
+    }
+    __asm__ volatile("invtlb 0x3, $zero, $zero" ::: "memory");
+    memset(g_asid_slots, 0, sizeof(g_asid_slots));
+    g_next_asid = 1;
+    asid_activate(1);
+
+    /*
+     * The entire per-pCPU TB index is shared by its VPs.  With fast indirect
+     * jumps disabled, clear every VP cache that can name code on this shard;
+     * never touch caches owned by a different active pCPU.
+     */
+    for (uint32_t vp = 0; vp < MAX_VCPUS; vp++) {
+        if ((vp_mask & (UINT64_C(1) << vp)) ||
+            hv_vp_owner_pcpu(vp) == self) {
+            memset(g_fast_jmp_cache[vp], 0, sizeof(g_fast_jmp_cache[0]));
+        }
+    }
+    tbc_flush_all(&tb_cache);
+    g_tb_highwater = 0;
+    g_tb_by_code_count = 0;
+    __atomic_store_n(&shard->hv_recycle_pending, 1u, __ATOMIC_RELEASE);
+    __asm__ volatile("dbar 0x700\n ibar 0\n dbar 0x700" ::: "memory");
+
+    (void)hv_recycle_tb_shard();
+    __atomic_store_n(&shard->hv_flush_completed, ticket, __ATOMIC_RELEASE);
+    if (barrier_ticket != 0) {
+        __atomic_store_n(&shard->hv_barrier_parked, barrier_ticket,
+                         __ATOMIC_RELEASE);
+        if (self != __atomic_load_n(&g_hv_barrier_coordinator,
+                                    __ATOMIC_ACQUIRE)) {
+            while (__atomic_load_n(&g_hv_barrier_released,
+                                   __ATOMIC_ACQUIRE) < barrier_ticket) {
+                (void)hv_service_flush_requests();
+                __asm__ volatile("dbar 0x700" ::: "memory");
+            }
+        }
+    }
+    return 1;
+}
+
+
+static void hv_flush_vp_mask(uint64_t mask)
+{
+    uint64_t owner_mask[MAX_VCPUS] = {0};
+    uint64_t ticket[MAX_VCPUS] = {0};
+    uint32_t self = cur_pcpu();
+
+    for (uint32_t vp = 0; vp < MAX_VCPUS; vp++) {
+        if ((mask & (UINT64_C(1) << vp)) != 0) {
+            uint32_t owner = hv_vp_owner_pcpu(vp);
+            owner_mask[owner] |= UINT64_C(1) << vp;
+        }
+    }
+
+    for (uint32_t pcpu = 0; pcpu < MAX_VCPUS; pcpu++) {
+        if (owner_mask[pcpu] == 0) {
+            continue;
+        }
+        ticket[pcpu] = hv_publish_flush_request(pcpu, owner_mask[pcpu], 0);
+        if (pcpu != self) {
+            __asm__ volatile("dbar 0x700" ::: "memory");
+            loongemu_ipi_send(pcpu, LOONGEMU_IPI_TLB_SHOOTDOWN);
+        }
+    }
+
+    /*
+     * Handle a local request synchronously, then service reciprocal requests
+     * while waiting.  The mailbox lock is never held across a wait.
+     */
+    if (ticket[self] != 0) {
+        (void)hv_service_flush_requests();
+    }
+    for (uint32_t pcpu = 0; pcpu < MAX_VCPUS; pcpu++) {
+        while (ticket[pcpu] != 0 &&
+               __atomic_load_n(&g_shard[pcpu].hv_flush_completed,
+                               __ATOMIC_ACQUIRE) < ticket[pcpu]) {
+            (void)hv_service_flush_requests();
+            __asm__ volatile("dbar 0x700" ::: "memory");
+        }
+    }
+}
+
+/*
+ * Hand a VP from the BSP multiplexer to its physical AP only after stopping
+ * the old owner and completing a local flush.  Publishing the owner before
+ * that flush lets a remote request ACK against a TLB the BSP is still using.
+ * Runs only at a dispatcher-safe point.
+ */
+static void hv_try_transfer_ap_ownership(void)
+{
+    uint32_t self = cur_pcpu();
+
+    for (uint32_t vp = 1; vp < MAX_VCPUS; vp++) {
+        if (__atomic_load_n(&g_vcpu_online[vp], __ATOMIC_ACQUIRE) == 0 ||
+            __atomic_load_n(&g_pcpu_online[vp], __ATOMIC_ACQUIRE) == 0 ||
+            __atomic_load_n(&g_vp_owner[vp], __ATOMIC_ACQUIRE) != 0) {
+            continue;
+        }
+        if (g_cur_vcpu == vp) {
+            switch_vcpu(0);
+        }
+        hv_flush_vp_mask(UINT64_C(1) << vp);
+        __atomic_store_n(&g_vp_owner[vp], vp, __ATOMIC_RELEASE);
+        if (vp != self) {
+            loongemu_ipi_send(vp, 0u);
+        }
+    }
+}
+
+/*
+ * Start a two-phase all-owner cutover from a PLV0 safe point.  The caller
+ * must not change mappings until every owner is parked and acknowledged.
+ */
+uint64_t hv_request_flush_all(void)
+{
+    uint64_t owner_mask[MAX_VCPUS] = {0};
+    uint64_t targets = 0;
+    uint64_t ticket;
+    uint32_t self = cur_pcpu();
+
+    if (g_active_helper_fn != 0) {
+        return 0;
+    }
+    for (uint32_t vp = 0; vp < MAX_VCPUS; vp++) {
+        owner_mask[hv_vp_owner_pcpu(vp)] |= UINT64_C(1) << vp;
+    }
+    for (uint32_t pcpu = 0; pcpu < MAX_VCPUS; pcpu++) {
+        if (owner_mask[pcpu] != 0) {
+            targets |= UINT64_C(1) << pcpu;
+        }
+    }
+
+    loongemu_spin_lock(&g_hv_barrier_lock);
+    if (__atomic_load_n(&g_hv_barrier_active, __ATOMIC_ACQUIRE) != 0) {
+        loongemu_spin_unlock(&g_hv_barrier_lock);
+        return 0;
+    }
+    ticket = ++g_hv_barrier_generation;
+    if (ticket == 0) {
+        ticket = ++g_hv_barrier_generation;
+    }
+    __atomic_store_n(&g_hv_barrier_coordinator, self, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_hv_barrier_targets, targets, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_hv_barrier_active, ticket, __ATOMIC_RELEASE);
+    for (uint32_t pcpu = 0; pcpu < MAX_VCPUS; pcpu++) {
+        if (owner_mask[pcpu] == 0) {
+            continue;
+        }
+        (void)hv_publish_flush_request(pcpu, owner_mask[pcpu], ticket);
+        if (pcpu != self) {
+            __asm__ volatile("dbar 0x700" ::: "memory");
+            loongemu_ipi_send(pcpu, LOONGEMU_IPI_TLB_SHOOTDOWN);
+        }
+    }
+    loongemu_spin_unlock(&g_hv_barrier_lock);
+
+    if (owner_mask[self] != 0) {
+        (void)hv_service_flush_requests();
+    }
+    return ticket;
+}
+
+int hv_flush_barrier_ready(uint64_t ticket)
+{
+    uint64_t targets;
+
+    if (ticket == 0 ||
+        __atomic_load_n(&g_hv_barrier_active, __ATOMIC_ACQUIRE) != ticket) {
+        return 0;
+    }
+    (void)hv_service_flush_requests();
+    targets = __atomic_load_n(&g_hv_barrier_targets, __ATOMIC_ACQUIRE);
+    for (uint32_t pcpu = 0; pcpu < MAX_VCPUS; pcpu++) {
+        if ((targets & (UINT64_C(1) << pcpu)) != 0 &&
+            __atomic_load_n(&g_shard[pcpu].hv_barrier_parked,
+                            __ATOMIC_ACQUIRE) < ticket) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int hv_release_flush_barrier(uint64_t ticket)
+{
+    if (ticket == 0 ||
+        __atomic_load_n(&g_hv_barrier_active, __ATOMIC_ACQUIRE) != ticket ||
+        __atomic_load_n(&g_hv_barrier_coordinator, __ATOMIC_ACQUIRE) !=
+            cur_pcpu() ||
+        !hv_flush_barrier_ready(ticket)) {
+        return 0;
+    }
+    __atomic_store_n(&g_hv_barrier_released, ticket, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_hv_barrier_targets, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_hv_barrier_active, 0, __ATOMIC_RELEASE);
+    return 1;
+}
+
+void hv_cancel_flush_barrier(uint64_t ticket)
+{
+    if (ticket == 0 ||
+        __atomic_load_n(&g_hv_barrier_active, __ATOMIC_ACQUIRE) != ticket ||
+        __atomic_load_n(&g_hv_barrier_coordinator, __ATOMIC_ACQUIRE) !=
+            cur_pcpu()) {
+        return;
+    }
+    /*
+     * Do not release a generation while a target still has its mailbox
+     * request unconsumed: the next barrier could overwrite it and the old
+     * target would park forever.  Drain every target before reuse.
+     */
+    while (!hv_flush_barrier_ready(ticket)) {
+        (void)hv_service_flush_requests();
+        __asm__ volatile("dbar 0x700" ::: "memory");
+    }
+    /* Safe only before the caller commits the remap. */
+    __atomic_store_n(&g_hv_barrier_released, ticket, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_hv_barrier_targets, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_hv_barrier_active, 0, __ATOMIC_RELEASE);
+}
+
+static int hv_wait_for_barrier_release(void)
+{
+    uint32_t self = cur_pcpu();
+    uint64_t ticket = __atomic_load_n(&g_hv_barrier_active, __ATOMIC_ACQUIRE);
+
+    if (ticket == 0 ||
+        __atomic_load_n(&g_hv_barrier_coordinator, __ATOMIC_ACQUIRE) != self) {
+        return 0;
+    }
+    while (__atomic_load_n(&g_hv_barrier_active, __ATOMIC_ACQUIRE) == ticket) {
+        (void)hv_service_flush_requests();
+        __asm__ volatile("dbar 0x700" ::: "memory");
+    }
+
+    /* Discard code translated while a coordinator was waiting on the barrier. */
+    for (uint32_t vp = 0; vp < MAX_VCPUS; vp++) {
+        if (hv_vp_owner_pcpu(vp) == self) {
+            memset(g_fast_jmp_cache[vp], 0, sizeof(g_fast_jmp_cache[0]));
+        }
+    }
+    tbc_flush_all(&tb_cache);
+    g_tb_highwater = 0;
+    g_tb_by_code_count = 0;
+    __atomic_store_n(&cur_shard->hv_recycle_pending, 1u, __ATOMIC_RELEASE);
+    (void)hv_recycle_tb_shard();
+    return 1;
+}
+
 static void latx_platform_tlb_shootdown_all(void)
 {
     uint32_t self = cur_pcpu();
@@ -1540,7 +2839,8 @@ static void latx_platform_tlb_shootdown_all(void)
     asid_activate(1);
     for (uint32_t c = 0; c < MAX_VCPUS; c++) {
         if (c != self && __atomic_load_n(&g_pcpu_online[c], __ATOMIC_ACQUIRE)) {
-            g_shard[c].tlb_shootdown_pending = 1;
+            __atomic_store_n(&g_shard[c].tlb_shootdown_pending, 1u,
+                             __ATOMIC_RELEASE);
             loongemu_ipi_send(c, 1u);
         }
     }
@@ -1845,7 +3145,7 @@ static void ioapic_reset(void)
 
 static void lapic_set_irr(uint32_t cpu, uint32_t vec)
 {
-    if (cpu < MAX_VCPUS && vec >= 0x20u && vec < 256u) {
+    if (cpu < MAX_VCPUS && vec >= 0x10u && vec < 256u) {
         g_lapic[cpu].irr[vec >> 5] |= (1u << (vec & 31u));
     }
 }
@@ -1908,8 +3208,12 @@ static uint32_t lapic_pop_irr(uint32_t cpu)
             for (int b = 31; b >= 0; b--) {
                 if (bits & (1u << b)) {
                     uint32_t vec = (uint32_t)(i * 32 + b);
-                    if (vec < 0x20u || ((vec >> 4) & 0xfu) <= min_prio) {
+                    if (vec < 0x10u || ((vec >> 4) & 0xfu) <= min_prio) {
                         return 0;
+                    }
+                    if (isr_prio != 0u) {
+                        /* A nested interrupt requires a conventional EOI. */
+                        pv_eoi_clear_locked(cpu);
                     }
                     l->irr[i] &= ~(1u << b);
                     l->isr[i] |= (1u << b);
@@ -2211,6 +3515,7 @@ static uint64_t g_hv_guest_os_id;
 static uint64_t g_hv_hypercall_msr;
 static uint64_t g_hv_apic_assist[MAX_VCPUS];
 static volatile uint8_t g_hv_apic_assist_pending[MAX_VCPUS];
+static volatile uint64_t g_hv_flush_calls;
 
 static void pv_eoi_sync_locked(uint32_t cpu)
 {
@@ -2376,15 +3681,17 @@ void latx_platform_kvm_wrmsr(CPUX86State *e, uint32_t msr, uint64_t val)
         break;
     case 0x40000073u: /* HV_X64_MSR_APIC_ASSIST_PAGE */
         loongemu_spin_lock(&g_lapic_lock);
-        g_hv_apic_assist_pending[cpu] = 0;
-        if ((val & 1u) != 0) {
+        pv_eoi_sync_locked(cpu);
+        if ((val & UINT64_C(0xffe)) == 0u && (val & 1u) != 0) {
             uint64_t gpa = val & ~UINT64_C(0xfff);
-            if (guest_phys_write_checked(gpa, 4, 0u)) {
+            LoongemuMemLookup lk;
+            if (loongemu_mem_resolve(&g_mem_map, gpa, 4096u, &lk) == LOONGEMU_MEM_RAM &&
+                guest_phys_write_checked(gpa, 4, 0u)) {
+                pv_eoi_clear_locked(cpu);
                 g_hv_apic_assist[cpu] = val;
-            } else {
-                g_hv_apic_assist[cpu] = 0;
             }
-        } else {
+        } else if ((val & 1u) == 0 && (val & UINT64_C(0xffe)) == 0u) {
+            pv_eoi_clear_locked(cpu);
             g_hv_apic_assist[cpu] = 0;
         }
         loongemu_spin_unlock(&g_lapic_lock);
@@ -2434,60 +3741,61 @@ int latx_platform_kvm_rdmsr(CPUX86State *e, uint32_t msr, uint64_t *val)
     }
 }
 
+static int hv_read_guest_qword(void *opaque, uint64_t gpa, uint64_t *value)
+{
+    LoongemuMemLookup lk;
+    (void)opaque;
+    return loongemu_mem_resolve(&g_mem_map, gpa, 8u, &lk) == LOONGEMU_MEM_RAM &&
+           guest_phys_read_checked(gpa, 8, value);
+}
+
+static uint64_t hv_read_xmm_qword(void *opaque, unsigned index)
+{
+    CPUX86State *e = (CPUX86State *)opaque;
+    return e->xmm_regs[index / 2u].ZMM_Q(index % 2u);
+}
+
+static void hv_flush_callback(void *opaque, uint64_t mask,
+                              uint64_t address_space, uint64_t flags)
+{
+    (void)opaque;
+    (void)address_space;
+    (void)flags;
+    __atomic_fetch_add(&g_hv_flush_calls, 1u, __ATOMIC_RELAXED);
+    /* Full flush is a permitted superset for selected VPs and address spaces. */
+    hv_flush_vp_mask(mask);
+}
+
+static void hv_send_ipi_callback(void *opaque, uint64_t mask, uint8_t vector)
+{
+    uint32_t self = cur_pcpu();
+    (void)opaque;
+    loongemu_spin_lock(&g_lapic_lock);
+    for (uint32_t v = 0; v < MAX_VCPUS; v++) {
+        if ((mask & (UINT64_C(1) << v)) == 0 ||
+            !__atomic_load_n(&g_vcpu_online[v], __ATOMIC_ACQUIRE)) {
+            continue;
+        }
+        lapic_set_irr(v, vector);
+        __atomic_store_n(&g_vcpu_halted[v], 0, __ATOMIC_RELEASE);
+        if (v != self && __atomic_load_n(&g_pcpu_online[v], __ATOMIC_ACQUIRE)) {
+            loongemu_ipi_send(v, 0u);
+        }
+    }
+    loongemu_spin_unlock(&g_lapic_lock);
+}
+
 void helper_hypercall(CPUX86State *e)
 {
     uint32_t self_pcpu = cur_pcpu();
 
     if (latx_hv_vendor == 1u) {
-        /* Hyper-V x64 ABI: RCX=control (bits[15:0]=code, bit16=fast), RDX=in, R8=out/fast2 */
-        uint64_t ctrl = e->regs[R_ECX];
-        uint16_t code = (uint16_t)(ctrl & 0xffffu);
-        int fast = (int)((ctrl >> 16) & 1u);
-        switch (code) {
-        case 0x0002u: /* HvCallFlushVirtualAddressSpace */
-        case 0x0003u: /* HvCallFlushVirtualAddressList */
-        case 0x0013u: /* HvCallFlushVirtualAddressSpaceEx */
-        case 0x0014u: /* HvCallFlushVirtualAddressListEx */
-            latx_x86_tlb_flush_all();
-            latx_platform_tlb_flush_all();
-            e->regs[R_EAX] = 0; /* HV_STATUS_SUCCESS */
-            return;
-        case 0x0008u: /* HvCallNotifyLongSpinWait */
-            e->regs[R_EAX] = 0; /* HV_STATUS_SUCCESS */
-            return;
-        case 0x000bu: { /* HvCallSendSyntheticClusterIpi */
-            uint64_t vec_raw = 0, mask = 0;
-            if (fast) {
-                vec_raw = e->regs[R_EDX] & 0xffu;
-                mask = e->regs[8]; /* R8 */
-            } else {
-                uint64_t in_gpa = e->regs[R_EDX];
-                if (!guest_phys_read_checked(in_gpa + 0u, 4, &vec_raw) ||
-                    !guest_phys_read_checked(in_gpa + 8u, 8, &mask)) {
-                    e->regs[R_EAX] = 0x0005u; /* HV_STATUS_INVALID_PARAMETER */
-                    return;
-                }
-                vec_raw &= 0xffu;
-            }
-            loongemu_spin_lock(&g_lapic_lock);
-            for (uint32_t t = 0; t < MAX_VCPUS; t++) {
-                if ((mask & (UINT64_C(1) << t)) == 0) {
-                    continue;
-                }
-                lapic_set_irr(t, (uint32_t)vec_raw);
-                g_vcpu_halted[t] = 0;
-                if (t != self_pcpu && __atomic_load_n(&g_pcpu_online[t], __ATOMIC_ACQUIRE)) {
-                    loongemu_ipi_send(t, 0u);
-                }
-            }
-            loongemu_spin_unlock(&g_lapic_lock);
-            e->regs[R_EAX] = 0; /* HV_STATUS_SUCCESS */
-            return;
-        }
-        default:
-            e->regs[R_EAX] = 0x0002u; /* HV_STATUS_INVALID_HYPERCALL_CODE */
-            return;
-        }
+        LoongemuHypervOps ops = {e, latx_guest_nr_cpus, hv_read_guest_qword,
+                                 hv_read_xmm_qword, hv_flush_callback,
+                                 hv_send_ipi_callback};
+        e->regs[R_EAX] = loongemu_hyperv_call(&ops, e->regs[R_ECX],
+                                              e->regs[R_EDX], e->regs[R_R8]);
+        return;
     }
 
     uint64_t nr = e->regs[R_EAX];
@@ -2594,7 +3902,9 @@ static int emulate_mmio_insn(uint64_t fault_pc, uint64_t gpa,
 
     if (is_store) {
         if (reg->write_cb != 0) {
+            g_bochs_mmio_bar_write++;
             reg->write_cb(reg->opaque, off, regs[rd], (unsigned)size);
+            g_bochs_mmio_bar_write--;
         }
     } else {
         uint64_t val = reg->read_cb ? reg->read_cb(reg->opaque, off, (unsigned)size) : 0;
@@ -2610,7 +3920,19 @@ static int emulate_mmio_insn(uint64_t fault_pc, uint64_t gpa,
         }
     }
 
-    if (is_refill) {
+    if (bochs_bar_pending_present()) {
+        /*
+         * The store completed, but the BAR move is queued for the all-owner
+         * barrier.  Return to the PLV0 dispatcher now so no later instruction
+         * in this TB can touch the old framebuffer mapping before cutover.
+         */
+        if (is_refill) {
+            csrwr(0x8a,
+                  ((uint64_t)(uintptr_t)tb_sys_plv3_done & ~UINT64_C(3)) | 1u);
+        } else {
+            csrwr(0x6, (uint64_t)(uintptr_t)tb_sys_plv3_done);
+        }
+    } else if (is_refill) {
         csrwr(0x8a, ((fault_pc + 4) & ~UINT64_C(3)) | 1u);
     } else {
         csrwr(0x6, fault_pc + 4);
@@ -2659,24 +3981,24 @@ static int start_ap_from_sipi(uint32_t cpu_id, uint32_t vec)
             break;
         }
         uint64_t hdr = sipi_pa - back;
-        uint32_t t_start = *(volatile uint32_t *)(uintptr_t)(hdr + 0x08);
-        uint32_t t_hdr = *(volatile uint32_t *)(uintptr_t)(hdr + 0x0c);
+        uint32_t t_start = *(volatile uint32_t *)gpa_to_host_ptr(hdr + 0x08);
+        uint32_t t_hdr = *(volatile uint32_t *)gpa_to_host_ptr(hdr + 0x0c);
         if (t_start == (uint32_t)sipi_pa &&
             t_hdr >= (uint32_t)hdr && t_hdr < (uint32_t)(hdr + 0x10000u)) {
             static const uint32_t pgd_offs[3] = { 0x18u, 0x14u, 0x10u };
             uint32_t t_pgd = 0;
             for (int k = 0; k < 3; k++) {
-                uint32_t cand = *(volatile uint32_t *)(uintptr_t)(hdr + pgd_offs[k]);
-                if (cand != 0 && (cand & 0xfffu) == 0 && cand < GUEST_RAM_SIZE &&
-                    (*(volatile uint64_t *)(uintptr_t)(cand + 511u * 8u) & 1u) != 0) {
+                uint32_t cand = *(volatile uint32_t *)gpa_to_host_ptr(hdr + pgd_offs[k]);
+                if (cand != 0 && (cand & 0xfffu) == 0 && cand < g_guest_ram_size &&
+                    (*(volatile uint64_t *)gpa_to_host_ptr(cand + 511u * 8u) & 1u) != 0) {
                     t_pgd = cand;
                     break;
                 }
             }
             if (t_pgd != 0) {
-                uint64_t s = *(volatile uint64_t *)(uintptr_t)(t_hdr + 0x00);
-                uint64_t ef = *(volatile uint64_t *)(uintptr_t)(t_hdr + 0x08);
-                uint32_t c4 = *(volatile uint32_t *)(uintptr_t)(t_hdr + 0x10);
+                uint64_t s = *(volatile uint64_t *)gpa_to_host_ptr(t_hdr + 0x00);
+                uint64_t ef = *(volatile uint64_t *)gpa_to_host_ptr(t_hdr + 0x08);
+                uint32_t c4 = *(volatile uint32_t *)gpa_to_host_ptr(t_hdr + 0x10);
                 if ((s >> 48) == 0xffffu) {
                     start_rip = s;
                     efer_val = ef;
@@ -2721,7 +4043,7 @@ static int start_ap_from_sipi(uint32_t cpu_id, uint32_t vec)
     ap->regs[R_ESP] = 0x7ff0;
     ap->eflags = 0x2;
     memset(g_fast_jmp_cache[cpu_id], 0, sizeof(g_fast_jmp_cache[0]));
-    ap->tb_jmp_cache_ptr = g_fast_jmp_cache[cpu_id];
+    ap->tb_jmp_cache_ptr = 0;
     g_vcpu_halted[cpu_id] = 0;
     g_vcpu_kicked[cpu_id] = 0;
     g_vcpu_init_pending[cpu_id] = 0;
@@ -2737,6 +4059,7 @@ static uint64_t build_guest_leaf_pte(uint32_t x86_r,
     uint64_t gpa_page = x86_tr->gpa & LAPG_PAGE_MASK;
     uint64_t hpa_page = 0;
     uint32_t perm = LAPG_PERM_READ | LAPG_PERM_USER;
+    uint32_t mat = LAPG_MAT_SUC;
     LoongemuMemLookup lk;
     LoongemuMemKind mk = loongemu_mem_resolve(&g_mem_map, gpa_page,
                                               LAPG_PAGE_SIZE, &lk);
@@ -2745,19 +4068,22 @@ static uint64_t build_guest_leaf_pte(uint32_t x86_r,
         /* Strict host/guest isolation: never map VMM-reserved HPA to PLV3. */
         g_isolation_violations++;
         return 0;
-    } else if (mk == LOONGEMU_MEM_RAM) {
+    } else if (mk == LOONGEMU_MEM_RAM || mk == LOONGEMU_MEM_ROM) {
         hpa_page = lk.hpa;
-    } else if (mk == LOONGEMU_MEM_ROM) {
-        hpa_page = lk.hpa;
+        mat = (uint32_t)lk.host_mat;
     } else if (mk == LOONGEMU_MEM_MMIO) {
         hpa_page = (gpa_page >= APIC_MMIO_BASE &&
                     gpa_page < APIC_MMIO_BASE + APIC_MMIO_SIZE)
                        ? (uint64_t)(uintptr_t)g_apic_mmio_page
                        : (uint64_t)(uintptr_t)g_mmio_dummy_page;
+        mat = (uint32_t)lk.host_mat;
     } else if (gpa_page >= UINT64_C(0x10000000)) {
-        /* Unclaimed high MMIO/PCI probe window -> harmless dummy sink. */
+        /* Unclaimed high MMIO/PCI probe window -> harmless uncached dummy sink. */
         hpa_page = (uint64_t)(uintptr_t)g_mmio_dummy_page;
     } else {
+        return 0;
+    }
+    if ((hpa_page & (LAPG_PAGE_SIZE - 1u)) != 0) {
         return 0;
     }
 
@@ -2802,7 +4128,294 @@ static uint64_t build_guest_leaf_pte(uint32_t x86_r,
             }
         }
     }
-    return lapg_make_leaf(hpa_page >> LAPG_PAGE_BITS, perm);
+    return lapg_make_leaf_mat(hpa_page >> LAPG_PAGE_BITS, perm, mat);
+}
+
+static void test_vmm_handoff_and_bochs_fb(void)
+{
+    static uint8_t test_fb[8192] __attribute__((aligned(4096)));
+    LoongemuVmmHandoff handoff;
+    LoongemuMemMap saved_mem_map = g_mem_map;
+    MmioRegion saved_mmio_regions[MAX_MMIO_REGIONS];
+    LoongemuBochsDisplay saved_display = g_pci_host.display;
+    uint32_t saved_mmio_count = g_mmio_region_count;
+    uint64_t saved_fallback = g_bochs_fb_fallback_hpa;
+    uint64_t saved_bar_gpa = g_bochs_fb_bar_gpa;
+    uint64_t saved_bar_size = g_bochs_fb_bar_size;
+    uint64_t saved_valid_size = g_bochs_fb_valid_size;
+    uint64_t saved_sink_gpa = g_bochs_fb_sink_gpa;
+    uint64_t saved_sink_size = g_bochs_fb_sink_size;
+    uint64_t saved_mmio_bar_gpa = g_bochs_mmio_bar_gpa;
+    uint64_t saved_mmio_bar_size = g_bochs_mmio_bar_size;
+    int saved_guest_ram_external = g_guest_ram_external;
+    BochsBarPending saved_bar_pending[2];
+    uint64_t saved_helper_fn = g_active_helper_fn;
+    uint64_t saved_helper_a1 = g_active_helper_a1;
+    uint64_t saved_helper_a2 = g_active_helper_a2;
+    uint64_t saved_helper_ra = g_active_helper_ra;
+    uint32_t saved_helper_bar_pending = g_active_helper_bar_pending;
+    LoongemuMemLookup lookup;
+    LatxX86Translation x86_tr = {0};
+    uint64_t pte;
+    int canary_ok = 1;
+    const uint64_t fb_gpa = UINT64_C(0x40000000);
+    const uint64_t moved_fb_gpa = UINT64_C(0x50000000);
+    const uint64_t fallback_test_gpa = UINT64_C(0x60000000);
+    const uint64_t owner_test_gpa = UINT64_C(0x70000000);
+    const uint64_t reserved_test_gpa = UINT64_C(0x70010000);
+    const uint64_t mmio_overlap_gpa = UINT64_C(0x70030000);
+    const uint64_t no_backing_gpa = UINT64_C(0x71000000);
+    const uint64_t queued_fb_gpa = UINT64_C(0x70040000);
+    int callback_ok;
+
+    memcpy(saved_bar_pending, g_bochs_bar_pending,
+           sizeof(saved_bar_pending));
+    memset(g_bochs_bar_pending, 0, sizeof(g_bochs_bar_pending));
+    memset(&handoff, 0, sizeof(handoff));
+    handoff.magic = LOONGEMU_VMM_HANDOFF_MAGIC;
+    handoff.version = LOONGEMU_VMM_HANDOFF_VERSION;
+    handoff.host_timer_hz = UINT64_C(100000000);
+    handoff.host_uart_phys = UINT64_C(0x1fe001e0);
+    handoff.vmm_image_base = UINT64_C(0x10000000);
+    handoff.vmm_image_size = UINT64_C(0x00100000);
+    handoff.guest_ram_hpa = UINT64_C(0x20000000);
+    handoff.guest_ram_size = GUEST_RAM_SIZE;
+    handoff.fb_fallback_hpa = UINT64_C(0x30000000);
+    handoff.fb_fallback_size = BOCHS_FB_FALLBACK_SIZE;
+    handoff.ovmf_code_hpa = UINT64_C(0x30400000);
+    handoff.ovmf_code_size = UINT64_C(0x00200000);
+    handoff.ovmf_vars_hpa = UINT64_C(0x30600000);
+    handoff.ovmf_vars_size = UINT64_C(0x00200000);
+    handoff.gop.fb_hpa = UINT64_C(0x30800000);
+    handoff.gop.fb_size = UINT64_C(0x4000);
+    handoff.gop.width = 64u;
+    handoff.gop.height = 64u;
+    handoff.gop.stride_px = 64u;
+    handoff.gop.bpp = 32u;
+    handoff.gop.pixel_format = 0u;
+    handoff.gop.valid = 1u;
+    handoff.gop.owner = (uint8_t)LOONGEMU_FB_OWNER_HOST_GOP;
+    handoff.gop.host_mat = (uint8_t)LOONGEMU_MAT_WUC;
+    check(vmm_handoff_valid(&handoff),
+          "UEFI handoff accepts page-aligned non-overlapping buffers");
+    handoff.gop.fb_hpa = handoff.guest_ram_hpa;
+    check(!vmm_handoff_valid(&handoff),
+          "UEFI handoff rejects GOP backing that overlaps guest RAM");
+    handoff.gop.fb_hpa = UINT64_C(0x30800000);
+    handoff.gop.fb_hpa = handoff.vmm_image_base;
+    check(!vmm_handoff_valid(&handoff),
+          "UEFI handoff rejects GOP backing that overlaps the VMM image");
+    handoff.gop.fb_hpa = handoff.fb_fallback_hpa;
+    check(!vmm_handoff_valid(&handoff),
+          "UEFI handoff rejects GOP backing that overlaps fallback storage");
+    handoff.gop.fb_hpa = handoff.ovmf_code_hpa;
+    check(!vmm_handoff_valid(&handoff),
+          "UEFI handoff rejects GOP backing that overlaps firmware");
+    handoff.gop.fb_hpa = UINT64_C(0x30800000);
+    handoff.fb_fallback_hpa = handoff.guest_ram_hpa +
+                              handoff.guest_ram_size - LAPG_PAGE_SIZE;
+    check(!vmm_handoff_valid(&handoff),
+          "UEFI handoff rejects overlapping guest and fallback allocations");
+    handoff.fb_fallback_hpa = UINT64_C(0x30000000);
+    handoff.ovmf_vars_hpa = handoff.ovmf_code_hpa + LAPG_PAGE_SIZE;
+    check(!vmm_handoff_valid(&handoff),
+          "UEFI handoff rejects overlapping OVMF buffers");
+    handoff.ovmf_vars_hpa = UINT64_C(0x30600000);
+    handoff.guest_ram_hpa++;
+    check(!vmm_handoff_valid(&handoff),
+          "UEFI handoff rejects unaligned physical allocations");
+
+    memcpy(saved_mmio_regions, g_mmio_regions, sizeof(saved_mmio_regions));
+    loongemu_mem_map_init(&g_mem_map);
+    memset(g_mmio_regions, 0, sizeof(g_mmio_regions));
+    g_mmio_region_count = 0;
+    g_bochs_fb_bar_gpa = 0;
+    g_bochs_fb_bar_size = 0;
+    g_bochs_fb_valid_size = 0;
+    g_bochs_fb_sink_gpa = 0;
+    g_bochs_fb_sink_size = 0;
+    g_guest_ram_external = 0;
+    memset(test_fb, 0xa5, sizeof(test_fb));
+    g_pci_host.display.gop.valid = 1u;
+    g_pci_host.display.gop.owner = (uint8_t)LOONGEMU_FB_OWNER_HOST_GOP;
+    g_pci_host.display.gop.fb_hpa = (uint64_t)(uintptr_t)test_fb;
+    g_pci_host.display.gop.fb_size = 5000u;
+    g_pci_host.display.gop.host_mat = (uint8_t)LOONGEMU_MAT_WUC;
+    callback_ok = bochs_display_bar_map_cb(0, 0, fb_gpa, UINT64_C(0x5000), 1);
+    check(callback_ok &&
+          loongemu_mem_resolve(&g_mem_map, fb_gpa, LAPG_PAGE_SIZE, &lookup) ==
+              LOONGEMU_MEM_RAM &&
+          lookup.hpa == (uint64_t)(uintptr_t)test_fb &&
+          lookup.host_mat == (uint8_t)LOONGEMU_MAT_WUC &&
+          g_bochs_fb_valid_size == LAPG_PAGE_SIZE,
+          "Bochs BAR0 maps only complete host-GOP pages with WUC ownership");
+    x86_tr.gpa = fb_gpa;
+    x86_tr.perm = LATX_X86_ACCESS_READ | LATX_X86_ACCESS_USER;
+    pte = build_guest_leaf_pte(LATX_X86_WALK_PAGING_OFF, &x86_tr,
+                               LATX_X86_ACCESS_READ | LATX_X86_ACCESS_USER);
+    check(((pte & LAPG_PTE_MAT_MASK) >> LAPG_PTE_MAT_SHIFT) == LAPG_MAT_WUC,
+          "host-GOP MAT reaches the actual guest shadow PTE");
+    {
+        const MmioRegion *sink = mmio_find_region(fb_gpa + LAPG_PAGE_SIZE);
+        check(sink != 0 && sink->gpa_base == fb_gpa + LAPG_PAGE_SIZE &&
+              sink->size == UINT64_C(0x4000) &&
+              sink->read_cb == bochs_oob_sink_read &&
+              sink->write_cb == bochs_oob_sink_write &&
+              sink->read_cb(sink->opaque, 0, 4) == 0,
+              "Bochs BAR0 tail is an MMIO read/write sink");
+        if (sink != 0) {
+            sink->write_cb(sink->opaque, 0, UINT64_MAX, 4);
+        }
+    }
+    callback_ok = bochs_display_bar_map_cb(0, 0, moved_fb_gpa,
+                                            UINT64_C(0x5000), 1);
+    check(callback_ok &&
+          loongemu_mem_resolve(&g_mem_map, fb_gpa, LAPG_PAGE_SIZE, &lookup) ==
+              LOONGEMU_MEM_UNMAPPED &&
+          mmio_find_region(fb_gpa + LAPG_PAGE_SIZE) == 0,
+          "Bochs BAR0 relocation removes the old RAM mapping and sink");
+    for (uint32_t i = 0; i < sizeof(test_fb); i++) {
+        if (test_fb[i] != 0xa5u) {
+            canary_ok = 0;
+            break;
+        }
+    }
+    check(canary_ok, "Bochs tail writes leave the host framebuffer canary intact");
+    g_guest_ram_external = saved_guest_ram_external;
+
+    g_pci_host.display.gop = (LoongemuGopHandover){0};
+    callback_ok = bochs_display_bar_map_cb(0, 0, fallback_test_gpa,
+                                            UINT64_C(0x5000), 1);
+    check(callback_ok &&
+          loongemu_mem_resolve(&g_mem_map, fallback_test_gpa, LAPG_PAGE_SIZE,
+                               &lookup) == LOONGEMU_MEM_RAM &&
+          lookup.hpa == g_bochs_fb_fallback_hpa &&
+          lookup.host_mat == (uint8_t)LOONGEMU_MAT_CC,
+          "Bochs fallback BAR uses its independent allocation with CC MAT");
+    x86_tr.gpa = fallback_test_gpa;
+    pte = build_guest_leaf_pte(LATX_X86_WALK_PAGING_OFF, &x86_tr,
+                               LATX_X86_ACCESS_READ | LATX_X86_ACCESS_USER);
+    check(((pte & LAPG_PTE_MAT_MASK) >> LAPG_PTE_MAT_SHIFT) == LAPG_MAT_CC,
+          "VMM-allocated fallback MAT reaches the actual guest shadow PTE");
+
+    g_pci_host.display.gop.valid = 1u;
+    g_pci_host.display.gop.owner = (uint8_t)LOONGEMU_FB_OWNER_VMM_ALLOC;
+    g_pci_host.display.gop.fb_hpa = saved_fallback;
+    g_pci_host.display.gop.fb_size = UINT64_C(0x3000);
+    g_pci_host.display.gop.host_mat = (uint8_t)LOONGEMU_MAT_WUC;
+    callback_ok = bochs_display_bar_map_cb(0, 0, owner_test_gpa,
+                                            UINT64_C(0x3000), 1);
+    check(callback_ok &&
+          loongemu_mem_resolve(&g_mem_map, owner_test_gpa, LAPG_PAGE_SIZE,
+                               &lookup) == LOONGEMU_MEM_RAM &&
+          lookup.hpa == saved_fallback &&
+          lookup.host_mat == (uint8_t)LOONGEMU_MAT_CC,
+          "VMM_ALLOC framebuffer ownership forces coherent cached MAT");
+    check(loongemu_mem_map_add(&g_mem_map, reserved_test_gpa, UINT64_C(0x10000),
+                               0, LOONGEMU_MEM_RESERVED, "fb_test_reserved") == 1,
+          "framebuffer overlap test reserves a conflicting guest range");
+    callback_ok = bochs_display_bar_map_cb(0, 0, reserved_test_gpa,
+                                            UINT64_C(0x3000), 1);
+    check(!callback_ok &&
+          loongemu_mem_resolve(&g_mem_map, reserved_test_gpa, LAPG_PAGE_SIZE,
+                               &lookup) == LOONGEMU_MEM_RESERVED &&
+          mmio_find_region(reserved_test_gpa) == 0 &&
+          loongemu_mem_resolve(&g_mem_map, owner_test_gpa, LAPG_PAGE_SIZE,
+                               &lookup) == LOONGEMU_MEM_RAM &&
+          lookup.hpa == saved_fallback,
+          "Bochs BAR0 cannot overlap a reserved guest range");
+    check(mmio_register(mmio_overlap_gpa, LAPG_PAGE_SIZE,
+                        loongemu_bochs_mmio_read, loongemu_bochs_mmio_write,
+                        &g_pci_host.display),
+          "framebuffer overlap test registers an existing MMIO range");
+    callback_ok = bochs_display_bar_map_cb(0, 0, mmio_overlap_gpa,
+                                            UINT64_C(0x3000), 1);
+    {
+        const MmioRegion *existing = mmio_find_region(mmio_overlap_gpa);
+        check(!callback_ok && existing != 0 &&
+              existing->read_cb == loongemu_bochs_mmio_read &&
+              loongemu_mem_resolve(&g_mem_map, mmio_overlap_gpa,
+                                   LAPG_PAGE_SIZE, &lookup) ==
+                  LOONGEMU_MEM_UNMAPPED,
+              "Bochs BAR0 cannot overlap an existing MMIO range");
+    }
+    g_pci_host.display.gop.owner = (uint8_t)LOONGEMU_FB_OWNER_HOST_GOP;
+    g_pci_host.display.gop.fb_hpa = (uint64_t)(uintptr_t)test_fb + 1u;
+    g_pci_host.display.gop.fb_size = LAPG_PAGE_SIZE;
+    callback_ok = bochs_display_bar_map_cb(
+        0, 0, owner_test_gpa + UINT64_C(0x20000), UINT64_C(0x3000), 1);
+    check(callback_ok &&
+          loongemu_mem_resolve(&g_mem_map, owner_test_gpa + UINT64_C(0x20000),
+                               LAPG_PAGE_SIZE, &lookup) == LOONGEMU_MEM_RAM &&
+          lookup.hpa == saved_fallback &&
+          lookup.host_mat == (uint8_t)LOONGEMU_MAT_CC,
+          "unaligned host-GOP backing is never exposed to the guest");
+    g_pci_host.display.gop = (LoongemuGopHandover){0};
+    g_bochs_fb_fallback_hpa = 0;
+    callback_ok = bochs_display_bar_map_cb(0, 0, no_backing_gpa,
+                                            UINT64_C(0x3000), 1);
+    check(!callback_ok &&
+          loongemu_mem_resolve(&g_mem_map, no_backing_gpa, LAPG_PAGE_SIZE,
+                               &lookup) == LOONGEMU_MEM_UNMAPPED &&
+          loongemu_mem_resolve(&g_mem_map, owner_test_gpa + UINT64_C(0x20000),
+                               LAPG_PAGE_SIZE,
+                               &lookup) == LOONGEMU_MEM_RAM &&
+          lookup.hpa == saved_fallback,
+          "missing real and fallback backing refuses BAR mapping without losing old BAR");
+    g_bochs_fb_fallback_hpa = saved_fallback;
+    g_active_helper_fn = (uint64_t)(uintptr_t)helper_outl;
+    g_active_helper_a1 = LOONGEMU_PCI_CFG_DATA_PORT;
+    g_active_helper_bar_pending = 0;
+    callback_ok = bochs_display_bar_map_cb(
+        0, 0, queued_fb_gpa, UINT64_C(0x3000), 1);
+    check(callback_ok && g_active_helper_bar_pending &&
+          g_bochs_bar_pending[0].valid &&
+          g_bochs_bar_pending[0].owner_vcpu == g_cur_vcpu &&
+          bochs_helper_requires_tb_exit() &&
+          loongemu_mem_resolve(&g_mem_map, queued_fb_gpa, LAPG_PAGE_SIZE,
+                               &lookup) == LOONGEMU_MEM_UNMAPPED &&
+          loongemu_mem_resolve(&g_mem_map, g_bochs_fb_bar_gpa,
+                               LAPG_PAGE_SIZE, &lookup) == LOONGEMU_MEM_RAM,
+          "PCI OUT remap exits its TB before a following framebuffer access");
+    g_bochs_bar_pending[0].valid = 0;
+    g_active_helper_bar_pending = 0;
+    g_active_helper_fn = 0;
+    g_bochs_mmio_bar_write = 1;
+    callback_ok = bochs_display_bar_map_cb(
+        0, 0, queued_fb_gpa + UINT64_C(0x10000), UINT64_C(0x3000), 1);
+    g_bochs_mmio_bar_write = 0;
+    check(callback_ok && g_bochs_bar_pending[0].valid &&
+          !g_active_helper_bar_pending,
+          "ECAM BAR write queues the remap without a helper context");
+    g_bochs_bar_pending[0].valid = 0;
+    g_active_helper_a1 = UINT64_C(0x80);
+    check(!bochs_helper_requires_tb_exit(),
+          "unrelated OUT does not trigger framebuffer TB exit");
+    g_active_helper_fn = 0;
+    g_active_helper_a1 = 0;
+    g_active_helper_a2 = 0;
+    g_active_helper_ra = 0;
+    g_active_helper_bar_pending = 0;
+    g_mem_map = saved_mem_map;
+    memcpy(g_mmio_regions, saved_mmio_regions, sizeof(saved_mmio_regions));
+    g_mmio_region_count = saved_mmio_count;
+    g_pci_host.display = saved_display;
+    g_bochs_fb_fallback_hpa = saved_fallback;
+    g_bochs_fb_bar_gpa = saved_bar_gpa;
+    g_bochs_fb_bar_size = saved_bar_size;
+    g_bochs_fb_valid_size = saved_valid_size;
+    g_bochs_fb_sink_gpa = saved_sink_gpa;
+    g_bochs_fb_sink_size = saved_sink_size;
+    g_guest_ram_external = saved_guest_ram_external;
+    g_bochs_mmio_bar_gpa = saved_mmio_bar_gpa;
+    g_bochs_mmio_bar_size = saved_mmio_bar_size;
+    memcpy(g_bochs_bar_pending, saved_bar_pending,
+           sizeof(saved_bar_pending));
+    g_active_helper_fn = saved_helper_fn;
+    g_active_helper_a1 = saved_helper_a1;
+    g_active_helper_a2 = saved_helper_a2;
+    g_active_helper_ra = saved_helper_ra;
+    g_active_helper_bar_pending = saved_helper_bar_pending;
 }
 
 static void fill_hw_tlb_guest(uint64_t badv, uint64_t fault_pte, int is_refill)
@@ -2812,17 +4425,15 @@ static void fill_hw_tlb_guest(uint64_t badv, uint64_t fault_pte, int is_refill)
     uint64_t sib_page = fault_page ^ LAPG_PAGE_SIZE;
     uint64_t sib_pte = 0;
 
-    if (is_host_vmm_va(sib_page)) {
-        LapgTranslation tr_sib;
-        if (lapg_walk(&g_memory, g_root, sib_page, LAPG_PERM_USER, &tr_sib) == LAPG_OK) {
-            sib_pte = tr_sib.pte;
-        }
-    } else {
+    {
         uint32_t sib_acc = LATX_X86_ACCESS_READ |
                            ((env.hflags & HF_CPL_MASK) ? LATX_X86_ACCESS_USER : 0);
         LatxX86Translation sib_tr;
         LatxX86WalkResult sib_r = latx_x86_walk_cached(&env, sib_page, sib_acc, &sib_tr);
-        if (sib_r == LATX_X86_WALK_OK || sib_r == LATX_X86_WALK_PAGING_OFF) {
+        if ((sib_r == LATX_X86_WALK_OK ||
+             sib_r == LATX_X86_WALK_PAGING_OFF) &&
+            mmio_find_region(sib_tr.gpa) == 0) {
+            /* MMIO, including the framebuffer tail sink, must trap on access. */
             sib_pte = build_guest_leaf_pte((uint32_t)sib_r, &sib_tr, sib_acc);
         }
     }
@@ -2887,6 +4498,38 @@ static void timer_ack(void)
 
     __asm__ volatile("csrwr %0, 0x44" : "+r"(one) :: "memory");
 }
+static int guest_linear_read_u64(uint64_t linear, uint64_t *value)
+{
+    uint64_t result = 0;
+
+    for (unsigned i = 0; i < 8u; i++) {
+        LatxX86Translation translation;
+        uint64_t byte;
+        LatxX86WalkResult walk =
+            latx_x86_walk(&env, linear + i, LATX_X86_ACCESS_READ, &translation);
+        if ((walk != LATX_X86_WALK_OK && walk != LATX_X86_WALK_PAGING_OFF) ||
+            !guest_phys_read_checked(translation.gpa, 1, &byte)) {
+            return 0;
+        }
+        result |= (byte & 0xffu) << (i * 8u);
+    }
+    *value = result;
+    return 1;
+}
+
+static int guest_linear_write_u64(uint64_t linear, uint64_t value)
+{
+    for (unsigned i = 0; i < 8u; i++) {
+        LatxX86Translation translation;
+        LatxX86WalkResult walk =
+            latx_x86_walk(&env, linear + i, LATX_X86_ACCESS_WRITE, &translation);
+        if ((walk != LATX_X86_WALK_OK && walk != LATX_X86_WALK_PAGING_OFF) ||
+            !guest_phys_write_checked(translation.gpa, 1, value >> (i * 8u))) {
+            return 0;
+        }
+    }
+    return 1;
+}
 
 /*
  * Deliver one tick to the guest.
@@ -2898,61 +4541,48 @@ static void timer_ack(void)
  */
 static int deliver_tick_to_guest(void)
 {
-    uint64_t idt_base, entry, handler, rflags, rsp, cs;
+    uint64_t idt_base, entry, hi, handler, rflags, rsp, stack_gva;
     uint16_t cs_sel;
     int vec = (int)g_timer_vector;
-    uint64_t *stack;
 
-    /* Interrupts disabled by the guest: drop the tick. */
-    rflags = *(volatile uint64_t *)(uintptr_t)&env.eflags;
+    rflags = env.eflags;
     if ((rflags & IF_MASK) == 0) {
         g_timer_masked++;
         return 0;
     }
 
-    idt_base = *(volatile uint64_t *)(uintptr_t)&env.idt.base;
-    if (idt_base == 0) {
+    idt_base = env.idt.base;
+    if (idt_base == 0 ||
+        !guest_linear_read_u64(idt_base + (uint64_t)vec * 16u, &entry) ||
+        !guest_linear_read_u64(idt_base + (uint64_t)vec * 16u + 8u, &hi)) {
         g_timer_masked++;
         return 0;
     }
 
-    /*
-     * A 64-bit interrupt gate is {offset[15:0], selector, ist, type,
-     * offset[31:16]} in the low half and {offset[63:32], reserved} in the
-     * high half.
-     */
-    entry = *(volatile uint64_t *)(uintptr_t)(idt_base + (uint64_t)vec * 16);
-    {
-        uint64_t hi = *(volatile uint64_t *)(uintptr_t)(idt_base +
-                                                        (uint64_t)vec * 16 + 8);
-
-        handler = (entry & 0xffffULL) | (((entry >> 48) & 0xffffULL) << 16) |
-                  ((hi & 0xffffffffULL) << 32);
-    }
+    handler = (entry & 0xffffULL) | (((entry >> 48) & 0xffffULL) << 16) |
+              ((hi & 0xffffffffULL) << 32);
     if (handler == 0) {
         g_timer_masked++;
         return 0;
     }
 
     cs_sel = (uint16_t)((entry >> 16) & 0xffff);
-    rsp = *(volatile uint64_t *)(uintptr_t)&env.regs[R_ESP];
-    stack = (uint64_t *)(uintptr_t)(rsp - 40);
+    rsp = env.regs[R_ESP];
+    if (rsp < 40u) {
+        return 0;
+    }
+    stack_gva = rsp - 40u;
+    if (!guest_linear_write_u64(stack_gva + 0u, env.eip) ||
+        !guest_linear_write_u64(stack_gva + 8u, cs_sel) ||
+        !guest_linear_write_u64(stack_gva + 16u, rflags) ||
+        !guest_linear_write_u64(stack_gva + 24u, rsp) ||
+        !guest_linear_write_u64(stack_gva + 32u, env.segs[R_SS].selector)) {
+        return 0;
+    }
 
-    stack[0] = *(volatile uint64_t *)(uintptr_t)&env.eip;
-    stack[1] = cs_sel;
-    /*
-     * The frame carries the RFLAGS the handler must return to, so this is the
-     * value *before* IF is cleared below.  Pushing the cleared one would make
-     * iretq restore IF=0 and the guest would never take a second interrupt.
-     */
-    stack[2] = rflags;
-    stack[3] = rsp;
-    stack[4] = *(volatile uint64_t *)(uintptr_t)&env.segs[R_SS].selector;
-
-    *(volatile uint64_t *)(uintptr_t)&env.regs[R_ESP] = (uint64_t)stack;
-    *(volatile uint64_t *)(uintptr_t)&env.eip = handler;
-    *(volatile uint64_t *)(uintptr_t)&env.eflags = rflags & ~IF_MASK;
-
+    env.regs[R_ESP] = stack_gva;
+    env.eip = handler;
+    env.eflags = rflags & ~IF_MASK;
     g_timer_delivered++;
     return 1;
 }
@@ -3179,7 +4809,6 @@ static uint32_t g_ovmf_exc_logs;
 static uint64_t g_run_tb_hits;
 static uint64_t g_run_tb_misses;
 static uint64_t g_run_tb_flushes;
-static uint64_t g_run_tb_links;
 static uint64_t g_sync_core_calls;
 static uint64_t g_sync_core_flushes;
 
@@ -3255,43 +4884,6 @@ static uint64_t hash_guest_code(uint64_t gva, uint16_t len)
     return h ? h : 1;
 }
 
-static void try_link_tb_slot(uint32_t from_slot, uint32_t to_slot)
-{
-    TbCacheEntry *from_e = &tb_entries[from_slot];
-    TbCacheEntry *to_e = &tb_entries[to_slot];
-    TbInsnMap *map = &tb_insn_maps[from_slot];
-
-    if (!from_e->used || !to_e->used) {
-        return;
-    }
-    /* Avoid linking a 1-exit unconditional self-loop (`jmp $`) so the
-     * PLV0 stuck detector can still observe it. */
-    if (from_slot == to_slot &&
-        map->jmp_slot_off[0] >= 0 && map->jmp_slot_off[1] < 0) {
-        return;
-    }
-    for (int i = 0; i < 2; i++) {
-        int32_t slot_off = map->jmp_slot_off[i];
-        if (slot_off < 0 || map->jmp_target_pc[i] != to_e->pc) {
-            continue;
-        }
-        uint64_t slot_addr = from_e->code + (uint64_t)slot_off;
-        uint32_t *slot_ptr = (uint32_t *)(uintptr_t)slot_addr;
-        if (*slot_ptr != 0x03400000u) {
-            continue; /* already patched */
-        }
-        int64_t disp = ((int64_t)to_e->code - (int64_t)slot_addr) >> 2;
-        if (disp < -(1LL << 25) || disp >= (1LL << 25)) {
-            continue;
-        }
-        uint32_t insn = 0x50000000u |
-                        (((uint32_t)disp & 0xffffu) << 10) |
-                        (((uint32_t)disp >> 16) & 0x3ffu);
-        *slot_ptr = insn;
-        __asm__ volatile("ibar 0" ::: "memory");
-        g_run_tb_links++;
-    }
-}
 
 static inline uint64_t current_tb_cs_base(void)
 {
@@ -3307,24 +4899,6 @@ static inline uint8_t current_tb_mode_flags(void)
     return f;
 }
 
-static void link_new_tb(uint32_t new_slot)
-{
-    TbCacheEntry *e = &tb_entries[new_slot];
-    TbInsnMap *map = &tb_insn_maps[new_slot];
-
-    /* 1. Outgoing edges from this newly translated TB to existing TBs. */
-    for (int i = 0; i < 2; i++) {
-        if (map->jmp_slot_off[i] >= 0) {
-            TbCacheEntry *dst = tbc_lookup_mode(&tb_cache, map->jmp_target_pc[i],
-                                                e->cs_base, e->cr3, e->cpl, e->mode_flags);
-            if (dst != 0) {
-                try_link_tb_slot(new_slot, (uint32_t)(dst - tb_entries));
-            }
-        }
-    }
-
-    /* Incoming edges are linked lazily on demand via prev_slot in run_blocks_from(). */
-}
 
 static int translate_tb_locked(uint64_t pc, uint8_t *buf, size_t max_bytes,
                                TbInsnMap *map)
@@ -3464,7 +5038,7 @@ static void run_ap_vcpu_loop(uint32_t pcpu)
     g_smc_dirty_count = 0;
     g_smc_dirty_overflow = 0;
     memset(fast_jmp_cache, 0, sizeof(g_fast_jmp_cache[0]));
-    env.tb_jmp_cache_ptr = fast_jmp_cache;
+    env.tb_jmp_cache_ptr = 0;
     latx_x86_tlb_flush_all();
     asid_activate(1);
     g_plv3_timer_preempt = 1;
@@ -3472,13 +5046,27 @@ static void run_ap_vcpu_loop(uint32_t pcpu)
     timer_start(timer_ticks_1ms());
 
     for (;;) {
-        if (cur_shard->tlb_shootdown_pending) {
-            cur_shard->tlb_shootdown_pending = 0;
+        if (hv_service_flush_requests()) {
+            prev_slot = -1;
+        }
+        int bar_map_status = bochs_process_pending_bar_maps();
+        if (bar_map_status != 0) {
+            prev_slot = -1;
+        }
+        if (bar_map_status < 0) {
+            continue;
+        }
+        if (hv_recycle_tb_shard()) {
+            prev_slot = -1;
+        }
+        if (__atomic_exchange_n(&cur_shard->tlb_shootdown_pending, 0,
+                                __ATOMIC_ACQ_REL)) {
             __asm__ volatile("invtlb 0x3, $zero, $zero" ::: "memory");
             latx_x86_tlb_flush_all();
             memset(g_asid_slots, 0, sizeof(g_asid_slots));
             g_next_asid = 1;
             asid_activate(1);
+            __atomic_fetch_add(&g_ipi_shootdowns_handled, 1u, __ATOMIC_RELAXED);
         }
         if (g_smc_dirty) {
             smc_flush_local_shard(&prev_slot);
@@ -3580,26 +5168,21 @@ static void run_ap_vcpu_loop(uint32_t pcpu)
             }
             code_used += (((uint64_t)rc + 255) & ~UINT64_C(255));
             __asm__ volatile("ibar 0" ::: "memory");
-            link_new_tb(slot_idx);
         }
 
         slot_idx = (uint32_t)(e - tb_entries);
-        if (prev_slot >= 0 && tb_entries[prev_slot].cr3 == tb_cr3 &&
-            tb_entries[prev_slot].cpl == cpl &&
-            tb_entries[prev_slot].cs_base == tb_cs_base &&
-            tb_entries[prev_slot].mode_flags == tb_mode) {
-            try_link_tb_slot((uint32_t)prev_slot, slot_idx);
-        }
-        {
-            uint32_t h = (uint32_t)(((before >> TB_JMP_CACHE_BITS) ^ before) &
-                                    (FAST_JMP_CACHE_SIZE - 1));
-            fast_jmp_cache[h].pc = before;
-            fast_jmp_cache[h].code = e->code;
-        }
         g_current_tb_code = e->code;
         g_current_tb_size = e->code_size;
         g_current_tb_pc = before;
         g_current_tb_map = &tb_insn_maps[slot_idx];
+        if (hv_service_flush_requests()) {
+            prev_slot = -1;
+            continue;
+        }
+        if (hv_wait_for_barrier_release()) {
+            prev_slot = -1;
+            continue;
+        }
 
         tb_sys_run_plv3((void *)(uintptr_t)pro_buf,
                         (void *)(uintptr_t)e->code, &env);
@@ -3622,9 +5205,18 @@ static void run_ap_vcpu_loop(uint32_t pcpu)
             int is_hlt = 0;
             {
                 LatxX86Translation tr_hlt;
-                if (walk_ok(latx_x86_walk_cached(&env, env.eip, LATX_X86_ACCESS_READ, &tr_hlt)) &&
-                    *(const volatile uint8_t *)(uintptr_t)tr_hlt.gpa == 0xf4u) {
-                    is_hlt = 1;
+                LoongemuMemLookup lk_hlt;
+                uint64_t hlt_lin = current_tb_cs_base() + env.eip;
+                if (walk_ok(latx_x86_walk_cached(&env, hlt_lin,
+                                                 LATX_X86_ACCESS_READ,
+                                                 &tr_hlt))) {
+                    LoongemuMemKind mk_hlt = loongemu_mem_resolve(
+                        &g_mem_map, tr_hlt.gpa, 1u, &lk_hlt);
+                    if ((mk_hlt == LOONGEMU_MEM_RAM ||
+                         mk_hlt == LOONGEMU_MEM_ROM) &&
+                        *(const volatile uint8_t *)(uintptr_t)lk_hlt.hpa == 0xf4u) {
+                        is_hlt = 1;
+                    }
                 }
             }
             uint64_t irq_rip = is_hlt ? (env.eip + 1) : env.eip;
@@ -3659,6 +5251,7 @@ static void run_ap_vcpu_loop(uint32_t pcpu)
                 }
             }
             if (is_hlt) {
+                int maintenance_only = 0;
                 /* KVM PV_UNHALT: consume pending kick or wait (handles both IF=0 and IF=1 HLT). */
                 if (__atomic_exchange_n(&g_vcpu_kicked[pcpu], 0, __ATOMIC_ACQ_REL)) {
                     g_vcpu_halted[pcpu] = 0;
@@ -3668,6 +5261,13 @@ static void run_ap_vcpu_loop(uint32_t pcpu)
                 }
                 g_vcpu_halted[pcpu] = 1;
                 for (int w = 0; w < 2000; w++) {
+                    if (hv_recycle_tb_shard()) {
+                        prev_slot = -1;
+                    }
+                    if (hv_service_flush_requests()) {
+                        prev_slot = -1;
+                        maintenance_only = 1;
+                    }
                     if (g_vcpu_nmi_pending[pcpu] ||
                         __atomic_load_n(&g_vcpu_kicked[pcpu], __ATOMIC_ACQUIRE) ||
                         ((env.eflags & IF_MASK) != 0 && (lapic_has_irr(pcpu) || g_timer_irq_pending[pcpu])) ||
@@ -3677,21 +5277,28 @@ static void run_ap_vcpu_loop(uint32_t pcpu)
                     uint32_t ipi = loongemu_ipi_status();
                     if (ipi != 0u) {
                         loongemu_ipi_clear(ipi);
-                        if (ipi & LOONGEMU_IPI_TLB_SHOOTDOWN) {
-                            cur_shard->tlb_shootdown_pending = 1;
+                        if ((ipi & (LOONGEMU_IPI_TLB_SHOOTDOWN |
+                                    LOONGEMU_IPI_SMC_BROADCAST)) != 0u &&
+                            (ipi & LOONGEMU_IPI_WAKE) == 0u) {
+                            maintenance_only = 1;
+                        }
+                        if (hv_service_flush_requests()) {
+                            prev_slot = -1;
+                            maintenance_only = 1;
                         }
                         break;
                     }
                     __asm__ volatile("dbar 0x700" ::: "memory");
                 }
                 if (__atomic_exchange_n(&g_vcpu_kicked[pcpu], 0, __ATOMIC_ACQ_REL) ||
-                    (env.eflags & IF_MASK) == 0) {
+                    ((env.eflags & IF_MASK) == 0 && !maintenance_only)) {
                     g_vcpu_halted[pcpu] = 0;
                     if (!g_vcpu_nmi_pending[pcpu]) {
                         env.eip = env.eip + 1;
                         prev_slot = -1;
                     }
-                } else if (!g_vcpu_nmi_pending[pcpu] && !lapic_has_irr(pcpu)) {
+                } else if (!maintenance_only &&
+                           !g_vcpu_nmi_pending[pcpu] && !lapic_has_irr(pcpu)) {
                     if (deliver_kernel_timer_tick(env.eip + 1)) {
                         g_timer_irq_pending[pcpu] = 0;
                         timer_ack();
@@ -3746,6 +5353,10 @@ void ap_main(uint32_t pcpu)
     csrwr(0xc, (uint64_t)(uintptr_t)tb_sys_trap);
     csrwr(0x88, (uint64_t)(uintptr_t)tb_sys_trap);
     csrwr(0x180, ((uint64_t)0 << 60) | (UINT64_C(1) << 4) | 1u);
+    /* AP firmware state is not trusted; leave only the PLV0 window. */
+    csrwr(0x181, 0);
+    csrwr(0x182, 0);
+    csrwr(0x183, 0);
     crmd = (csrrd(0x0) & ~UINT64_C(0x1f)) | (UINT64_C(1) << 4);
     csrwr(0x0, crmd);
     __asm__ volatile("invtlb 0x0, $zero, $zero" ::: "memory");
@@ -3757,12 +5368,15 @@ void ap_main(uint32_t pcpu)
     asid_activate(1);
     __atomic_store_n(&g_pcpu_online[pcpu], 1u, __ATOMIC_RELEASE);
 
-    while (!__atomic_load_n(&g_vcpu_online[pcpu], __ATOMIC_ACQUIRE)) {
+    while (!__atomic_load_n(&g_vcpu_online[pcpu], __ATOMIC_ACQUIRE) ||
+           __atomic_load_n(&g_vp_owner[pcpu], __ATOMIC_ACQUIRE) != pcpu) {
+        (void)hv_service_flush_requests();
+        (void)hv_recycle_tb_shard();
         uint32_t ipi = loongemu_ipi_status();
         if (ipi != 0u) {
             loongemu_ipi_clear(ipi);
-            if ((ipi & LOONGEMU_IPI_TLB_SHOOTDOWN) || g_shard[pcpu].tlb_shootdown_pending) {
-                g_shard[pcpu].tlb_shootdown_pending = 0;
+            if (__atomic_exchange_n(&g_shard[pcpu].tlb_shootdown_pending, 0,
+                                    __ATOMIC_ACQ_REL)) {
                 __asm__ volatile("invtlb 0x3, $zero, $zero" ::: "memory");
                 latx_x86_tlb_flush_all();
                 memset(g_asid_slots, 0, sizeof(g_asid_slots));
@@ -3786,6 +5400,8 @@ static void boot_physical_aps(void)
     }
     uint64_t t0 = vclock_read_host_rdtime(0);
     while ((vclock_read_host_rdtime(0) - t0) < 2000000ULL) {
+        (void)hv_service_flush_requests();
+        (void)hv_recycle_tb_shard();
         uint32_t cnt = 1u;
         for (uint32_t c = 1u; c < MAX_VCPUS; c++) {
             if (__atomic_load_n(&g_pcpu_online[c], __ATOMIC_ACQUIRE)) {
@@ -3808,6 +5424,8 @@ static void boot_physical_aps(void)
         latx_platform_tlb_shootdown_all();
         uint64_t ts = vclock_read_host_rdtime(0);
         while ((vclock_read_host_rdtime(0) - ts) < 2000000ULL) {
+            (void)hv_service_flush_requests();
+            (void)hv_recycle_tb_shard();
             if (__atomic_load_n(&g_ipi_shootdowns_handled, __ATOMIC_ACQUIRE) >= expect) {
                 break;
             }
@@ -3821,69 +5439,86 @@ static void boot_physical_aps(void)
     }
 }
 
-static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
+static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc,
+                           int reset, int keep_running)
 {
     int ran = 0;
     int stuck = 0;
     uint64_t last_fp = 0;
     int32_t prev_slot = -1;
 
-    env.eip = pc;
-    env.tb_jmp_cache_ptr = fast_jmp_cache;
     g_run_blocks_exit = RUN_EXIT_MAX_BLOCKS;
-    g_recent_count = 0;
-    g_run_tb_hits = 0;
-    g_run_tb_misses = 0;
-    g_run_tb_flushes = 0;
-    g_run_tb_links = 0;
-    g_sync_core_calls = 0;
-    g_sync_core_flushes = 0;
-    tbc_flush_all(&tb_cache);
-    g_tb_highwater = 0;
-    g_tb_by_code_count = 0;
-    memset(g_code_page_bitmap, 0, sizeof(g_code_page_bitmap));
-    g_smc_dirty = 0;
-    g_smc_dirty_count = 0;
-    g_smc_dirty_overflow = 0;
-    g_smc_granular_evicts = 0;
-    memset(g_fast_jmp_cache, 0, sizeof(g_fast_jmp_cache));
-    code_used = 0x2000;
-    __asm__ volatile("ibar 0" ::: "memory");
-    latx_x86_tlb_flush_all();
-    env.idt.base = 0;
-    env.idt.limit = 0;
-    env.eflags = 0x2;
-    g_pic_imr[0] = 0xffu;
-    g_pic_imr[1] = 0xffu;
-    g_pic_icw_idx[0] = 0;
-    g_pic_icw_idx[1] = 0;
-    g_pic_icw_rem[0] = 0;
-    g_pic_icw_rem[1] = 0;
-    g_pic_irq0_vec = 0x30;
-    g_cur_vcpu = 0;
-    latx_guest_apic_id = 0;
-    for (uint32_t i = 0; i < MAX_VCPUS; i++) {
-        g_vcpu_online[i] = (i == 0) ? 1 : 0;
-        g_vcpu_halted[i] = 0;
-        g_vcpu_init_pending[i] = 0;
-        g_vcpu_sipi_pending[i] = 0;
-        g_vcpu_sipi_vec[i] = 0;
+    if (reset) {
+        env.eip = pc;
+        env.tb_jmp_cache_ptr = 0;
+        g_recent_count = 0;
+        g_run_tb_hits = 0;
+        g_run_tb_misses = 0;
+        g_run_tb_flushes = 0;
+        g_sync_core_calls = 0;
+        g_sync_core_flushes = 0;
+        tbc_flush_all(&tb_cache);
+        g_tb_highwater = 0;
+        g_tb_by_code_count = 0;
+        memset(g_code_page_bitmap, 0, sizeof(g_code_page_bitmap));
+        g_smc_dirty = 0;
+        g_smc_dirty_count = 0;
+        g_smc_dirty_overflow = 0;
+        g_smc_granular_evicts = 0;
+        memset(g_fast_jmp_cache, 0, sizeof(g_fast_jmp_cache));
+        code_used = 0x2000;
+        __asm__ volatile("ibar 0" ::: "memory");
+        latx_x86_tlb_flush_all();
+        memset((void *)&g_plv3_exit, 0, sizeof(g_plv3_exit));
+        env.idt.base = 0;
+        env.idt.limit = 0;
+        env.eflags = 0x2;
+        g_pic_imr[0] = 0xffu;
+        g_pic_imr[1] = 0xffu;
+        g_pic_icw_idx[0] = 0;
+        g_pic_icw_idx[1] = 0;
+        g_pic_icw_rem[0] = 0;
+        g_pic_icw_rem[1] = 0;
+        g_pic_irq0_vec = 0x30;
+        g_cur_vcpu = 0;
+        latx_guest_apic_id = 0;
+        for (uint32_t i = 0; i < MAX_VCPUS; i++) {
+            g_vcpu_online[i] = (i == 0) ? 1 : 0;
+            g_vcpu_halted[i] = 0;
+            g_vcpu_init_pending[i] = 0;
+            g_vcpu_sipi_pending[i] = 0;
+            g_vcpu_sipi_vec[i] = 0;
+        }
+        lapic_reset_all();
+        ioapic_reset();
+        g_timer_delivered = 0;
+        g_timer_ticks = 0;
+        g_timer_masked = 0;
+        for (uint32_t i = 0; i < MAX_VCPUS; i++) {
+            g_timer_irq_pending[i] = 0;
+            g_vcpu_nmi_pending[i] = 0;
+        }
+        g_vcpu_preempt_needed = 0;
+        g_plv3_timer_preempt = 1;
+        timer_ack();
+        timer_start(timer_ticks_1ms());
     }
-    lapic_reset_all();
-    ioapic_reset();
-    g_timer_delivered = 0;
-    g_timer_ticks = 0;
-    g_timer_masked = 0;
-    for (uint32_t i = 0; i < MAX_VCPUS; i++) {
-        g_timer_irq_pending[i] = 0;
-        g_vcpu_nmi_pending[i] = 0;
-    }
-    g_vcpu_preempt_needed = 0;
-    g_plv3_timer_preempt = 1;
-    timer_ack();
-    timer_start(timer_ticks_1ms());
 
     while (ran < max_blocks) {
+        if (hv_service_flush_requests()) {
+            prev_slot = -1;
+        }
+        hv_try_transfer_ap_ownership();
+        int bar_map_status = bochs_process_pending_bar_maps();
+        if (bar_map_status != 0) {
+            prev_slot = -1;
+        }
+        if (bar_map_status < 0) {
+            continue;
+        }
+        if (hv_recycle_tb_shard()) {
+            prev_slot = -1;
+        }
         if (g_smc_dirty) {
             smc_flush_local_shard(&prev_slot);
         }
@@ -3895,6 +5530,8 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
                         __atomic_store_n(&g_vcpu_online[t], 1, __ATOMIC_RELEASE);
                         loongemu_ipi_send(t, 0u);
                     } else {
+                        /* BSP executes the VP until its AP owns it. */
+                        __atomic_store_n(&g_vcpu_online[t], 1, __ATOMIC_RELEASE);
                         switch_vcpu(t);
                         prev_slot = -1;
                         stuck = 0;
@@ -4063,23 +5700,8 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
             }
             code_used += (((uint64_t)rc + 255) & ~UINT64_C(255));
             __asm__ volatile("ibar 0" ::: "memory");
-            link_new_tb(slot_idx);
         }
 
-        slot_idx = (uint32_t)(e - tb_entries);
-        if (prev_slot >= 0 && tb_entries[prev_slot].cr3 == tb_cr3 &&
-            tb_entries[prev_slot].cpl == cpl &&
-            tb_entries[prev_slot].cs_base == tb_cs_base &&
-            tb_entries[prev_slot].mode_flags == tb_mode) {
-            try_link_tb_slot((uint32_t)prev_slot, slot_idx);
-        }
-
-        {
-            uint32_t h = (uint32_t)(((before >> TB_JMP_CACHE_BITS) ^ before) &
-                                    (FAST_JMP_CACHE_SIZE - 1));
-            fast_jmp_cache[h].pc = before;
-            fast_jmp_cache[h].code = e->code;
-        }
 
         /* Publish this block before running it: the fault path resolves the
          * faulting guest RIP through the executing block's map. */
@@ -4087,6 +5709,14 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
         g_current_tb_size = e->code_size;
         g_current_tb_pc = before;
         g_current_tb_map = &tb_insn_maps[slot_idx];
+        if (hv_service_flush_requests()) {
+            prev_slot = -1;
+            continue;
+        }
+        if (hv_wait_for_barrier_release()) {
+            prev_slot = -1;
+            continue;
+        }
 
         tb_sys_run_plv3((void *)(uintptr_t)pro_buf,
                         (void *)(uintptr_t)e->code, &env);
@@ -4211,7 +5841,7 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
                                    (g_vcpu_env[c].eflags & IF_MASK) != 0) ||
                                   (com1_irq_dest_match(c) && com1_irq_pending() &&
                                    (g_vcpu_env[c].eflags & IF_MASK) != 0);
-                        if (g_vcpu_online[c] && !g_pcpu_online[c] &&
+                        if (g_vcpu_online[c] && hv_vp_owner_pcpu(c) == 0 &&
                             (!g_vcpu_halted[c] || urg)) {
                             target = c;
                             break;
@@ -4239,7 +5869,7 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
                 uint32_t target = MAX_VCPUS;
                 for (uint32_t step = 1; step < MAX_VCPUS; step++) {
                     uint32_t c = (g_cur_vcpu + step) % MAX_VCPUS;
-                    if (g_vcpu_online[c] && !g_pcpu_online[c] &&
+                    if (g_vcpu_online[c] && hv_vp_owner_pcpu(c) == 0 &&
                         (g_vcpu_nmi_pending[c] ||
                          (lapic_has_irr(c) &&
                           (g_vcpu_env[c].eflags & IF_MASK) != 0))) {
@@ -4251,7 +5881,7 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
                     g_vcpu_preempt_needed = 0;
                     for (uint32_t step = 1; step < MAX_VCPUS; step++) {
                         uint32_t c = (g_cur_vcpu + step) % MAX_VCPUS;
-                        if (g_vcpu_online[c] && !g_pcpu_online[c] && !g_vcpu_halted[c]) {
+                        if (g_vcpu_online[c] && hv_vp_owner_pcpu(c) == 0 && !g_vcpu_halted[c]) {
                             target = c;
                             break;
                         }
@@ -4299,14 +5929,21 @@ static int run_blocks_from(uint64_t pc, int max_blocks, uint64_t *end_pc)
             }
         }
     }
-
-    timer_stop();
-    timer_ack();
-    g_plv3_timer_preempt = 0;
-    for (uint32_t i = 0; i < MAX_VCPUS; i++) {
-        g_timer_irq_pending[i] = 0;
+    (void)hv_service_flush_requests();
+    (void)hv_recycle_tb_shard();
+    while (bochs_process_pending_bar_maps() < 0) {
+        (void)hv_service_flush_requests();
     }
-    env.tb_jmp_cache_ptr = 0;
+
+    if (!keep_running) {
+        timer_stop();
+        timer_ack();
+        g_plv3_timer_preempt = 0;
+        for (uint32_t i = 0; i < MAX_VCPUS; i++) {
+            g_timer_irq_pending[i] = 0;
+        }
+        env.tb_jmp_cache_ptr = 0;
+    }
     if (end_pc) {
         *end_pc = env.eip;
     }
@@ -4319,8 +5956,8 @@ static int run_guest_idle_loop(int rounds)
     int i;
     int woke = 0;
 
-    *(volatile uint8_t *)(uintptr_t)HLT_PC_TEST = 0xf4;
-    *(volatile uint32_t *)(uintptr_t)TICK_COUNTER_PC = 0;
+    *(volatile uint8_t *)gpa_to_host_ptr(HLT_PC_TEST) = 0xf4;
+    *(volatile uint32_t *)gpa_to_host_ptr(TICK_COUNTER_PC) = 0;
 
     /* The ISR must be in place: this test is about the loop, not the gate. */
     {
@@ -4330,16 +5967,16 @@ static int run_guest_idle_loop(int rounds)
         };
         uint64_t gate_lo, gate_hi;
 
-        memcpy((void *)(uintptr_t)TICK_ISR_PC, isr_code, sizeof(isr_code));
+        memcpy(gpa_to_host_ptr(TICK_ISR_PC), isr_code, sizeof(isr_code));
         gate_lo = ((uint64_t)TICK_ISR_PC & 0xffffULL) |
                   ((uint64_t)0x08 << 16) |
                   ((uint64_t)0x8e << 40) |
                   (((((uint64_t)TICK_ISR_PC) >> 16) & 0xffffULL) << 48);
         gate_hi = ((uint64_t)TICK_ISR_PC >> 32) & 0xffffffffULL;
-        *(volatile uint64_t *)(uintptr_t)(TICK_IDT_PC + TICK_VECTOR * 16) =
+        *(volatile uint64_t *)gpa_to_host_ptr(TICK_IDT_PC + TICK_VECTOR * 16) =
             gate_lo;
-        *(volatile uint64_t *)(uintptr_t)(TICK_IDT_PC +
-                                          TICK_VECTOR * 16 + 8) = gate_hi;
+        *(volatile uint64_t *)gpa_to_host_ptr(TICK_IDT_PC +
+                                              TICK_VECTOR * 16 + 8) = gate_hi;
     }
 
     env.idt.base = TICK_IDT_PC;
@@ -4405,7 +6042,7 @@ static int run_halted_guest_rounds(int rounds)
     int i;
     int woke = 0;
 
-    *(volatile uint8_t *)(uintptr_t)HLT_PC_TEST = 0xf4;
+    *(volatile uint8_t *)gpa_to_host_ptr(HLT_PC_TEST) = 0xf4;
 
     env.idt.base = TICK_IDT_PC;
     env.idt.limit = 0xffff;
@@ -4446,16 +6083,16 @@ static uint32_t run_guest_tick_case(int enable_ticks, int injections)
     int i;
     int taken = 0;
 
-    *(volatile uint32_t *)(uintptr_t)TICK_COUNTER_PC = 0;
-    memcpy((void *)(uintptr_t)TICK_ISR_PC, isr_code, sizeof(isr_code));
+    *(volatile uint32_t *)gpa_to_host_ptr(TICK_COUNTER_PC) = 0;
+    memcpy(gpa_to_host_ptr(TICK_ISR_PC), isr_code, sizeof(isr_code));
 
     gate_lo = ((uint64_t)TICK_ISR_PC & 0xffffULL) |
               ((uint64_t)0x08 << 16) |
               ((uint64_t)0x8e << 40) |
               (((((uint64_t)TICK_ISR_PC) >> 16) & 0xffffULL) << 48);
     gate_hi = ((uint64_t)TICK_ISR_PC >> 32) & 0xffffffffULL;
-    *(volatile uint64_t *)(uintptr_t)(TICK_IDT_PC + TICK_VECTOR * 16) = gate_lo;
-    *(volatile uint64_t *)(uintptr_t)(TICK_IDT_PC + TICK_VECTOR * 16 + 8) = gate_hi;
+    *(volatile uint64_t *)gpa_to_host_ptr(TICK_IDT_PC + TICK_VECTOR * 16) = gate_lo;
+    *(volatile uint64_t *)gpa_to_host_ptr(TICK_IDT_PC + TICK_VECTOR * 16 + 8) = gate_hi;
 
     /*
      * The body is a one-instruction spin at its own address, so "the guest
@@ -4467,7 +6104,7 @@ static uint32_t run_guest_tick_case(int enable_ticks, int injections)
 
         spin[0] = 0xeb;                       /* jmp $ */
         spin[1] = 0xfe;
-        memcpy((void *)(uintptr_t)TICK_SPIN_PC, spin, sizeof(spin));
+        memcpy(gpa_to_host_ptr(TICK_SPIN_PC), spin, sizeof(spin));
     }
 
     env.idt.base = TICK_IDT_PC;
@@ -4780,8 +6417,8 @@ void tb_sys_handle_trap(uint64_t *regs)
             if (ipi != 0u) {
                 loongemu_ipi_clear(ipi);
             }
-            if ((ipi & LOONGEMU_IPI_TLB_SHOOTDOWN) || cur_shard->tlb_shootdown_pending) {
-                cur_shard->tlb_shootdown_pending = 0;
+            if (__atomic_exchange_n(&cur_shard->tlb_shootdown_pending, 0,
+                                    __ATOMIC_ACQ_REL)) {
                 __asm__ volatile("invtlb 0x3, $zero, $zero" ::: "memory");
                 latx_x86_tlb_flush_all();
                 memset(g_asid_slots, 0, sizeof(g_asid_slots));
@@ -4941,18 +6578,75 @@ void tb_sys_handle_trap(uint64_t *regs)
     if ((is_refill || ecode == EXC_PIF || ecode == EXC_PPI || ecode == EXC_PNX) &&
         fault_pc == badv && is_plv0_helper_entry(badv)) {
         HelperFn fn = (HelperFn)(uintptr_t)badv;
+        int abort_after_bar_map;
+
         g_active_helper_fn = badv;
         g_active_helper_a1 = regs[la_a1];
         g_active_helper_a2 = regs[la_a2];
         g_active_helper_ra = regs[la_ra];
+        g_active_helper_bar_pending = 0;
         uint64_t ret = fn(regs[la_a0], regs[la_a1], regs[la_a2],
                           regs[la_a3], regs[la_a4]);
+        abort_after_bar_map = bochs_helper_requires_tb_exit();
+        g_active_helper_bar_pending = 0;
         g_active_helper_fn = 0;
-
         regs[la_a0] = ret;
+        if (abort_after_bar_map) {
+            const TbInsnMap *map = g_current_tb_map;
+            uint64_t code_base = plv3_code_pc_to_phys(g_current_tb_code);
+            uint64_t return_pc = plv3_code_pc_to_phys(g_active_helper_ra);
+            uint64_t fault_x86_pc = 0;
+            uint8_t ea_seg_class = IR1_EA_SEG_UNKNOWN;
+            int mapped = 0;
+
+            if (map != 0) {
+                mapped = tb_harness_resolve_x86_fault(
+                    map, code_base, return_pc, g_current_tb_pc,
+                    &fault_x86_pc, &ea_seg_class);
+            }
+            if (!mapped) {
+                int slot = find_tb_slot_by_code_pc(return_pc);
+                if (slot >= 0) {
+                    map = &tb_insn_maps[slot];
+                    code_base = tb_entries[slot].code;
+                    mapped = tb_harness_resolve_x86_fault(
+                        map, code_base, return_pc, tb_entries[slot].pc,
+                        &fault_x86_pc, &ea_seg_class);
+                }
+            }
+            const TbInsnSpan *fault_span = 0;
+            if (mapped && map != 0) {
+                for (uint32_t i = 0; i < map->count; i++) {
+                    if (map->spans[i].x86_pc == fault_x86_pc &&
+                        map->spans[i].x86_size != 0) {
+                        fault_span = &map->spans[i];
+                        break;
+                    }
+                }
+            }
+            if (fault_span == 0) {
+                latx_platform_refuse("Bochs BAR helper lacks a mapped x86 span");
+            }
+            env.eip = fault_span->x86_pc + fault_span->x86_size;
+            sync_env_to_trap_regs(regs);
+            g_plv3_exit.reason = PLV3_EXIT_NORMAL;
+            g_plv3_exit.ecode = 0;
+            g_plv3_exit.esubcode = 0;
+            g_plv3_exit.is_refill = 0;
+            g_plv3_exit.era = return_pc;
+            g_plv3_exit.badv = 0;
+            g_plv3_exit.guest_rip = env.eip;
+            if (is_refill) {
+                csrwr(0x8a,
+                      ((uint64_t)(uintptr_t)tb_sys_plv3_done &
+                       ~UINT64_C(3)) | 1u);
+            } else {
+                csrwr(0x6, (uint64_t)(uintptr_t)tb_sys_plv3_done);
+            }
+            return;
+        }
         if (is_refill) {
-            /* Keep TLBRERA.ISTLBR = 1 so ERTN pops TLBRERA/TLBRPRMD and returns
-             * to $ra at PLV3. */
+            /* Keep TLBRERA.ISTLBR=1 so ERTN returns to the PLV3 caller. */
             csrwr(0x8a, (regs[la_ra] & ~UINT64_C(3)) | 1u);
         } else {
             csrwr(0x6, regs[la_ra]);
@@ -4975,6 +6669,14 @@ void tb_sys_handle_trap(uint64_t *regs)
         /*
          * 3a. Host VMM resource access (code cache, pro_buf, epi_buf, env,
          *     kstack): already mapped in g_root by rebuild_host_mappings().
+         */
+        /*
+         * Host control mappings share the PLV3 virtual space with guest
+         * addresses.  This path is not a security boundary: a warm TLB entry
+         * for a host page is reached before any fault, so the trap predicate
+         * cannot distinguish a guest access from a host helper access.  See
+         * README Known limitations; untrusted guests are unsupported until
+         * translator-side sandboxing or a separate hardware context exists.
          */
         if (is_host_vmm_va(badv)) {
             r_la = lapg_walk(&g_memory, g_root, badv, lapg_access, &tr_la);
@@ -5074,73 +6776,53 @@ void tb_sys_handle_trap(uint64_t *regs)
      *     - All other guest non-canonical accesses inject #GP(0) (vec 13).
      */
     if (!is_refill && ecode == EXC_ADE) {
+        uint64_t code_pc = plv3_code_pc_to_phys(fault_pc);
+        uint64_t current_code = plv3_code_pc_to_phys(g_current_tb_code);
+        uint64_t fault_code_base = 0;
+        const TbInsnMap *fault_map = 0;
         int in_tb = (g_current_tb_code != 0 &&
-                     fault_pc >= g_current_tb_code &&
-                     fault_pc < g_current_tb_code + (uint64_t)g_current_tb_size);
+                     code_pc >= current_code &&
+                     code_pc < current_code + (uint64_t)g_current_tb_size);
+        int mapped_insn = 0;
+        uint8_t ea_seg_class = IR1_EA_SEG_UNKNOWN;
+        uint64_t fault_x86_pc = env.eip;
         int non_canonical = (((int64_t)(badv << 16) >> 16) != (int64_t)badv);
 
         sync_trap_regs_to_env(regs);
-        env.eip = resolve_fault_x86_pc(fault_pc);
+        if (in_tb && g_current_tb_map != 0) {
+            fault_map = g_current_tb_map;
+            fault_code_base = current_code;
+            mapped_insn = tb_harness_resolve_x86_fault(
+                fault_map, fault_code_base, code_pc,
+                g_current_tb_pc, &fault_x86_pc, &ea_seg_class);
+        } else {
+            int slot = find_tb_slot_by_code_pc(code_pc);
+            if (slot >= 0) {
+                fault_map = &tb_insn_maps[slot];
+                fault_code_base = tb_entries[slot].code;
+                mapped_insn = tb_harness_resolve_x86_fault(
+                    fault_map, fault_code_base, code_pc,
+                    tb_entries[slot].pc, &fault_x86_pc, &ea_seg_class);
+                in_tb = mapped_insn;
+            }
+        }
+        if (mapped_insn && ea_seg_class == IR1_EA_SEG_UNKNOWN &&
+            (env.cr[0] & CR0_PG_MASK) == 0) {
+            (void)tb_harness_refine_x86_fault_ea(
+                fault_map, fault_code_base, code_pc, badv, env.regs,
+                env.segs[R_FS].base, env.segs[R_GS].base, &ea_seg_class);
+        }
+        env.eip = mapped_insn ? fault_x86_pc : resolve_fault_x86_pc(fault_pc);
         g_plv3_exit.ecode = ecode;
         g_plv3_exit.esubcode = (estat >> 22) & 0x1ffu;
         g_plv3_exit.is_refill = 0;
         g_plv3_exit.era = fault_pc;
         g_plv3_exit.badv = badv;
 
-        if (in_tb && non_canonical) {
-            uint32_t exc_vec = 13u; /* #GP(0) default */
-            uint8_t ib[15];
-            int pos = 0, seg_ovr = 0, rex = 0;
-            for (int k = 0; k < 15; k++) {
-                ib[k] = latx_x86_fetch_byte(&env, env.eip + (uint64_t)k);
-            }
-            while (pos < 14) {
-                uint8_t b = ib[pos];
-                if (b == 0x26u || b == 0x2eu || b == 0x36u || b == 0x3eu ||
-                    b == 0x64u || b == 0x65u) {
-                    seg_ovr = b;
-                    pos++;
-                } else if (b == 0x66u || b == 0x67u || b == 0xf0u ||
-                           b == 0xf2u || b == 0xf3u) {
-                    pos++;
-                } else if ((b & 0xf0u) == 0x40u) {
-                    rex = b;
-                    pos++;
-                } else {
-                    break;
-                }
-            }
-            if (seg_ovr == 0x36) {
-                exc_vec = 12u; /* explicit SS override -> #SS(0) */
-            } else if (seg_ovr == 0 && pos < 14) {
-                uint8_t op = ib[pos];
-                /* Implicit stack instructions always use SS */
-                if ((op >= 0x50u && op <= 0x5fu) || op == 0x68u || op == 0x6au ||
-                    op == 0x8fu || op == 0x9cu || op == 0x9du || op == 0xc2u ||
-                    op == 0xc3u || op == 0xc8u || op == 0xc9u || op == 0xcau ||
-                    op == 0xcbu || op == 0xcfu || op == 0xe8u) {
-                    exc_vec = 12u;
-                } else if (pos + 1 < 15) {
-                    /* Check ModRM/SIB base register for RSP (4) or RBP (5) when REX.B == 0 */
-                    int op2 = (op == 0x0fu) ? 1 : 0;
-                    if (pos + op2 + 1 < 15) {
-                        uint8_t modrm = ib[pos + op2 + 1];
-                        uint8_t mod = (modrm >> 6) & 3u;
-                        uint8_t rm = modrm & 7u;
-                        if (mod != 3u && (rex & 1u) == 0) {
-                            if (rm == 5u && mod != 0u) {
-                                exc_vec = 12u; /* [rbp + disp8/disp32] */
-                            } else if (rm == 4u && pos + op2 + 2 < 15) {
-                                uint8_t sib = ib[pos + op2 + 2];
-                                uint8_t base = sib & 7u;
-                                if (base == 4u || (base == 5u && mod != 0u)) {
-                                    exc_vec = 12u; /* [rsp+...] or [rbp+...] */
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if (in_tb && non_canonical && mapped_insn &&
+            (ea_seg_class == IR1_EA_SEG_SS ||
+             ea_seg_class == IR1_EA_SEG_NOT_SS)) {
+            uint32_t exc_vec = ea_seg_class == IR1_EA_SEG_SS ? 12u : 13u;
             g_hw_guest_gp++;
             if (deliver_x86_exception(exc_vec, env.eip, 0u, 1)) {
                 g_plv3_exit.reason = PLV3_EXIT_GUEST_PF;
@@ -5151,7 +6833,7 @@ void tb_sys_handle_trap(uint64_t *regs)
                 g_plv3_exit.guest_rip = env.eip;
             }
         } else {
-            /* Host/DBT address error: do NOT mask as a guest exception. */
+            /* Unknown metadata is not enough evidence for #SS or #GP. */
             g_plv3_exit.reason = PLV3_EXIT_TRAP;
             g_plv3_exit.guest_rip = env.eip;
         }
@@ -5437,6 +7119,7 @@ void kmain(void)
 
     latx_bare_uart_puts("tb-sys: start\n");
     init_phys_mem_and_vclock();
+    test_vmm_handoff_and_bochs_fb();
 
     {
         uint64_t euen, crmd;
@@ -5457,9 +7140,9 @@ void kmain(void)
         }
     }
 
-    memset((void *)GUEST_BASE, 0, GUEST_RAM_SIZE);
-    memcpy((void *)(uintptr_t)PROGRAM_PC, program, sizeof(program));
-    memcpy((void *)(uintptr_t)GDT_PC, gdt_descriptor, sizeof(gdt_descriptor));
+    memset(gpa_to_host_ptr(GUEST_BASE), 0, (size_t)g_guest_ram_size);
+    memcpy(gpa_to_host_ptr(PROGRAM_PC), program, sizeof(program));
+    memcpy(gpa_to_host_ptr(GDT_PC), gdt_descriptor, sizeof(gdt_descriptor));
     {
         static const uint8_t idt_descriptor[10] = {
             0xff, 0x00,                     /* limit 0xff (16 gates)  */
@@ -5467,15 +7150,15 @@ void kmain(void)
             0x00, 0x00, 0x00, 0x00,
         };
 
-        memcpy((void *)(uintptr_t)IDT_DESC_PC, idt_descriptor,
+        memcpy(gpa_to_host_ptr(IDT_DESC_PC), idt_descriptor,
                sizeof(idt_descriptor));
     }
-    memcpy((void *)(uintptr_t)STR_PC, banner, sizeof(banner));
-    *(volatile uint64_t *)(uintptr_t)ALIAS_PA = 0;
+    memcpy(gpa_to_host_ptr(STR_PC), banner, sizeof(banner));
+    *(volatile uint64_t *)gpa_to_host_ptr(ALIAS_PA) = 0;
     {
         uint32_t str_addr = STR_PC;
 
-        memcpy((void *)(uintptr_t)(PROGRAM_PC + 0xf6), &str_addr,
+        memcpy(gpa_to_host_ptr(PROGRAM_PC + 0xf6), &str_addr,
                sizeof(str_addr));
     }
 
@@ -5623,6 +7306,14 @@ void kmain(void)
 
     /* DMW0: VSEG=0, MAT=CC (1<<4), PLV0=1 */
     csrwr(0x180, ((uint64_t)0 << 60) | (UINT64_C(1) << 4) | 1u);
+    /* Keep DMW1's direct map but strip every PLV1..3 enable bit. */
+    csrwr(0x181, (csrrd(0x181) & ~UINT64_C(0x0e)) | 1u);
+    csrwr(0x182, 0);
+    csrwr(0x183, 0);
+    check((csrrd(0x181) & UINT64_C(0x0e)) == 0u &&
+          (csrrd(0x182) & UINT64_C(0x0e)) == 0u &&
+          (csrrd(0x183) & UINT64_C(0x0e)) == 0u,
+          "inherited PLV1..3 DMW windows cleared");
     {
         uint64_t crmd = csrrd(0x0);
 
@@ -5639,8 +7330,8 @@ void kmain(void)
      * Save host page 0x201000 before the guest test writes to PA 0x201000
      * (`RO_PC`), then restore it right after the guest loop finishes.
      */
-    memcpy(host_page_201000_backup, (const void *)(uintptr_t)RO_PC, 4096);
-    *(volatile uint8_t *)(uintptr_t)RO_PC = 0;
+    memcpy(host_page_201000_backup, gpa_to_host_ptr(RO_PC), 4096);
+    *(volatile uint8_t *)gpa_to_host_ptr(RO_PC) = 0;
 
     for (steps = 0; steps < 128; steps++) {
         TbCacheEntry *e;
@@ -5694,8 +7385,8 @@ void kmain(void)
                         &env);
     }
 
-    ro_byte_observed = *(volatile uint8_t *)(uintptr_t)RO_PC;
-    memcpy((void *)(uintptr_t)RO_PC, host_page_201000_backup, 4096);
+    ro_byte_observed = *(volatile uint8_t *)gpa_to_host_ptr(RO_PC);
+    memcpy(gpa_to_host_ptr(RO_PC), host_page_201000_backup, 4096);
     __asm__ volatile("ibar 0" ::: "memory");
 
     latx_bare_uart_puts("tb-sys: steps=");
@@ -5711,16 +7402,16 @@ void kmain(void)
     puthex(env.cr[3]);
     latx_bare_uart_puts("\n");
     latx_bare_uart_puts("tb-sys: handler runs=");
-    puthex(*(volatile uint32_t *)(uintptr_t)0x1628);
+    puthex(*(volatile uint32_t *)gpa_to_host_ptr(0x1628));
     latx_bare_uart_puts(" cr2=");
-    puthex(*(volatile uint64_t *)(uintptr_t)0x1600);
+    puthex(*(volatile uint64_t *)gpa_to_host_ptr(0x1600));
     latx_bare_uart_puts(" ec=");
-    puthex(*(volatile uint32_t *)(uintptr_t)0x1620);
+    puthex(*(volatile uint32_t *)gpa_to_host_ptr(0x1620));
     latx_bare_uart_puts("\n");
     latx_bare_uart_puts("tb-sys: alias r14=");
     puthex(env.regs[R_R14]);
     latx_bare_uart_puts(" pa100000=");
-    puthex(*(volatile uint64_t *)(uintptr_t)ALIAS_PA);
+    puthex(*(volatile uint64_t *)gpa_to_host_ptr(ALIAS_PA));
     latx_bare_uart_puts("\n");
     latx_bare_uart_puts("tb-sys: gdt.base=");
     puthex(env.gdt.base);
@@ -5755,16 +7446,16 @@ void kmain(void)
      * the exception now.
      */
     check(faults == 0, "no fault escaped to the driver");
-    check(*(volatile uint32_t *)(uintptr_t)0x1628 == 1,
+    check(*(volatile uint32_t *)gpa_to_host_ptr(0x1628) == 1,
           "the #PF handler ran exactly once");
-    check(*(volatile uint64_t *)(uintptr_t)0x1600 == RO_PC,
+    check(*(volatile uint64_t *)gpa_to_host_ptr(0x1600) == RO_PC,
           "handler saw CR2 = the faulting store address");
-    check(*(volatile uint64_t *)(uintptr_t)0x1610 == STORE_PC,
+    check(*(volatile uint64_t *)gpa_to_host_ptr(0x1610) == STORE_PC,
           "the frame RIP is the faulting instruction");
-    check(*(volatile uint32_t *)(uintptr_t)0x1620 == 0x3u,
+    check(*(volatile uint32_t *)gpa_to_host_ptr(0x1620) == 0x3u,
           "error code is P|W (supervisor write)");
-    check((*(volatile uint64_t *)(uintptr_t)0x5008 & ~UINT64_C(0x60)) == 0x00201003u &&
-          (*(volatile uint64_t *)(uintptr_t)0x5008 & UINT64_C(0x60)) == UINT64_C(0x60),
+    check((*(volatile uint64_t *)gpa_to_host_ptr(0x5008) & ~UINT64_C(0x60)) == 0x00201003u &&
+          (*(volatile uint64_t *)gpa_to_host_ptr(0x5008) & UINT64_C(0x60)) == UINT64_C(0x60),
           "the handler made the leaf writable (with A|D set by authoritative walker)");
     check(ro_byte_observed == 2,
           "the retried store landed after the PTE was fixed");
@@ -5794,7 +7485,7 @@ void kmain(void)
         uint64_t saved_cr0 = env.cr[0];
 
         env.cr[0] &= ~(uint64_t)CR0_WP_MASK;
-        *(volatile uint64_t *)0x4000 = 0x81;
+        *(volatile uint64_t *)gpa_to_host_ptr(0x4000) = 0x81;
         r = latx_x86_walk(&env, 0x1000, LATX_X86_ACCESS_WRITE, &t);
         check(r == LATX_X86_WALK_OK,
               "WP clear: supervisor may write a read-only leaf");
@@ -5815,7 +7506,7 @@ void kmain(void)
 
         /* NX on the leaf, with EFER.NXE enabled, blocks fetch only. */
         env.efer |= MSR_EFER_NXE;
-        *(volatile uint64_t *)0x4000 = 0x8000000000000083ull;
+        *(volatile uint64_t *)gpa_to_host_ptr(0x4000) = 0x8000000000000083ull;
         r = latx_x86_walk(&env, 0x1000, LATX_X86_ACCESS_EXEC, &t);
         check(r == LATX_X86_WALK_PROTECTION &&
               latx_x86_fault_error_code(&env, r, LATX_X86_ACCESS_EXEC) == 0x11,
@@ -5829,7 +7520,7 @@ void kmain(void)
          * and must be dropped by INVLPG and by a CR3 write.
          */
         latx_x86_tlb_flush_all();
-        *(volatile uint64_t *)0x4000 = 0x81;      /* read-only leaf */
+        *(volatile uint64_t *)gpa_to_host_ptr(0x4000) = 0x81;      /* read-only leaf */
         r = latx_x86_walk_cached(&env, 0x1000, LATX_X86_ACCESS_READ, &t);
         check(r == LATX_X86_WALK_OK && t.gpa == 0x1000, "cached walk fills");
         env.cr[0] |= CR0_WP_MASK;
@@ -5837,7 +7528,7 @@ void kmain(void)
         check(r == LATX_X86_WALK_PROTECTION,
               "cached leaf permissions are re-checked without a walk");
         /* Back to writable in the table, but the cache still says read-only. */
-        *(volatile uint64_t *)0x4000 = 0x83;
+        *(volatile uint64_t *)gpa_to_host_ptr(0x4000) = 0x83;
         r = latx_x86_walk_cached(&env, 0x1000, LATX_X86_ACCESS_WRITE, &t);
         check(r == LATX_X86_WALK_PROTECTION, "no invalidation keeps the old leaf");
         /* INVLPG goes through helper_invlpg -> tlb_flush_page. */
@@ -5846,20 +7537,20 @@ void kmain(void)
         check(r == LATX_X86_WALK_OK, "INVLPG drops the stale leaf");
         env.cr[0] &= ~(uint64_t)CR0_WP_MASK;
         /* A CR3 write drops everything, as a real address-space switch must. */
-        *(volatile uint64_t *)0x4000 = 0x81;
+        *(volatile uint64_t *)gpa_to_host_ptr(0x4000) = 0x81;
         r = latx_x86_walk_cached(&env, 0x1000, LATX_X86_ACCESS_READ, &t);
         check(r == LATX_X86_WALK_OK, "cache refilled after INVLPG");
-        *(volatile uint64_t *)0x4000 = 0x83;
+        *(volatile uint64_t *)gpa_to_host_ptr(0x4000) = 0x83;
         cpu_x86_update_cr3(&env, env.cr[3]);
         r = latx_x86_walk_cached(&env, 0x1000, LATX_X86_ACCESS_WRITE, &t);
         check(r == LATX_X86_WALK_OK, "CR3 write drops the cache");
 
         /* PS at the PML4 level is a reserved encoding, not a 512 GiB page. */
-        *(volatile uint64_t *)0x4000 = 0x83;
-        *(volatile uint64_t *)0x2000 = 0x3003 | 0x80;
+        *(volatile uint64_t *)gpa_to_host_ptr(0x4000) = 0x83;
+        *(volatile uint64_t *)gpa_to_host_ptr(0x2000) = 0x3003 | 0x80;
         r = latx_x86_walk(&env, 0x1000, LATX_X86_ACCESS_READ, &t);
         check(r == LATX_X86_WALK_RESERVED, "PS at the PML4 level is reserved");
-        *(volatile uint64_t *)0x2000 = 0x3003;
+        *(volatile uint64_t *)gpa_to_host_ptr(0x2000) = 0x3003;
 
         /* Authoritative x86_64_paging.c semantics: A/D bits, SMEP, SMAP+AC, PKU */
         {
@@ -5867,20 +7558,20 @@ void kmain(void)
             uint64_t saved_eflags = env.eflags;
             uint32_t saved_pkru = env.pkru;
 
-            *(volatile uint64_t *)0x2000 = 0x3007;
-            *(volatile uint64_t *)0x3000 = 0x4007;
-            *(volatile uint64_t *)0x4000 = 0x87;
+            *(volatile uint64_t *)gpa_to_host_ptr(0x2000) = 0x3007;
+            *(volatile uint64_t *)gpa_to_host_ptr(0x3000) = 0x4007;
+            *(volatile uint64_t *)gpa_to_host_ptr(0x4000) = 0x87;
             latx_x86_tlb_flush_all();
 
             r = latx_x86_walk(&env, 0x1000, LATX_X86_ACCESS_READ, &t);
             check(r == LATX_X86_WALK_OK &&
-                  ((*(volatile uint64_t *)0x4000 & (1ULL << 5)) != 0) &&
-                  ((*(volatile uint64_t *)0x4000 & (1ULL << 6)) == 0),
+                  ((*(volatile uint64_t *)gpa_to_host_ptr(0x4000) & (1ULL << 5)) != 0) &&
+                  ((*(volatile uint64_t *)gpa_to_host_ptr(0x4000) & (1ULL << 6)) == 0),
                   "authoritative walk sets Accessed bit without Dirty on read");
 
             r = latx_x86_walk_cached(&env, 0x1000, LATX_X86_ACCESS_WRITE, &t);
             check(r == LATX_X86_WALK_OK &&
-                  ((*(volatile uint64_t *)0x4000 & (1ULL << 6)) != 0),
+                  ((*(volatile uint64_t *)gpa_to_host_ptr(0x4000) & (1ULL << 6)) != 0),
                   "cached write promotes Dirty bit via authoritative walker");
 
             env.cr[4] = saved_cr4 | X86_CR4_SMEP;
@@ -5900,7 +7591,7 @@ void kmain(void)
 
             env.cr[4] = saved_cr4 | X86_CR4_PKE;
             env.eflags = saved_eflags;
-            *(volatile uint64_t *)0x4000 = 0x87 | (UINT64_C(2) << 59);
+            *(volatile uint64_t *)gpa_to_host_ptr(0x4000) = 0x87 | (UINT64_C(2) << 59);
             env.pkru = (2u << (2u * 2u));
             latx_x86_tlb_flush_all();
             r = latx_x86_walk(&env, 0x1000,
@@ -5912,7 +7603,11 @@ void kmain(void)
             {
                 uint64_t viol_before = g_isolation_violations;
                 uint64_t pte_vmm;
-                *(volatile uint64_t *)0x4000 = VMM_IMAGE_BASE | 0x83;
+                uint64_t saved_pte = *(volatile uint64_t *)gpa_to_host_ptr(0x6008);
+                /* A 2 MiB leaf cannot address an arbitrary page-aligned EFI image. */
+                *(volatile uint64_t *)gpa_to_host_ptr(0x4000) = 0x6003;
+                *(volatile uint64_t *)gpa_to_host_ptr(0x6008) =
+                    (g_vmm_image_base & LAPG_PAGE_MASK) | 0x03;
                 latx_x86_tlb_flush_all();
                 r = latx_x86_walk(&env, 0x1000, LATX_X86_ACCESS_READ, &t);
                 pte_vmm = (r == LATX_X86_WALK_OK)
@@ -5920,6 +7615,7 @@ void kmain(void)
                               : 0;
                 check(pte_vmm == 0 && g_isolation_violations > viol_before,
                       "host/guest isolation rejects VMM_IMAGE_BASE shadow PTE");
+                *(volatile uint64_t *)gpa_to_host_ptr(0x6008) = saved_pte;
             }
 
             {
@@ -5942,9 +7638,9 @@ void kmain(void)
                       "vclock: LAPIC one-shot expires cleanly at deadline");
             }
 
-            *(volatile uint64_t *)0x2000 = 0x3003;
-            *(volatile uint64_t *)0x3000 = 0x4003;
-            *(volatile uint64_t *)0x4000 = 0x83;
+            *(volatile uint64_t *)gpa_to_host_ptr(0x2000) = 0x3003;
+            *(volatile uint64_t *)gpa_to_host_ptr(0x3000) = 0x4003;
+            *(volatile uint64_t *)gpa_to_host_ptr(0x4000) = 0x83;
             env.cr[4] = saved_cr4;
             env.eflags = saved_eflags;
             env.pkru = saved_pkru;
@@ -5960,14 +7656,14 @@ void kmain(void)
               probe.page_bits == 12,
               "walk maps the aliased VA to PA 0x100000");
     }
-    check(*(volatile uint64_t *)(uintptr_t)ALIAS_PA == 0x44332211ull,
+    check(*(volatile uint64_t *)gpa_to_host_ptr(ALIAS_PA) == 0x44332211ull,
           "store through the aliased VA reached PA 0x100000");
     check(env.regs[R_R14] == 0x44332211u, "read through the aliased VA agrees");
 
     /* the 4-level tables the guest built, read back through the data path */
-    check((*(volatile uint64_t *)0x2000 & ~UINT64_C(0x20)) == 0x3003u, "PML4 entry");
-    check((*(volatile uint64_t *)0x3000 & ~UINT64_C(0x20)) == 0x4003u, "PDPT entry");
-    check((*(volatile uint64_t *)0x4000 & ~UINT64_C(0x60)) == 0x83u, "PD entry (2 MiB leaf)");
+    check((*(volatile uint64_t *)gpa_to_host_ptr(0x2000) & ~UINT64_C(0x20)) == 0x3003u, "PML4 entry");
+    check((*(volatile uint64_t *)gpa_to_host_ptr(0x3000) & ~UINT64_C(0x20)) == 0x4003u, "PDPT entry");
+    check((*(volatile uint64_t *)gpa_to_host_ptr(0x4000) & ~UINT64_C(0x60)) == 0x83u, "PD entry (2 MiB leaf)");
     /* every byte of the banner came out of the guest's loop */
     check(uart_tx_count == (int)sizeof(banner) - 1 &&
           memcmp(uart_tx, banner, sizeof(banner) - 1) == 0,
@@ -6024,14 +7720,14 @@ void kmain(void)
         rflags_save = env.eflags;
 
         env.idt.base = TIMER_IDT_PC;
-        *(volatile uint64_t *)(uintptr_t)(TIMER_IDT_PC + 0x20 * 16) =
+        *(volatile uint64_t *)gpa_to_host_ptr(TIMER_IDT_PC + 0x20 * 16) =
             (uint64_t)TIMER_STUB_PC & 0xffff;
-        *(volatile uint64_t *)(uintptr_t)(TIMER_IDT_PC + 0x20 * 16 + 8) =
+        *(volatile uint64_t *)gpa_to_host_ptr(TIMER_IDT_PC + 0x20 * 16 + 8) =
             ((uint64_t)TIMER_STUB_PC >> 16) & 0xffff;
 
         {
             uint64_t *slot =
-                (uint64_t *)(uintptr_t)(TIMER_IDT_PC + 0x20 * 16 + 8);
+                (uint64_t *)gpa_to_host_ptr(TIMER_IDT_PC + 0x20 * 16 + 8);
 
             *slot = (*slot & ~UINT64_C(0xffff0000)) |
                     ((((uint64_t)TIMER_STUB_PC >> 32) & 0xffff) << 16);
@@ -6154,35 +7850,46 @@ void kmain(void)
                   "Loongson 7A DC/GPU filter & internal root port quirk classification verified");
             check(latx_platform_io_read(LOONGEMU_QEMU_DEBUGCON_PORT, 1) == 0xe9u,
                   "QEMU debugcon port 0x402 returns 0xE9 signature");
-            /* Verify Host UEFI -> tb_sys VMM handoff (GOP zero-copy HPA + 1920x1080 EDID + 7A MCFG) */
+            /* Verify the GOP and 7A portions of the VMM handoff. */
             {
                 LoongemuVmmHandoff h;
                 LoongemuMemLookup lk_fb;
+                LoongemuVmmHandoff saved_handoff = g_vmm_handoff;
+                int saved_external = g_guest_ram_external;
                 memset(&h, 0, sizeof(h));
                 h.magic = LOONGEMU_VMM_HANDOFF_MAGIC;
                 h.version = LOONGEMU_VMM_HANDOFF_VERSION;
-                h.gop.fb_hpa = UINT64_C(0x00000000e0000000);
-                h.gop.fb_size = UINT64_C(0x01000000);
-                h.gop.width = 1920u;
-                h.gop.height = 1080u;
-                h.gop.stride_px = 1920u;
+                h.gop.fb_hpa = g_bochs_fb_fallback_hpa;
+                h.gop.fb_size = BOCHS_FB_FALLBACK_SIZE;
+                h.gop.width = 1024u;
+                h.gop.height = 768u;
+                h.gop.stride_px = 1024u;
                 h.gop.bpp = 32u;
                 h.gop.pixel_format = 1u;
                 h.gop.valid = 1u;
+                h.gop.owner = (uint8_t)LOONGEMU_FB_OWNER_HOST_GOP;
+                h.gop.host_mat = (uint8_t)LOONGEMU_MAT_WUC;
                 h.ls7a_cfg_type0_base = LOONGSON_7A_CFG_TYPE0_BASE;
                 h.ls7a_cfg_type1_base = LOONGSON_7A_CFG_TYPE1_BASE;
                 h.ls7a_mcfg_valid = 1u;
                 h.hide_host_dc_gpu = 1u;
+                /* Synthetic GOP backed by the allocated test buffer. */
+                g_guest_ram_external = 0;
                 tb_sys_set_vmm_handoff(&h);
                 LoongemuMemKind k_fb = loongemu_mem_resolve(&g_mem_map, LOONGEMU_BOCHS_FB_DEFAULT_GPA, 4u, &lk_fb);
                 uint64_t xres = loongemu_bochs_mmio_read(&g_pci_host.display, 0x502u, 2u);
                 uint64_t yres = loongemu_bochs_mmio_read(&g_pci_host.display, 0x504u, 2u);
                 check(k_fb == LOONGEMU_MEM_RAM && lk_fb.hpa == h.gop.fb_hpa &&
-                      xres == 1920u && yres == 1080u && g_pci_host.ls7a.hide_host_dc_gpu == 1,
-                      "Host UEFI VmmHandoff binds Bochs BAR0 zero-copy to GOP HPA & 1920x1080 EDID/DISPI");
-                /* Restore fallback FB backing for subsequent local tests */
-                memset(&g_vmm_handoff, 0, sizeof(g_vmm_handoff));
-                loongemu_pci_host_init(&g_pci_host, 0, bochs_display_bar_map_cb, 0);
+                      xres == 1024u && yres == 768u && g_pci_host.ls7a.hide_host_dc_gpu == 1,
+                      "VMM handoff binds Bochs BAR0 to GOP backing and geometry");
+                bochs_display_bar_map_cb(0, 0, 0, 0, 0);
+                g_guest_ram_external = saved_external;
+                g_vmm_handoff = saved_handoff;
+                if (saved_handoff.magic == LOONGEMU_VMM_HANDOFF_MAGIC) {
+                    tb_sys_set_vmm_handoff(&saved_handoff);
+                } else {
+                    loongemu_pci_host_init(&g_pci_host, 0, bochs_display_bar_map_cb, 0);
+                }
             }
         }
 
@@ -6230,7 +7937,7 @@ void kmain(void)
             uint8_t *code_addr = code_cache + 0x18000;
             int rc;
 
-            *(volatile uint8_t *)(uintptr_t)HLT_PC_TEST = 0xf4;  /* hlt */
+            *(volatile uint8_t *)gpa_to_host_ptr(HLT_PC_TEST) = 0xf4;  /* hlt */
             env.eip = HLT_PC_TEST;
             env.regs[R_ESP] = TICK_STACK_PC;
             env.eflags = IF_MASK | 0x2;
@@ -6257,16 +7964,16 @@ void kmain(void)
         {
             uint64_t gate_lo, gate_hi, before;
 
-            *(volatile uint8_t *)(uintptr_t)HLT_PC_TEST = 0xf4;
+            *(volatile uint8_t *)gpa_to_host_ptr(HLT_PC_TEST) = 0xf4;
             gate_lo = ((uint64_t)TICK_ISR_PC & 0xffffULL) |
                       ((uint64_t)0x08 << 16) |
                       ((uint64_t)0x8e << 40) |
                       (((((uint64_t)TICK_ISR_PC) >> 16) & 0xffffULL) << 48);
             gate_hi = ((uint64_t)TICK_ISR_PC >> 32) & 0xffffffffULL;
-            *(volatile uint64_t *)(uintptr_t)(TICK_IDT_PC + TICK_VECTOR * 16) =
+            *(volatile uint64_t *)gpa_to_host_ptr(TICK_IDT_PC + TICK_VECTOR * 16) =
                 gate_lo;
-            *(volatile uint64_t *)(uintptr_t)(TICK_IDT_PC +
-                                              TICK_VECTOR * 16 + 8) = gate_hi;
+            *(volatile uint64_t *)gpa_to_host_ptr(TICK_IDT_PC +
+                                                  TICK_VECTOR * 16 + 8) = gate_hi;
 
             env.idt.base = TICK_IDT_PC;
             env.idt.limit = 0xffff;
@@ -6307,12 +8014,12 @@ void kmain(void)
 
                 check(idle == 4,
                       "idle loop: 4 halt/wake rounds executed end to end");
-                check(*(volatile uint32_t *)(uintptr_t)TICK_COUNTER_PC == 4,
+                check(*(volatile uint32_t *)gpa_to_host_ptr(TICK_COUNTER_PC) == 4,
                       "idle loop: the handler's own inc ran four times");
                 latx_bare_uart_puts("tb-sys: idle_rounds=");
                 puthex((uint64_t)(idle < 0 ? 0 : idle));
                 latx_bare_uart_puts(" idle_count=");
-                puthex(*(volatile uint32_t *)(uintptr_t)TICK_COUNTER_PC);
+                puthex(*(volatile uint32_t *)gpa_to_host_ptr(TICK_COUNTER_PC));
                 latx_bare_uart_puts("\n");
             }
         }
@@ -6368,7 +8075,7 @@ void kmain(void)
         uint64_t pc = base;
         int blocks = 0;
 
-        memcpy((void *)(uintptr_t)base, kernel_head, sizeof(kernel_head));
+        memcpy(gpa_to_host_ptr(base), kernel_head, sizeof(kernel_head));
 
         /*
          * Walk instruction by instruction rather than in fixed strides: a
@@ -6379,7 +8086,7 @@ void kmain(void)
         while (blocks < 40 && pc < base + 96) {
             TbInsnMap map;
             int rc = tb_harness_translate_at_with_map(
-                         pc, (uint8_t *)(uintptr_t)(CODE_SCRATCH + 0x20000),
+                         pc, gpa_to_host_ptr(CODE_SCRATCH + 0x20000),
                          4096, &map);
             /*
              * The harness records each instruction's guest PC and the native
@@ -6427,7 +8134,7 @@ void kmain(void)
         uint64_t pc = OVMF_RESET_PC;
         int emitted;
 
-        memcpy((void *)(uintptr_t)pc, ovmf_reset, sizeof(ovmf_reset));
+        memcpy(gpa_to_host_ptr(pc), ovmf_reset, sizeof(ovmf_reset));
         emitted = tb_harness_translate_at(pc, code_cache + 0x8000, 4096);
         check(emitted > 0, "OVMF reset vector translates");
         latx_bare_uart_puts("tb-sys: ovmf_reset_bytes=");
@@ -6481,8 +8188,8 @@ void kmain(void)
         int rc_dst, rc_src;
         int has_gr2scr = 0, has_jiscr0 = 0, has_jirl = 0;
 
-        memcpy((void *)(uintptr_t)src_pc, src_x86, sizeof(src_x86));
-        memcpy((void *)(uintptr_t)dst_pc, dst_x86, sizeof(dst_x86));
+        memcpy(gpa_to_host_ptr(src_pc), src_x86, sizeof(src_x86));
+        memcpy(gpa_to_host_ptr(dst_pc), dst_x86, sizeof(dst_x86));
         memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
         env.tb_jmp_cache_ptr = fast_jmp_cache;
         option_lbt_jiscr = !option_sw_lbt;
@@ -6550,10 +8257,9 @@ void kmain(void)
         uint64_t pc = KERNEL_ENTRY_PC;
         int emitted;
 
-        memcpy((void *)(uintptr_t)pc, kernel_entry, sizeof(kernel_entry));
+        memcpy(gpa_to_host_ptr(pc), kernel_entry, sizeof(kernel_entry));
 
-        emitted = tb_harness_translate_at(pc, (uint8_t *)(uintptr_t)
-                                          (CODE_SCRATCH), 4096);
+        emitted = tb_harness_translate_at(pc, gpa_to_host_ptr(CODE_SCRATCH), 4096);
         check(emitted > 0, "kernel entry block translates");
         latx_bare_uart_puts("tb-sys: kernel_entry_bytes=");
         puthex((uint64_t)emitted);
@@ -6601,7 +8307,7 @@ void kmain(void)
         uint64_t saved_cr3 = env.cr[3];
         uint64_t saved_cr0 = env.cr[0];
 
-        memset((void *)(uintptr_t)pml4, 0, 0x4000);
+        memset(gpa_to_host_ptr(pml4), 0, 0x4000);
         /* PML4[511] -> PDPT, PDPT[510] -> PD, PD[0] -> PT, PT[0] -> 16 MiB */
         /*
          * Low identity map: PML4[0] -> PDPT[0] -> PD, PD[8..] -> 2 MiB leaves
@@ -6609,8 +8315,8 @@ void kmain(void)
          * address, so the address it computes from RIP and the address the
          * tables translate are the same number.
          */
-        *(volatile uint64_t *)(uintptr_t)(pml4 + 0 * 8) = pdpt | 0x3;
-        *(volatile uint64_t *)(uintptr_t)(pdpt + 0 * 8) = pd | 0x3;
+        *(volatile uint64_t *)gpa_to_host_ptr(pml4 + 0 * 8) = pdpt | 0x3;
+        *(volatile uint64_t *)gpa_to_host_ptr(pdpt + 0 * 8) = pd | 0x3;
 
         /*
          * The kernel's own prologue loads RSP from a RIP-relative LEA that
@@ -6620,8 +8326,8 @@ void kmain(void)
          * entry's `rdi >> 46` check; it does not change the addresses the
          * image computes for itself.
          */
-        *(volatile uint64_t *)(uintptr_t)(pml4 + 511 * 8) = pdpt | 0x3;
-        *(volatile uint64_t *)(uintptr_t)(pdpt + 510 * 8) = pd | 0x3;
+        *(volatile uint64_t *)gpa_to_host_ptr(pml4 + 511 * 8) = pdpt | 0x3;
+        *(volatile uint64_t *)gpa_to_host_ptr(pdpt + 510 * 8) = pd | 0x3;
         /*
          * Index arithmetic for 0xffffffff81000000: PML4[511], PDPT[510],
          * PD[8].  The PD index is 8, not 0 -- 0x81000000 has a non-zero bit
@@ -6645,7 +8351,7 @@ void kmain(void)
             for (i = 0; i < 64; i++) {
                 uint64_t pa = (uint64_t)i * 0x200000ULL;
 
-                *(volatile uint64_t *)(uintptr_t)(pd + i * 8) =
+                *(volatile uint64_t *)gpa_to_host_ptr(pd + i * 8) =
                     (pa & ~UINT64_C(0x1fffff)) | 0x83;   /* P|RW|PS */
             }
             (void)pt;
@@ -6698,13 +8404,12 @@ void kmain(void)
                  * the load base (including PT_LOAD #2 .data..percpu at rel
                  * 0x1d5f000 so pcpu_hot.current_task resolves to init_task).
                  */
-                memcpy((void *)(uintptr_t)gpa, _ktext_start,
-                       KERNEL_TEXT_SIZE);
-                memcpy((void *)(uintptr_t)(gpa + KERNEL_SEG1_REL),
+                memcpy(gpa_to_host_ptr(gpa), _ktext_start, KERNEL_TEXT_SIZE);
+                memcpy(gpa_to_host_ptr(gpa + KERNEL_SEG1_REL),
                        _kseg1_start, KERNEL_SEG1_SIZE);
-                memcpy((void *)(uintptr_t)(gpa + KERNEL_SEG2_REL),
+                memcpy(gpa_to_host_ptr(gpa + KERNEL_SEG2_REL),
                        _kseg2_start, KERNEL_SEG2_SIZE);
-                memcpy((void *)(uintptr_t)(gpa + KERNEL_SEG3_REL),
+                memcpy(gpa_to_host_ptr(gpa + KERNEL_SEG3_REL),
                        _kseg3_start, KERNEL_SEG3_SIZE);
             }
 
@@ -6714,7 +8419,7 @@ void kmain(void)
                 env.cr[4] = saved_cr4 | CR4_PAE_MASK;
                 /*
                  * Populate a minimal Linux x86-64 boot_params at
-                 * BOOT_PARAMS_GPA (0x10000) with a 64 MiB e820 RAM map and
+                 * BOOT_PARAMS_GPA (0x10000) with a 128 MiB e820 RAM map and
                  * an earlyprintk serial command line at 0x20000.
                  */
                 {
@@ -6723,7 +8428,7 @@ void kmain(void)
                     uint64_t initramfs_gpa = 0x03900000ULL;
                     uint32_t initramfs_img = (uint32_t)initramfs_gpa;
                     uint32_t initramfs_sz = (uint32_t)(_initramfs_end - _initramfs_start);
-                    uint8_t *bp = (uint8_t *)(uintptr_t)BOOT_PARAMS_GPA;
+                    uint8_t *bp = (uint8_t *)gpa_to_host_ptr(BOOT_PARAMS_GPA);
                     uint64_t cmdline_gpa = 0x00020000ULL;
                     static const char cmdline[] =
                         "earlycon=uart,io,0x3f8,115200n8 console=ttyS0,115200 "
@@ -6845,11 +8550,14 @@ void kmain(void)
                             uint64_t rval = 0;
 
                             latx_hv_vendor = 1u;
+                            __atomic_store_n(&g_vcpu_online[0], 1, __ATOMIC_RELEASE);
                             cpu_x86_cpuid(&env, 0x40000003u, 0, &ha, &hb, &hc, &hd);
-                            check(ha == ((1u << 1) | (1u << 4) | (1u << 5) | (1u << 6)),
+                            check(ha == ((1u << 1) | (1u << 4) | (1u << 5) | (1u << 6)) &&
+                                  (hd & (1u << 4)) != 0u,
                                   "Hyper-V CPUID.40000003 advertises implemented MSRs & hypercalls");
                             cpu_x86_cpuid(&env, 0x40000004u, 0, &ha, &hb, &hc, &hd);
-                            check(ha == ((1u << 1) | (1u << 2) | (1u << 3) | (1u << 5) | (1u << 10)) &&
+                            check(ha == ((1u << 1) | (1u << 2) | (1u << 3) | (1u << 5) |
+                                         (1u << 10) | (1u << 11)) &&
                                   hb == 0x00000fffu,
                                   "Hyper-V CPUID.40000004 advertises backed TLB/APIC/timing/IPI recs");
 
@@ -6865,6 +8573,10 @@ void kmain(void)
                                   "HV_X64_MSR_TPR reads/writes LAPIC TPR");
                             latx_platform_kvm_wrmsr(&env, 0x40000072u, 0u);
                             latx_platform_kvm_wrmsr(&env, 0x40000073u, hv_as_gpa | 1u);
+                            latx_platform_kvm_wrmsr(&env, 0x40000073u, hv_as_gpa | 3u);
+                            check(latx_platform_kvm_rdmsr(&env, 0x40000073u, &rval) &&
+                                  rval == (hv_as_gpa | 1u),
+                                  "APIC assist rejects reserved unaligned bits");
                             lapic_set_irr(0, 0x55u);
                             check(lapic_pop_irr(0) == 0x55u &&
                                   latx_platform_phys_read(hv_as_gpa, 4) == 1u,
@@ -6874,10 +8586,25 @@ void kmain(void)
                             check(lapic_pop_irr(0) == 0x52u,
                                   "Hyper-V APIC Assist fast EOI retires ISR and delivers 0x52");
                             latx_platform_kvm_wrmsr(&env, 0x40000070u, 0u); /* HV_X64_MSR_EOI */
+                            lapic_set_irr(0, 0x55u);
+                            check(lapic_pop_irr(0) == 0x55u &&
+                                  latx_platform_phys_read(hv_as_gpa, 4) == 1u,
+                                  "APIC assist arms before nesting");
+                            lapic_set_irr(0, 0x71u);
+                            check(lapic_pop_irr(0) == 0x71u &&
+                                  latx_platform_phys_read(hv_as_gpa, 4) == 0u,
+                                  "APIC assist clears on nested interrupt");
+                            latx_platform_kvm_wrmsr(&env, 0x40000070u, 0u);
+                            check((g_lapic[0].isr[0x55u >> 5] & (1u << (0x55u & 31u))) != 0u,
+                                  "nested EOI retains underlying ISR");
+                            latx_platform_kvm_wrmsr(&env, 0x40000070u, 0u);
                             latx_platform_kvm_wrmsr(&env, 0x40000073u, 0u);
 
                             /* Hyper-V Hypercalls: FlushVirtualAddressSpace + SendSyntheticClusterIpi */
                             env.regs[R_ECX] = 0x00010002u; /* fast HvCallFlushVirtualAddressSpace */
+                            env.regs[R_EDX] = 0u;
+                            env.regs[R_R8] = 1u;
+                            env.xmm_regs[0].ZMM_Q(0) = 1u;
                             helper_hypercall(&env);
                             check(env.regs[R_EAX] == 0u,
                                   "HvCallFlushVirtualAddressSpace returns HV_STATUS_SUCCESS");
@@ -6888,6 +8615,60 @@ void kmain(void)
                             check(env.regs[R_EAX] == 0u && lapic_pop_irr(0) == 0x61u,
                                   "HvCallSendSyntheticClusterIpi injects vector 0x61 cleanly");
                             latx_platform_kvm_wrmsr(&env, 0x40000070u, 0u);
+                            env.regs[R_ECX] = 0x0001000bu;
+                            env.regs[R_EDX] = 0x0fu;
+                            helper_hypercall(&env);
+                            check(env.regs[R_EAX] == 3u, "Hyper-V rejects reserved IPI vectors");
+                            env.regs[R_ECX] = 0x0002u;
+                            env.regs[R_EDX] = hv_as_gpa + 1u;
+                            helper_hypercall(&env);
+                            check(env.regs[R_EAX] == 4u, "Hyper-V rejects unaligned input GPA");
+
+                            /*
+                             * Fast flush input qwords 2+ travel in XMM0..XMM5.
+                             * Exercise the translated VMCALL path, not just a
+                             * direct C helper call, so a missing XMM spill fails.
+                             */
+                            {
+                                static const uint8_t hv_vmcall_x86[] = {
+                                    0xb8, 0x01, 0x00, 0x00, 0x00, /* mov eax,1 */
+                                    0x66, 0x0f, 0x6e, 0xc0,       /* movd xmm0,eax */
+                                    0xb9, 0x02, 0x00, 0x01, 0x00, /* mov ecx,0x10002 */
+                                    0x31, 0xd2,                   /* xor edx,edx */
+                                    0x45, 0x31, 0xc0,             /* xor r8d,r8d */
+                                    0x0f, 0x01, 0xc1,             /* vmcall */
+                                    0xf4,                         /* hlt */
+                                };
+                                uint64_t hv_pc = 0x0000e900ULL;
+                                uint8_t *hv_code = code_cache + 0x17000;
+                                uint64_t flushes_before =
+                                    __atomic_load_n(&g_hv_flush_calls,
+                                                    __ATOMIC_RELAXED);
+
+                                memcpy(gpa_to_host_ptr(hv_pc), hv_vmcall_x86,
+                                       sizeof(hv_vmcall_x86));
+                                env.xmm_regs[0].ZMM_Q(0) = 0;
+                                env.eip = hv_pc;
+                                env.eflags = 0x2;
+                                latx_x86_tlb_flush_all();
+                                int rc_hv = tb_harness_translate_at(
+                                    hv_pc, hv_code, 4096);
+                                check(rc_hv > 0,
+                                      "fast Hyper-V VMCALL block translates");
+                                if (rc_hv > 0) {
+                                    loongemu_sync_icache_range(
+                                        (uint64_t)(uintptr_t)hv_code,
+                                        (uint64_t)rc_hv);
+                                    tb_sys_run_plv3(
+                                        (void *)(uintptr_t)pro_buf,
+                                        hv_code, &env);
+                                    check(env.regs[R_EAX] == 0u &&
+                                          __atomic_load_n(&g_hv_flush_calls,
+                                                          __ATOMIC_RELAXED) ==
+                                              flushes_before + 1u,
+                                          "translated VMCALL flushes XMM0 mask");
+                                }
+                            }
 
                             latx_platform_kvm_wrmsr(&env, 0x40000001u, 0u);
                             latx_hv_vendor = saved_hv;
@@ -6975,8 +8756,8 @@ void kmain(void)
                             uint64_t gate_hi = (gp_isr >> 32) & 0xffffffffULL;
                             TbInsnMap ade_map;
 
-                            *(volatile uint64_t *)(uintptr_t)(gp_idt + 13u * 16u) = gate_lo;
-                            *(volatile uint64_t *)(uintptr_t)(gp_idt + 13u * 16u + 8u) = gate_hi;
+                            (void)guest_linear_write_u64(gp_idt + 13u * 16u, gate_lo);
+                            (void)guest_linear_write_u64(gp_idt + 13u * 16u + 8u, gate_hi);
                             memcpy(gpa_to_host_ptr(ade_pc), ade_x86, sizeof(ade_x86));
                             env.idt.base = gp_idt;
                             env.idt.limit = 0xfffu;
@@ -6998,11 +8779,15 @@ void kmain(void)
                                 g_current_tb_size = 0;
                                 g_current_tb_pc = 0;
                                 g_current_tb_map = 0;
+                                uint64_t ade_stack_error = UINT64_MAX;
+                                uint64_t ade_stack_rip = UINT64_MAX;
+                                int ade_stack_ok =
+                                    guest_linear_read_u64(env.regs[R_ESP], &ade_stack_error) &&
+                                    guest_linear_read_u64(env.regs[R_ESP] + 8u, &ade_stack_rip);
                                 check(g_hw_guest_gp == gp_before + 1u &&
                                       g_plv3_exit.reason == PLV3_EXIT_GUEST_PF &&
-                                      env.eip == gp_isr &&
-                                      *(volatile uint64_t *)(uintptr_t)env.regs[R_ESP] == 0ULL &&
-                                      *(volatile uint64_t *)(uintptr_t)(env.regs[R_ESP] + 8u) == ade_pc + 10u,
+                                      env.eip == gp_isr && ade_stack_ok &&
+                                      ade_stack_error == 0ULL && ade_stack_rip == ade_pc + 10u,
                                       "EXC_ADE delivers #GP(0) to guest IDT[13] with exact faulting RIP");
                             }
                             /* P0-D: SS-segment non-canonical access ([rbp+8]) -> #SS(0) IDT[12] */
@@ -7021,8 +8806,8 @@ void kmain(void)
                                                  (((ss_isr >> 16) & 0xffffULL) << 48);
                                 uint64_t ss_hi = (ss_isr >> 32) & 0xffffffffULL;
                                 TbInsnMap ss_map;
-                                *(volatile uint64_t *)(uintptr_t)(gp_idt + 12u * 16u) = ss_lo;
-                                *(volatile uint64_t *)(uintptr_t)(gp_idt + 12u * 16u + 8u) = ss_hi;
+                                (void)guest_linear_write_u64(gp_idt + 12u * 16u, ss_lo);
+                                (void)guest_linear_write_u64(gp_idt + 12u * 16u + 8u, ss_hi);
                                 memcpy(gpa_to_host_ptr(ss_pc), ss_x86, sizeof(ss_x86));
                                 env.regs[R_ESP] = gp_stk;
                                 env.eip = ss_pc;
@@ -7039,10 +8824,14 @@ void kmain(void)
                                     g_current_tb_size = 0;
                                     g_current_tb_pc = 0;
                                     g_current_tb_map = 0;
+                                    uint64_t ss_stack_error = UINT64_MAX;
+                                    uint64_t ss_stack_rip = UINT64_MAX;
+                                    int ss_stack_ok =
+                                        guest_linear_read_u64(env.regs[R_ESP], &ss_stack_error) &&
+                                        guest_linear_read_u64(env.regs[R_ESP] + 8u, &ss_stack_rip);
                                     check(g_plv3_exit.reason == PLV3_EXIT_GUEST_PF &&
-                                          env.eip == ss_isr &&
-                                          *(volatile uint64_t *)(uintptr_t)env.regs[R_ESP] == 0ULL &&
-                                          *(volatile uint64_t *)(uintptr_t)(env.regs[R_ESP] + 8u) == ss_pc + 10u,
+                                          env.eip == ss_isr && ss_stack_ok &&
+                                          ss_stack_error == 0ULL && ss_stack_rip == ss_pc + 10u,
                                           "P0-D: SS-segment non-canonical EXC_ADE delivers #SS(0) to IDT[12]");
                                 }
                             }
@@ -7240,10 +9029,10 @@ void kmain(void)
                         env.eip = saved_eip_r;
                         latx_x86_tlb_flush_all();
                     }
-                    memcpy((void *)(uintptr_t)initramfs_gpa, _initramfs_start,
+                    memcpy(gpa_to_host_ptr(initramfs_gpa), _initramfs_start,
                            initramfs_sz);
                     memset(bp, 0, 4096);
-                    memcpy((void *)(uintptr_t)cmdline_gpa, cmdline,
+                    memcpy(gpa_to_host_ptr(cmdline_gpa), cmdline,
                            sizeof(cmdline));
                     /* boot_params.acpi_rsdp_addr (offset 0x070) */
                     memcpy(bp + 0x070, &acpi_info.rsdp_gpa, 8);
@@ -7360,7 +9149,8 @@ void kmain(void)
                              * step budget.
                              */
                             boot_physical_aps();
-                            int ran = run_blocks_from(gva + 0x90, 50000000, &stop);
+                            int ran = run_blocks_from(gva + 0x90, 4194304,
+                                                      &stop, 1, 0);
 
                             latx_bare_uart_puts("tb-sys: kernel_blocks_run=");
                             puthex((uint64_t)(ran < 0 ? 0 : ran));
@@ -7374,8 +9164,6 @@ void kmain(void)
                             puthex(g_run_tb_hits);
                             latx_bare_uart_puts(" misses=");
                             puthex(g_run_tb_misses);
-                            latx_bare_uart_puts(" links=");
-                            puthex(g_run_tb_links);
                             latx_bare_uart_puts(" sync=");
                             puthex(g_sync_core_flushes);
                             latx_bare_uart_puts("/");
@@ -7439,7 +9227,7 @@ void kmain(void)
     }
 
     /*
-     * The low 64 MiB belongs to the guest and the VMM starts above it.  A
+     * The low 128 MiB belongs to the guest and the VMM starts above it.  A
      * translation at the top of that window must succeed and must not be
      * rejected by the fetch guard, which is what bounds a guest image.
      */
@@ -7452,11 +9240,11 @@ void kmain(void)
          * only maps the low 2 MiB test window. */
         env.cr[0] &= ~(uint64_t)CR0_PG_MASK;
         latx_x86_tlb_flush_all();
-        memset((void *)(uintptr_t)probe, 0x90, 256);   /* nop sled */
+        memset(gpa_to_host_ptr(probe), 0x90, 256);   /* nop sled */
         emitted = tb_harness_translate_at(probe, code_cache, 1024);
         env.cr[0] = saved_cr0;
         latx_x86_tlb_flush_all();
-        check(emitted > 0, "guest RAM reaches 64 MiB");
+        check(emitted > 0, "guest RAM reaches 128 MiB");
         check(g_bad_fetch == 0, "no fetch outside guest RAM");
     }
 
@@ -7473,13 +9261,17 @@ void kmain(void)
         puthex(g_ovmf_board.vars_flash.size);
         latx_bare_uart_puts("\n");
 
+        if (fails != 0) {
+            latx_platform_refuse("integrated VMM selftests failed");
+        }
+
         /* Clear guest RAM of prior self-test artifacts before real OVMF boot. */
-        memset((void *)(uintptr_t)g_guest_ram_hpa, 0, GUEST_RAM_SIZE);
+        memset(gpa_to_host_ptr(GUEST_BASE), 0, (size_t)g_guest_ram_size);
         latx_guest_nr_cpus = 1u;
         latx_x86_reset_real_mode(&env);
         latx_x86_tlb_flush_all();
         tbc_flush_all(&tb_cache);
-        int ran = run_blocks_from(0xfff0ULL, 50000000, &stop);
+        int ran = run_blocks_from(0xfff0ULL, 4194304, &stop, 1, 1);
         latx_bare_uart_puts("tb-sys: ovmf_blocks_run=");
         puthex((uint64_t)(ran < 0 ? 0 : ran));
         latx_bare_uart_puts(" stop=");
@@ -7540,6 +9332,35 @@ void kmain(void)
             latx_bare_uart_puts("\n");
         }
         check(ran >= 1, "real OVMF_CODE.fd executes at least one block from reset vector");
+        latx_bare_uart_puts("tb-sys: checks=");
+        puthex((uint64_t)checks);
+        latx_bare_uart_puts(" fails=");
+        puthex((uint64_t)fails);
+        latx_bare_uart_puts(fails ? " BAD\n" : " ok\n");
+        if (fails != 0) {
+            latx_platform_refuse("integrated VMM selftests failed");
+        }
+        if (g_plv3_exit.reason != PLV3_EXIT_NORMAL ||
+            g_run_blocks_exit != RUN_EXIT_MAX_BLOCKS) {
+            latx_platform_refuse("OVMF runner stopped before live execution");
+        }
+        latx_bare_uart_puts("tb-sys: ovmf_run_live=1 rip=");
+        puthex(env.eip);
+        latx_bare_uart_puts("\n");
+        for (;;) {
+            (void)run_blocks_from(env.eip, 4194304, &stop, 0, 1);
+            if (g_plv3_exit.reason != PLV3_EXIT_NORMAL ||
+                g_run_blocks_exit != RUN_EXIT_MAX_BLOCKS) {
+                latx_bare_uart_puts("tb-sys: ovmf_persistent_abort exit=");
+                puthex(g_run_blocks_exit);
+                latx_bare_uart_puts(" reason=");
+                puthex(g_plv3_exit.reason);
+                latx_bare_uart_puts(" rip=");
+                puthex(env.eip);
+                latx_bare_uart_puts("\n");
+                latx_platform_refuse("persistent OVMF runner stopped");
+            }
+        }
     }
 #endif
 
@@ -7550,5 +9371,8 @@ void kmain(void)
     latx_bare_uart_puts(fails ? " BAD\n" : " ok\n");
     latx_bare_uart_puts("tb-sys: done\n");
     for (;;) {
+        (void)hv_service_flush_requests();
+        (void)hv_recycle_tb_shard();
+        __asm__ volatile("dbar 0x700" ::: "memory");
     }
 }

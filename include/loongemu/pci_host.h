@@ -45,18 +45,20 @@ extern "C" {
 /* Host LoongArch UEFI GOP handover descriptor */
 typedef struct LoongemuGopHandover {
     uint64_t fb_hpa;        /* Host physical address of linear framebuffer */
-    uint64_t fb_size;       /* Total framebuffer size in bytes */
+    uint64_t fb_size;       /* Total usable framebuffer size in bytes */
     uint32_t width;         /* Horizontal resolution in pixels */
     uint32_t height;        /* Vertical resolution in pixels */
     uint32_t stride_px;     /* PixelsPerScanLine */
     uint32_t bpp;           /* Bits per pixel (32 for BGRX/RGBX) */
     uint32_t pixel_format;  /* 0=RGBX, 1=BGRX (matches EFI_GRAPHICS_PIXEL_FORMAT) */
     uint32_t valid;         /* Non-zero if backed by real Host UEFI GOP */
+    uint8_t  owner;         /* LoongemuFbOwner */
+    uint8_t  host_mat;      /* LoongemuHostMat: HOST_GOP -> WUC/SUC, VMM_ALLOC -> CC */
+    uint8_t  reserved[6];
 } LoongemuGopHandover;
 
-/* Callback invoked when Guest/OVMF relocates a virtual device BAR */
-typedef void (*LoongemuPciBarMapFn)(void *opaque, uint32_t bar_idx,
-                                    uint64_t new_gpa, uint64_t size, int enabled);
+typedef int (*LoongemuPciBarMapFn)(void *opaque, uint32_t bar_idx,
+                                   uint64_t new_gpa, uint64_t size, int enabled);
 
 typedef struct LoongemuPciDev {
     uint8_t  used;
@@ -80,18 +82,23 @@ typedef struct LoongemuBochsDisplay {
     uint8_t  edid[128];
     uint64_t fb_gpa;
     uint64_t mmio_gpa;
+    uint64_t fb_mapped_size; /* real backing mapped in host physical memory */
     int      fb_mapped;
     int      mmio_mapped;
 } LoongemuBochsDisplay;
+
+/* Must issue one naturally aligned native config cycle (size 1, 2, or 4). */
+typedef void (*LoongemuLs7aConfigWriteFn)(uint64_t phys_addr,
+                                          uint32_t val, unsigned size);
 
 /* Loongson 7A1000 / 7A2000 physical PCIe passthrough backend */
 typedef struct LoongemuLs7aBackend {
     uint64_t cfg_type0_base; /* e.g. 0xefe00000000 or ACPI MCFG base */
     uint64_t cfg_type1_base; /* e.g. 0xefe10000000 */
     int      enabled;
-    int      hide_host_dc_gpu; /* Hide 0014:7a06/7a36/7a15/7a25 when GOP handover active */
+    int      hide_host_dc_gpu; /* Legacy flag; known DC/GPU IDs are always hidden */
     uint32_t (*hw_read32)(uint64_t phys_addr);
-    void     (*hw_write32)(uint64_t phys_addr, uint32_t val);
+    LoongemuLs7aConfigWriteFn hw_write_config;
 } LoongemuLs7aBackend;
 
 typedef struct LoongemuPciHost {
@@ -110,12 +117,13 @@ void loongemu_pci_host_init(LoongemuPciHost *host,
                             void *disp_bar_opaque);
 
 /* Configure Loongson 7A1000/7A2000 HT split-CFG passthrough backend. */
+/* A NULL write callback leaves the physical config backend read-only. */
 void loongemu_pci_host_attach_ls7a(LoongemuPciHost *host,
                                    uint64_t cfg_type0_base,
                                    uint64_t cfg_type1_base,
                                    int hide_host_dc_gpu,
                                    uint32_t (*hw_read32)(uint64_t),
-                                   void (*hw_write32)(uint64_t, uint32_t));
+                                   LoongemuLs7aConfigWriteFn hw_write_config);
 
 /* Compute Loongson 7A1000/7A2000 HT split-CFG physical address (split [27:24]|[7:0]). */
 uint64_t loongemu_ls7a_cfg_addr(uint64_t cfg_t0_base, uint64_t cfg_t1_base,

@@ -305,6 +305,106 @@ void tr_fini(void)
 #define FCSR_EXTRA_SPACE        (RA_EXTRA_SPACE + REG_LEN)
 
 
+
+static void emit_env_vector_memory(IR2_OPND vector, int offset, bool store)
+{
+    LataVectorAddressPlan plan = env_vector_address_plan(offset);
+    IR2_OPND base = env_ir2_opnd;
+    IR2_OPND address;
+
+    if (plan.materialize_address) {
+        address = ra_alloc_itemp();
+        li_d(address, (int64_t)offset);
+        la_add_d(address, env_ir2_opnd, address);
+        base = address;
+    }
+    if (store) {
+        la_vst(vector, base, plan.displacement);
+    } else {
+        la_vld(vector, base, plan.displacement);
+    }
+    if (plan.materialize_address) {
+        ra_free_temp(address);
+    }
+}
+
+void lata_env_vld(IR2_OPND vector, int offset)
+{
+    emit_env_vector_memory(vector, offset, false);
+}
+
+void lata_env_vst(IR2_OPND vector, int offset)
+{
+    emit_env_vector_memory(vector, offset, true);
+}
+
+static void emit_env_xvector_memory(IR2_OPND vector, int offset, bool store)
+{
+    LataVectorAddressPlan plan = env_vector_address_plan(offset);
+    IR2_OPND base = env_ir2_opnd;
+    IR2_OPND address;
+
+    if (plan.materialize_address) {
+        address = ra_alloc_itemp();
+        li_d(address, (int64_t)offset);
+        la_add_d(address, env_ir2_opnd, address);
+        base = address;
+    }
+    if (store) {
+        la_xvst(vector, base, plan.displacement);
+    } else {
+        la_xvld(vector, base, plan.displacement);
+    }
+    if (plan.materialize_address) {
+        ra_free_temp(address);
+    }
+}
+
+void lata_env_xvld(IR2_OPND vector, int offset)
+{
+    emit_env_xvector_memory(vector, offset, false);
+}
+
+void lata_env_xvst(IR2_OPND vector, int offset)
+{
+    emit_env_xvector_memory(vector, offset, true);
+}
+
+static IR2_OPND env_scalar_address(int offset, LataVectorAddressPlan *plan)
+{
+    IR2_OPND base = env_ir2_opnd;
+
+    *plan = env_vector_address_plan(offset);
+    if (plan->materialize_address) {
+        base = ra_alloc_itemp();
+        li_d(base, (int64_t)offset);
+        la_add_d(base, env_ir2_opnd, base);
+    }
+    return base;
+}
+
+void lata_env_ld_wu(IR2_OPND scalar, int offset)
+{
+    LataVectorAddressPlan plan;
+    IR2_OPND base = env_scalar_address(offset, &plan);
+
+    la_ld_wu(scalar, base, plan.displacement);
+    if (plan.materialize_address) {
+        ra_free_temp(base);
+    }
+}
+
+void lata_env_st_b(IR2_OPND scalar, int offset)
+{
+    LataVectorAddressPlan plan;
+    IR2_OPND base = env_scalar_address(offset, &plan);
+
+    la_st_b(scalar, base, plan.displacement);
+    if (plan.materialize_address) {
+        ra_free_temp(base);
+    }
+}
+
 static void generate_context_switch_bt_to_native(void)
 {
     la_addi_d(sp_ir2_opnd, sp_ir2_opnd, -256);
@@ -328,10 +428,7 @@ static void generate_context_switch_bt_to_native(void)
     la_mov64(env_ir2_opnd, a0_ir2_opnd);
     la_mov64(a0_ir2_opnd, a1_ir2_opnd);
 
-    /* set pstate reg */
-    la_ld_w(a7_ir2_opnd, env_ir2_opnd, env_offset_PSTATE());
-    la_armmtflag(a7_ir2_opnd, 0x39);
-
+    /* NZCV remains in env->pstate; context entry does not use LBT flags. */
     /* set fcsr, rm set by FPSCR[23:22], others was cleared */
     li_d(a5_ir2_opnd, env_offset_FPSCR());
     la_ldx_wu(a7_ir2_opnd, env_ir2_opnd, a5_ir2_opnd);
@@ -347,7 +444,7 @@ static void generate_context_switch_bt_to_native(void)
     /* load gpr and fpr */
     for(int i = 0; i <= 31; ++i) {
         if (arm_la_fmap[i] >= 0) {
-            la_vld(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]), env_ir2_opnd, env_offset_fpr(i));
+            lata_env_vld(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]), env_offset_vreg(i));
         }
     }
     for(int i = 0; i <= 31; ++i) {
@@ -375,14 +472,11 @@ static void generate_context_switch_native_to_bt(void)
     }
     for(int i = 0; i <= 31; ++i) {
         if (arm_la_fmap[i] >= 0) {
-            la_vst(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]), env_ir2_opnd, env_offset_fpr(i));
+            lata_env_vst(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]), env_offset_vreg(i));
         }
     }
 
-    /* store pstate reg */
-    la_armmfflag(t0_ir2_opnd, 0x39);
-    la_st_w(t0_ir2_opnd, env_ir2_opnd, env_offset_PSTATE());
-    
+    /* NZCV remains in env->pstate; context exit does not use LBT flags. */
     /* store fcsr(rouding mode) to vfp.xregs[ARM_VFP_FPSCR] */
     la_movfcsr2gr(t0_ir2_opnd, fcsr3_ir2_opnd);
     li_d(t1_ir2_opnd, 2 << 6 | 1 << 4 | 3 << 2 | 0);
@@ -613,18 +707,11 @@ void lata_gen_call_helper_prologue(TCGContext *tcg_ctx)
 
     for(int i = 0; i <= 31; ++i) {
         if (arm_la_fmap[i] >= 0) {
-            la_vst(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]), env_ir2_opnd, env_offset_fpr(i));
+            lata_env_vst(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]), env_offset_vreg(i));
         }
-        // if(arm_la_fmap[i] >= 0) {
-        //     li_d(t0_ir2_opnd, env_offset_fpr(i));
-        //     la_vstx(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]), env_ir2_opnd, t0_ir2_opnd);
-        // }
     }
 
-    /* store pstate reg */
-    la_armmfflag(t0_ir2_opnd, 0x39);
-    la_st_w(t0_ir2_opnd, env_ir2_opnd, env_offset_PSTATE());
-    
+    /* Helper boundaries keep NZCV in env->pstate, not the LBT flag register. */
     /* store fcsr(rouding mode) to vfp.xregs[ARM_VFP_FPSCR] */
     la_movfcsr2gr(t0_ir2_opnd, fcsr3_ir2_opnd);
     li_d(t1_ir2_opnd, 2 << 6 | 1 << 4 | 3 << 2 | 0);
@@ -642,9 +729,7 @@ void lata_gen_call_helper_prologue(TCGContext *tcg_ctx)
 
 void lata_gen_call_helper_epilogue(TCGContext *tcg_ctx)
 {
-    /* set pstate reg */
-    la_ld_w(a7_ir2_opnd, env_ir2_opnd, env_offset_PSTATE());
-    la_armmtflag(a7_ir2_opnd, 0x39);
+    /* Restore scalar/FPSCR state below; NZCV remains in env->pstate. */
 
     /* set fcsr, rm set by FPSCR[23:22], others was cleared */
     li_d(a5_ir2_opnd, env_offset_FPSCR());
@@ -659,12 +744,8 @@ void lata_gen_call_helper_epilogue(TCGContext *tcg_ctx)
 
     for(int i = 0; i <= 31; ++i) {
         if (arm_la_fmap[i] >= 0) {
-            la_vld(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]), env_ir2_opnd, env_offset_fpr(i));
+            lata_env_vld(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]), env_offset_vreg(i));
         }
-        // if(arm_la_fmap[i] >= 0) {
-        //     li_d(a7_ir2_opnd, env_offset_fpr(i));
-        //     la_vldx(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]), env_ir2_opnd, a7_ir2_opnd);
-        // }
     }
 
     for(int i = 0; i <= 31; ++i) {
@@ -789,15 +870,9 @@ IR2_OPND alloc_fpr_src(int i) {
         return ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]);
     } else {
         IR2_OPND t = ra_alloc_ftemp();
-        // IR2_OPND offset = ra_alloc_itemp();
 
-        // li_d(offset, env_offset_fpr(i));
-        // la_vldx(t, env_ir2_opnd, offset);
-        // int offset = env_offset_fpr(i);
-        // assert(offset >= -(1 << 11) && offset <= (1 << 11) - 1 );
-        la_vld(t, env_ir2_opnd, env_offset_fpr(i));
+        lata_env_vld(t, env_offset_vreg(i));
 
-        // ra_free_temp(offset);
         return t;
     }
 }
@@ -812,15 +887,7 @@ IR2_OPND alloc_fpr_dst(int i) {
 
 void store_fpr_dst(int i, IR2_OPND opnd) {
     if (arm_la_fmap[i] < 0) {
-        // int offset = env_offset_fpr(i);
-        // assert(offset >= -(1 << 11) && offset <= (1 << 11) - 1 );
-        la_vst(opnd, env_ir2_opnd, env_offset_fpr(i));
-        // IR2_OPND offset = ra_alloc_itemp();
-
-        // li_d(offset, env_offset_fpr(i));
-        // la_vstx(opnd, env_ir2_opnd, offset);
-
-        // ra_free_temp(offset);
+        lata_env_vst(opnd, env_offset_vreg(i));
     }
 }
 

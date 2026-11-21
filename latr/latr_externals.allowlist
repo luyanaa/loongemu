@@ -1,0 +1,10 @@
+# Platform/runtime symbols provided by the bare-metal test harness.
+abort
+calloc
+free
+malloc
+memcpy
+memset
+qemu_log
+realloc
+stderr

@@ -1,5 +1,6 @@
-CLANG   ?= /opt/homebrew/Cellar/llvm/23.1.5_1/bin/clang
-AR      := /opt/homebrew/Cellar/llvm/23.1.5_1/bin/llvm-ar
+LLVM_PREFIX ?= $(shell brew --prefix llvm 2>/dev/null)
+CLANG   ?= $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/clang,clang)
+AR      ?= $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/llvm-ar,llvm-ar)
 TARGET  ?= loongarch64-unknown-linux-gnu
 RESINC  := $(shell $(CLANG) -print-resource-dir)/include
 LATX    := ../latx
@@ -49,19 +50,40 @@ SRCS := ../src/x86_64_paging.c ../src/phys_mem.c ../src/vclock.c ../src/loongarc
         $(LATX)/optimization/flag-lbt.c $(LATX)/optimization/flag-reduction.c \
         $(LATX)/optimization/ir1-optimization.c $(LATX)/optimization/ir2-optimization.c
 
+SRCS += ../src/hyperv.c
+
 GEN := gen/latx/include/format-table.h gen/latx/include/ir2-name.h \
        gen/latx/include/ir2-opcode.h gen/latx/include/la-append.h gen/latx/ir2/la-append.c
 
-.PHONY: all gen probe clean
-all: gen
+.PHONY: all gen probe clean vmm-efi vmm-boot vmm-integrated vmm-integrated-boot update-core-manifest
+CORE_OBJS := $(foreach src,$(SRCS),build/$(patsubst %.c,%.o,$(patsubst ../%,%,$(src))))
+CORE_MANIFEST := build/liblatx_core.sources
+
+all: gen build/liblatx_core.a
+
+.PHONY: update-core-manifest
+update-core-manifest:
 	@mkdir -p build
-	@for f in $(SRCS); do \
-	  obj=build/$$(basename $$f .c).o; \
-	  printf '  CC  %s\n' "$$f"; \
-	  $(CLANG) $(CFLAGS) -c $$f -o $$obj || exit 1; \
-	done
-	@$(AR) rcs build/liblatx_core.a build/*.o
-	@printf '  AR  build/liblatx_core.a (%s members)\n' "$$(ls build/*.o | wc -l | tr -d ' ')"
+	@printf '%s\n' $(SRCS) > $(CORE_MANIFEST).tmp
+	@if ! cmp -s $(CORE_MANIFEST).tmp $(CORE_MANIFEST); then mv $(CORE_MANIFEST).tmp $(CORE_MANIFEST); else rm -f $(CORE_MANIFEST).tmp; fi
+
+$(CORE_MANIFEST): | update-core-manifest
+	@test -f $@ || printf '%s\n' $(SRCS) > $@
+
+build/liblatx_core.a: $(CORE_OBJS) $(CORE_MANIFEST) Makefile | gen
+	@rm -f $@
+	@$(AR) rcs $@ $(CORE_OBJS)
+	@printf '  AR  build/liblatx_core.a (%s members)\n' "$(words $(CORE_OBJS))"
+
+build/gen/%.o: gen/%.c | gen
+	@mkdir -p $(dir $@)
+	$(CLANG) $(CFLAGS) -MD -MP -MF $(patsubst %.o,%.d,$@) -MT $@ -c $< -o $@
+
+build/%.o: ../%.c | gen
+	@mkdir -p $(dir $@)
+	$(CLANG) $(CFLAGS) -MD -MP -MF $(patsubst %.o,%.d,$@) -MT $@ -c $< -o $@
+
+-include $(CORE_OBJS:.o=.d)
 
 gen: $(GEN)
 
@@ -80,5 +102,8 @@ probe: gen
 	  fi; \
 	done
 
+
+vmm-efi vmm-boot vmm-integrated vmm-integrated-boot:
+	$(MAKE) -C .. $@
 clean:
 	rm -rf build gen

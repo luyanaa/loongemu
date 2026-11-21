@@ -12,6 +12,7 @@
 #include "latx_bare.h"
 #include "glib.h"
 
+#include "cpu-features.h"
 typedef uint64_t ram_addr_t;
 #define TARGET_LONG_BITS 64
 typedef uint64_t vaddr;
@@ -76,13 +77,6 @@ static inline int64_t sextract64(uint64_t v, int start, int len)
     return (int64_t)((field ^ sign) - sign);
 }
 
-int latx_cpu_has_lsx(void);
-int latx_cpu_has_lasx(void);
-void latx_cpu_set_vector_features(int lsx, int lasx);
-/* 3 = x86-64-v3, 2 = x86-64-v2, 0 = host cannot run x86-64 at all. */
-int latx_cpu_x86_level(void);
-/* Called when the host cannot honour the advertised ABI; does not return. */
-void latx_platform_refuse(const char *why);
 
 typedef struct IRQState *qemu_irq;
 static inline void qemu_irq_lower(qemu_irq irq) { (void)irq; }

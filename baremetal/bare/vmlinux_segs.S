@@ -30,7 +30,10 @@ _kseg3_end:
 .balign 4096
 .globl _initramfs_start
 _initramfs_start:
-.incbin "firmware/initramfs.cpio.gz"
+#ifndef LOONGEMU_INITRAMFS_PATH
+#define LOONGEMU_INITRAMFS_PATH "firmware/initramfs.cpio.gz"
+#endif
+.incbin LOONGEMU_INITRAMFS_PATH
 .globl _initramfs_end
 _initramfs_end:
 .text

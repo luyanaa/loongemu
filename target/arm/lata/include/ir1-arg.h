@@ -1,5 +1,8 @@
 #ifndef _IR1_ARG_H_
 #define _IR1_ARG_H_
+#include <stdbool.h>
+#include <stdint.h>
+#include "la-pvir.h"
 
 typedef struct {
     int rs;
@@ -374,6 +377,104 @@ typedef arg_ldst_tag arg_ST2G;
 typedef arg_ldst_tag arg_LDGM;
 typedef arg_ldst_tag arg_STZ2G;
 
+
+/* PVIR-facing semantic intent retained by the SVE IR1 decoder. */
+typedef struct {
+    PvirInactivePolicy inactive_policy;
+    PvirMemoryEffect memory;
+    PvirFaultBehavior fault_behavior;
+    PvirFaultOrder fault_order;
+    PvirFaultResultKind fault_result;
+    PvirArchStateDomain state_domain;
+    PvirArchStateAction state_action;
+    PvirArchStateUpdateKind state_update;
+    bool result_unknown_from_fault_boundary;
+    bool result_unknown_where_ffr_input_clear;
+    bool writes_nzcv;
+    bool ffr_initializes_all_true;
+    bool ffr_clears_from_fault_boundary;
+} arg_sve_effect_intent;
+
+typedef struct {
+    uint8_t pd;
+    uint8_t element_bits;
+    uint8_t pattern;
+    arg_sve_effect_intent effects;
+} arg_sve_ptrue;
+
+typedef struct {
+    uint8_t pd;
+    uint8_t rn;
+    uint8_t rm;
+    uint8_t element_bits;
+    uint8_t scalar_bits;
+    arg_sve_effect_intent effects;
+} arg_sve_whilelo;
+
+typedef struct {
+    uint8_t zd;
+    uint8_t pg;
+    uint8_t zm;
+    uint8_t element_bits;
+    arg_sve_effect_intent effects;
+} arg_sve_integer_binary;
+typedef arg_sve_integer_binary arg_sve_add;
+typedef arg_sve_integer_binary arg_sve_sub;
+typedef arg_sve_integer_binary arg_sve_mul;
+
+typedef struct {
+    uint8_t zt;
+    uint8_t pg;
+    uint8_t rn;
+    uint8_t element_bits;
+    uint8_t memory_bits;
+    int8_t immediate_vl;
+    bool base_is_sp;
+    arg_sve_effect_intent effects;
+} arg_sve_contiguous;
+
+typedef struct {
+    uint8_t pd;
+    bool has_pd;
+    arg_sve_effect_intent effects;
+} arg_sve_ffr;
+
+typedef struct {
+    uint8_t zt;
+    uint8_t pg;
+    uint8_t rn;
+    uint8_t rm;
+    uint8_t element_bits;
+    uint8_t memory_bits;
+    bool base_is_sp;
+    bool has_index;
+    arg_sve_effect_intent effects;
+} arg_sve_fault_load;
+
+typedef struct {
+    uint8_t zt;
+    uint8_t pg;
+    uint8_t rn;
+    uint8_t element_bits;
+    uint8_t memory_bits;
+    int8_t immediate_vl;
+    bool base_is_sp;
+    arg_sve_effect_intent effects;
+} arg_sve_nonfault_load;
+
+typedef struct {
+    uint32_t raw_insn;
+    int recognized_type;
+} arg_sve_access_failure;
+
+typedef struct {
+    uint32_t raw_insn;
+} arg_sve_unsupported_encoding;
+
+typedef struct {
+    uint32_t raw_insn;
+    int recognized_type;
+} arg_sve_lasx_failure;
 /* arguments for translation function*/
 union a64_u{
     arg_atomic f_atomic;
@@ -410,6 +511,18 @@ union a64_u{
     arg_stlr f_stlr;
     arg_stxr f_stxr;
     arg_tbz f_tbz;
+    arg_sve_ptrue f_sve_ptrue;
+    arg_sve_whilelo f_sve_whilelo;
+    arg_sve_add f_sve_add;
+    arg_sve_sub f_sve_sub;
+    arg_sve_mul f_sve_mul;
+    arg_sve_contiguous f_sve_contiguous;
+    arg_sve_ffr f_sve_ffr;
+    arg_sve_fault_load f_sve_fault_load;
+    arg_sve_nonfault_load f_sve_nonfault_load;
+    arg_sve_access_failure f_sve_access_failure;
+    arg_sve_unsupported_encoding f_sve_unsupported_encoding;
+    arg_sve_lasx_failure f_sve_lasx_failure;
 } ;
 
 #endif

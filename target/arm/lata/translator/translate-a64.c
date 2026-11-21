@@ -25,8 +25,21 @@
 #include "ir1.h"
 #include "ir1-arg.h"
 #include "translate-a64.h"
+#include "../ir1/sve-decode.h"
+#include "../ir1/sve-pvir.h"
+#include "sve-lasx-lower.h"
 #include "tu.h"
 #include "clear-high.h"
+static bool dc_has_sve(const DisasContext *s)
+{
+    return s != NULL && arm_isar_has_aa64_sve(s->isar);
+}
+
+static bool dc_has_lse(const DisasContext *s)
+{
+    return s != NULL && arm_isar_has_aa64_lse(s->isar);
+}
+
 #endif
 
 #include "qemu/log.h"
@@ -257,6 +270,12 @@ static void lata_unallocated_encoding(DisasContext *s)
     return;
 }
 
+static bool trans_sve_feature_absent(DisasContext *s)
+{
+    lata_unallocated_encoding(s);
+    return true;
+}
+
 static void lata_clean_data_tbi(DisasContext *s, IR2_OPND *dst, IR2_OPND *src, int tbi)
 {
     if (tbi == 0)
@@ -384,7 +403,7 @@ static void lata_helper_addl_saturate_s64(DisasContext *ctx, IR2_OPND vreg_d, IR
     la_vinsgr2vr_d(vreg_d, a0_ir2_opnd, 1);
 
     if (rd != -1)
-        la_vst(vreg_d, env_ir2_opnd, env_offset_fpr(rd));
+        lata_env_vst(vreg_d, env_offset_vreg(rd));
 
     lata_gen_call_helper_epilogue(tcg_ctx);
 
@@ -429,7 +448,7 @@ static void lata_helper_addl_saturate_s32(DisasContext *ctx, IR2_OPND vreg_d, IR
     la_jirl(ra_ir2_opnd, temp, 0);
     la_vinsgr2vr_w(vreg_d, a0_ir2_opnd, 3);
     if (rd != -1)
-        la_vst(vreg_d, env_ir2_opnd, env_offset_fpr(rd));
+        lata_env_vst(vreg_d, env_offset_vreg(rd));
 
     lata_gen_call_helper_epilogue(tcg_ctx);
     free_alloc_gpr(temp);
@@ -744,7 +763,13 @@ static bool sme_access_check(DisasContext *s)
  */
 bool sve_access_check(DisasContext *s)
 {
-    if (s->pstate_sm || !dc_isar_feature(aa64_sve, s))
+    if (!dc_has_sve(s))
+    {
+        s->sve_access_checked = true;
+        lata_unallocated_encoding(s);
+        return false;
+    }
+    else if (s->pstate_sm)
     {
         assert(0);
     }
@@ -1548,7 +1573,10 @@ static void handle_sys(DisasContext *s, bool isread,
     }
     else if ((ri->type & ARM_CP_SVE) && !sve_access_check(s))
     {
-        assert(0);
+        if (s->base->is_jmp != DISAS_NORETURN)
+        {
+            assert(0);
+        }
         return;
     }
     else if ((ri->type & ARM_CP_SME) && !sme_access_check(s))
@@ -2178,7 +2206,7 @@ static bool trans_CAS(DisasContext *s)
     int acquire = extract32(s->insn, 22, 1);
     int release = extract32(s->insn, 15, 1);
 
-    if (!dc_isar_feature(aa64_atomics, s))
+    if (!dc_has_lse(s))
     {
         return false;
     }
@@ -3899,6 +3927,11 @@ static bool trans_STR_v(DisasContext *s)
 
 static bool trans_LDADD(DisasContext *s)
 {
+
+    if (!dc_has_lse(s))
+    {
+        return false;
+    }
     int acquire = extract32(s->insn, 23, 1);
     int release = extract32(s->insn, 22, 1);
 
@@ -3926,9 +3959,9 @@ static bool trans_LDADD(DisasContext *s)
             IR2_OPND label_ll = ir2_opnd_new_type(IR2_OPND_LABEL);
             la_or(src, reg_s, zero_ir2_opnd);
             la_label(label_ll);
-            la_ll_w(reg_t, reg_n, 0);
+            la_ll_d(reg_t, reg_n, 0);
             la_add_d(dest, src, reg_t);
-            la_sc_w(dest, reg_n, 0);
+            la_sc_d(dest, reg_n, 0);
             la_beqz(dest, label_ll);
         }
         else
@@ -9161,7 +9194,7 @@ static void handle_fpfpcvt(DisasContext *s, int rd, int rn, int opcode,
             /* a1: shift */
             li_d(a1_ir2_opnd, 64 - scale);
             /* a0: fp */
-            li_d(temp, env_offset_fpr(rn));
+            li_d(temp, env_offset_vreg(rn));
             la_ldx_d(a0_ir2_opnd, env_ir2_opnd, temp);
 
             switch (type)
@@ -17132,6 +17165,19 @@ static bool (*translate_functions[])(DisasContext *) = {
     TRANS_FUNC_GEN(AARCH64_A64_YIELD, YIELD),
     TRANS_DISAS_FUNC_GEN(AARCH64_A64_DATA_PROC_REG, reg),
     TRANS_DISAS_FUNC_GEN(AARCH64_A64_DATA_PROC_SIMD_FD, simd_fp),
+    TRANS_FUNC_GEN_REAL(AARCH64_A64_SVE_PTRUE, trans_sve_ptrue),
+    TRANS_FUNC_GEN_REAL(AARCH64_A64_SVE_WHILELO, trans_sve_whilelo),
+    TRANS_FUNC_GEN_REAL(AARCH64_A64_SVE_ADD, trans_sve_add),
+    TRANS_FUNC_GEN_REAL(AARCH64_A64_SVE_SUB, trans_sve_sub),
+    TRANS_FUNC_GEN_REAL(AARCH64_A64_SVE_MUL, trans_sve_mul),
+    TRANS_FUNC_GEN_REAL(AARCH64_A64_SVE_LD1B, trans_sve_ld1b),
+    TRANS_FUNC_GEN_REAL(AARCH64_A64_SVE_ST1B, trans_sve_st1b),
+    TRANS_FUNC_GEN_REAL(AARCH64_A64_SVE_SETFFR, trans_sve_setffr),
+    TRANS_FUNC_GEN_REAL(AARCH64_A64_SVE_RDFFR, trans_sve_rdffr),
+    TRANS_FUNC_GEN_REAL(AARCH64_A64_SVE_FEATURE_ABSENT, trans_sve_feature_absent),
+    TRANS_FUNC_GEN_REAL(AARCH64_A64_SVE_ACCESS_UNSUPPORTED, NULL),
+    TRANS_FUNC_GEN_REAL(AARCH64_A64_SVE_UNSUPPORTED_ENCODING, NULL),
+    TRANS_FUNC_GEN_REAL(AARCH64_A64_SVE_LASX_UNAVAILABLE, NULL),
 };
 
 static void aarch64_tr_init_disas_context(DisasContext *dc,
@@ -17287,7 +17333,12 @@ void get_last_info(TranslationBlock *tb, DisasContext *s)
 
 static void set_base_isjump(DisasContext *s)
 {
-    if (ir1_is_branch(s) || ir1_is_jmp(s) || ir1_is_call(s) || ir1_is_ret(s) || ir1_is_syscall(s))
+    if (ir1_is_branch(s) || ir1_is_jmp(s) || ir1_is_call(s) ||
+        ir1_is_ret(s) || ir1_is_syscall(s) ||
+        s->insn_type == AARCH64_A64_SVE_FEATURE_ABSENT ||
+        s->insn_type == AARCH64_A64_SVE_ACCESS_UNSUPPORTED ||
+        s->insn_type == AARCH64_A64_SVE_UNSUPPORTED_ENCODING ||
+        s->insn_type == AARCH64_A64_SVE_LASX_UNAVAILABLE)
     {
         s->base->is_jmp = DISAS_NORETURN;
         return;
@@ -17479,10 +17530,60 @@ void translate_aarch64_insn(DisasContext *s, CPUState *cpu)
 
     s->is_nonstreaming = false;
 
-    // don't support sme and sve
-    if (!decode_insn32(s, insn))
+    A64SVEIR1Instruction sve_ir1;
+    A64SVEDecodeStatus sve_status = a64_sve_decode(insn, &sve_ir1);
+    if (sve_status == A64_SVE_DECODE_MATCH)
     {
-        disas_a64_legacy(s, insn);
+        /* LATA lacks CPACR/CPTR state and an SVEAccessTrap route. */
+        A64SVEAccessDisposition access = a64_sve_access_disposition(
+            dc_has_sve(s), A64_SVE_CONTROL_UNMODELED);
+
+        A64SVEIR2Dispatch dispatch = a64_sve_ir2_dispatch(access);
+
+        switch (dispatch)
+        {
+        case A64_SVE_IR2_FEATURE_ABSENT:
+            s->insn_type = AARCH64_A64_SVE_FEATURE_ABSENT;
+            break;
+        case A64_SVE_IR2_ACCESS_UNSUPPORTED:
+            s->insn_type = AARCH64_A64_SVE_ACCESS_UNSUPPORTED;
+            s->arg.f_sve_access_failure.raw_insn = insn;
+            s->arg.f_sve_access_failure.recognized_type =
+                sve_ir1.insn_type;
+            break;
+        case A64_SVE_IR2_LASX_UNAVAILABLE:
+            s->insn_type = AARCH64_A64_SVE_LASX_UNAVAILABLE;
+            s->arg.f_sve_lasx_failure.raw_insn = insn;
+            s->arg.f_sve_lasx_failure.recognized_type =
+                sve_ir1.insn_type;
+            break;
+        case A64_SVE_IR2_READY:
+            s->insn_type = sve_ir1.insn_type;
+            s->arg = sve_ir1.arg;
+            break;
+        }
+    }
+    else if (sve_status == A64_SVE_DECODE_UNSUPPORTED_ENCODING)
+    {
+        /* Never route an unrecognized SVE-primary encoding to legacy decode. */
+        s->insn_type = sve_ir1.insn_type;
+        s->arg = sve_ir1.arg;
+    }
+    else if (!decode_insn32(s, insn))
+    {
+        if (dc_has_sve(s))
+        {
+            /*
+             * With FEAT_SVE present, do not let an unrecognized instruction
+             * reach the coarse legacy SIMD/data-register fallback.
+             */
+            s->insn_type = AARCH64_A64_SVE_UNSUPPORTED_ENCODING;
+            s->arg.f_sve_unsupported_encoding.raw_insn = insn;
+        }
+        else
+        {
+            disas_a64_legacy(s, insn);
+        }
     }
 
 #ifdef CONFIG_LATA_INSTS_PATTERN
@@ -17504,8 +17605,11 @@ bool tr_ir2_generate(struct TranslationBlock *tb)
 
     int ir1_nr = tb->icount;
     DisasContext *pir1 = (DisasContext *)tb->ir1;
+    A64SVEPvirBuilder sve_builder;
+    a64_sve_pvir_builder_init(&sve_builder);
     for (i = start; i < ir1_nr + start; ++i)
     {
+        pir1->sve_pvir_builder = &sve_builder;
 #ifdef CONFIG_LATA_INSTS_PATTERN
         /*Only check if the last two elements are CMP+B.COND*/
         if (i == ir1_nr + start - 2 && insts_pattern(pir1, pir1 + 1))
@@ -17516,6 +17620,10 @@ bool tr_ir2_generate(struct TranslationBlock *tb)
             break;
         }
 #endif
+        if (translate_functions[pir1->insn_type] == NULL)
+        {
+            return false;
+        }
         bool trans_success = translate_functions[pir1->insn_type](pir1);
         if (!trans_success)
         {

@@ -133,7 +133,7 @@ static void test_invalidate_cross_page(void)
 
     reset();
     e = tbc_insert(&g_cache, 0x4ff0, 0, 0x2000, 0);
-    e->code_size = 32;          /* 0x4ff0..0x500f spans two pages */
+    e->guest_size = 32;         /* 0x4ff0..0x500f spans two pages */
 
     tbc_invalidate_range(&g_cache, 0x2000, 0x5000, 1);
     CHECK(tbc_lookup(&g_cache, 0x4ff0, 0, 0x2000, 0) == 0);

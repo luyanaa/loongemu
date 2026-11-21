@@ -3,10 +3,14 @@ CC      ?= cc
 CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Werror -pedantic -Iinclude
 LBT_SRC := src/loongbt_semantics.c src/loongbt_cpu.c src/loongbt_hw.c src/loongbt_ir2.c
 
-CLANG   ?= $(shell brew --prefix llvm)/bin/clang
-OBJDUMP ?= $(shell brew --prefix llvm)/bin/llvm-objdump
+LLVM_PREFIX ?= $(shell brew --prefix llvm 2>/dev/null)
+CLANG   ?= $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/clang,clang)
+AR      ?= $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/llvm-ar,llvm-ar)
+OBJDUMP ?= $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/llvm-objdump,llvm-objdump)
+LLD_PREFIX ?= $(shell brew --prefix lld 2>/dev/null)
+LD_LLD   ?= $(if $(LLD_PREFIX),$(LLD_PREFIX)/bin/ld.lld,ld.lld)
+QEMU_PREFIX ?= $(shell brew --prefix qemu 2>/dev/null)
 
-.PHONY: all test test-cpu test-lapaging test-tbc test-p0 vmm-efi vmm-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot clean
 .PHONY: all test test-pvir test-sve-decode test-sve-pvir test-arm-state test-cpu test-lapaging test-pci-host test-hyperv test-tbc test-p0 vmm-efi vmm-boot vmm-integrated vmm-integrated-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot test-latr latr-core latr-isa-image latr-isa-run latr-riscv-ref test-latm test-latm-decode latm-core latm-isa-image latm-isa-run latm-riscv-ref clean
 
 all: test
@@ -19,16 +23,79 @@ build/test_tb_cache: tests/test_tb_cache.c src/tb_cache.c include/loongemu/tb_ca
 	@mkdir -p build
 	$(CC) $(CFLAGS) src/tb_cache.c tests/test_tb_cache.c -o $@
 
+build/test_pvir: tests/test_pvir.c target/arm/lata/pvir.c \
+                 target/arm/lata/include/la-pvir.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Itarget/arm/lata/include \
+	      target/arm/lata/pvir.c tests/test_pvir.c -o $@
+
+test-pvir: build/test_pvir
+	./build/test_pvir
+
+build/test_sve_decode: tests/test_sve_decode.c \
+                       target/arm/lata/ir1/sve-decode.c \
+                       target/arm/lata/ir1/sve-decode.h \
+                       target/arm/lata/include/ir1.h \
+                       target/arm/lata/include/ir1-arg.h \
+                       target/arm/lata/include/la-pvir.h \
+                       lata/compat/target/arm/cpu.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Wno-gnu-empty-struct \
+	      -Ilata/compat -iquote latx/compat \
+	      -Itarget/arm/lata/include -Itarget/arm/lata/ir1 \
+	      target/arm/lata/ir1/sve-decode.c tests/test_sve_decode.c -o $@
+
+test-sve-decode: build/test_sve_decode
+	./build/test_sve_decode
+
+build/test_sve_pvir: tests/test_sve_pvir.c target/arm/lata/ir1/sve-pvir.c \
+                     target/arm/lata/ir1/sve-decode.c target/arm/lata/pvir.c \
+                     target/arm/lata/ir1/sve-pvir.h \
+                     target/arm/lata/ir1/sve-decode.h \
+                     target/arm/lata/include/ir1.h \
+                     target/arm/lata/include/ir1-arg.h \
+                     target/arm/lata/include/la-pvir.h \
+                     target/arm/lata/include/env.h \
+                     lata/compat/target/arm/cpu.h \
+                     latx/runtime/cpu_features.c \
+                     latx/compat/qemu/cpu-features.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Wno-gnu-empty-struct -I. \
+	      -Ilata/compat -iquote latx/compat \
+	      -Itarget/arm/lata/include -Itarget/arm/lata/ir1 \
+	      target/arm/lata/pvir.c target/arm/lata/ir1/sve-decode.c \
+	      target/arm/lata/ir1/sve-pvir.c latx/runtime/cpu_features.c \
+	      tests/test_sve_pvir.c -o $@
+
+test-sve-pvir: build/test_sve_pvir
+	./build/test_sve_pvir
+
+build/test_arm_state: tests/test_arm_state.c \
+                      target/arm/lata/include/env.h \
+                      lata/compat/target/arm/cpu.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Ilata/compat -Ilatx/compat \
+	      -Itarget/arm/lata/include tests/test_arm_state.c -o $@
+
+test-arm-state: build/test_arm_state
+	./build/test_arm_state
+
 test-tbc: build/test_tb_cache
 	./build/test_tb_cache
 
 test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging \
-      build/test_tb_cache
+      build/test_pci_host build/test_hyperv build/test_tb_cache build/test_pvir build/test_sve_decode build/test_sve_pvir build/test_arm_state \
       build/test_latm_decode
 	./build/test_loongbt
 	./build/test_loongbt_cpu
 	./build/test_loongarch_paging
+	./build/test_pci_host
 	./build/test_tb_cache
+	./build/test_hyperv
+	./build/test_pvir
+	./build/test_sve_decode
+	./build/test_sve_pvir
+	./build/test_arm_state
 	./build/test_latm_decode
 
 # Back-end selection and the EFLAGS pack/unpack bridge.  Kept separate from
@@ -49,6 +116,22 @@ build/test_loongarch_paging: tests/test_loongarch_paging.c src/loongarch_paging.
 test-lapaging: build/test_loongarch_paging
 	./build/test_loongarch_paging
 
+build/test_pci_host: tests/test_pci_host.c src/pci_host.c src/phys_mem.c \
+                     include/loongemu/pci_host.h include/loongemu/phys_mem.h \
+                     include/loongemu/acpi_tables.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) src/pci_host.c src/phys_mem.c tests/test_pci_host.c -o $@
+
+test-pci-host: build/test_pci_host
+	./build/test_pci_host
+
+build/test_hyperv: tests/test_hyperv.c src/hyperv.c include/loongemu/hyperv.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) src/hyperv.c tests/test_hyperv.c -o $@
+
+test-hyperv: build/test_hyperv
+	./build/test_hyperv
+
 # ---- P0: 4 KiB paging, PLV3 page fault, PLV0 walk + TLBFILL, resume ----
 P0_SRC := baremetal/bare/paging_smoke.c src/loongarch_paging.c
 
@@ -60,7 +143,7 @@ build/p0_paging.elf: $(P0_SRC) include/loongemu/loongarch_paging.h
 	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
 	         -fno-builtin -O1 -mno-lsx -mno-lasx -Iinclude \
 	         -c src/loongarch_paging.c -o build/p0_loongarch_paging.o
-	/opt/homebrew/opt/lld/bin/ld.lld -T baremetal/bare/bare.lds -e _start \
+	$(LD_LLD) -T baremetal/bare/bare.lds -e _start \
 	   build/p0_paging.o build/p0_loongarch_paging.o -o $@
 
 test-p0: build/p0_paging.elf
@@ -155,7 +238,7 @@ build/lbt_selftest.o: $(EFI_SRC) include/loongemu/loongbt.h
 build/lbt_selftest.elf: build/lbt_selftest.o build/efi_loongbt_semantics.o \
                         build/efi_loongbt_cpu.o build/efi_loongbt_hw.o build/efi_loongbt_ir2.o
 	@printf 'ENTRY(efi_main)\nSECTIONS { . = 0x1000; .text : { *(.text*) } .rodata : { *(.rodata*) } .data : { *(.data*) } .bss : { *(.bss*) *(COMMON) } }\n' > build/efi.lds
-	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T build/efi.lds -e efi_main \
+	$(LD_LLD) --emit-relocs -T build/efi.lds -e efi_main \
 	   build/lbt_selftest.o build/efi_loongbt_semantics.o build/efi_loongbt_cpu.o \
 	   build/efi_loongbt_hw.o build/efi_loongbt_ir2.o -o $@
 
@@ -249,7 +332,7 @@ build/ir1_smoke.o: baremetal/efi/ir1_smoke.c
 
 build/ir1_smoke.elf: build/ir1_smoke.o baremetal/build/liblatx_core.a
 	@printf 'ENTRY(efi_main)\nSECTIONS { . = 0x1000; .text : { *(.text*) } .rodata : { *(.rodata*) } .data : { *(.data*) } .bss : { *(.bss*) *(COMMON) } }\n' > build/ir1_smoke.lds
-	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T build/ir1_smoke.lds -e efi_main \
+	$(LD_LLD) --emit-relocs -T build/ir1_smoke.lds -e efi_main \
 	   build/ir1_smoke.o baremetal/build/liblatx_core.a -o $@
 
 build/ir1_smoke.efi: build/ir1_smoke.elf
@@ -277,7 +360,7 @@ build/lvz_probe.o: baremetal/efi/lvz_probe.c
 
 build/lvz_probe.elf: build/lvz_probe.o
 	@printf 'ENTRY(efi_main)\nSECTIONS { . = 0x1000; .text : { *(.text*) } .rodata : { *(.rodata*) } .data : { *(.data*) } .bss : { *(.bss*) *(COMMON) } }\n' > build/lvz_probe.lds
-	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T build/lvz_probe.lds -e efi_main build/lvz_probe.o -o $@
+	$(LD_LLD) --emit-relocs -T build/lvz_probe.lds -e efi_main build/lvz_probe.o -o $@
 
 build/lvz_probe.efi: build/lvz_probe.elf
 	$(GENFW) -o $@ -e UEFI_APPLICATION $<
@@ -298,11 +381,75 @@ efi-lvz-probe: build/lvz_probe.efi
 # ---- bare-metal LoongArch execution harness ----
 LATA_BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
                -fno-builtin -O2 -mno-lsx -mno-lasx -fno-vectorize -fno-slp-vectorize \
-               -DTARGET_AARCH64 -DCONFIG_LATA -DCONFIG_LATA_TU \
+               -DTARGET_AARCH64 -DCONFIG_LATA -DCONFIG_LATA_TU -DCONFIG_LATA_STANDALONE \
                -D__WORDSIZE=64 -D__thread= \
                -I lata/compat -I . -I target/arm/lata/include -I target/arm/lata \
                -I latx/compat -I latx/include -I latx/upstream/include \
                -isystem $(shell $(CLANG) -print-resource-dir)/include
+
+# ---- bare-metal RISC-V -> LoongArch translator smoke ----
+LATR_BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
+               -fno-builtin -O2 -mno-lsx -mno-lasx -fno-vectorize -fno-slp-vectorize \
+               -DTARGET_RISCV64 -DCONFIG_LATR -DCONFIG_LATR_STANDALONE \
+               -DCONFIG_LATX -D__WORDSIZE=64 -D__thread= \
+               -I latr/compat -I target/riscv/latr/include -I . \
+               -I target/arm/lata/include -I target/arm/lata \
+               -I latx/compat -I latx/compat/include -I latx/upstream/include \
+               -isystem $(shell $(CLANG) -print-resource-dir)/include
+
+build/latr_isa_test.o: baremetal/bare/latr_isa_test.c \
+                       target/riscv/latr/include/riscv-env.h \
+                       tests/latr_isa_diff_vectors.h
+	@mkdir -p build
+	$(CLANG) $(LATR_BARE_CFLAGS) -c $< -o $@
+
+build/latr_miniglib.o: latx/compat/miniglib.c
+	@mkdir -p build
+	$(CLANG) $(LATR_BARE_CFLAGS) -c $< -o $@
+
+build/latr_libc_min.o: latx/compat/libc_min.c
+	@mkdir -p build
+	$(CLANG) $(LATR_BARE_CFLAGS) -c $< -o $@
+
+latr-core:
+	$(MAKE) -C latr all
+
+build/bare_latr_isa.elf: build/latr_isa_test.o build/latr_miniglib.o \
+                         build/latr_libc_min.o latr-core baremetal/bare/bare.lds
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	   build/latr_isa_test.o build/latr_miniglib.o build/latr_libc_min.o \
+	   latr/build/liblatr_core.a -o $@
+
+latr-isa-image: build/bare_latr_isa.elf
+
+test-latr: latr-isa-run latr-riscv-ref
+	@latr_sig=$$(grep -aEo 'latr-diff=[0-9a-f]+' build/latr_isa.log | tail -1); \
+	 qemu_sig=$$(grep -aEo 'latr-diff=[0-9a-f]+' build/latr_riscv_ref.log | tail -1); \
+	 test -n "$$latr_sig" && test "$$latr_sig" = "$$qemu_sig" && \
+	 echo "latr-diff: PASS $$latr_sig"
+
+latr-isa-run: latr-isa-image
+	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_latr_isa.elf" \
+	     QEMU_LOG="build/latr_isa.log" QEMU_DONE="latr-isa: done" \
+	     QEMU_TIMEOUT=60 CPU=la464 \
+	     bash scripts/run_qemu_lata.sh
+	@grep -aE 'latr-isa' build/latr_isa.log | head -30
+	@grep -qa 'latr-isa: PASS' build/latr_isa.log
+
+build/latr_riscv_ref.elf: tests/latr_isa_qemu_ref.S \
+                          tests/latr_isa_diff_vectors.h
+	@mkdir -p build
+	$(CLANG) --target=riscv64-unknown-elf -march=rv64gc -mabi=lp64d \
+	         -ffreestanding -nostdlib -fno-builtin -O2 -fuse-ld=lld \
+	         -I tests -Wl,-Ttext=0x80000000 -Wl,-e,_start $< -o $@
+
+latr-riscv-ref: build/latr_riscv_ref.elf
+	@rm -f build/latr_riscv_ref.log
+	@timeout 20 $(QEMU_RISCV64) -M virt -cpu max -m 128M -bios none \
+	     -kernel $< -display none -monitor none \
+	     -serial file:build/latr_riscv_ref.log -no-reboot 2>/dev/null
+	@grep -a 'latr-riscv-ref: PASS' build/latr_riscv_ref.log
+	@grep -aE 'latr-diff=' build/latr_riscv_ref.log
 
 build/lata_smoke.o: baremetal/bare/lata_smoke.c
 	@mkdir -p build
@@ -321,11 +468,11 @@ build/lata_isa_test.o: baremetal/bare/lata_isa_test.c
 	$(CLANG) $(LATA_BARE_CFLAGS) -c $< -o $@
 
 build/bare_lata_isa.elf: build/lata_isa_test.o build/lata_miniglib.o build/lata_libc_min.o lata/build/liblata_core.a baremetal/bare/bare.lds
-	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
 	   build/lata_isa_test.o build/lata_miniglib.o build/lata_libc_min.o lata/build/liblata_core.a -o $@
 
 build/bare_lata.elf: build/lata_smoke.o build/lata_miniglib.o build/lata_libc_min.o lata/build/liblata_core.a baremetal/bare/bare.lds
-	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
 	   build/lata_smoke.o build/lata_miniglib.o build/lata_libc_min.o lata/build/liblata_core.a -o $@
 
 build/lbt_smoke.o: baremetal/bare/lbt_smoke.c
@@ -335,10 +482,11 @@ build/lbt_smoke.o: baremetal/bare/lbt_smoke.c
 	         -c $< -o $@
 
 build/lbt_smoke.elf: build/lbt_smoke.o baremetal/bare/bare.lds
-	/opt/homebrew/opt/lld/bin/ld.lld -T baremetal/bare/bare.lds -e _start $< -o $@
+	$(LD_LLD) -T baremetal/bare/bare.lds -e _start $< -o $@
 
 QLVZ ?= $(HOME)/Documents/QEMU-LVZ/build/qemu-system-loongarch64
 QLVZ_REPO ?= $(CURDIR)/qemu-system-loongarch64
+QEMU_RISCV64 ?= $(if $(wildcard ../QEMU-LVZ/build/qemu-system-riscv64),../QEMU-LVZ/build/qemu-system-riscv64,qemu-system-riscv64)
 lbt-smoke-run: build/lbt_smoke.elf
 	@rm -f build/lbt_smoke.log
 	@timeout 8 $(QLVZ) -M virt -cpu max -m 512M -kernel build/lbt_smoke.elf \
@@ -589,7 +737,7 @@ build/latm_libc_min.o: latx/compat/libc_min.c
 	$(CLANG) $(LATM_BARE_CFLAGS) -c $< -o $@
 
 build/bare_latm_isa.elf: build/latm_isa_test.o build/latm_miniglib.o build/latm_libc_min.o latm/build/liblatm_core.a baremetal/bare/bare.lds
-	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
 	   build/latm_isa_test.o build/latm_miniglib.o build/latm_libc_min.o latm/build/liblatm_core.a -o $@
 
 latm-isa-image: latm-core build/bare_latm_isa.elf
@@ -614,7 +762,7 @@ build/latm_vclock.o: src/vclock.c include/loongemu/vclock.h
 	$(CLANG) $(LATM_BARE_CFLAGS) -Iinclude -c $< -o $@
 
 build/bare_latm_board.elf: build/latm_board.o build/latm_phys_mem.o                             build/latm_vclock.o build/latm_tb_cache.o                             build/latm_system.o build/latm_mmio.o                             build/latm_memory.o build/latm_dtb.o                             build/latm_pci.o build/latm_uart.o                             build/latm_uncore.o build/latm_acpi_tables.o                             build/latm_pci_host.o                             build/latm_miniglib.o build/latm_libc_min.o                             latm/build/liblatm_core.a baremetal/bare/bare.lds
-	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
 	   build/latm_board.o build/latm_phys_mem.o build/latm_vclock.o \
 	   build/latm_tb_cache.o build/latm_system.o build/latm_mmio.o \
 	   build/latm_memory.o build/latm_dtb.o build/latm_pci.o \
@@ -719,77 +867,99 @@ BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
                -I latx/upstream/include \
                -isystem $(shell $(CLANG) -print-resource-dir)/include \
                -include latx/compat/latx_bare_prelude.h
+BARE_DEPFLAGS = -MD -MP -MF $(patsubst %.o,%.d,$@) -MT $@
+BARE_DEP_OBJECTS := build/bare_main.o build/tb_loop.o build/lbt_emu.o \
+                    build/tb_cache_bare.o build/tb_harness.o \
+                    build/loongarch_paging_bare.o build/acpi_tables_bare.o \
+                    build/tb_sys.o build/regress_x86.o build/tb_harness_test.o \
+                    build/vmm_entry.o build/vmm_loongarch_paging.o \
+                    build/vmm_acpi_tables.o build/vmm_vclock.o \
+                    build/vmm_integrated_entry.o build/vmm_integrated_tb_sys.o
+-include $(patsubst %.o,%.d,$(BARE_DEP_OBJECTS))
 
 build/bare_main.o: baremetal/bare/main.c baremetal/bare/lbt_emu.h
 	@mkdir -p build
-	$(CLANG) $(BARE_CFLAGS) -Ibaremetal/bare -c $< -o $@
+	$(CLANG) $(BARE_CFLAGS) $(BARE_DEPFLAGS) -Ibaremetal/bare -c $< -o $@
 
 build/bare_latx.elf: build/bare_main.o build/lbt_emu.o baremetal/build/liblatx_core.a baremetal/bare/bare.lds
-	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
 	   build/bare_main.o build/lbt_emu.o baremetal/build/liblatx_core.a -o $@
 
 # ---- P1: multi-TB dynamic execution loop ----
 build/tb_loop.o: baremetal/bare/tb_loop.c include/loongemu/tb_cache.h baremetal/bare/lbt_emu.h
 	@mkdir -p build
-	$(CLANG) $(BARE_CFLAGS) -Iinclude -Ibaremetal/bare -c $< -o $@
+	$(CLANG) $(BARE_CFLAGS) $(BARE_DEPFLAGS) -Iinclude -Ibaremetal/bare -c $< -o $@
 
 build/lbt_emu.o: baremetal/bare/lbt_emu.c baremetal/bare/lbt_emu.h
 	@mkdir -p build
-	$(CLANG) $(BARE_CFLAGS) -Iinclude -Ibaremetal/bare -c $< -o $@
+	$(CLANG) $(BARE_CFLAGS) $(BARE_DEPFLAGS) -Iinclude -Ibaremetal/bare -c $< -o $@
 
 build/tb_cache_bare.o: src/tb_cache.c include/loongemu/tb_cache.h
 	@mkdir -p build
-	$(CLANG) $(BARE_CFLAGS) -Iinclude -c $< -o $@
+	$(CLANG) $(BARE_CFLAGS) $(BARE_DEPFLAGS) -Iinclude -c $< -o $@
 
-build/tb_harness.o: baremetal/bare/tb_harness.c baremetal/bare/tb_harness.h
+build/tb_harness.o: baremetal/bare/tb_harness.c baremetal/bare/tb_harness.h latx/include/ir1.h
 	@mkdir -p build
-	$(CLANG) $(BARE_CFLAGS) -Iinclude -Ibaremetal/bare -c $< -o $@
+	$(CLANG) $(BARE_CFLAGS) $(BARE_DEPFLAGS) -Iinclude -Ibaremetal/bare -c $< -o $@
 
 build/tb_loop.elf: build/tb_loop.o build/tb_harness.o build/tb_cache_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a baremetal/bare/bare.lds
-	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
 	   build/tb_loop.o build/tb_harness.o build/tb_cache_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a -o $@
 
 tb-loop-image: build/tb_loop.elf
 
 build/loongarch_paging_bare.o: src/loongarch_paging.c include/loongemu/loongarch_paging.h
 	@mkdir -p build
-	$(CLANG) $(BARE_CFLAGS) -Iinclude -c $< -o $@
+	$(CLANG) $(BARE_CFLAGS) $(BARE_DEPFLAGS) -Iinclude -c $< -o $@
 
 build/acpi_tables_bare.o: src/acpi_tables.c
 	@mkdir -p build
-	$(CLANG) $(BARE_CFLAGS) -Iinclude -Ibaremetal/bare -c $< -o $@
+	$(CLANG) $(BARE_CFLAGS) $(BARE_DEPFLAGS) -Iinclude -Ibaremetal/bare -c $< -o $@
 
-build/tb_sys.o: baremetal/bare/tb_sys.c include/loongemu/tb_cache.h include/loongemu/loongarch_paging.h baremetal/bare/lbt_emu.h baremetal/bare/tb_harness.h
+build/tb_sys.o: baremetal/bare/tb_sys.c include/loongemu/tb_cache.h include/loongemu/loongarch_paging.h include/loongemu/hyperv.h baremetal/bare/lbt_emu.h baremetal/bare/tb_harness.h latx/include/ir1.h
 	@mkdir -p build
-	$(CLANG) $(BARE_CFLAGS) -Iinclude -Ibaremetal/bare -c $< -o $@
+	$(CLANG) $(BARE_CFLAGS) $(BARE_DEPFLAGS) -Iinclude -Ibaremetal/bare -c $< -o $@
 
 build/vmlinux_text.o: baremetal/bare/vmlinux_text.S firmware/vmlinux-x86_64-text.bin
 	@mkdir -p build
 	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib -c $< -o $@
 
-build/vmlinux_segs.o: baremetal/bare/vmlinux_segs.S firmware/vmlinux-x86_64-seg1.bin firmware/vmlinux-x86_64-seg2.bin firmware/vmlinux-x86_64-seg3.bin
+INITRAMFS ?= firmware/initramfs.cpio.gz
+build/vmlinux_segs.o: baremetal/bare/vmlinux_segs.S firmware/vmlinux-x86_64-seg1.bin firmware/vmlinux-x86_64-seg2.bin firmware/vmlinux-x86_64-seg3.bin $(INITRAMFS)
 	@mkdir -p build
-	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib -c $< -o $@
+	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
+	         '-DLOONGEMU_INITRAMFS_PATH="$(abspath $(INITRAMFS))"' -c $< -o $@
 
-build/tb_sys.elf: build/tb_sys.o build/tb_harness.o build/tb_cache_bare.o build/loongarch_paging_bare.o build/lbt_emu.o build/acpi_tables_bare.o baremetal/build/liblatx_core.a baremetal/bare/bare.lds
-	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T baremetal/bare/bare.lds -e _start \
+.PHONY: refresh-baremetal-core
+refresh-baremetal-core:
+	$(MAKE) -C baremetal all
+
+baremetal/build/liblatx_core.a: | refresh-baremetal-core
+	@test -f $@
+
+build/tb_sys.elf: build/tb_sys.o build/tb_harness.o build/tb_cache_bare.o build/loongarch_paging_bare.o build/lbt_emu.o build/acpi_tables_bare.o build/vmlinux_text.o build/vmlinux_segs.o baremetal/build/liblatx_core.a baremetal/bare/bare.lds
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
 	   build/tb_sys.o build/tb_harness.o build/tb_cache_bare.o build/loongarch_paging_bare.o build/lbt_emu.o build/acpi_tables_bare.o build/vmlinux_text.o build/vmlinux_segs.o baremetal/build/liblatx_core.a -o $@
 
 tb-sys-image: build/tb_sys.elf
 
-build/regress_x86.o: baremetal/bare/regress_x86.c include/loongemu/tb_cache.h include/loongemu/loongarch_paging.h baremetal/bare/lbt_emu.h baremetal/bare/tb_harness.h
+build/regress_x86.o: baremetal/bare/regress_x86.c include/loongemu/tb_cache.h include/loongemu/loongarch_paging.h baremetal/bare/lbt_emu.h baremetal/bare/tb_harness.h latx/include/ir1.h
 	@mkdir -p build
-	$(CLANG) $(BARE_CFLAGS) -Iinclude -Ibaremetal/bare -c $< -o $@
+	$(CLANG) $(BARE_CFLAGS) $(BARE_DEPFLAGS) -Iinclude -Ibaremetal/bare -c $< -o $@
 
-build/regress_x86.elf: build/regress_x86.o build/tb_harness.o build/tb_cache_bare.o build/loongarch_paging_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a baremetal/bare/bare.lds
-	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T baremetal/bare/bare.lds -e _start \
-	   build/regress_x86.o build/tb_harness.o build/tb_cache_bare.o build/loongarch_paging_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a -o $@
+
+build/tb_harness_test.o: baremetal/bare/tb_harness_test.c baremetal/bare/tb_harness.h latx/include/ir1.h
+	@mkdir -p build
+	$(CLANG) $(BARE_CFLAGS) $(BARE_DEPFLAGS) -Iinclude -Ibaremetal/bare -c $< -o $@
+build/regress_x86.elf: build/regress_x86.o build/tb_harness.o build/tb_harness_test.o build/tb_cache_bare.o build/loongarch_paging_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a baremetal/bare/bare.lds
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	   build/regress_x86.o build/tb_harness.o build/tb_harness_test.o build/tb_cache_bare.o build/loongarch_paging_bare.o build/lbt_emu.o baremetal/build/liblatx_core.a -o $@
 
 regress-x86-image: build/regress_x86.elf
 
 tb-sys-run: build/tb_sys.elf
 	@rm -f build/tb_sys.log
-	@timeout 15 $(QLVZ) -M virt -cpu max -m 512M -kernel build/tb_sys.elf \
+	@timeout 90 $(QLVZ) -M virt -cpu max -m 512M -kernel build/tb_sys.elf \
 	     -display none -monitor none -serial file:build/tb_sys.log -no-reboot 2>/dev/null || true
 	@grep -a 'tb-sys:' build/tb_sys.log | tail -8
 	@grep -qa 'tb-sys: done' build/tb_sys.log
@@ -823,23 +993,45 @@ bare-run: bare-image
 	@sleep 12; kill $$(cat build/qemu_bare.pid) 2>/dev/null; true
 	@grep -aE 'bare:|lbt|FAIL' build/bare_run.log | head -30
 
-# ---- P0 UEFI entry: ExitBootServices handoff and the 4 KiB bring-up ----
-VMM_SRC := baremetal/efi/vmm_entry.c src/loongarch_paging.c
+# ---- P0 UEFI entry: standalone probe and System VMM handoff ------------
 VMM_INC := -Iinclude -Ibaremetal/efi
+VMM_EFI_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
+                  -fno-builtin -fno-stack-protector -O2 -mno-lsx -mno-lasx \
+                  -fno-vectorize -fno-slp-vectorize $(VMM_INC)
+OVMF_CODE ?= $(firstword $(wildcard \
+	$(QEMU_PREFIX)/share/qemu/edk2-x86_64-code.fd \
+	/usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/x64/OVMF_CODE.fd \
+	/usr/share/edk2-ovmf/x64/OVMF_CODE.fd firmware/OVMF_CODE.fd))
+OVMF_VARS ?= $(firstword $(wildcard \
+	$(QEMU_PREFIX)/share/qemu/edk2-x86_64-vars.fd \
+	$(shell brew --prefix 2>/dev/null)/share/qemu/edk2-i386-vars.fd \
+	/usr/share/OVMF/OVMF_VARS.fd /usr/share/edk2/x64/OVMF_VARS.fd \
+	/usr/share/edk2-ovmf/x64/OVMF_VARS.fd firmware/OVMF_VARS.fd))
 
-build/vmm_entry.o: $(VMM_SRC) include/loongemu/loongarch_paging.h baremetal/efi/efi_min.h
+# Standalone paging probe remains a separate EFI application.
+build/vmm_entry.o: baremetal/efi/vmm_entry.c include/loongemu/vmm_handoff.h \
+                   include/loongemu/loongarch_paging.h baremetal/efi/efi_min.h
 	@mkdir -p build
-	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
-	         -fno-builtin -O2 -mno-lsx -mno-lasx -fno-vectorize -fno-slp-vectorize \
-	         $(VMM_INC) -c baremetal/efi/vmm_entry.c -o $@
-	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
-	         -fno-builtin -O2 -mno-lsx -mno-lasx -fno-vectorize -fno-slp-vectorize \
-	         $(VMM_INC) -c src/loongarch_paging.c -o build/vmm_loongarch_paging.o
+	$(CLANG) $(VMM_EFI_CFLAGS) $(BARE_DEPFLAGS) -DVMM_STANDALONE_PROBE -c $< -o $@
 
-build/vmm_entry.elf: build/vmm_entry.o build/vmm_loongarch_paging.o
+build/vmm_loongarch_paging.o: src/loongarch_paging.c include/loongemu/loongarch_paging.h
+	@mkdir -p build
+	$(CLANG) $(VMM_EFI_CFLAGS) $(BARE_DEPFLAGS) -c $< -o $@
+
+build/vmm_acpi_tables.o: src/acpi_tables.c include/loongemu/acpi_tables.h
+	@mkdir -p build
+	$(CLANG) $(VMM_EFI_CFLAGS) $(BARE_DEPFLAGS) -c $< -o $@
+
+build/vmm_vclock.o: src/vclock.c include/loongemu/vclock.h
+	@mkdir -p build
+	$(CLANG) $(VMM_EFI_CFLAGS) $(BARE_DEPFLAGS) -c $< -o $@
+
+build/vmm_entry.elf: build/vmm_entry.o build/vmm_loongarch_paging.o \
+                     build/vmm_acpi_tables.o build/vmm_vclock.o
 	@printf 'ENTRY(efi_main)\nSECTIONS { . = 0x1000; .text : { *(.text*) } .rodata : { *(.rodata*) } .data : { *(.data*) } .bss : { *(.bss*) *(COMMON) } }\n' > build/vmm.lds
-	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T build/vmm.lds -e efi_main \
-	   build/vmm_entry.o build/vmm_loongarch_paging.o -o $@
+	$(LD_LLD) --emit-relocs -T build/vmm.lds -e efi_main \
+	   build/vmm_entry.o build/vmm_loongarch_paging.o build/vmm_acpi_tables.o \
+	   build/vmm_vclock.o -o $@
 
 build/vmm_entry.efi: build/vmm_entry.elf
 	$(GENFW) -o $@ -e UEFI_APPLICATION $<
@@ -854,7 +1046,62 @@ vmm-boot: vmm-efi
 	     -bios firmware/QEMU_EFI.fd \
 	     -drive id=esp,file=fat:rw:build/esp_vmm,format=raw,if=none \
 	     -device virtio-blk-pci,drive=esp \
-	     -display none -monitor none -serial file:build/vmm-serial.log -no-reboot & \
+	     -display none -monitor none -serial file:build/vmm-serial.log -no-reboot 2>/dev/null & \
 	   echo $$! > build/qemu_vmm.pid )
 	@sleep 40; kill $$(cat build/qemu_vmm.pid) 2>/dev/null; true
 	@grep -aE 'vmm:' build/vmm-serial.log | head -30
+
+# The integrated EFI image embeds the supplied x86-64 guest firmware, then
+# copies it into independent UEFI-owned buffers before ExitBootServices.
+build/vmm_ovmf_payload.o: baremetal/efi/vmm_ovmf_payload.S $(OVMF_CODE) $(OVMF_VARS)
+	@test -r "$(OVMF_CODE)" || { echo "Set OVMF_CODE to an x86-64 OVMF_CODE.fd file" >&2; exit 1; }
+	@test -r "$(OVMF_VARS)" || { echo "Set OVMF_VARS to an x86-64 OVMF_VARS.fd file" >&2; exit 1; }
+	@mkdir -p build
+	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
+	         '-DLOONGEMU_OVMF_CODE_PATH="$(abspath $(OVMF_CODE))"' \
+	         '-DLOONGEMU_OVMF_VARS_PATH="$(abspath $(OVMF_VARS))"' \
+	         -c $< -o $@
+
+build/vmm_integrated_entry.o: baremetal/efi/vmm_entry.c include/loongemu/vmm_handoff.h \
+                              include/loongemu/loongarch_paging.h baremetal/efi/efi_min.h
+	@mkdir -p build
+	$(CLANG) $(VMM_EFI_CFLAGS) $(BARE_DEPFLAGS) -DLOONGEMU_BOOT_OVMF -c $< -o $@
+
+build/vmm_integrated_tb_sys.o: baremetal/bare/tb_sys.c include/loongemu/vmm_handoff.h \
+                               include/loongemu/hyperv.h baremetal/bare/tb_harness.h
+	@mkdir -p build
+	$(CLANG) $(BARE_CFLAGS) $(BARE_DEPFLAGS) -DLOONGEMU_BOOT_OVMF -Iinclude -Ibaremetal/bare -c $< -o $@
+
+build/vmm_integrated.elf: build/vmm_integrated_entry.o build/vmm_integrated_tb_sys.o \
+                          build/vmm_ovmf_payload.o build/tb_harness.o \
+                          build/tb_cache_bare.o build/loongarch_paging_bare.o \
+                          build/lbt_emu.o build/acpi_tables_bare.o \
+                          build/vmlinux_text.o build/vmlinux_segs.o \
+                          baremetal/build/liblatx_core.a baremetal/bare/bare.lds
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e efi_main \
+	   build/vmm_integrated_entry.o build/vmm_integrated_tb_sys.o \
+	   build/vmm_ovmf_payload.o build/tb_harness.o build/tb_cache_bare.o \
+	   build/loongarch_paging_bare.o build/lbt_emu.o build/acpi_tables_bare.o \
+	   build/vmlinux_text.o build/vmlinux_segs.o \
+	   baremetal/build/liblatx_core.a -o $@
+
+build/vmm_integrated.efi: build/vmm_integrated.elf
+	$(GENFW) -o $@ -e UEFI_APPLICATION $<
+
+vmm-integrated: build/vmm_integrated.efi
+
+vmm-integrated-boot: vmm-integrated
+	@rm -rf build/esp_vmm_integrated && mkdir -p build/esp_vmm_integrated/EFI/BOOT
+	@cp build/vmm_integrated.efi build/esp_vmm_integrated/EFI/BOOT/BOOTLOONGARCH64.EFI
+	@rm -f build/vmm-integrated-serial.log
+	@( qemu-system-loongarch64 -M virt -cpu la464 -m 2G \
+	     -bios firmware/QEMU_EFI.fd \
+	     -drive id=esp,file=fat:rw:build/esp_vmm_integrated,format=raw,if=none \
+	     -device virtio-blk-pci,drive=esp \
+	     -display none -monitor none -serial file:build/vmm-integrated-serial.log -no-reboot 2>/dev/null & \
+	   echo $$! > build/qemu_vmm_integrated.pid )
+	@sleep 60; kill $$(cat build/qemu_vmm_integrated.pid) 2>/dev/null; true
+	@grep -aE 'vmm:|tb-sys:' build/vmm-integrated-serial.log | tail -40
+	@grep -qa 'fails=0' build/vmm-integrated-serial.log
+	@grep -qa 'tb-sys: ovmf_run_live=1' build/vmm-integrated-serial.log
+	@! grep -qa 'FAIL\|ovmf_abort\|ovmf_persistent_abort\|refusing to start' build/vmm-integrated-serial.log

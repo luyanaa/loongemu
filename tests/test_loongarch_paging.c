@@ -180,6 +180,31 @@ static void test_leaf_encoding(void)
     /* A page number wider than the PPN field must not corrupt the flags. */
     pte = lapg_make_leaf(UINT64_C(1) << 40, LAPG_PERM_READ);
     CHECK(pte & LAPG_PTE_V);
+    CHECK(((pte & LAPG_PTE_MAT_MASK) >> LAPG_PTE_MAT_SHIFT) == LAPG_MAT_CC);
+
+    /* Explicit MAT encoding: SUC=0, CC=1, WUC=2; reserved value 3 clamps to CC. */
+    pte = lapg_make_leaf_mat(0x100, LAPG_PERM_READ | LAPG_PERM_WRITE, LAPG_MAT_SUC);
+    CHECK(((pte & LAPG_PTE_MAT_MASK) >> LAPG_PTE_MAT_SHIFT) == LAPG_MAT_SUC);
+    pte = lapg_make_leaf_mat(0x100, LAPG_PERM_READ | LAPG_PERM_WRITE, LAPG_MAT_WUC);
+    CHECK(((pte & LAPG_PTE_MAT_MASK) >> LAPG_PTE_MAT_SHIFT) == LAPG_MAT_WUC);
+    pte = lapg_make_leaf_mat(0x100, LAPG_PERM_READ | LAPG_PERM_WRITE, 3u);
+    CHECK(((pte & LAPG_PTE_MAT_MASK) >> LAPG_PTE_MAT_SHIFT) == LAPG_MAT_CC);
+}
+
+static void test_map_mat_walk(void)
+{
+    LapgPagePool pool;
+    LapgMemory memory = { .opaque = 0, .read_u64 = arena_read,
+                          .write_u64 = arena_write };
+    LapgTranslation tr;
+    uint64_t root;
+
+    arena_reset(&pool);
+    CHECK(lapg_pool_alloc(&pool, LAPG_PAGE_SIZE, &root));
+    CHECK(lapg_map_mat(&memory, &pool, root, 0x30000, arena_phys() + 0x4000,
+                       LAPG_PERM_READ | LAPG_PERM_WRITE, LAPG_MAT_WUC) == LAPG_OK);
+    CHECK(lapg_walk(&memory, root, 0x30000, LAPG_PERM_READ | LAPG_PERM_WRITE, &tr) == LAPG_OK);
+    CHECK(((tr.pte & LAPG_PTE_MAT_MASK) >> LAPG_PTE_MAT_SHIFT) == LAPG_MAT_WUC);
 }
 
 static void test_table_encoding(void)
@@ -377,6 +402,7 @@ int main(void)
     test_leaf_encoding();
     test_table_encoding();
     test_map_walk_roundtrip();
+    test_map_mat_walk();
     test_unmapped_and_protection();
     test_malformed_input();
     test_remap();

@@ -10,6 +10,7 @@
 #define LATX_BARE_TB_HARNESS_H
 
 #include <stdint.h>
+#include "ir1.h"
 
 /*
  * Mapping from one translated x86 instruction inside a TB to the native code
@@ -19,14 +20,41 @@
  */
 #define TB_HARNESS_MAX_INSNS 64
 
+#define TB_HARNESS_FAULT_EA_NONE UINT8_MAX
+#define TB_HARNESS_FAULT_REG_NONE UINT8_MAX
+#define TB_HARNESS_FAULT_REG_RIP 0xfeu
+#define TB_HARNESS_STACK_ACCESS_NONE 0u
+#define TB_HARNESS_STACK_ACCESS_PUSH 1u
+#define TB_HARNESS_STACK_ACCESS_POP 2u
+
+typedef struct TbFaultEa {
+    int32_t displacement;
+    uint8_t base;          /* GPR index, TB_HARNESS_FAULT_REG_*, or RIP */
+    uint8_t index;         /* GPR index or TB_HARNESS_FAULT_REG_NONE */
+    uint8_t scale;         /* 1, 2, 4, or 8 */
+    uint8_t address_size;  /* bytes: 4 or 8 */
+    uint8_t size;          /* bytes accessed */
+    uint8_t segment_prefix; /* effective FS/GS override byte, or zero */
+    uint8_t ea_seg_class;  /* class of this explicit memory EA */
+    uint8_t reserved;
+} TbFaultEa;
+
 typedef struct TbInsnSpan {
     uint64_t x86_pc;
     uint16_t native_end_off;
+    uint8_t  ea_seg_class; /* IR1_EA_SEG_*; UNKNOWN without one unambiguous fault class */
+    uint8_t  x86_size;
+    uint8_t  fault_ea_index; /* index into TbInsnMap.fault_eas, or NONE */
+    uint8_t  stack_access_kind;
+    uint8_t  stack_access_size;
+    uint8_t  reserved;
 } TbInsnSpan;
 
 typedef struct TbInsnMap {
     uint16_t count;
+    uint16_t fault_ea_count;
     TbInsnSpan spans[TB_HARNESS_MAX_INSNS];
+    TbFaultEa fault_eas[TB_HARNESS_MAX_INSNS];
     /* Direct-branch link slots (`b 0` patched to `nop` at translate time). */
     int32_t jmp_slot_off[2];
     uint64_t jmp_target_pc[2];
@@ -49,10 +77,31 @@ int tb_harness_translate_at_with_map(uint64_t pc, uint8_t *code,
 
 /*
  * Resolve a host ERA inside a translated block (`tb_code`) back to the
- * guest x86 PC that emitted that native instruction.  Falls back to
- * `fallback_pc` if `era` is outside the recorded spans.
+ * guest x86 PC and its decode-time IR1_EA_SEG_* class.  The class is UNKNOWN
+ * when the ERA is outside a recorded instruction span or no single faulting
+ * EA class can be assigned to the instruction.
  */
 uint64_t tb_harness_resolve_x86_pc(const TbInsnMap *map, uint64_t tb_code,
                                    uint64_t era, uint64_t fallback_pc);
+uint64_t tb_harness_resolve_x86_span(const TbInsnMap *map, uint64_t tb_code,
+                                     uint64_t era, uint64_t fallback_pc,
+                                     uint8_t *out_ea_seg_class);
+/* Resolve only when ERA lies inside a recorded instruction span. */
+int tb_harness_resolve_x86_fault(const TbInsnMap *map, uint64_t tb_code,
+                                 uint64_t era, uint64_t fallback_pc,
+                                 uint64_t *out_x86_pc,
+                                 uint8_t *out_ea_seg_class);
+/*
+ * Refine supported x86-64 stack+data instructions by matching BADV against
+ * the decoded memory EA and implicit stack EA. `gpr` uses the x86 order
+ * RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8-R15. This is valid only when
+ * generated accesses use guest-linear addresses directly (guest paging off);
+ * unsupported or ambiguous cases remain UNKNOWN.
+ */
+int tb_harness_refine_x86_fault_ea(const TbInsnMap *map, uint64_t tb_code,
+                                   uint64_t era, uint64_t badv,
+                                   const uint64_t gpr[16],
+                                   uint64_t fs_base, uint64_t gs_base,
+                                   uint8_t *out_ea_seg_class);
 
 #endif

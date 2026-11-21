@@ -518,6 +518,8 @@ static bool translate_hypercall_common(IR1_INST *pir1)
     IR2_OPND fn;
     (void)pir1;
     tr_save_guest_regs_for_helper();
+    /* Hyper-V fast calls pass input qwords 2..13 in XMM0..XMM5. */
+    tr_save_xmm_to_env(0x3fu);
     fn = ra_alloc_itemp();
     li_d(fn, (ADDR)helper_hypercall);
     la_mov64(a0_ir2_opnd, env_ir2_opnd);
