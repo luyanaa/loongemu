@@ -299,8 +299,9 @@ static int sys_atomic_ll(CPUMIPSState *env, uint64_t gpa, unsigned size,
     (void)env;
     LatmSystem *sys = latm_platform_get()->opaque;
     void *host;
+    if (!value) return LATM_MEM_FAULT;
     int status = sys_atomic_ram(sys, gpa, size, &host);
-    if (status != LATM_MEM_OK || !value) return status;
+    if (status != LATM_MEM_OK) return status;
     *value = size == 4 ? __atomic_load_n((uint32_t *)host, __ATOMIC_ACQUIRE)
                        : __atomic_load_n((uint64_t *)host, __ATOMIC_ACQUIRE);
     return LATM_MEM_OK;
