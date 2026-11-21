@@ -1855,6 +1855,27 @@ typedef struct FastJmpEntry {
 #define FAST_JMP_CACHE_SIZE (1u << TB_JMP_CACHE_BITS)
 static FastJmpEntry g_fast_jmp_cache[MAX_VCPUS][FAST_JMP_CACHE_SIZE]
     __attribute__((aligned(4096)));
+
+typedef struct LargePageCache {
+    uint64_t gpa_base;
+    uint64_t hpa_base;
+    uint64_t span;
+    uint64_t cr3;
+    uint16_t pcid;
+    uint16_t valid;
+    uint32_t page_bits;
+    uint8_t mat;
+} LargePageCache;
+static LargePageCache g_large_page_cache[MAX_VCPUS];
+static volatile uint64_t g_large_page_hits;
+static volatile uint64_t g_large_page_fills;
+
+static void large_page_cache_invalidate(uint32_t vcpu)
+{
+    if (vcpu < MAX_VCPUS) {
+        g_large_page_cache[vcpu].valid = 0;
+    }
+}
 #define fast_jmp_cache (g_fast_jmp_cache[g_cur_vcpu])
 
 #define CODE_CACHE_PER_CORE (4 * 1024 * 1024)
@@ -2952,6 +2973,7 @@ void latx_platform_tlb_flush_all(void)
         return;
     }
     memset(fast_jmp_cache, 0, sizeof(g_fast_jmp_cache[0]));
+    large_page_cache_invalidate(g_cur_vcpu);
     asid_activate(1);
 }
 
@@ -2959,7 +2981,12 @@ void latx_platform_tlb_flush_page(uint64_t addr)
 {
     uint64_t vppn = addr & UINT64_C(0x0000ffffffffe000);
     uint64_t asid = (uint64_t)g_cur_asid;
+    LargePageCache *large = &g_large_page_cache[g_cur_vcpu];
 
+    if (large->valid && addr >= large->gpa_base &&
+        addr - large->gpa_base < large->span) {
+        large->valid = 0;
+    }
     __asm__ volatile("invtlb 0x5, %0, %1" :: "r"(asid), "r"(vppn) : "memory");
     for (int i = 0; i < ASID_SLOTS; i++) {
         if (g_asid_slots[i].valid && g_asid_slots[i].vcpu == g_cur_vcpu &&
@@ -2982,6 +3009,7 @@ void latx_platform_tlb_switch_cr3(int noflush)
      * discard the single fast-jump root because it is not yet banked.
      */
     memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
+    large_page_cache_invalidate(g_cur_vcpu);
     asid_activate(0);
 }
 
@@ -4183,9 +4211,28 @@ static uint64_t build_guest_leaf_pte(uint32_t x86_r,
     uint64_t hpa_page = 0;
     uint32_t perm = LAPG_PERM_READ | LAPG_PERM_USER;
     uint32_t mat = LAPG_MAT_SUC;
+    uint32_t page_bits = x86_tr->page_bits;
+    uint64_t cr3 = env.cr[3] & UINT64_C(0x000000fffffff000);
+    uint16_t pcid = (env.cr[4] & X86_CR4_PCIDE)
+                        ? (uint16_t)(env.cr[3] & 0xfffu) : 0u;
+    LargePageCache *large = &g_large_page_cache[g_cur_vcpu];
     LoongemuMemLookup lk;
-    LoongemuMemKind mk = loongemu_mem_resolve(&g_mem_map, gpa_page,
-                                              LAPG_PAGE_SIZE, &lk);
+    LoongemuMemKind mk;
+    int cache_hit = 0;
+
+    if (page_bits >= 21 && large->valid &&
+        large->cr3 == cr3 && large->pcid == pcid &&
+        gpa_page >= large->gpa_base &&
+        gpa_page - large->gpa_base < large->span) {
+        hpa_page = large->hpa_base + (gpa_page - large->gpa_base);
+        mat = large->mat;
+        mk = LOONGEMU_MEM_RAM;
+        cache_hit = 1;
+        g_large_page_hits++;
+        goto have_hpa;
+    }
+
+    mk = loongemu_mem_resolve(&g_mem_map, gpa_page, LAPG_PAGE_SIZE, &lk);
 
     if (mk == LOONGEMU_MEM_RESERVED) {
         /* Strict host/guest isolation: never map VMM-reserved HPA to PLV3. */
@@ -4206,8 +4253,33 @@ static uint64_t build_guest_leaf_pte(uint32_t x86_r,
     } else {
         return 0;
     }
+
+have_hpa:
     if ((hpa_page & (LAPG_PAGE_SIZE - 1u)) != 0) {
         return 0;
+    }
+    if (!cache_hit && page_bits >= 21 && mk == LOONGEMU_MEM_RAM) {
+        uint64_t span = (page_bits == 30) ? (UINT64_C(1) << 21)
+                                          : (UINT64_C(1) << page_bits);
+        uint64_t base = gpa_page & ~(span - 1);
+        uint64_t hpa_base = hpa_page - (gpa_page - base);
+        LoongemuMemLookup last;
+
+        if (span <= GUEST_RAM_SIZE &&
+            loongemu_mem_resolve(&g_mem_map, base + span - LAPG_PAGE_SIZE,
+                                 LAPG_PAGE_SIZE, &last) == LOONGEMU_MEM_RAM &&
+            last.hpa == hpa_base + span - LAPG_PAGE_SIZE &&
+            last.host_mat == mat) {
+            large->gpa_base = base;
+            large->hpa_base = hpa_base;
+            large->span = span;
+            large->page_bits = (page_bits == 30) ? 21u : page_bits;
+            large->cr3 = cr3;
+            large->pcid = pcid;
+            large->mat = (uint8_t)mat;
+            large->valid = 1;
+            g_large_page_fills++;
+        }
     }
 
     if (x86_r == LATX_X86_WALK_PAGING_OFF) {
@@ -7242,6 +7314,22 @@ void kmain(void)
 
     latx_bare_uart_puts("tb-sys: start\n");
     init_phys_mem_and_vclock();
+    {
+        LatxX86Translation t = {0};
+        uint64_t fills = g_large_page_fills;
+        uint64_t hits = g_large_page_hits;
+
+        t.gpa = UINT64_C(0x100000);
+        t.page_bits = 21;
+        t.perm = LATX_X86_ACCESS_READ | LATX_X86_ACCESS_WRITE;
+        (void)build_guest_leaf_pte(LATX_X86_WALK_PAGING_OFF, &t,
+                                   LATX_X86_ACCESS_READ);
+        t.gpa += LAPG_PAGE_SIZE;
+        (void)build_guest_leaf_pte(LATX_X86_WALK_PAGING_OFF, &t,
+                                   LATX_X86_ACCESS_READ);
+        check(g_large_page_fills > fills && g_large_page_hits > hits,
+              "2 MiB guest page fills and reuses a 4 KiB shadow batch");
+    }
     test_vmm_handoff_and_bochs_fb();
 
     {
