@@ -16,6 +16,8 @@
 #include "translate.h"
 #include "loongemu/phys_mem.h"
 #include "loongemu/vclock.h"
+#include "loongemu/tb_cache.h"
+#include "latm-system-board.h"
 
 #define UART0_THR ((volatile unsigned char *)0x1fe001e0)
 void latx_bare_uart_putc(int c) { *UART0_THR = (unsigned char)c; }
@@ -49,6 +51,8 @@ static Uart16550 uart;
 static uint32_t count_bias;
 static uint32_t compare_value;
 static int compare_armed;
+static TbCache board_tb_cache;
+static unsigned board_tb_hits;
 static volatile int board_exit_code;
 static uint64_t board_exit_jmp[16] __attribute__((aligned(16)));
 static volatile int board_exit_active;
@@ -237,6 +241,7 @@ static void board_set_compare(CPUMIPSState *env, uint32_t compare)
 static void board_tlb_flush(CPUMIPSState *env)
 {
     (void)env;
+    tbc_flush_all(&board_tb_cache);
 }
 
 static void board_request_interrupt(CPUMIPSState *env, uint32_t cause_bits)
@@ -330,6 +335,8 @@ static int board_fetch(CPUMIPSState *env, uint64_t gpa, uint32_t *value)
     return LATM_MEM_OK;
 }
 
+static void board_smc_broadcast(CPUMIPSState *env, uint64_t start,
+                                uint64_t end);
 static const LatmPlatform platform = {
     .mem_read = board_read,
     .mem_write = board_write,
@@ -338,6 +345,7 @@ static const LatmPlatform platform = {
     .store_count = board_store_count,
     .set_compare = board_set_compare,
     .tlb_flush = board_tlb_flush,
+    .smc_broadcast = board_smc_broadcast,
     .request_interrupt = board_request_interrupt,
     .atomic_ll = board_atomic_ll,
     .atomic_sc = board_atomic_sc,
@@ -483,6 +491,33 @@ static uint32_t board_tb_next = BOARD_TB_START;
 static TranslationBlock tb;
 static CPUMIPSState env;
 static CPUMIPSTLBContext tlb;
+#define BOARD_TB_CACHE_CAP 128u
+static TbCacheEntry board_tb_entries[BOARD_TB_CACHE_CAP];
+static uint32_t board_tb_buckets[BOARD_TB_CACHE_CAP];
+
+static uint64_t board_asid(void)
+{
+    return env.CP0_EntryHi & env.CP0_EntryHi_ASID_mask;
+}
+
+static uint8_t board_mode(void)
+{
+    return (uint8_t)(env.hflags &
+                     (MIPS_HFLAG_UM | MIPS_HFLAG_SM | MIPS_HFLAG_M16));
+}
+
+static void board_cache_invalidate(uint64_t start, uint64_t end)
+{
+    if (end > start) {
+        tbc_invalidate_range(&board_tb_cache, board_asid(), start, end - start);
+    }
+}
+
+static void board_smc_broadcast(CPUMIPSState *envp, uint64_t start, uint64_t end)
+{
+    (void)envp;
+    board_cache_invalidate(start, end);
+}
 uint64_t latx_tcg_gen_insn_data[TCG_MAX_INSNS * 2];
 
 static void board_poll(void)
@@ -504,11 +539,34 @@ static void board_poll(void)
     latm_check_interrupts(&env);
 }
 
+static void board_run_host(uint8_t *host)
+{
+    if (board_setjmp(board_exit_jmp) == 0) {
+        board_exit_active = 1;
+        ((void (*)(void *, void *))(uintptr_t)
+         ((TRANSLATION_DATA *)env.latm_tr_data)->cs_bt_to_native)(&env, host);
+        board_exit_active = 0;
+    } else {
+        board_exit_active = 0;
+    }
+}
+
 static int run_one_tb(void)
 {
+    uint64_t asid = board_asid();
+    uint8_t mode = board_mode();
+    TbCacheEntry *cached = tbc_lookup_mips(&board_tb_cache,
+                                            env.active_tc.PC, (uint32_t)asid,
+                                            mode);
+    if (cached && cached->code) {
+        board_tb_hits++;
+        board_run_host((uint8_t *)(uintptr_t)cached->code);
+        return 1;
+    }
     if (board_tb_next + BOARD_TB_SLOT > sizeof(code_buf)) {
         board_tb_next = BOARD_TB_START;
         latm_tb_insn_map_flush(env.latm_tr_data);
+        tbc_flush_all(&board_tb_cache);
     }
     uint8_t *host = code_buf + board_tb_next;
     board_tb_next += BOARD_TB_SLOT;
@@ -526,13 +584,82 @@ static int run_one_tb(void)
     tr_fini();
     __asm__ volatile("ibar 0" ::: "memory");
     if (n <= 0) return 0;
-    if (board_setjmp(board_exit_jmp) == 0) {
-        board_exit_active = 1;
-        ((void (*)(void *, void *))(uintptr_t)
-         ((TRANSLATION_DATA *)env.latm_tr_data)->cs_bt_to_native)(&env, host);
-        board_exit_active = 0;
-    } else {
-        board_exit_active = 0;
+    TbCacheEntry *entry = tbc_insert_mips(&board_tb_cache, tb.pc,
+                                          (uint32_t)asid, mode);
+    if (!entry) {
+        tbc_flush_all(&board_tb_cache);
+        entry = tbc_insert_mips(&board_tb_cache, tb.pc, (uint32_t)asid,
+                                mode);
+    }
+    if (entry) {
+        entry->code = (uintptr_t)host;
+        entry->code_size = (uint32_t)n;
+        entry->guest_size = tb.size;
+    }
+    board_run_host(host);
+    return 1;
+}
+
+static void board_put32(uint8_t *p, uint32_t v)
+{
+    p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24;
+}
+static void board_put64(uint8_t *p, uint64_t v)
+{
+    for (unsigned i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+static int board_system_smoke(void)
+{
+    /* KSEG1 UART; this is executed through the LatmSystem platform, not the
+     * legacy board_mem_map callbacks. */
+    static const uint32_t insns[] = {
+        0x3c08bfe0, 0x350801e0, 0x3409004b, 0xa1090000, 0x0000000d,
+    };
+    static LatmSystem sys;
+    uint8_t elf[128];
+    uint64_t entry = 0;
+    const size_t phoff = 64, code_off = 120;
+    memset(elf, 0, sizeof(elf));
+    elf[0] = 0x7f; elf[1] = 'E'; elf[2] = 'L'; elf[3] = 'F';
+    elf[4] = 2; elf[5] = 1; elf[6] = 1;
+    elf[16] = 2; elf[18] = 8; elf[20] = 1;
+    board_put64(elf + 24, 0x2000);
+    board_put64(elf + 32, phoff);
+    board_put32(elf + 20, 64);
+    elf[52] = 64; elf[54] = 56; elf[56] = 1;
+    board_put32(elf + phoff + 0, 1);
+    board_put32(elf + phoff + 4, 5);
+    board_put64(elf + phoff + 8, code_off);
+    board_put64(elf + phoff + 16, 0x2000);
+    board_put64(elf + phoff + 24, 0x2000);
+    board_put64(elf + phoff + 32, sizeof(insns));
+    board_put64(elf + phoff + 40, sizeof(insns));
+    board_put64(elf + phoff + 48, 0x1000);
+    for (unsigned i = 0; i < sizeof(insns) / sizeof(insns[0]); i++) {
+        board_put32(elf + code_off + i * 4, insns[i]);
+    }
+    if (!latm_system_init_3a4000(&sys, ram, 0x100000000ull, sizeof(ram),
+                                 0x100000000ull, 0x400000ull,
+                                 0x100400000ull, 0x400000ull)) {
+        latx_bare_uart_puts("latm-board: system-init-fail\n");
+        return 0;
+    }
+    if (!latm_system_load_elf(&sys, elf, code_off + sizeof(insns), &entry)) {
+        latx_bare_uart_puts("latm-board: system-elf-fail\n");
+        return 0;
+    }
+    tbc_flush_all(&board_tb_cache);
+    latm_tb_insn_map_flush(env.latm_tr_data);
+    env.latm_fetch_fault = 0;
+    env.active_tc.PC = entry | 0xffffffff80000000ull;
+    if (!run_one_tb()) {
+        latx_bare_uart_puts("latm-board: system-tb-fail\n");
+        return 0;
+    }
+    if (sys.uart.tx_count != 1) {
+        latx_bare_uart_puts("latm-board: system-uart-fail\n");
+        return 0;
     }
     return 1;
 }
@@ -548,6 +675,11 @@ void kmain(void)
     loongemu_vclock_init(&vclock, LOONGEMU_VCLOCK_VIRTUAL_STEP,
                          loongemu_host_timer_hz(), 100000000, 100000000,
                          62500000, 0, 0);
+    if (!tbc_init(&board_tb_cache, board_tb_entries, board_tb_buckets,
+                  BOARD_TB_CACHE_CAP)) {
+        latx_bare_uart_puts("latm-board: FAIL tb-cache init\n");
+        return;
+    }
     latm_platform_set(&platform);
     latm_set_system_memory(true);
     unsigned fdt_len = build_dtb();
@@ -582,6 +714,10 @@ void kmain(void)
     latm_helper_cp0_write(&env, 10, 0, 0x22);
     uint64_t cache_miss = latm_jmp_cache_lookup(&env,
                                                0xffffffff80000000ull);
+    latx_bare_uart_puts("\nlatm-board: tb-cache-hits=");
+    puthex(board_tb_hits);
+    latx_bare_uart_puts(" tb-cache-count=");
+    puthex(tbc_count(&board_tb_cache));
     latx_bare_uart_puts("\nlatm-board: cache-hit=");
     puthex(cache_hit);
     latx_bare_uart_puts(" cache-after-asid=");
@@ -721,6 +857,8 @@ void kmain(void)
     puthex(DTB_GPA);
     latx_bare_uart_puts(" dtb-len=");
     puthex(fdt_len);
+    latx_bare_uart_puts("\nlatm-board: system-first-tb=");
+    puthex(board_system_smoke());
     latx_bare_uart_puts("\nlatm-board: done\n");
 }
 void kmain(void);

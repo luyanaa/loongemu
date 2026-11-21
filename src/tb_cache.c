@@ -179,6 +179,18 @@ TbCacheEntry *tbc_insert(TbCache *cache, uint64_t pc, uint64_t cs_base,
     return tbc_insert_mode(cache, pc, cs_base, cr3, cpl, 0);
 }
 
+TbCacheEntry *tbc_lookup_mips(TbCache *cache, uint64_t pc, uint32_t asid,
+                              uint8_t hflags)
+{
+    return tbc_lookup_mode(cache, pc, 0, asid, 0, hflags);
+}
+
+TbCacheEntry *tbc_insert_mips(TbCache *cache, uint64_t pc, uint32_t asid,
+                              uint8_t hflags)
+{
+    return tbc_insert_mode(cache, pc, 0, asid, 0, hflags);
+}
+
 void tbc_invalidate_range(TbCache *cache, uint64_t cr3, uint64_t addr,
                           uint64_t len)
 {

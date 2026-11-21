@@ -846,5 +846,8 @@ DTB 已由 host test 生成并用 `dtc -I dtb -O dts` 验证（3A4000 compatible
 - **EXTIOI 边界**：COREISR 读写严格限制在每 CPU 8 个 32-bit 寄存器（`0x1400+0x400..0x420`）；更大的 Guest aperture 不再直接索引数组。仍保持 QEMU 3A 的 per-CPU COREISR 语义。
 - **LWL/LWR**：32 位 word 先按 QEMU `MO_TEUL` 零扩展，merge 后再按 MIPS32 规则 sign-extend；LWR/LDR mask 改为 QEMU 的 `~1 << (bits-1-shift)`，并新增 4/8 字节 × 四个地址低位 × 多种旧寄存器 mask 的差分测试。`LatmPlatform.mem_probe` 可无副作用验证 unaligned 首字节，避免对 MMIO 做额外读取。
 - **TB map 生命周期**：`LatmTbInsnMap` 改为动态链表，并保存到 `TranslationBlock.latm_insn_map`；不再有 32 项 LRU 淘汰。`latm_tb_insn_map_release()` 供 TB 回收路径释放；SMC flush 将 map 标为 invalid 而不解引用已失效 TB 指针。
+- **board 与系统运行循环**：`baremetal/bare/latm_board.c` 保留合成板自检，并在末尾调用 `latm_system_init_3a4000()` + `latm_system_load_elf()` 的系统模式路径；`latm-board: system-first-tb=1` 证明 `LatmSystem` 已进入真实运行循环，而不是只存在于主 host 单测。
+- **MIPS TB cache**：`tb_cache` 新增 `tbc_lookup_mips/tbc_insert_mips`，键为 `PC + CP0 ASID + hflags mode`；board 已用其缓存 TB，`latm-board: tb-cache-hits=5`；ASID 变化/TLB flush/SMC 会失效对应条目。
 - **启动烟雾**：`baremetal/bare/latm_boot_smoke.c` 用真实 `latm_system_load_elf()` 加载 synthetic MIPS64 ELF，经 `LatmSystem` 平台取指/执行首个 TB，Guest `sb` 经系统 MMIO 写 UART，`break` 不可返回退出；`latm-boot-smoke-run` 断言 `UART tx=1 PASS\n`。仍不包含真实 vmlinux/initrd 与 `start_kernel()`。
+- `make test-latm-tb-cache`：7 项 MIPS ASID/hflags 键与失效测试。
 - **取指异常**：`cpu_ldl_code()` 设置 `latm_fetch_fault`，`get_ir1_list()` 在普通/延迟槽取指失败时清空 icount 并返回，`tr_ir2_generate()` 拒绝空 IR1，保证第二页不可执行时不会生成部分 TB。ISA `fetch-fault` 覆盖页末 branch + 下一页不可取指。

@@ -85,6 +85,12 @@ TbCacheEntry *tbc_insert(TbCache *cache, uint64_t pc, uint64_t cs_base,
 TbCacheEntry *tbc_insert_mode(TbCache *cache, uint64_t pc, uint64_t cs_base,
                               uint64_t cr3, uint8_t cpl, uint8_t mode_flags);
 
+/* MIPS key: PC + CP0 ASID + execution mode/hflags. */
+TbCacheEntry *tbc_lookup_mips(TbCache *cache, uint64_t pc, uint32_t asid,
+                              uint8_t hflags);
+TbCacheEntry *tbc_insert_mips(TbCache *cache, uint64_t pc, uint32_t asid,
+                              uint8_t hflags);
+
 /* Drop every block overlapping [addr, addr+len) in the given address space. */
 void tbc_invalidate_range(TbCache *cache, uint64_t cr3, uint64_t addr,
                           uint64_t len);

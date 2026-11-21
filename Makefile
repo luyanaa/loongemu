@@ -385,6 +385,15 @@ test-latm-interrupts: build/test_latm_interrupts
 test-latm-insn-map: build/test_latm_insn_map
 	./build/test_latm_insn_map
 
+build/test_latm_tb_cache: tests/test_latm_tb_cache.c src/tb_cache.c \
+                          include/loongemu/tb_cache.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Iinclude src/tb_cache.c \
+	      tests/test_latm_tb_cache.c -o $@
+
+test-latm-tb-cache: build/test_latm_tb_cache
+	./build/test_latm_tb_cache
+
 test-latm-cpu: build/test_latm_cpu
 	./build/test_latm_cpu
 
@@ -548,8 +557,8 @@ build/test_latm_decode: tests/test_latm_decode.c target/mips/latm/ir1/decode-mip
 	      tests/test_latm_decode.c target/mips/latm/ir1/decode-mips.c -o $@
 
 # ---- LATM: MIPS64r2 -> LoongArch ----
-.PHONY: test-latm test-latm-decode test-latm-tlb test-latm-vclock latm-core latm-isa-image latm-isa-run latm-board-image latm-board-run latm-boot-smoke-run
-test-latm: test-latm-decode test-latm-tlb test-latm-vclock test-latm-interrupts test-latm-insn-map test-latm-cpu test-latm-loongson test-latm-system test-latm-uncore test-latm-llsc test-latm-unaligned test-latm-pci test-latm-board-system latm-isa-run latm-board-run latm-boot-smoke-run
+.PHONY: test-latm test-latm-decode test-latm-tlb test-latm-vclock test-latm-tb-cache latm-core latm-isa-image latm-isa-run latm-board-image latm-board-run latm-boot-smoke-run
+test-latm: test-latm-decode test-latm-tlb test-latm-vclock test-latm-interrupts test-latm-insn-map test-latm-tb-cache test-latm-cpu test-latm-loongson test-latm-system test-latm-uncore test-latm-llsc test-latm-unaligned test-latm-pci test-latm-board-system latm-isa-run latm-board-run latm-boot-smoke-run
 
 # ---- bare-metal MIPS64r2 (LATM) execution harness ----
 LATM_BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
@@ -596,13 +605,22 @@ build/latm_phys_mem.o: src/phys_mem.c include/loongemu/phys_mem.h
 	@mkdir -p build
 	$(CLANG) $(LATM_BARE_CFLAGS) -Iinclude -c $< -o $@
 
+build/latm_tb_cache.o: src/tb_cache.c include/loongemu/tb_cache.h
+	@mkdir -p build
+	$(CLANG) $(LATM_BARE_CFLAGS) -Iinclude -c $< -o $@
+
 build/latm_vclock.o: src/vclock.c include/loongemu/vclock.h
 	@mkdir -p build
 	$(CLANG) $(LATM_BARE_CFLAGS) -Iinclude -c $< -o $@
 
-build/bare_latm_board.elf: build/latm_board.o build/latm_phys_mem.o build/latm_vclock.o build/latm_miniglib.o build/latm_libc_min.o latm/build/liblatm_core.a baremetal/bare/bare.lds
+build/bare_latm_board.elf: build/latm_board.o build/latm_phys_mem.o                             build/latm_vclock.o build/latm_tb_cache.o                             build/latm_system.o build/latm_mmio.o                             build/latm_memory.o build/latm_dtb.o                             build/latm_pci.o build/latm_uart.o                             build/latm_uncore.o build/latm_acpi_tables.o                             build/latm_pci_host.o                             build/latm_miniglib.o build/latm_libc_min.o                             latm/build/liblatm_core.a baremetal/bare/bare.lds
 	/opt/homebrew/opt/lld/bin/ld.lld --emit-relocs -T baremetal/bare/bare.lds -e _start \
-	   build/latm_board.o build/latm_phys_mem.o build/latm_vclock.o build/latm_miniglib.o build/latm_libc_min.o latm/build/liblatm_core.a -o $@
+	   build/latm_board.o build/latm_phys_mem.o build/latm_vclock.o \
+	   build/latm_tb_cache.o build/latm_system.o build/latm_mmio.o \
+	   build/latm_memory.o build/latm_dtb.o build/latm_pci.o \
+	   build/latm_uart.o build/latm_uncore.o build/latm_acpi_tables.o \
+	   build/latm_pci_host.o build/latm_miniglib.o build/latm_libc_min.o \
+	   latm/build/liblatm_core.a -o $@
 
 latm-board-image: latm-core build/bare_latm_board.elf
 
