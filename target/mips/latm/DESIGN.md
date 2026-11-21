@@ -839,11 +839,12 @@ DTB 已由 host test 生成并用 `dtc -I dtb -O dts` 验证（3A4000 compatible
 - **PCH/MailBox/CPUCFG**：PCH-PIC 使用 `0x20 MASK/0x40 HTMSI/0x60 EDGE/0x80 CLR/0x200 HTMSI_VEC/0x3a0 STATUS`；MailBox Buf0..3 改到 `0x20..0x3f`；CPUCFG sel1/sel2 返回 FP/MMI/LEXT/LSPW/LCSRP 非零能力位。
 - **7A/DTB/ELF/VMM 入口**：7A Split-CFG Type0/Type1 注册进 `LatmMmioBus`，`LatmPci` 的 VGA BAR map callback 接入 bus；DTB 生成 4 个 `cpu@N` 与 `cpu-map`；新增 `latm_system_load_elf`（KSEG0 物理折算）、`latm_system_load_initrd`、`latm_system_boot`，entry/initrd/fw_arg2 可直接设置；`latm_system_init_from_handoff()` 消费 `LoongemuVmmHandoff` 的 guest RAM/VMM/code-cache/7A CFG 基址。**仍不是完整 3A4000 虚拟机**：真实 vmlinux/initrd 文件加载入口、四 vCPU 调度、TB allocator/回收、宿主 VMM 交接与真实 7A 中断仍未接入。
 
-### 13.9 平台返回值、RAM 原子与精确映射生命周期（2026-11-21）
+### 13.9 3A 启动烟雾与平台返回值、RAM 原子与精确映射生命周期（2026-11-21）
 
 - **平台状态码**：`LatmSystem` 的 `fetch32/atomic_ll/atomic_sc` 现在统一返回 `LatmMemStatus`。`fetch32` 只在成功时写指令；`atomic_ll/sc` 不再把成功布尔值误报为失败。
 - **RAM 原子**：`sys_atomic_ll/sc` 先通过 `LatmMemoryLayout` 确认目标为对齐、完整、可写的 RAM 4/8 字节范围，再在 Host backing 上执行 `__atomic_load_n` / `__atomic_compare_exchange_n`；MMIO/Reserved 返回 `LATM_MEM_RESERVED`，普通对齐 SW/SD 也改为原子 store，避免 SC 比较与写入之间被普通 store 插入。
 - **EXTIOI 边界**：COREISR 读写严格限制在每 CPU 8 个 32-bit 寄存器（`0x1400+0x400..0x420`）；更大的 Guest aperture 不再直接索引数组。仍保持 QEMU 3A 的 per-CPU COREISR 语义。
 - **LWL/LWR**：32 位 word 先按 QEMU `MO_TEUL` 零扩展，merge 后再按 MIPS32 规则 sign-extend；LWR/LDR mask 改为 QEMU 的 `~1 << (bits-1-shift)`，并新增 4/8 字节 × 四个地址低位 × 多种旧寄存器 mask 的差分测试。`LatmPlatform.mem_probe` 可无副作用验证 unaligned 首字节，避免对 MMIO 做额外读取。
 - **TB map 生命周期**：`LatmTbInsnMap` 改为动态链表，并保存到 `TranslationBlock.latm_insn_map`；不再有 32 项 LRU 淘汰。`latm_tb_insn_map_release()` 供 TB 回收路径释放；SMC flush 将 map 标为 invalid 而不解引用已失效 TB 指针。
+- **启动烟雾**：`baremetal/bare/latm_boot_smoke.c` 用真实 `latm_system_load_elf()` 加载 synthetic MIPS64 ELF，经 `LatmSystem` 平台取指/执行首个 TB，Guest `sb` 经系统 MMIO 写 UART，`break` 不可返回退出；`latm-boot-smoke-run` 断言 `UART tx=1 PASS\n`。仍不包含真实 vmlinux/initrd 与 `start_kernel()`。
 - **取指异常**：`cpu_ldl_code()` 设置 `latm_fetch_fault`，`get_ir1_list()` 在普通/延迟槽取指失败时清空 icount 并返回，`tr_ir2_generate()` 拒绝空 IR1，保证第二页不可执行时不会生成部分 TB。ISA `fetch-fault` 覆盖页末 branch + 下一页不可取指。

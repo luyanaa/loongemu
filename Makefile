@@ -548,8 +548,8 @@ build/test_latm_decode: tests/test_latm_decode.c target/mips/latm/ir1/decode-mip
 	      tests/test_latm_decode.c target/mips/latm/ir1/decode-mips.c -o $@
 
 # ---- LATM: MIPS64r2 -> LoongArch ----
-.PHONY: test-latm test-latm-decode test-latm-tlb test-latm-vclock latm-core latm-isa-image latm-isa-run latm-board-image latm-board-run
-test-latm: test-latm-decode test-latm-tlb test-latm-vclock test-latm-interrupts test-latm-insn-map test-latm-cpu test-latm-loongson test-latm-system test-latm-uncore test-latm-llsc test-latm-unaligned test-latm-pci test-latm-board-system latm-isa-run latm-board-run
+.PHONY: test-latm test-latm-decode test-latm-tlb test-latm-vclock latm-core latm-isa-image latm-isa-run latm-board-image latm-board-run latm-boot-smoke-run
+test-latm: test-latm-decode test-latm-tlb test-latm-vclock test-latm-interrupts test-latm-insn-map test-latm-cpu test-latm-loongson test-latm-system test-latm-uncore test-latm-llsc test-latm-unaligned test-latm-pci test-latm-board-system latm-isa-run latm-board-run latm-boot-smoke-run
 
 # ---- bare-metal MIPS64r2 (LATM) execution harness ----
 LATM_BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
@@ -605,6 +605,74 @@ build/bare_latm_board.elf: build/latm_board.o build/latm_phys_mem.o build/latm_v
 	   build/latm_board.o build/latm_phys_mem.o build/latm_vclock.o build/latm_miniglib.o build/latm_libc_min.o latm/build/liblatm_core.a -o $@
 
 latm-board-image: latm-core build/bare_latm_board.elf
+
+build/latm_boot_smoke.o: baremetal/bare/latm_boot_smoke.c \
+                         target/mips/latm/include/latm.h \
+                         target/mips/latm/include/latm-system-board.h \
+                         target/mips/cpu.h target/mips/internal.h
+	@mkdir -p build
+	$(CLANG) $(LATM_BARE_CFLAGS) -Iinclude -c $< -o $@
+
+build/latm_system.o: target/mips/latm/system/latm_system.c
+	@mkdir -p build
+	$(CLANG) $(LATM_BARE_CFLAGS) -Iinclude -c $< -o $@
+
+build/latm_mmio.o: target/mips/latm/system/latm_mmio.c
+	@mkdir -p build
+	$(CLANG) $(LATM_BARE_CFLAGS) -Iinclude -c $< -o $@
+
+build/latm_memory.o: target/mips/latm/system/latm_memory.c
+	@mkdir -p build
+	$(CLANG) $(LATM_BARE_CFLAGS) -Iinclude -c $< -o $@
+
+build/latm_dtb.o: target/mips/latm/system/latm_dtb.c
+	@mkdir -p build
+	$(CLANG) $(LATM_BARE_CFLAGS) -Iinclude -c $< -o $@
+
+build/latm_pci.o: target/mips/latm/system/latm_pci.c
+	@mkdir -p build
+	$(CLANG) $(LATM_BARE_CFLAGS) -Iinclude -c $< -o $@
+
+build/latm_uart.o: target/mips/latm/system/latm_uart.c
+	@mkdir -p build
+	$(CLANG) $(LATM_BARE_CFLAGS) -Iinclude -c $< -o $@
+
+build/latm_uncore.o: target/mips/latm/uncore/latm_uncore.c
+	@mkdir -p build
+	$(CLANG) $(LATM_BARE_CFLAGS) -Iinclude -c $< -o $@
+
+build/latm_acpi_tables.o: src/acpi_tables.c
+	@mkdir -p build
+	$(CLANG) $(LATM_BARE_CFLAGS) -Iinclude -c $< -o $@
+
+build/latm_pci_host.o: src/pci_host.c
+	@mkdir -p build
+	$(CLANG) $(LATM_BARE_CFLAGS) -Iinclude -c $< -o $@
+
+build/bare_latm_boot_smoke.elf: build/latm_boot_smoke.o build/latm_system.o \
+                                 build/latm_mmio.o build/latm_memory.o \
+                                 build/latm_dtb.o build/latm_pci.o \
+                                 build/latm_uart.o build/latm_uncore.o \
+                                 build/latm_phys_mem.o build/latm_vclock.o \
+                                 build/latm_acpi_tables.o build/latm_pci_host.o \
+                                 build/latm_miniglib.o build/latm_libc_min.o \
+                                 latm/build/liblatm_core.a baremetal/bare/bare.lds
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	   build/latm_boot_smoke.o build/latm_system.o build/latm_mmio.o \
+	   build/latm_memory.o build/latm_dtb.o build/latm_pci.o \
+	   build/latm_uart.o build/latm_uncore.o build/latm_phys_mem.o \
+	   build/latm_vclock.o build/latm_acpi_tables.o build/latm_pci_host.o \
+	   build/latm_miniglib.o build/latm_libc_min.o \
+	   latm/build/liblatm_core.a -o $@
+
+latm-boot-smoke-image: latm-core build/bare_latm_boot_smoke.elf
+
+latm-boot-smoke-run: latm-boot-smoke-image
+	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_latm_boot_smoke.elf" \
+	     QEMU_LOG="build/latm_boot_smoke.log" QEMU_DONE="latm-boot-smoke: PASS" \
+	     QEMU_TIMEOUT=30 CPU=la464 \
+	     bash scripts/run_qemu_lata.sh
+	@grep -a 'latm-boot-smoke' build/latm_boot_smoke.log
 
 latm-board-run: latm-board-image
 	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_latm_board.elf" \
