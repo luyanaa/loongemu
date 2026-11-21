@@ -26,6 +26,8 @@ void latx_bare_uart_puts(const char *s)
 
 static uint8_t ram[32u << 20] __attribute__((aligned(4096)));
 static uint8_t code_buf[65536] __attribute__((aligned(4096)));
+static CPUMIPSTLBContext tlb;
+static uint8_t dtb[8192], dtb_struct[8192], dtb_strings[4096];
 static uint64_t exit_jmp[16] __attribute__((aligned(16)));
 static volatile int exit_active;
 uint64_t latx_tcg_gen_insn_data[TCG_MAX_INSNS * 2];
@@ -117,10 +119,11 @@ static size_t build_elf(uint8_t *elf, const uint32_t *insns, size_t count)
 
 void kmain(void)
 {
-    /* lui $t0,0x1fe0; ori $t0,$t0,0x1e0; ori $t1,$0,'K';
+    /* KSEG1 UART (0xbfe001e0 maps to GPA 0x1fe001e0):
+     * lui $t0,0xbfe0; ori $t0,$t0,0x1e0; ori $t1,$0,'K';
      * sb $t1,0($t0); break. */
     static const uint32_t insns[] = {
-        0x3c081fe0, 0x350801e0, 0x3409004b, 0xa1090000, 0x0000000d,
+        0x3c08bfe0, 0x350801e0, 0x3409004b, 0xa1090000, 0x0000000d,
     };
     static uint8_t elf[128];
     LatmSystem sys;
@@ -136,6 +139,16 @@ void kmain(void)
         return;
     }
     latm_set_system_memory(true);
+    size_t dtb_len = latm_system_build_dtb(&sys, dtb, sizeof(dtb),
+                                           dtb_struct, sizeof(dtb_struct),
+                                           dtb_strings, sizeof(dtb_strings));
+    if (!dtb_len) {
+        latx_bare_uart_puts("latm-boot-smoke: FAIL DTB\n");
+        return;
+    }
+    memcpy(ram + 0x100000, dtb, dtb_len);
+    latm_system_set_boot_args(&sys, 0x100000, 0, 0,
+                              "console=ttyS0 earlycon");
     size_t elf_len = build_elf(elf, insns, sizeof(insns) / sizeof(insns[0]));
     if (!latm_system_load_elf(&sys, elf, elf_len, &entry)) {
         latx_bare_uart_puts("latm-boot-smoke: FAIL ELF load\n");
@@ -154,7 +167,11 @@ void kmain(void)
     memset(&env, 0, sizeof(env));
     env.SEGBITS = 42;
     env.PABITS = 36;
-    env.active_tc.PC = entry;
+    latm_tlb_init(&env, &tlb, 16);
+    env.exception_base = 0xffffffff80000000ull;
+    env.CP0_IntCtl = 0xe0000000u;
+    latm_system_apply_boot_args(&sys, &env);
+    env.active_tc.PC = entry | 0xffffffff80000000ull;
     lata_tr_data_init(&env);
     tcg_ctx->code_ptr = code_buf + 0x1000;
     lata_gen_prologue_env(&env, tcg_ctx);
