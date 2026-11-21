@@ -302,7 +302,9 @@ uint64_t latm_uncore_iocsr_read_cpu(LatmUncore *u, uint64_t addr,
         v = u->extioi_bounce[(off - 0x280) / 4];
     } else if (off >= 0x300 && off < 0x320) {
         v = u->extioi_isr[(off - 0x300) / 4];
-    } else if (off >= 0x400 && off < 0x720) {
+    } else if (off >= 0x400 &&
+               off < 0x400 + (sizeof(u->extioi_coreisr[0]) /
+                              sizeof(u->extioi_coreisr[0][0])) * 4) {
         v = u->extioi_coreisr[cpu][(off - 0x400) / 4];
     } else if (off >= 0x800 && off < 0x900) {
         v = u->extioi_coremap[(off - 0x800) / 4];
@@ -356,7 +358,9 @@ void latm_uncore_iocsr_write_cpu(LatmUncore *u, uint64_t addr, uint64_t value,
                              (val >> i) & 1u, __ATOMIC_RELEASE);
         }
         latm_uncore_extioi_recompute(u);
-    } else if (off >= 0x400 && off < 0x720) {
+    } else if (off >= 0x400 &&
+               off < 0x400 + (sizeof(u->extioi_coreisr[0]) /
+                              sizeof(u->extioi_coreisr[0][0])) * 4) {
         unsigned n = (off - 0x400) / 4;
         /* Write one to clear the pending core ISR bits. */
         u->extioi_coreisr[cpu][n] &= ~val;

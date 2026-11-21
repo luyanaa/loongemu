@@ -294,12 +294,15 @@ uint32_t cpu_ldl_code(CPUMIPSState *env, uint64_t addr)
 {
     const LatmPlatform *plat = latm_platform_get();
     uint64_t p = latm_translate(env, addr, MMU_INST_FETCH, 0);
-    uint32_t v;
+    uint32_t v = 0;
 
     if (plat && plat->fetch32) {
         if (plat->fetch32(env, p, &v) != LATM_MEM_OK) {
+            env->latm_fetch_fault = 1;
             do_raise_exception(env, EXCP_AdEL, GETPC());
+            return 0;
         }
+        env->latm_fetch_fault = 0;
         return v;
     }
     return *(const uint32_t *)(uintptr_t)p;
@@ -412,6 +415,16 @@ static int latm_big_endian(CPUMIPSState *env)
     return (env->CP0_Config0 & (1u << CP0C0_BE)) != 0;
 }
 
+static int latm_probe_load(CPUMIPSState *env, uint64_t addr, unsigned size)
+{
+    const LatmPlatform *plat = latm_platform_get();
+    if (!plat || !plat->mem_probe) {
+        return -1;
+    }
+    uint64_t p = latm_translate(env, addr, MMU_DATA_LOAD, GETPC());
+    return plat->mem_probe(env, p, size);
+}
+
 static unsigned latm_lmask(CPUMIPSState *env, uint64_t addr, unsigned bits)
 {
     unsigned mask = bits / 8u - 1u;
@@ -429,20 +442,34 @@ uint64_t latm_helper_unaligned_load(CPUMIPSState *env, uint32_t op,
     unsigned shift;
     uint64_t word;
 
-    /* Trigger the page/alignment exception at the guest address. */
-    (void)latm_helper_load(env, MIPS_MEM_LBU, addr);
-    word = latm_helper_load(env, size == 4 ? MIPS_MEM_LW : MIPS_MEM_LD,
+    /* Trigger the page/alignment exception at the guest address.  A probing
+     * platform lets us validate without a side-effecting MMIO byte read. */
+    {
+        int probe = latm_probe_load(env, addr, 1);
+        if (probe < 0) {
+            (void)latm_helper_load(env, MIPS_MEM_LBU, addr);
+        } else if (probe != LATM_MEM_OK) {
+            (void)latm_helper_load(env, MIPS_MEM_LBU, addr);
+            return 0;
+        }
+    }
+    /* LWL/LWR operate on the zero-extended 32-bit word; MIPS32 results are
+     * sign-extended only after the byte merge (QEMU gen_lxl/gen_lxr +
+     * ext32s). */
+    word = latm_helper_load(env, size == 4 ? MIPS_MEM_LWU : MIPS_MEM_LD,
                             addr & ~(uint64_t)mask);
     if (op == MIPS_MEM_LWL || op == MIPS_MEM_LDL) {
         shift = (latm_big_endian(env) ? pos : (mask - pos)) * 8u;
-        return (old & ~((size == 4 ? UINT64_C(0xffffffff) : UINT64_MAX)
-                        << shift)) | (word << shift);
+        uint64_t result = (old & ~((size == 4 ? UINT64_C(0xffffffff) : UINT64_MAX)
+                                   << shift)) | (word << shift);
+        return size == 4 ? (uint64_t)(int64_t)(int32_t)result : result;
     } else {
         shift = (latm_big_endian(env) ? (mask - pos) : pos) * 8u;
         word >>= shift;
         {
-            uint64_t keep = ~UINT64_C(0) << (size * 8u - 1u - shift);
-            return (old & keep) | word;
+            uint64_t keep = ~UINT64_C(1) << (size * 8u - 1u - shift);
+            uint64_t result = (old & keep) | word;
+            return size == 4 ? (uint64_t)(int64_t)(int32_t)result : result;
         }
     }
 }

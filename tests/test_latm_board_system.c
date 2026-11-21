@@ -91,6 +91,39 @@ int main(void)
 
     const LatmPlatform *p = latm_system_platform(&sys);
     check(p != NULL, 1, "system platform");
+    {
+        CPUMIPSState fenv;
+        uint32_t insn = 0;
+        uint64_t av = 0;
+        int ok = -1;
+        memset(&fenv, 0, sizeof(fenv));
+        check(latm_system_mmio_write(&sys, 0x2000, 4, 0x6402002a), 1,
+              "platform test code");
+        check(p->fetch32(&fenv, 0x2000, &insn), LATM_MEM_OK,
+              "fetch32 success status");
+        check(insn, 0x6402002a, "fetch32 instruction");
+        check(p->fetch32(&fenv, 0x30000000, &insn), LATM_MEM_FAULT,
+              "fetch32 fault status");
+        check(latm_system_mmio_write(&sys, 0x2008, 8, 0x1111222233334444ull),
+              1, "atomic test value");
+        check(p->atomic_ll(&fenv, 0x2008, 8, &av), LATM_MEM_OK,
+              "atomic_ll success status");
+        check(av, 0x1111222233334444ull, "atomic_ll value");
+        check(p->atomic_sc(&fenv, 0x2008, 8, av, 0xaaaabbbbccccddddull,
+                           &ok), LATM_MEM_OK, "atomic_sc success status");
+        check(ok, 1, "atomic_sc success");
+        check(p->atomic_sc(&fenv, 0x2008, 8, av, 0, &ok), LATM_MEM_OK,
+              "atomic_sc mismatch status");
+        check(ok, 0, "atomic_sc mismatch");
+        check(latm_system_mmio_read(&sys, 0x2008, 8, &v), 1, "atomic result");
+        check(v, 0xaaaabbbbccccddddull, "atomic CAS updated RAM");
+        check(p->atomic_ll(&fenv, 0x2001, 8, &av), LATM_MEM_FAULT,
+              "atomic_ll alignment");
+        check(p->atomic_ll(&fenv, 0x10000000, 8, &av), LATM_MEM_RESERVED,
+              "atomic_ll rejects MMIO");
+        check(p->atomic_sc(&fenv, 0x10000000, 8, 0, 1, &ok),
+              LATM_MEM_RESERVED, "atomic_sc rejects MMIO");
+    }
     p->iocsr_write(NULL, 0x14a0, 0x11223344, 4);
     check(p->iocsr_read(NULL, 0x14a0, 4), 0x11223344, "IOCSR readback");
     latm_uncore_extioi_route(&sys.uncore, 9, 2, 4, 1);

@@ -811,9 +811,9 @@ FDT 已用 `dtc -I dtb -O dts` 反编译验证：无 `FDT_END` 缺失、无 rese
 - `make test-latm-cpu`：9 项 profile/CP0/Diag/VTLB。
 - `make test-latm-loongson`：10 项 gs 算术与 CRC。
 - `make test-latm-system`：21 项 exact-width MMIO、内存布局、DTB 和 `fw_arg2`。
-- `make test-latm-uncore`：19 项 MailBox/PIC/MSI/EXTIOI 4-core 路由、共享 IP EOI、IOCSR IPMAP/COREMAP/COREISR。
+- `make test-latm-uncore`：20 项 MailBox/PIC/MSI/EXTIOI 4-core 路由、共享 IP EOI、IOCSR IPMAP/COREMAP/COREISR。
 - `make test-latm-pci`：7 项 7A mock blacklist + PCI BAR exact-width。
-- `make test-latm-board-system`：39 项 system composition + UART + DTB + 7A Split-CFG + ELF/handoff 入口。
+- `make test-latm-board-system`：55 项 system composition + UART + DTB + 7A Split-CFG + ELF/handoff 入口。
 - `latm-isa` 新增 `loongson`/`loongson-mem`：gs 算术、gslq/gssq 端到端通过；`test-latm-decode` 32 项。
 
 DTB 已由 host test 生成并用 `dtc -I dtb -O dts` 验证（3A4000 compatible、reserved-memory、initrd、serial/PIC、PCI 节点）。
@@ -826,7 +826,7 @@ DTB 已由 host test 生成并用 `dtc -I dtb -O dts` 验证（3A4000 compatible
 - **P0-A LL/SC**：`LatmPlatform` 新增 `atomic_ll/atomic_sc`。系统态 `LL/SC` 先做 VA→GPA 翻译，再交给平台原子回调；平台缺失回调或 GPA 不属于可原子 RAM（MMIO/Reserved）时直接拒绝并清除 reservation。只有 `latm_platform_get()==NULL` 的 identity 测试路径保留宿主 CAS。
 - **P0-B 非对齐/COP1**：系统态 `LWL/LWR/LDL/LDR` 和 `SWL/SWR/SDL/SDR` 改走 `latm_helper_unaligned_load/store`，由平台 `mem_read/mem_write` 逐字节/对齐字完成；COP1 `LWC1/LDC1/SWC1/SDC1` 及 indexed 变体在系统态改走 `latm_helper_load/store`。普通系统态 LW/LD/SW/SD 在 helper 内检查 MIPS 对齐，错误地址分别注入 AdEL/AdES。
 - **P0-C helper 参数**：`hcall()` 先把所有参数写入 `CPUMIPSState.latm_hcall_args[]`，完成 helper prologue 后再装载 ABI 参数寄存器，避免 Guest `$1..$7` 映射到 `a1..a7` 时的顺序覆盖。
-- 新增门禁：`latm-llsc` 11 项（GPA/HPA 非 identity、reservation、MMIO 拒绝）、`latm-unaligned` 6 项（对齐 fault、SWL/SWR、LWL/LWR）、ISA `hcall-args` 覆盖 `$1/$2` 源参数。
+- 新增门禁：`latm-llsc` 11 项（GPA/HPA 非 identity、reservation、MMIO 拒绝）、`latm-unaligned` 296 项（对齐 fault、SWL/SWR、LWL/LWR）、ISA `hcall-args` 覆盖 `$1/$2` 源参数。
 
 ### 13.8 P0-D / P1 索引、异常与 3A4000 平台修复（2026-11-21）
 
@@ -838,3 +838,12 @@ DTB 已由 host test 生成并用 `dtc -I dtb -O dts` 验证（3A4000 compatible
 - **真实 3A4000 IOCSR**：EXTIOI 寄存器窗口按 Linux/QEMU 3A ABI 实现于 `0x1400 + {0xa0 nodetype, 0xc0 ipmap, 0x200 enable, 0x280 bounce, 0x300 isr, 0x400 coreisr, 0x800 coremap}`；CoreMap/IPMap/Enable 更新 route，COREISR 写 1 清除。`latm_system` 绑定 `LatmPlatform.iocsr_read/write`，并用 `latm_cpu_index` 选择 per-CPU COREISR。
 - **PCH/MailBox/CPUCFG**：PCH-PIC 使用 `0x20 MASK/0x40 HTMSI/0x60 EDGE/0x80 CLR/0x200 HTMSI_VEC/0x3a0 STATUS`；MailBox Buf0..3 改到 `0x20..0x3f`；CPUCFG sel1/sel2 返回 FP/MMI/LEXT/LSPW/LCSRP 非零能力位。
 - **7A/DTB/ELF/VMM 入口**：7A Split-CFG Type0/Type1 注册进 `LatmMmioBus`，`LatmPci` 的 VGA BAR map callback 接入 bus；DTB 生成 4 个 `cpu@N` 与 `cpu-map`；新增 `latm_system_load_elf`（KSEG0 物理折算）、`latm_system_load_initrd`、`latm_system_boot`，entry/initrd/fw_arg2 可直接设置；`latm_system_init_from_handoff()` 消费 `LoongemuVmmHandoff` 的 guest RAM/VMM/code-cache/7A CFG 基址。**仍不是完整 3A4000 虚拟机**：真实 vmlinux/initrd 文件加载入口、四 vCPU 调度、TB allocator/回收、宿主 VMM 交接与真实 7A 中断仍未接入。
+
+### 13.9 平台返回值、RAM 原子与精确映射生命周期（2026-11-21）
+
+- **平台状态码**：`LatmSystem` 的 `fetch32/atomic_ll/atomic_sc` 现在统一返回 `LatmMemStatus`。`fetch32` 只在成功时写指令；`atomic_ll/sc` 不再把成功布尔值误报为失败。
+- **RAM 原子**：`sys_atomic_ll/sc` 先通过 `LatmMemoryLayout` 确认目标为对齐、完整、可写的 RAM 4/8 字节范围，再在 Host backing 上执行 `__atomic_load_n` / `__atomic_compare_exchange_n`；MMIO/Reserved 返回 `LATM_MEM_RESERVED`，普通对齐 SW/SD 也改为原子 store，避免 SC 比较与写入之间被普通 store 插入。
+- **EXTIOI 边界**：COREISR 读写严格限制在每 CPU 8 个 32-bit 寄存器（`0x1400+0x400..0x420`）；更大的 Guest aperture 不再直接索引数组。仍保持 QEMU 3A 的 per-CPU COREISR 语义。
+- **LWL/LWR**：32 位 word 先按 QEMU `MO_TEUL` 零扩展，merge 后再按 MIPS32 规则 sign-extend；LWR/LDR mask 改为 QEMU 的 `~1 << (bits-1-shift)`，并新增 4/8 字节 × 四个地址低位 × 多种旧寄存器 mask 的差分测试。`LatmPlatform.mem_probe` 可无副作用验证 unaligned 首字节，避免对 MMIO 做额外读取。
+- **TB map 生命周期**：`LatmTbInsnMap` 改为动态链表，并保存到 `TranslationBlock.latm_insn_map`；不再有 32 项 LRU 淘汰。`latm_tb_insn_map_release()` 供 TB 回收路径释放；SMC flush 将 map 标为 invalid 而不解引用已失效 TB 指针。
+- **取指异常**：`cpu_ldl_code()` 设置 `latm_fetch_fault`，`get_ir1_list()` 在普通/延迟槽取指失败时清空 icount 并返回，`tr_ir2_generate()` 拒绝空 IR1，保证第二页不可执行时不会生成部分 TB。ISA `fetch-fault` 覆盖页末 branch + 下一页不可取指。

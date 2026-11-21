@@ -1544,6 +1544,9 @@ static DisasContext *get_ir1_list(TranslationBlock *tb, int max_insns)
     uint64_t pc = tb->pc;
     uint64_t page_start = pc & TARGET_PAGE_MASK;
 
+    if (lsenv && lsenv->cpu_state) {
+        ((CPUMIPSState *)lsenv->cpu_state)->latm_fetch_fault = 0;
+    }
     db->tb = tb;
     db->pc_first = pc;
     db->pc_next = pc;
@@ -1563,6 +1566,14 @@ static DisasContext *get_ir1_list(TranslationBlock *tb, int max_insns)
         }
 
         insn = latm_guest_ldl(db->pc_next);
+        if (lsenv && lsenv->cpu_state &&
+            ((CPUMIPSState *)lsenv->cpu_state)->latm_fetch_fault) {
+            db->is_jmp = DISAS_NORETURN;
+            db->num_insns = 0;
+            tb->size = 0;
+            tb->icount = 0;
+            return ir1_list;
+        }
         ir1_list[n].base = db;
         mips_decode_one(&ir1_list[n].ir1, insn, db->pc_next);
 
@@ -1573,6 +1584,14 @@ static DisasContext *get_ir1_list(TranslationBlock *tb, int max_insns)
             }
             db->pc_next += 4;
             insn = latm_guest_ldl(db->pc_next);
+            if (lsenv && lsenv->cpu_state &&
+                ((CPUMIPSState *)lsenv->cpu_state)->latm_fetch_fault) {
+                db->is_jmp = DISAS_NORETURN;
+                db->num_insns = 0;
+                tb->size = 0;
+                tb->icount = 0;
+                return ir1_list;
+            }
             ir1_list[n + 1].base = db;
             mips_decode_one(&ir1_list[n + 1].ir1, insn, db->pc_next);
             ir1_list[n + 1].ir1.delay_slot = true;
@@ -1617,6 +1636,10 @@ bool tr_ir2_generate(TranslationBlock *tb)
 
     tr_init(tb);
     latm_tb_insn_map_begin(lsenv->tr_data, tb->tc.ptr, 0);
+    if (ir1_nr <= 0) {
+        tr_fini();
+        return false;
+    }
     for (int i = 0; i < ir1_nr; i++) {
         if (pir1->ir1.delay_slot) {
             pir1++;

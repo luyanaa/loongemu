@@ -16,6 +16,8 @@ typedef struct LatmPlatform {
     int (*mem_write)(CPUMIPSState *env, uint64_t gpa, uint64_t value,
                      uint32_t size);
     int (*fetch32)(CPUMIPSState *env, uint64_t gpa, uint32_t *value);
+    /* Optional side-effect-free access check; -1 means unsupported. */
+    int (*mem_probe)(CPUMIPSState *env, uint64_t gpa, uint32_t size);
     uint32_t (*read_count)(CPUMIPSState *env, uint64_t hz);
     void (*store_count)(CPUMIPSState *env, uint32_t count);
     void (*set_compare)(CPUMIPSState *env, uint32_t compare);

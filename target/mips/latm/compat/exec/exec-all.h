@@ -188,6 +188,7 @@ struct TranslationBlock {
     uint64_t lazylinkinst[2];
     struct separated_data *s_data;
     void *ir1;
+    void *latm_insn_map;
     struct TranslationBlock *next_tb[2];
     uint8_t last_ir1_type;
     target_ulong next_pc;

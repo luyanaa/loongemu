@@ -70,6 +70,10 @@ int main(void)
     check(latm_uncore_cpu_ip(&u, 2), 0, "IOCSR coreisr EOI");
     check(latm_uncore_iocsr_read(&u, 0x14c0, 4), 0x00000001,
           "IOCSR ipmap readback");
+    /* 0x420 is beyond the eight per-CPU COREISR registers. */
+    latm_uncore_iocsr_write(&u, 0x1820, 0xffffffffu, 4);
+    check(latm_uncore_iocsr_read(&u, 0x1820, 4), 0,
+          "IOCSR coreisr out-of-bank ignored");
 
     printf("latm-uncore: checks=%d fails=%d\n", checks, fails);
     return fails != 0;

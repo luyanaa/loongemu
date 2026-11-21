@@ -68,6 +68,24 @@ int main(void)
     check(latm_tb_insn_map_resolve(&td, base + 6, &guest, &delay), 0,
           "flush drops all TB maps");
 
+    /* Maps are owned by their TranslationBlock, not an LRU pool. */
+    static TranslationBlock tbs[40];
+    for (unsigned i = 0; i < 40; i++) {
+        uintptr_t code = base + 0x10000 + i * 0x100;
+        memset(&tbs[i], 0, sizeof(tbs[i]));
+        td.curr_tb = &tbs[i];
+        latm_tb_insn_map_begin(&td, (const void *)code, 32);
+        latm_tb_insn_map_add(&td, 0x90000000u + i * 4, 0, 8, 0);
+    }
+    check(latm_tb_insn_map_resolve(&td, base + 0x10006, &guest, &delay), 1,
+          "oldest TB map survives 40 live TBs");
+    check(guest, 0x90000000u, "oldest TB guest PC");
+    latm_tb_insn_map_release(&td, &tbs[0]);
+    check(latm_tb_insn_map_resolve(&td, base + 0x10006, &guest, &delay), 0,
+          "released TB map removed");
+    td.curr_tb = NULL;
+    latm_tb_insn_map_flush(&td);
+
     printf("latm-insn-map: checks=%d fails=%d\n", checks, fails);
     return fails != 0;
 }

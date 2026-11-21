@@ -183,13 +183,32 @@ int latm_system_init_from_handoff(LatmSystem *sys,
 }
 
 
+static uint8_t *sys_ram_host(LatmSystem *sys, uint64_t gpa, unsigned size)
+{
+    if (!sys || (size != 4 && size != 8) || (gpa & (size - 1))) return NULL;
+    const LatmMemoryRegion *r = latm_memory_find(&sys->memory, gpa, size);
+    if (!r || r->kind != LATM_MMIO_RAM || r->hpa < sys->ram_hpa) return NULL;
+    uint64_t roff = r->hpa - sys->ram_hpa;
+    uint64_t goff = gpa - r->base;
+    if (roff > sys->ram_size || goff > sys->ram_size - roff ||
+        size > sys->ram_size - roff - goff) return NULL;
+    return sys->ram + roff + goff;
+}
+
 static int sys_mem_read(CPUMIPSState *env, uint64_t gpa, uint64_t *value,
                         uint32_t size)
 {
     (void)env;
     LatmSystem *sys = latm_platform_get()->opaque;
     uint64_t v;
-    if (!sys || !value || !size || !latm_system_mmio_read(sys, gpa, size, &v)) {
+    uint8_t *host = sys_ram_host(sys, gpa, size);
+    if (!sys || !value || !size) return LATM_MEM_FAULT;
+    if (host) {
+        *value = size == 4 ? __atomic_load_n((uint32_t *)host, __ATOMIC_ACQUIRE)
+                           : __atomic_load_n((uint64_t *)host, __ATOMIC_ACQUIRE);
+        return LATM_MEM_OK;
+    }
+    if (!latm_system_mmio_read(sys, gpa, size, &v)) {
         return LATM_MEM_FAULT;
     }
     *value = v;
@@ -201,7 +220,18 @@ static int sys_mem_write(CPUMIPSState *env, uint64_t gpa, uint64_t value,
 {
     (void)env;
     LatmSystem *sys = latm_platform_get()->opaque;
-    if (!sys || !size || !latm_system_mmio_write(sys, gpa, size, value)) {
+    uint8_t *host = sys_ram_host(sys, gpa, size);
+    if (!sys || !size) return LATM_MEM_FAULT;
+    if (host) {
+        if (size == 4) {
+            __atomic_store_n((uint32_t *)host, (uint32_t)value,
+                             __ATOMIC_RELEASE);
+        } else {
+            __atomic_store_n((uint64_t *)host, value, __ATOMIC_RELEASE);
+        }
+        return LATM_MEM_OK;
+    }
+    if (!latm_system_mmio_write(sys, gpa, size, value)) {
         return LATM_MEM_FAULT;
     }
     return LATM_MEM_OK;
@@ -210,9 +240,20 @@ static int sys_mem_write(CPUMIPSState *env, uint64_t gpa, uint64_t value,
 static int sys_fetch32(CPUMIPSState *env, uint64_t gpa, uint32_t *value)
 {
     uint64_t v;
-    if (!value || sys_mem_read(env, gpa, &v, 4) != LATM_MEM_OK) return 0;
+    if (!value) return LATM_MEM_FAULT;
+    int status = sys_mem_read(env, gpa, &v, 4);
+    if (status != LATM_MEM_OK) return status;
     *value = (uint32_t)v;
-    return 1;
+    return LATM_MEM_OK;
+}
+
+static int sys_mem_probe(CPUMIPSState *env, uint64_t gpa, uint32_t size)
+{
+    (void)env;
+    LatmSystem *sys = latm_platform_get()->opaque;
+    if (!sys || !size) return LATM_MEM_FAULT;
+    return latm_mmio_find(&sys->mmio, gpa, size) ? LATM_MEM_OK :
+                                                   LATM_MEM_FAULT;
 }
 
 static uint64_t sys_iocsr_read(CPUMIPSState *env, uint64_t addr, unsigned size)
@@ -231,33 +272,63 @@ static void sys_iocsr_write(CPUMIPSState *env, uint64_t addr, uint64_t value,
     if (sys) latm_uncore_iocsr_write_cpu(&sys->uncore, addr, value, size, cpu);
 }
 
+static int sys_atomic_ram(LatmSystem *sys, uint64_t gpa, unsigned size,
+                          void **host)
+{
+    if (!sys || !host || (size != 4 && size != 8) || (gpa & (size - 1))) {
+        return LATM_MEM_FAULT;
+    }
+    const LatmMemoryRegion *r = latm_memory_find(&sys->memory, gpa, size);
+    if (!r || r->kind != LATM_MMIO_RAM) {
+        return LATM_MEM_RESERVED;
+    }
+    if (r->hpa < sys->ram_hpa) return LATM_MEM_FAULT;
+    uint64_t roff = r->hpa - sys->ram_hpa;
+    uint64_t goff = gpa - r->base;
+    if (roff > sys->ram_size || goff > sys->ram_size - roff ||
+        size > sys->ram_size - roff - goff) {
+        return LATM_MEM_FAULT;
+    }
+    *host = sys->ram + roff + goff;
+    return LATM_MEM_OK;
+}
+
 static int sys_atomic_ll(CPUMIPSState *env, uint64_t gpa, unsigned size,
                          uint64_t *value)
 {
-    return sys_mem_read(env, gpa, value, size) == LATM_MEM_OK;
+    (void)env;
+    LatmSystem *sys = latm_platform_get()->opaque;
+    void *host;
+    int status = sys_atomic_ram(sys, gpa, size, &host);
+    if (status != LATM_MEM_OK || !value) return status;
+    *value = size == 4 ? __atomic_load_n((uint32_t *)host, __ATOMIC_ACQUIRE)
+                       : __atomic_load_n((uint64_t *)host, __ATOMIC_ACQUIRE);
+    return LATM_MEM_OK;
 }
 
 static int sys_atomic_sc(CPUMIPSState *env, uint64_t gpa, unsigned size,
                          uint64_t expected, uint64_t desired, int *ok)
 {
+    (void)env;
     LatmSystem *sys = latm_platform_get()->opaque;
-    uint64_t old;
-    int result = 1;
-    if (!sys || !ok) return 0;
-    while (__atomic_exchange_n(&sys->atomic_lock, 1, __ATOMIC_ACQUIRE)) {
-        /* spin: SC is rare and only serializes atomic RAM updates */
-    }
-    if (sys_mem_read(env, gpa, &old, size) != LATM_MEM_OK) {
-        result = 0;
-    } else if (old != expected) {
-        *ok = 0;
-    } else if (sys_mem_write(env, gpa, desired, size) != LATM_MEM_OK) {
-        result = 0;
+    void *host;
+    int status;
+    if (!ok) return LATM_MEM_FAULT;
+    status = sys_atomic_ram(sys, gpa, size, &host);
+    if (status != LATM_MEM_OK) return status;
+    if (size == 4) {
+        uint32_t old = (uint32_t)expected;
+        *ok = __atomic_compare_exchange_n((uint32_t *)host, &old,
+                                          (uint32_t)desired, false,
+                                          __ATOMIC_SEQ_CST,
+                                          __ATOMIC_SEQ_CST);
     } else {
-        *ok = 1;
+        uint64_t old = expected;
+        *ok = __atomic_compare_exchange_n((uint64_t *)host, &old, desired,
+                                          false, __ATOMIC_SEQ_CST,
+                                          __ATOMIC_SEQ_CST);
     }
-    __atomic_store_n(&sys->atomic_lock, 0, __ATOMIC_RELEASE);
-    return result;
+    return LATM_MEM_OK;
 }
 
 void latm_system_bind_platform(LatmSystem *sys)
@@ -267,6 +338,7 @@ void latm_system_bind_platform(LatmSystem *sys)
     sys->platform.mem_read = sys_mem_read;
     sys->platform.mem_write = sys_mem_write;
     sys->platform.fetch32 = sys_fetch32;
+    sys->platform.mem_probe = sys_mem_probe;
     sys->platform.iocsr_read = sys_iocsr_read;
     sys->platform.iocsr_write = sys_iocsr_write;
     sys->platform.atomic_ll = sys_atomic_ll;

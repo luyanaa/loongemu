@@ -342,6 +342,23 @@ static void run_chain(int use_jiscr1)
                                    : "latm-isa: chain-jiscr0 done\n");
 }
 
+static volatile int isa_stop_on_exception;
+static volatile int isa_exception_seen;
+
+static int cross_page_fetch(CPUMIPSState *env, uint64_t gpa, uint32_t *value)
+{
+    (void)env;
+    if (gpa >= (uint64_t)(uintptr_t)(cross_page_code + 4096)) {
+        return LATM_MEM_FAULT;
+    }
+    *value = *(const uint32_t *)(uintptr_t)gpa;
+    return LATM_MEM_OK;
+}
+
+static const LatmPlatform fault_platform = {
+    .fetch32 = cross_page_fetch,
+};
+
 static void run_block(uint32_t *guest, int insns, const char *name)
 {
     uint8_t *tb_code = code_buf + TB_OFFSET;
@@ -474,6 +491,25 @@ void kmain(void)
         last[2] = 0x00000000;
         run_block(last, 3, "branch-cross-page");
         check(env.active_tc.gpr[3], 0x22, "cross-page delay slot executed");
+    }
+    {
+        uint32_t *last = (uint32_t *)(cross_page_code + 4096 - 4);
+        int max_insns = 2;
+        latx_bare_uart_puts("latm-isa: fetch-fault begin\n");
+        memset(&tb, 0, sizeof(tb));
+        tb.pc = (uint64_t)(uintptr_t)last;
+        tb.tc.ptr = code_buf + TB_OFFSET;
+        isa_stop_on_exception = 1;
+        isa_exception_seen = 0;
+        latm_platform_set(&fault_platform);
+        target_disasm(&tb, &max_insns, &env);
+        tr_fini();
+        latm_platform_set(NULL);
+        isa_stop_on_exception = 0;
+        check(tb.icount, 0, "cross-page fetch fault rejects TB");
+        check(env.latm_fetch_fault, 1, "cross-page fetch fault recorded");
+        check(isa_exception_seen, 1, "cross-page fetch raises exception");
+        latx_bare_uart_puts("latm-isa: fetch-fault done\n");
     }
     run_block(loongson_mem_code, 5, "loongson-mem");
     check(env.active_tc.gpr[11], 0x11, "gssq/gslq first");
@@ -670,6 +706,10 @@ struct CPUState;
 void cpu_loop_exit(struct CPUState *cs)
 {
     (void)cs;
+    if (isa_stop_on_exception) {
+        isa_exception_seen = 1;
+        return;
+    }
     latx_bare_uart_puts("latm-isa: cpu_loop_exit\n");
     for (;;) { }
 }
