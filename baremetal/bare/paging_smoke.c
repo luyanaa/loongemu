@@ -526,8 +526,8 @@ void kmain(void)
          * the image turns into a spurious fault that hides the data-load
          * case the test is about.
          */
-        uint64_t code_va = 0x200000UL;
-        uint64_t stack_va = 0x200000UL;
+        uint64_t code_va = (uint64_t)(uintptr_t)p0_probe & ~UINT64_C(0xfffff);
+        uint64_t stack_va = (uint64_t)(uintptr_t)p0_stack & ~UINT64_C(0xfffff);
         uint64_t i;
 
         /* Cover the whole probe stack, including the page the initial

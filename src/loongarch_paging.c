@@ -10,12 +10,12 @@
 #include "loongemu/loongarch_paging.h"
 
 /* Bits of the VA that select the entry at each level, most significant
- * first.  Level 1 is the top of the four. */
+ * first (Dir3 -> Dir2 -> Dir1 -> PT). */
 static const unsigned level_base[LAPG_LEVELS] = {
-    LAPG_DIR1_BASE, LAPG_DIR2_BASE, LAPG_PT_BASE, LAPG_DIR3_BASE,
+    LAPG_DIR3_BASE, LAPG_DIR2_BASE, LAPG_DIR1_BASE, LAPG_PT_BASE,
 };
 static const unsigned level_width[LAPG_LEVELS] = {
-    LAPG_DIR1_WIDTH, LAPG_DIR2_WIDTH, LAPG_PT_WIDTH, LAPG_DIR3_WIDTH,
+    LAPG_DIR3_WIDTH, LAPG_DIR2_WIDTH, LAPG_DIR1_WIDTH, LAPG_PT_WIDTH,
 };
 
 static uint64_t index_mask(unsigned width)
@@ -75,21 +75,25 @@ uint64_t lapg_pool_pages_remaining(const LapgPagePool *pool)
 }
 
 /*
- * PWCL packs DIR1, DIR2 and the PT level; PWCH packs DIR3.  The widths are
- * stored as (width - 1) in hardware, the usual LoongArch convention for
- * these two registers.
+ * LoongArch CSR.PWCL (0x1c) is 32-bit, bottom-up, with 5-bit base/width fields
+ * encoding actual bit widths (NOT width - 1):
+ *   [4:0]   PTbase      [9:5]   PTwidth
+ *   [14:10] Dir1_base   [19:15] Dir1_width
+ *   [24:20] Dir2_base   [29:25] Dir2_width
+ *   [31:30] PTEWidth (0 = 64-bit)
+ * CSR.PWCH (0x1d) holds Dir3_base [5:0], Dir3_width [11:6], and HPTW_En [24]=0.
  */
 uint64_t lapg_pwcl_value(void)
 {
     uint64_t v = 0;
 
-    v |= ((uint64_t)LAPG_DIR1_BASE & 0x3f) << 0;
-    v |= (((uint64_t)LAPG_DIR1_WIDTH - 1) & 0x3f) << 6;
-    v |= ((uint64_t)LAPG_DIR2_BASE & 0x3f) << 12;
-    v |= (((uint64_t)LAPG_DIR2_WIDTH - 1) & 0x3f) << 18;
-    v |= ((uint64_t)LAPG_PT_BASE & 0x3f) << 24;
-    v |= (((uint64_t)LAPG_PT_WIDTH - 1) & 0x3f) << 30;
-    v |= ((uint64_t)0 & 0x3) << 36;   /* PTEWIDTH = 0: 64-bit entries */
+    v |= ((uint64_t)LAPG_PT_BASE & 0x1f) << 0;
+    v |= ((uint64_t)LAPG_PT_WIDTH & 0x1f) << 5;
+    v |= ((uint64_t)LAPG_DIR1_BASE & 0x1f) << 10;
+    v |= ((uint64_t)LAPG_DIR1_WIDTH & 0x1f) << 15;
+    v |= ((uint64_t)LAPG_DIR2_BASE & 0x1f) << 20;
+    v |= ((uint64_t)LAPG_DIR2_WIDTH & 0x1f) << 25;
+    v |= ((uint64_t)0 & 0x3) << 30;   /* PTEWidth = 0: 64-bit entries */
     return v;
 }
 
@@ -98,7 +102,7 @@ uint64_t lapg_pwch_value(void)
     uint64_t v = 0;
 
     v |= ((uint64_t)LAPG_DIR3_BASE & 0x3f) << 0;
-    v |= (((uint64_t)LAPG_DIR3_WIDTH - 1) & 0x3f) << 6;
+    v |= ((uint64_t)LAPG_DIR3_WIDTH & 0x3f) << 6;
     return v;
 }
 

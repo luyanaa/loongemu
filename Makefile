@@ -5,13 +5,17 @@ LBT_SRC := src/loongbt_semantics.c src/loongbt_cpu.c src/loongbt_hw.c src/loongb
 
 LLVM_PREFIX ?= $(shell brew --prefix llvm 2>/dev/null)
 CLANG   ?= $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/clang,clang)
-AR      ?= $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/llvm-ar,llvm-ar)
+ifeq ($(origin AR),default)
+AR := $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/llvm-ar,llvm-ar)
+else
+AR ?= $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/llvm-ar,llvm-ar)
+endif
 OBJDUMP ?= $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/llvm-objdump,llvm-objdump)
 LLD_PREFIX ?= $(shell brew --prefix lld 2>/dev/null)
 LD_LLD   ?= $(if $(LLD_PREFIX),$(LLD_PREFIX)/bin/ld.lld,ld.lld)
 QEMU_PREFIX ?= $(shell brew --prefix qemu 2>/dev/null)
 
-.PHONY: all test test-pvir test-sve-decode test-sve-pvir test-arm-state test-cpu test-lapaging test-pci-host test-hyperv test-tbc test-p0 vmm-efi vmm-boot vmm-integrated vmm-integrated-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot test-latr latr-core latr-isa-image latr-isa-run latr-riscv-ref test-latm test-latm-decode latm-core latm-isa-image latm-isa-run latm-riscv-ref clean
+.PHONY: all test test-pvir test-sve-decode test-sve-pvir test-arm-state test-cpu test-lapaging test-pci-host test-hyperv test-tbc test-soft-ras test-p0 test-plv3-isolation tb-sys-run tb-sys-smp-run vmm-efi vmm-boot vmm-integrated vmm-integrated-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot test-latr latr-core latr-isa-image latr-isa-run latr-riscv-ref test-latm test-latm-decode latm-core latm-isa-image latm-isa-run latm-riscv-ref clean
 
 all: test
 
@@ -83,14 +87,23 @@ test-arm-state: build/test_arm_state
 test-tbc: build/test_tb_cache
 	./build/test_tb_cache
 
-test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging \
-      build/test_pci_host build/test_hyperv build/test_tb_cache build/test_pvir build/test_sve_decode build/test_sve_pvir build/test_arm_state \
+build/test_soft_ras: tests/test_soft_ras.c src/soft_ras.c include/loongemu/soft_ras.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) src/soft_ras.c tests/test_soft_ras.c -o $@
+
+test-soft-ras: build/test_soft_ras
+	./build/test_soft_ras
+
+test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging build/test_x86_64_paging \
+      build/test_pci_host build/test_hyperv build/test_tb_cache build/test_soft_ras build/test_pvir build/test_sve_decode build/test_sve_pvir build/test_arm_state \
       build/test_latm_decode
 	./build/test_loongbt
 	./build/test_loongbt_cpu
 	./build/test_loongarch_paging
+	./build/test_x86_64_paging
 	./build/test_pci_host
 	./build/test_tb_cache
+	./build/test_soft_ras
 	./build/test_hyperv
 	./build/test_pvir
 	./build/test_sve_decode
@@ -156,6 +169,34 @@ test-p0: build/p0_paging.elf
 	  { echo "P0 REGRESSION"; exit 1; }
 	@grep -q 'value=0x1234abcd5678ef90' build/p0.log || \
 	  { echo "P0 WRONG DATA"; exit 1; }
+
+# ---- P0 PLV3 Isolation Probe (non-LVZ 2K3000/3B6000M compatible) ----
+PLV3_ISO_SRC := baremetal/bare/plv3_isolation_probe.c src/loongarch_paging.c
+
+build/plv3_isolation_probe.elf: $(PLV3_ISO_SRC) include/loongemu/loongarch_paging.h baremetal/bare/bare.lds
+	@mkdir -p build
+	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
+	         -fno-builtin -fno-stack-protector -O2 -mno-lsx -mno-lasx -Iinclude \
+	         -c baremetal/bare/plv3_isolation_probe.c -o build/plv3_isolation_probe.o
+	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
+	         -fno-builtin -fno-stack-protector -O2 -mno-lsx -mno-lasx -Iinclude \
+	         -c src/loongarch_paging.c -o build/plv3_iso_loongarch_paging.o
+	$(LD_LLD) -T baremetal/bare/bare.lds -e _start \
+	   build/plv3_isolation_probe.o build/plv3_iso_loongarch_paging.o -o $@
+
+QEMU_LA64 ?= $(shell command -v qemu-system-loongarch64 || echo $(QLVZ_REPO))
+
+test-plv3-isolation: build/plv3_isolation_probe.elf
+	@for cpu in la464 max; do \
+	  echo "=== plv3-iso (CPU=$$cpu) ==="; \
+	  env QEMU_BIN="$(QEMU_LA64)" QEMU_KERNEL="build/plv3_isolation_probe.elf" \
+	      QEMU_LOG="build/plv3_iso_$$cpu.log" QEMU_DONE="plv3-iso: done" \
+	      QEMU_TIMEOUT=20 QEMU_CPU="$$cpu" \
+	      bash scripts/run_qemu_lata.sh; \
+	  cat "build/plv3_iso_$$cpu.log"; \
+	  grep -qa 'plv3-iso: done' "build/plv3_iso_$$cpu.log" || exit 1; \
+	  grep -qa 'fails=0000000000000000 ok' "build/plv3_iso_$$cpu.log" || exit 1; \
+	done
 
 # This host's clang defaults to an SDK path that does not exist; xcrun knows the
 # real one.  Empty on a machine where the default already resolves.
@@ -961,9 +1002,18 @@ tb-sys-run: build/tb_sys.elf
 	@rm -f build/tb_sys.log
 	@timeout 90 $(QLVZ) -M virt -cpu max -m 512M -kernel build/tb_sys.elf \
 	     -display none -monitor none -serial file:build/tb_sys.log -no-reboot 2>/dev/null || true
-	@grep -a 'tb-sys:' build/tb_sys.log | tail -8
+	@grep -a 'tb-sys:' build/tb_sys.log | tail -12
 	@grep -qa 'tb-sys: done' build/tb_sys.log
-	@grep -qa 'fails=0' build/tb_sys.log
+	@grep -qa 'fails=0000000000000000 ok' build/tb_sys.log
+
+tb-sys-smp-run: build/tb_sys.elf
+	@rm -f build/tb_sys_smp.log
+	@timeout 90 $(QLVZ) -M virt -cpu max -smp 4 -m 512M -kernel build/tb_sys.elf \
+	     -display none -monitor none -serial file:build/tb_sys_smp.log -no-reboot 2>/dev/null || true
+	@grep -a 'tb-sys:' build/tb_sys_smp.log | tail -12
+	@grep -qa 'tb-sys: phys_cpus_online=0000000000000004' build/tb_sys_smp.log
+	@grep -qa 'tb-sys: done' build/tb_sys_smp.log
+	@grep -qa 'fails=0000000000000000 ok' build/tb_sys_smp.log
 
 tb-loop-run: build/tb_loop.elf
 	@rm -f build/tb_loop.log

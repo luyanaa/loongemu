@@ -126,18 +126,19 @@ static void test_csr_encoding(void)
     uint64_t pwcl = lapg_pwcl_value();
     uint64_t pwch = lapg_pwch_value();
 
-    /* The registers store (base, width-1) pairs; check each field lands
-     * where the hardware reads it. */
-    CHECK(((pwcl >> 0) & 0x3f) == LAPG_DIR1_BASE);
-    CHECK(((pwcl >> 6) & 0x3f) == LAPG_DIR1_WIDTH - 1);
-    CHECK(((pwcl >> 12) & 0x3f) == LAPG_DIR2_BASE);
-    CHECK(((pwcl >> 18) & 0x3f) == LAPG_DIR2_WIDTH - 1);
-    CHECK(((pwcl >> 24) & 0x3f) == LAPG_PT_BASE);
-    CHECK(((pwcl >> 30) & 0x3f) == LAPG_PT_WIDTH - 1);
-    CHECK(((pwcl >> 36) & 0x3) == 0); /* PTEWIDTH: 64-bit entries */
+    /* LoongArch CSR.PWCL: 5-bit fields, bottom-up, actual widths, 32-bit register. */
+    CHECK(((pwcl >> 0) & 0x1f) == LAPG_PT_BASE);
+    CHECK(((pwcl >> 5) & 0x1f) == LAPG_PT_WIDTH);
+    CHECK(((pwcl >> 10) & 0x1f) == LAPG_DIR1_BASE);
+    CHECK(((pwcl >> 15) & 0x1f) == LAPG_DIR1_WIDTH);
+    CHECK(((pwcl >> 20) & 0x1f) == LAPG_DIR2_BASE);
+    CHECK(((pwcl >> 25) & 0x1f) == LAPG_DIR2_WIDTH);
+    CHECK(((pwcl >> 30) & 0x3) == 0); /* PTEWidth: 64-bit entries */
+    CHECK((pwcl >> 32) == 0);
 
     CHECK(((pwch >> 0) & 0x3f) == LAPG_DIR3_BASE);
-    CHECK(((pwch >> 6) & 0x3f) == LAPG_DIR3_WIDTH - 1);
+    CHECK(((pwch >> 6) & 0x3f) == LAPG_DIR3_WIDTH);
+    CHECK(((pwch >> 24) & 0x1) == 0); /* HPTW_En */
 
     /* 4 KiB granule. */
     CHECK(lapg_stlbps_value() == 12);
@@ -175,6 +176,14 @@ static void test_leaf_encoding(void)
 
     /* User pages carry PLV3. */
     pte = lapg_make_leaf(1, LAPG_PERM_READ | LAPG_PERM_WRITE | LAPG_PERM_USER);
+    CHECK((pte & LAPG_PTE_PLV_MASK) == LAPG_PTE_PLV3);
+
+    /* Execute-only PLV3 page: NR=1, NX=0, D=0, PLV=3. */
+    pte = lapg_make_leaf(1, LAPG_PERM_EXEC | LAPG_PERM_USER);
+    CHECK(pte & LAPG_PTE_V);
+    CHECK(pte & LAPG_PTE_NR);
+    CHECK(!(pte & LAPG_PTE_NX));
+    CHECK(!(pte & LAPG_PTE_D));
     CHECK((pte & LAPG_PTE_PLV_MASK) == LAPG_PTE_PLV3);
 
     /* A page number wider than the PPN field must not corrupt the flags. */
@@ -294,6 +303,19 @@ static void test_unmapped_and_protection(void)
     CHECK(!(tr.perm & LAPG_PERM_READ));
     CHECK(lapg_walk(&memory, root, 0xa000, LAPG_PERM_READ, &tr) ==
           LAPG_FAULT_PROTECTION);
+
+    /*
+     * An Execute-Only PLV3 page (NR=1, NX=0, D=0, PLV=3) must permit PLV3
+     * fetch and reject PLV3 load/store.
+     */
+    CHECK(lapg_map(&memory, &pool, root, 0xb000, arena_phys() + 0x4000,
+                   LAPG_PERM_EXEC | LAPG_PERM_USER) == LAPG_OK);
+    CHECK(lapg_walk(&memory, root, 0xb000, LAPG_PERM_EXEC | LAPG_PERM_USER,
+                    &tr) == LAPG_OK);
+    CHECK(lapg_walk(&memory, root, 0xb000, LAPG_PERM_READ | LAPG_PERM_USER,
+                    &tr) == LAPG_FAULT_PROTECTION);
+    CHECK(lapg_walk(&memory, root, 0xb000, LAPG_PERM_WRITE | LAPG_PERM_USER,
+                    &tr) == LAPG_FAULT_PROTECTION);
 
     /* Two VAs sharing the top three levels still differ at the leaf. */
     CHECK(lapg_map(&memory, &pool, root, 0x9000, arena_phys() + 0x2000,

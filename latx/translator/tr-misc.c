@@ -968,7 +968,6 @@ bool translate_call(IR1_INST *pir1)
     int opnd_size = ir1_get_opnd_size(pir1) >> 3;
 
     /* 2. save return address onto stack */
-    IR2_OPND return_addr_opnd = ra_alloc_itemp();
     IR2_OPND x86_addr_opnd = ra_alloc_itemp();
 
     target_ulong call_offset __attribute__((unused)) =
@@ -996,10 +995,23 @@ bool translate_call(IR1_INST *pir1)
     }
     la_addi_addrx(esp_opnd, esp_opnd, -opnd_size);
 
+    if (option_soft_ras && CODEIS64 && opnd_size == 8) {
+        IR2_OPND helper_opnd = ra_alloc_itemp();
+        la_mov64(a0_ir2_opnd, x86_addr_opnd);
+        li_d(helper_opnd, (uint64_t)(uintptr_t)latx_soft_ras_push_abi);
+        la_jirl(ra_ir2_opnd, helper_opnd, 0);
+        ra_free_temp(helper_opnd);
+    }
+
+    /*
+     * tr_generate_exit_tb(direct_jmp) uses ir1_target_addr(pir1) and allocates
+     * its own fresh itemps; freeing x86_addr_opnd beforehand avoids starving it.
+     */
+    ra_free_temp(x86_addr_opnd);
+
     /* QEMU exit_tb & goto_tb */
     tr_generate_exit_tb(pir1, 0);
 
-    ra_free_temp(return_addr_opnd);
     return true;
 }
 
@@ -1089,7 +1101,6 @@ bool translate_callin(IR1_INST *pir1)
     int opnd_size = ir1_get_opnd_size(pir1) >> 3;
 
     /* 3. save return address onto stack */
-    ra_alloc_itemp();
     IR2_OPND return_addr_opnd = ra_alloc_itemp();
     target_ulong call_offset __attribute__((unused)) =
             aot_get_call_offset(ir1_addr_next(pir1));
@@ -1115,6 +1126,13 @@ bool translate_callin(IR1_INST *pir1)
         la_st_h(return_addr_opnd, esp_opnd, -opnd_size);
     }
     la_addi_addrx(esp_opnd, esp_opnd, -opnd_size);
+    if (option_soft_ras && CODEIS64 && opnd_size == 8) {
+        IR2_OPND helper_opnd = ra_alloc_itemp();
+        la_mov64(a0_ir2_opnd, return_addr_opnd);
+        li_d(helper_opnd, (uint64_t)(uintptr_t)latx_soft_ras_push_abi);
+        la_jirl(ra_ir2_opnd, helper_opnd, 0);
+        ra_free_temp(helper_opnd);
+    }
     ra_free_temp(return_addr_opnd);
 
     /* 5. indirect linkage */
@@ -1314,6 +1332,7 @@ bool translate_ret_without_ss_opt(IR1_INST *pir1)
             IR2_OPND imm_opnd = ra_alloc_itemp();
             li_d(imm_opnd, imm);
             la_add(esp_opnd, esp_opnd, imm_opnd);
+            ra_free_temp(imm_opnd);
         } else {
             la_addi_addrx(esp_opnd, esp_opnd, imm);
         }
@@ -1322,6 +1341,17 @@ bool translate_ret_without_ss_opt(IR1_INST *pir1)
     }
     if (jrra_translate_ret(lsenv->tr_data->curr_tb, return_addr_opnd, pir1)) {
         return true;
+    }
+    if (option_soft_ras && CODEIS64 && opnd_size == 8) {
+        IR2_OPND label_miss = ra_alloc_label();
+        IR2_OPND helper_opnd = ra_alloc_itemp();
+        la_mov64(a0_ir2_opnd, return_addr_opnd);
+        li_d(helper_opnd, (uint64_t)(uintptr_t)latx_soft_ras_lookup_abi);
+        la_jirl(ra_ir2_opnd, helper_opnd, 0);
+        ra_free_temp(helper_opnd);
+        la_beqz(a0_ir2_opnd, label_miss);
+        la_jirl(zero_ir2_opnd, a0_ir2_opnd, 0);
+        la_label(label_miss);
     }
     tr_generate_exit_tb(pir1, 0);
 

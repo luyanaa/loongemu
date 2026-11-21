@@ -12,19 +12,19 @@
  * a guest translation can be turned into a host TLB entry without reshaping
  * the address.
  *
- *   VA[47:39] -> level 1 (PML4 equivalent)
- *   VA[38:30] -> level 2
- *   VA[29:21] -> level 3
- *   VA[20:12] -> level 4 (page)
+ *   VA[47:39] -> level 1 / Dir3
+ *   VA[38:30] -> level 2 / Dir2
+ *   VA[29:21] -> level 3 / Dir1
+ *   VA[20:12] -> level 4 / PT (page)
  *
- * CSR.PWCL/PWCH describe this to the hardware:
+ * CSR.PWCL/PWCH describe this to the hardware (LoongArch Vol 1, bottom-up):
  *
- *   PWCL.DIR1_BASE  = 39, DIR1_WIDTH = 9
- *   PWCL.DIR2_BASE  = 30, DIR2_WIDTH = 9
- *   PWCL.PTBASE     = 21, PTWIDTH    = 9
- *   PWCH.DIR3_BASE  = 12, DIR3_WIDTH = 9
- *   PWCL.PTEWIDTH   = 0  (64-bit entries)
- *   CSR.STLBPS.PS   = 12 (4 KiB)
+ *   PWCL.PTbase    = 12, PTwidth   = 9
+ *   PWCL.Dir1_base = 21, Dir1_width = 9
+ *   PWCL.Dir2_base = 30, Dir2_width = 9
+ *   PWCL.PTEWidth  = 0  (64-bit entries)
+ *   PWCH.Dir3_base = 39, Dir3_width = 9
+ *   CSR.STLBPS.PS  = 12 (4 KiB)
  */
 
 #ifndef LOONGEMU_LOONGARCH_PAGING_H
@@ -43,14 +43,18 @@ extern "C" {
 #define LAPG_INDEX_COUNT (1 << LAPG_INDEX_BITS)
 #define LAPG_LEVELS      4
 
-/* The four VA ranges the hardware walks, as (base, width) pairs. */
-#define LAPG_DIR1_BASE   39
+#define LAPG_PS_4K       12
+#define LAPG_PS_1M       20
+#define LAPG_PS_1G       30
+
+/* The four VA ranges the hardware walks, as (base, width) pairs (bottom-up). */
+#define LAPG_PT_BASE     12
+#define LAPG_PT_WIDTH    9
+#define LAPG_DIR1_BASE   21
 #define LAPG_DIR1_WIDTH  9
 #define LAPG_DIR2_BASE   30
 #define LAPG_DIR2_WIDTH  9
-#define LAPG_PT_BASE     21
-#define LAPG_PT_WIDTH    9
-#define LAPG_DIR3_BASE   12
+#define LAPG_DIR3_BASE   39
 #define LAPG_DIR3_WIDTH  9
 
 /* Hardware PTE bits (LoongArch manual, TLB entry format). */

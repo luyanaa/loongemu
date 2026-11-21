@@ -56,6 +56,7 @@ extern int option_trace_ir1;
 extern int option_enable_fcsr_exc;
 extern int option_latx_disassemble_trace_cmp;
 extern int option_jr_ra;
+extern int option_soft_ras;
 #define SMC_ILL_INST 0x1
 /* ld.w      $a1,$zero,0 */
 #define READ_ILL_INST 0x28800005

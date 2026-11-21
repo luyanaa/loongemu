@@ -75,7 +75,24 @@ uint32_t latx_x86_fault_error_code(const struct CPUX86State *env,
  * A page-granular cache keyed by (cr3, pcid, leaf index) delegates every miss
  * and dirty-bit promotion to the single authoritative x86_64_walk_page_tables().
  */
-#define LATX_X86_TLB_ENTRIES 64
+#define LATX_X86_TLB_ENTRIES       64
+#define LATX_X86_LARGE_TLB_ENTRIES 16
+
+typedef struct LatxX86TlbStats {
+    uint64_t lookups;
+    uint64_t hits_4k;
+    uint64_t hits_2m;
+    uint64_t hits_1g;
+    uint64_t misses;
+    uint64_t fills_4k;
+    uint64_t fills_2m;
+    uint64_t fills_1g;
+    uint64_t flushes_all;
+    uint64_t flushes_page;
+} LatxX86TlbStats;
+
+const LatxX86TlbStats *latx_x86_tlb_stats(void);
+void latx_x86_tlb_stats_reset(void);
 
 void latx_x86_tlb_flush_all(void);
 /* Caller must ensure that this vCPU is not concurrently using its cache. */

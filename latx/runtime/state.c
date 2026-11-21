@@ -210,3 +210,134 @@ int smc_store_helper_vst_x4(void *env, uint64_t address,
 }
 
 /* --- capstone entry points: decoding is wired up with the capstone build --- */
+
+/*
+ * SoftRAS platform hooks (strong overrides live in PLV0 VMM runtime, e.g.
+ * baremetal/bare/tb_sys.c).  Because translated TBs keep live guest GPRs in
+ * caller-saved LoongArch registers ($a2..$a5, $t5..$t8), EFLAGS in $a6, SW-LBT
+ * CC in $tp, and DBT scratch/link registers in $r21/$fp/$a7, the ABI veneers
+ * save and restore all non-$a0 caller-saved/DBT registers around C calls.
+ */
+__attribute__((weak)) void latx_platform_soft_ras_push(uint64_t ret_x86_pc)
+{
+    (void)ret_x86_pc;
+}
+
+__attribute__((weak)) uint64_t latx_platform_soft_ras_lookup(uint64_t target_x86_pc)
+{
+    (void)target_x86_pc;
+    return 0;
+}
+
+#ifdef __loongarch__
+__asm__(
+".text\n"
+".balign 4\n"
+".globl latx_soft_ras_push_abi\n"
+"latx_soft_ras_push_abi:\n"
+"  addi.d $sp, $sp, -176\n"
+"  st.d   $ra,  $sp, 0\n"
+"  st.d   $tp,  $sp, 8\n"
+"  st.d   $a0,  $sp, 16\n"
+"  st.d   $a1,  $sp, 24\n"
+"  st.d   $a2,  $sp, 32\n"
+"  st.d   $a3,  $sp, 40\n"
+"  st.d   $a4,  $sp, 48\n"
+"  st.d   $a5,  $sp, 56\n"
+"  st.d   $a6,  $sp, 64\n"
+"  st.d   $a7,  $sp, 72\n"
+"  st.d   $t0,  $sp, 80\n"
+"  st.d   $t1,  $sp, 88\n"
+"  st.d   $t2,  $sp, 96\n"
+"  st.d   $t3,  $sp, 104\n"
+"  st.d   $t4,  $sp, 112\n"
+"  st.d   $t5,  $sp, 120\n"
+"  st.d   $t6,  $sp, 128\n"
+"  st.d   $t7,  $sp, 136\n"
+"  st.d   $t8,  $sp, 144\n"
+"  st.d   $r21, $sp, 152\n"
+"  st.d   $fp,  $sp, 160\n"
+"  bl     latx_platform_soft_ras_push\n"
+"  ld.d   $ra,  $sp, 0\n"
+"  ld.d   $tp,  $sp, 8\n"
+"  ld.d   $a0,  $sp, 16\n"
+"  ld.d   $a1,  $sp, 24\n"
+"  ld.d   $a2,  $sp, 32\n"
+"  ld.d   $a3,  $sp, 40\n"
+"  ld.d   $a4,  $sp, 48\n"
+"  ld.d   $a5,  $sp, 56\n"
+"  ld.d   $a6,  $sp, 64\n"
+"  ld.d   $a7,  $sp, 72\n"
+"  ld.d   $t0,  $sp, 80\n"
+"  ld.d   $t1,  $sp, 88\n"
+"  ld.d   $t2,  $sp, 96\n"
+"  ld.d   $t3,  $sp, 104\n"
+"  ld.d   $t4,  $sp, 112\n"
+"  ld.d   $t5,  $sp, 120\n"
+"  ld.d   $t6,  $sp, 128\n"
+"  ld.d   $t7,  $sp, 136\n"
+"  ld.d   $t8,  $sp, 144\n"
+"  ld.d   $r21, $sp, 152\n"
+"  ld.d   $fp,  $sp, 160\n"
+"  addi.d $sp,  $sp, 176\n"
+"  jirl   $zero, $ra, 0\n"
+"\n"
+".balign 4\n"
+".globl latx_soft_ras_lookup_abi\n"
+"latx_soft_ras_lookup_abi:\n"
+"  addi.d $sp, $sp, -176\n"
+"  st.d   $ra,  $sp, 0\n"
+"  st.d   $tp,  $sp, 8\n"
+"  st.d   $a1,  $sp, 24\n"
+"  st.d   $a2,  $sp, 32\n"
+"  st.d   $a3,  $sp, 40\n"
+"  st.d   $a4,  $sp, 48\n"
+"  st.d   $a5,  $sp, 56\n"
+"  st.d   $a6,  $sp, 64\n"
+"  st.d   $a7,  $sp, 72\n"
+"  st.d   $t0,  $sp, 80\n"
+"  st.d   $t1,  $sp, 88\n"
+"  st.d   $t2,  $sp, 96\n"
+"  st.d   $t3,  $sp, 104\n"
+"  st.d   $t4,  $sp, 112\n"
+"  st.d   $t5,  $sp, 120\n"
+"  st.d   $t6,  $sp, 128\n"
+"  st.d   $t7,  $sp, 136\n"
+"  st.d   $t8,  $sp, 144\n"
+"  st.d   $r21, $sp, 152\n"
+"  st.d   $fp,  $sp, 160\n"
+"  bl     latx_platform_soft_ras_lookup\n"
+"  ld.d   $ra,  $sp, 0\n"
+"  ld.d   $tp,  $sp, 8\n"
+"  ld.d   $a1,  $sp, 24\n"
+"  ld.d   $a2,  $sp, 32\n"
+"  ld.d   $a3,  $sp, 40\n"
+"  ld.d   $a4,  $sp, 48\n"
+"  ld.d   $a5,  $sp, 56\n"
+"  ld.d   $a6,  $sp, 64\n"
+"  ld.d   $a7,  $sp, 72\n"
+"  ld.d   $t0,  $sp, 80\n"
+"  ld.d   $t1,  $sp, 88\n"
+"  ld.d   $t2,  $sp, 96\n"
+"  ld.d   $t3,  $sp, 104\n"
+"  ld.d   $t4,  $sp, 112\n"
+"  ld.d   $t5,  $sp, 120\n"
+"  ld.d   $t6,  $sp, 128\n"
+"  ld.d   $t7,  $sp, 136\n"
+"  ld.d   $t8,  $sp, 144\n"
+"  ld.d   $r21, $sp, 152\n"
+"  ld.d   $fp,  $sp, 160\n"
+"  addi.d $sp,  $sp, 176\n"
+"  jirl   $zero, $ra, 0\n"
+);
+#else
+void latx_soft_ras_push_abi(uint64_t ret_x86_pc)
+{
+    latx_platform_soft_ras_push(ret_x86_pc);
+}
+
+uint64_t latx_soft_ras_lookup_abi(uint64_t target_x86_pc)
+{
+    return latx_platform_soft_ras_lookup(target_x86_pc);
+}
+#endif

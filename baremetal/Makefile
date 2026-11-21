@@ -1,6 +1,10 @@
 LLVM_PREFIX ?= $(shell brew --prefix llvm 2>/dev/null)
 CLANG   ?= $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/clang,clang)
-AR      ?= $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/llvm-ar,llvm-ar)
+ifeq ($(origin AR),default)
+AR := $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/llvm-ar,llvm-ar)
+else
+AR ?= $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/llvm-ar,llvm-ar)
+endif
 TARGET  ?= loongarch64-unknown-linux-gnu
 RESINC  := $(shell $(CLANG) -print-resource-dir)/include
 LATX    := ../latx
@@ -50,7 +54,7 @@ SRCS := ../src/x86_64_paging.c ../src/phys_mem.c ../src/vclock.c ../src/loongarc
         $(LATX)/optimization/flag-lbt.c $(LATX)/optimization/flag-reduction.c \
         $(LATX)/optimization/ir1-optimization.c $(LATX)/optimization/ir2-optimization.c
 
-SRCS += ../src/hyperv.c
+SRCS += ../src/hyperv.c ../src/soft_ras.c
 
 GEN := gen/latx/include/format-table.h gen/latx/include/ir2-name.h \
        gen/latx/include/ir2-opcode.h gen/latx/include/la-append.h gen/latx/ir2/la-append.c

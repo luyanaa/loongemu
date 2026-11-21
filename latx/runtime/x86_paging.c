@@ -254,61 +254,121 @@ __attribute__((weak)) uint32_t latx_platform_cpu_id(void)
 }
 
 static LatxX86TlbEntry latx_x86_tlb[LATX_MAX_PCPU][LATX_X86_TLB_ENTRIES];
+static LatxX86TlbEntry latx_x86_large_tlb[LATX_MAX_PCPU][LATX_X86_LARGE_TLB_ENTRIES];
+static uint32_t latx_x86_large_victim[LATX_MAX_PCPU];
+static LatxX86TlbStats latx_x86_stats[LATX_MAX_PCPU];
+
+static inline uint32_t cur_tlb_cpu_idx(void)
+{
+    uint32_t cid = latx_platform_cpu_id();
+    return cid < LATX_MAX_PCPU ? cid : 0u;
+}
 
 static inline LatxX86TlbEntry *cur_cpu_tlb(void)
 {
-    uint32_t cid = latx_platform_cpu_id();
-    return latx_x86_tlb[cid < LATX_MAX_PCPU ? cid : 0u];
+    return latx_x86_tlb[cur_tlb_cpu_idx()];
+}
+
+static inline LatxX86TlbEntry *cur_cpu_large_tlb(void)
+{
+    return latx_x86_large_tlb[cur_tlb_cpu_idx()];
+}
+
+static inline LatxX86TlbStats *cur_cpu_tlb_stats(void)
+{
+    return &latx_x86_stats[cur_tlb_cpu_idx()];
+}
+
+const LatxX86TlbStats *latx_x86_tlb_stats(void)
+{
+    return cur_cpu_tlb_stats();
+}
+
+void latx_x86_tlb_stats_reset(void)
+{
+    memset(cur_cpu_tlb_stats(), 0, sizeof(LatxX86TlbStats));
 }
 
 void latx_x86_tlb_flush_all(void)
 {
-    memset(cur_cpu_tlb(), 0, sizeof(latx_x86_tlb[0]));
+    uint32_t cid = cur_tlb_cpu_idx();
+    memset(latx_x86_tlb[cid], 0, sizeof(latx_x86_tlb[0]));
+    memset(latx_x86_large_tlb[cid], 0, sizeof(latx_x86_large_tlb[0]));
+    latx_x86_large_victim[cid] = 0;
+    latx_x86_stats[cid].flushes_all++;
 }
 
 void latx_x86_tlb_flush_cpu(uint32_t cpu)
 {
     if (cpu < LATX_MAX_PCPU) {
         memset(latx_x86_tlb[cpu], 0, sizeof(latx_x86_tlb[cpu]));
+        memset(latx_x86_large_tlb[cpu], 0, sizeof(latx_x86_large_tlb[cpu]));
+        latx_x86_large_victim[cpu] = 0;
+        latx_x86_stats[cpu].flushes_all++;
     }
 }
 
 void latx_x86_tlb_flush_all_cpus(void)
 {
     memset(latx_x86_tlb, 0, sizeof(latx_x86_tlb));
+    memset(latx_x86_large_tlb, 0, sizeof(latx_x86_large_tlb));
+    memset(latx_x86_large_victim, 0, sizeof(latx_x86_large_victim));
+    for (uint32_t i = 0; i < LATX_MAX_PCPU; i++) {
+        latx_x86_stats[i].flushes_all++;
+    }
+}
+
+static void flush_non_global_array(LatxX86TlbEntry *arr, unsigned count)
+{
+    for (unsigned i = 0; i < count; i++) {
+        if (arr[i].valid && !arr[i].global) {
+            arr[i].valid = false;
+        }
+    }
 }
 
 void latx_x86_tlb_flush_non_global(void)
 {
-    LatxX86TlbEntry *tlb = cur_cpu_tlb();
-    for (unsigned i = 0; i < LATX_X86_TLB_ENTRIES; i++) {
-        if (tlb[i].valid && !tlb[i].global) {
-            tlb[i].valid = false;
+    uint32_t cid = cur_tlb_cpu_idx();
+    flush_non_global_array(latx_x86_tlb[cid], LATX_X86_TLB_ENTRIES);
+    flush_non_global_array(latx_x86_large_tlb[cid], LATX_X86_LARGE_TLB_ENTRIES);
+    latx_x86_stats[cid].flushes_all++;
+}
+
+static void flush_pcid_array(LatxX86TlbEntry *arr, unsigned count, uint16_t pcid)
+{
+    for (unsigned i = 0; i < count; i++) {
+        if (arr[i].valid && !arr[i].global && arr[i].pcid == pcid) {
+            arr[i].valid = false;
         }
     }
 }
 
 void latx_x86_tlb_flush_pcid(uint16_t pcid)
 {
-    LatxX86TlbEntry *tlb = cur_cpu_tlb();
-    for (unsigned i = 0; i < LATX_X86_TLB_ENTRIES; i++) {
-        if (tlb[i].valid && !tlb[i].global &&
-            tlb[i].pcid == pcid) {
-            tlb[i].valid = false;
+    uint32_t cid = cur_tlb_cpu_idx();
+    flush_pcid_array(latx_x86_tlb[cid], LATX_X86_TLB_ENTRIES, pcid);
+    flush_pcid_array(latx_x86_large_tlb[cid], LATX_X86_LARGE_TLB_ENTRIES, pcid);
+    latx_x86_stats[cid].flushes_all++;
+}
+
+static void flush_page_array(LatxX86TlbEntry *arr, unsigned count, uint64_t va)
+{
+    for (unsigned i = 0; i < count; i++) {
+        LatxX86TlbEntry *e = &arr[i];
+
+        if (e->valid && (va >> e->page_bits) == e->tag) {
+            e->valid = false;
         }
     }
 }
 
 void latx_x86_tlb_flush_page(uint64_t va)
 {
-    LatxX86TlbEntry *tlb = cur_cpu_tlb();
-    for (unsigned i = 0; i < LATX_X86_TLB_ENTRIES; i++) {
-        LatxX86TlbEntry *e = &tlb[i];
-
-        if (e->valid && (va >> e->page_bits) == e->tag) {
-            e->valid = false;
-        }
-    }
+    uint32_t cid = cur_tlb_cpu_idx();
+    flush_page_array(latx_x86_tlb[cid], LATX_X86_TLB_ENTRIES, va);
+    flush_page_array(latx_x86_large_tlb[cid], LATX_X86_LARGE_TLB_ENTRIES, va);
+    latx_x86_stats[cid].flushes_page++;
 }
 
 static uint32_t cached_access_fault_code(const CPUX86State *env, uint32_t access,
@@ -329,82 +389,82 @@ static uint32_t cached_access_fault_code(const CPUX86State *env, uint32_t access
     return ec;
 }
 
-LatxX86WalkResult latx_x86_walk_cached(const CPUX86State *env, uint64_t va,
-                                       uint32_t access,
-                                       LatxX86Translation *out)
+static int check_tlb_entry_hit(const CPUX86State *env, LatxX86TlbEntry *e,
+                               uint64_t va, uint64_t cr3, uint16_t pcid,
+                               uint32_t access, LatxX86Translation *out,
+                               LatxX86WalkResult *out_res)
 {
-    uint64_t cr3 = env->cr[3] & PTE_PHYS_MASK;
-    uint16_t pcid = (env->cr[4] & X86_CR4_PCIDE) ? (uint16_t)(env->cr[3] & 0xfffu) : 0u;
-    LatxX86TlbEntry *e = &cur_cpu_tlb()[(va >> 12) & (LATX_X86_TLB_ENTRIES - 1)];
-    LatxX86WalkResult r;
-
-    /* Paging off, or no long-mode paging at all: delegate directly. */
-    if (!(env->cr[0] & CR0_PG_MASK) || !(env->cr[4] & CR4_PAE_MASK)) {
-        return latx_x86_walk(env, va, access, out);
+    if (!e->valid || (va >> e->page_bits) != e->tag ||
+        !((e->global && (env->cr[4] & X86_CR4_PGE)) ||
+          (e->cr3 == cr3 && e->pcid == pcid))) {
+        return 0;
     }
 
-    if (e->valid && (va >> e->page_bits) == e->tag &&
-        ((e->global && (env->cr[4] & X86_CR4_PGE)) ||
-         (e->cr3 == cr3 && e->pcid == pcid))) {
-        bool user = (access & LATX_X86_ACCESS_USER) != 0;
-        bool write = (access & LATX_X86_ACCESS_WRITE) != 0;
-        bool exec = (access & LATX_X86_ACCESS_EXEC) != 0;
-        bool user_page = (e->perm & LATX_X86_ACCESS_USER) != 0;
+    bool user = (access & LATX_X86_ACCESS_USER) != 0;
+    bool write = (access & LATX_X86_ACCESS_WRITE) != 0;
+    bool exec = (access & LATX_X86_ACCESS_EXEC) != 0;
+    bool user_page = (e->perm & LATX_X86_ACCESS_USER) != 0;
 
-        memset(out, 0, sizeof(*out));
-        out->page_bits = e->page_bits;
-        out->gpa = e->gpa_base | (va & ((UINT64_C(1) << e->page_bits) - 1));
-        out->perm = e->perm;
-        out->global = e->global;
-        out->pkey = e->pkey;
-        out->dirty = e->dirty;
+    memset(out, 0, sizeof(*out));
+    out->page_bits = e->page_bits;
+    out->gpa = e->gpa_base | (va & ((UINT64_C(1) << e->page_bits) - 1));
+    out->perm = e->perm;
+    out->global = e->global;
+    out->pkey = e->pkey;
+    out->dirty = e->dirty;
 
-        if (user && !user_page) {
-            out->fault_error_code = cached_access_fault_code(env, access, 0);
-            return LATX_X86_WALK_PROTECTION;
-        }
-        if (write && !(e->perm & LATX_X86_ACCESS_WRITE) &&
-            (user || (env->cr[0] & CR0_WP_MASK))) {
-            out->fault_error_code = cached_access_fault_code(env, access, 0);
-            return LATX_X86_WALK_PROTECTION;
-        }
-        if (exec && !(e->perm & LATX_X86_ACCESS_EXEC)) {
-            out->fault_error_code = cached_access_fault_code(env, access, 0);
-            return LATX_X86_WALK_PROTECTION;
-        }
-        if (exec && !user && user_page && (env->cr[4] & X86_CR4_SMEP)) {
-            out->fault_error_code = cached_access_fault_code(env, access, 0);
-            return LATX_X86_WALK_PROTECTION;
-        }
-        if (!exec && !user && user_page && (env->cr[4] & X86_CR4_SMAP) &&
-            !(env->eflags & X86_RFLAGS_AC)) {
-            out->fault_error_code = cached_access_fault_code(env, access, 0);
-            return LATX_X86_WALK_PROTECTION;
-        }
-        if (!exec && user && user_page && (env->cr[4] & X86_CR4_PKE)) {
-            uint32_t rights = (env->pkru >> (e->pkey * 2u)) & 3u;
-            if ((rights & 1u) || (write && (rights & 2u))) {
-                out->fault_error_code = cached_access_fault_code(
-                    env, access, X86_PF_PROTECTION_KEY);
-                return LATX_X86_WALK_PROTECTION;
-            }
-        }
-        /* Dirty-bit promotion: fall through to authoritative walker on first write. */
-        if (write && !e->dirty) {
-            r = latx_x86_walk(env, va, access, out);
-            if (r == LATX_X86_WALK_OK) {
-                e->dirty = out->dirty;
-            }
-            return r;
-        }
-        return LATX_X86_WALK_OK;
+    if (user && !user_page) {
+        out->fault_error_code = cached_access_fault_code(env, access, 0);
+        *out_res = LATX_X86_WALK_PROTECTION;
+        return 1;
     }
-
-    r = latx_x86_walk(env, va, access, out);
-    if (r != LATX_X86_WALK_OK) {
-        /* Never cache faulting entries; only cache valid translations. */
-        return r;
+    if (write && !(e->perm & LATX_X86_ACCESS_WRITE) &&
+        (user || (env->cr[0] & CR0_WP_MASK))) {
+        out->fault_error_code = cached_access_fault_code(env, access, 0);
+        *out_res = LATX_X86_WALK_PROTECTION;
+        return 1;
     }
+    if (exec && !(e->perm & LATX_X86_ACCESS_EXEC)) {
+        out->fault_error_code = cached_access_fault_code(env, access, 0);
+        *out_res = LATX_X86_WALK_PROTECTION;
+        return 1;
+    }
+    if (exec && !user && user_page && (env->cr[4] & X86_CR4_SMEP)) {
+        out->fault_error_code = cached_access_fault_code(env, access, 0);
+        *out_res = LATX_X86_WALK_PROTECTION;
+        return 1;
+    }
+    if (!exec && !user && user_page && (env->cr[4] & X86_CR4_SMAP) &&
+        !(env->eflags & X86_RFLAGS_AC)) {
+        out->fault_error_code = cached_access_fault_code(env, access, 0);
+        *out_res = LATX_X86_WALK_PROTECTION;
+        return 1;
+    }
+    if (!exec && user && user_page && (env->cr[4] & X86_CR4_PKE)) {
+        uint32_t rights = (env->pkru >> (e->pkey * 2u)) & 3u;
+        if ((rights & 1u) || (write && (rights & 2u))) {
+            out->fault_error_code = cached_access_fault_code(
+                env, access, X86_PF_PROTECTION_KEY);
+            *out_res = LATX_X86_WALK_PROTECTION;
+            return 1;
+        }
+    }
+    /* Dirty-bit promotion: fall through to authoritative walker on first write. */
+    if (write && !e->dirty) {
+        LatxX86WalkResult r = latx_x86_walk(env, va, access, out);
+        if (r == LATX_X86_WALK_OK) {
+            e->dirty = out->dirty;
+        }
+        *out_res = r;
+        return 1;
+    }
+    *out_res = LATX_X86_WALK_OK;
+    return 1;
+}
+
+static void store_tlb_entry(LatxX86TlbEntry *e, uint64_t va, uint64_t cr3,
+                            uint16_t pcid, const LatxX86Translation *out)
+{
     e->cr3 = cr3;
     e->pcid = pcid;
     e->page_bits = out->page_bits;
@@ -415,6 +475,72 @@ LatxX86WalkResult latx_x86_walk_cached(const CPUX86State *env, uint64_t va,
     e->pkey = out->pkey;
     e->dirty = out->dirty;
     e->valid = true;
+}
+
+LatxX86WalkResult latx_x86_walk_cached(const CPUX86State *env, uint64_t va,
+                                       uint32_t access,
+                                       LatxX86Translation *out)
+{
+    uint32_t cid = cur_tlb_cpu_idx();
+    LatxX86TlbStats *stats = &latx_x86_stats[cid];
+    uint64_t cr3 = env->cr[3] & PTE_PHYS_MASK;
+    uint16_t pcid = (env->cr[4] & X86_CR4_PCIDE) ? (uint16_t)(env->cr[3] & 0xfffu) : 0u;
+    LatxX86TlbEntry *ltlb = latx_x86_large_tlb[cid];
+    LatxX86TlbEntry *e4k = &latx_x86_tlb[cid][(va >> 12) & (LATX_X86_TLB_ENTRIES - 1)];
+    LatxX86WalkResult r;
+
+    /* Paging off, or no long-mode paging at all: delegate directly. */
+    if (!(env->cr[0] & CR0_PG_MASK) || !(env->cr[4] & CR4_PAE_MASK)) {
+        return latx_x86_walk(env, va, access, out);
+    }
+
+    stats->lookups++;
+    for (unsigned i = 0; i < LATX_X86_LARGE_TLB_ENTRIES; i++) {
+        if (check_tlb_entry_hit(env, &ltlb[i], va, cr3, pcid, access, out, &r)) {
+            if (ltlb[i].page_bits == 30) {
+                stats->hits_1g++;
+            } else {
+                stats->hits_2m++;
+            }
+            return r;
+        }
+    }
+
+    if (check_tlb_entry_hit(env, e4k, va, cr3, pcid, access, out, &r)) {
+        stats->hits_4k++;
+        return r;
+    }
+
+    stats->misses++;
+    r = latx_x86_walk(env, va, access, out);
+    if (r != LATX_X86_WALK_OK) {
+        /* Never cache faulting entries; only cache valid translations. */
+        return r;
+    }
+
+    if (out->page_bits >= 21u) {
+        LatxX86TlbEntry *victim = 0;
+        for (unsigned i = 0; i < LATX_X86_LARGE_TLB_ENTRIES; i++) {
+            if (!ltlb[i].valid) {
+                victim = &ltlb[i];
+                break;
+            }
+        }
+        if (victim == 0) {
+            uint32_t v = latx_x86_large_victim[cid] % LATX_X86_LARGE_TLB_ENTRIES;
+            victim = &ltlb[v];
+            latx_x86_large_victim[cid] = (v + 1u) % LATX_X86_LARGE_TLB_ENTRIES;
+        }
+        store_tlb_entry(victim, va, cr3, pcid, out);
+        if (out->page_bits == 30u) {
+            stats->fills_1g++;
+        } else {
+            stats->fills_2m++;
+        }
+    } else {
+        store_tlb_entry(e4k, va, cr3, pcid, out);
+        stats->fills_4k++;
+    }
     return r;
 }
 

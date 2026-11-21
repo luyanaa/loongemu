@@ -17,6 +17,7 @@ int option_trace_ir1 = 0;
 int option_enable_fcsr_exc = 0;
 int option_latx_disassemble_trace_cmp = 0;
 int option_jr_ra = 0;
+int option_soft_ras = 1;
 int option_lative = 0;
 int option_jr_ra_stack = 0;
 int option_tunnel_lib = 0;

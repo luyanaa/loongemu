@@ -230,6 +230,10 @@ void latx_platform_tlb_flush_all(void);
 void latx_platform_tlb_flush_page(uint64_t addr);
 /* noflush: PCID-qualified MOV CR3 that must retain other address-space state. */
 void latx_platform_tlb_switch_cr3(int noflush);
+void latx_soft_ras_push_abi(uint64_t ret_x86_pc);
+uint64_t latx_soft_ras_lookup_abi(uint64_t target_x86_pc);
+void latx_platform_soft_ras_push(uint64_t ret_x86_pc);
+uint64_t latx_platform_soft_ras_lookup(uint64_t target_x86_pc);
 int latx_gen_prologue(void *code_buf);
 int latx_gen_epilogue(void *code_buf);
 extern ADDR context_switch_bt_to_native;

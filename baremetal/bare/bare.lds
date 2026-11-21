@@ -6,7 +6,9 @@ SECTIONS {
    * so the guest cannot alias VMM-owned pages.
    */
   . = 0x8000000;
+  _stext = .;
   .text   : { *(.text*) }
+  _etext = .;
   .rodata : { *(.rodata*) }
   .data   : { *(.data*) }
   .bss    : { *(.bss*) *(COMMON) }
