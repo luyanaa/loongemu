@@ -811,7 +811,7 @@ FDT 已用 `dtc -I dtb -O dts` 反编译验证：无 `FDT_END` 缺失、无 rese
 - `make test-latm-cpu`：9 项 profile/CP0/Diag/VTLB。
 - `make test-latm-loongson`：10 项 gs 算术与 CRC。
 - `make test-latm-system`：21 项 exact-width MMIO、内存布局、DTB 和 `fw_arg2`。
-- `make test-latm-uncore`：20 项 MailBox/PIC/MSI/EXTIOI 4-core 路由、共享 IP EOI、IOCSR IPMAP/COREMAP/COREISR。
+- `make test-latm-uncore`：25 项 MailBox/PIC/MSI/EXTIOI 4-core 路由、共享 IP EOI、IOCSR IPMAP/COREMAP/COREISR。
 - `make test-latm-pci`：7 项 7A mock blacklist + PCI BAR exact-width。
 - `make test-latm-board-system`：55 项 system composition + UART + DTB + 7A Split-CFG + ELF/handoff 入口。
 - `latm-isa` 新增 `loongson`/`loongson-mem`：gs 算术、gslq/gssq 端到端通过；`test-latm-decode` 32 项。
@@ -843,6 +843,8 @@ DTB 已由 host test 生成并用 `dtc -I dtb -O dts` 验证（3A4000 compatible
 
 - **平台状态码**：`LatmSystem` 的 `fetch32/atomic_ll/atomic_sc` 现在统一返回 `LatmMemStatus`。`fetch32` 只在成功时写指令；`atomic_ll/sc` 不再把成功布尔值误报为失败。
 - **RAM 原子**：`sys_atomic_ll/sc` 先通过 `LatmMemoryLayout` 确认目标为对齐、完整、可写的 RAM 4/8 字节范围，再在 Host backing 上执行 `__atomic_load_n` / `__atomic_compare_exchange_n`；MMIO/Reserved 返回 `LATM_MEM_RESERVED`，普通对齐 SW/SD 也改为原子 store，避免 SC 比较与写入之间被普通 store 插入。
+- **IOCSR 0x1000 SMP MailBox**：`latm_uncore_iocsr_*` 新增 3A4000 IPI MailBox 窗口 `0x1000..0x10ff`：`0x00 status/0x04 enable/0x08 set/0x0c clear/0x20..0x3f buf/0x40 IPI_SEND/0x48 MAIL_SEND`，并按 `latm_cpu_index` 选择当前核。
+- **PCH→EXTIOI 级联**：PCH line raise/eoi 现在调用对应 EXTIOI vector；CLR 写同时清除 EXTIOI pending。覆写范围仍限于 line 0..63，未建模 `htmsi_vector` 重映射。
 - **EXTIOI 边界**：COREISR 读写严格限制在每 CPU 8 个 32-bit 寄存器（`0x1400+0x400..0x420`）；更大的 Guest aperture 不再直接索引数组。仍保持 QEMU 3A 的 per-CPU COREISR 语义。
 - **LWL/LWR**：32 位 word 先按 QEMU `MO_TEUL` 零扩展，merge 后再按 MIPS32 规则 sign-extend；LWR/LDR mask 改为 QEMU 的 `~1 << (bits-1-shift)`，并新增 4/8 字节 × 四个地址低位 × 多种旧寄存器 mask 的差分测试。`LatmPlatform.mem_probe` 可无副作用验证 unaligned 首字节，避免对 MMIO 做额外读取。
 - **TB map 生命周期**：`LatmTbInsnMap` 改为动态链表，并保存到 `TranslationBlock.latm_insn_map`；不再有 32 项 LRU 淘汰。`latm_tb_insn_map_release()` 供 TB 回收路径释放；SMC flush 将 map 标为 invalid 而不解引用已失效 TB 指针。

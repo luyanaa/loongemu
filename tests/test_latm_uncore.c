@@ -70,6 +70,25 @@ int main(void)
     check(latm_uncore_cpu_ip(&u, 2), 0, "IOCSR coreisr EOI");
     check(latm_uncore_iocsr_read(&u, 0x14c0, 4), 0x00000001,
           "IOCSR ipmap readback");
+
+    /* 3A4000 SMP IOCSR mailbox at 0x1000 + per-core selector. */
+    latm_uncore_iocsr_write_cpu(&u, 0x1020, 0x12345678, 4, 1);
+    check(latm_uncore_iocsr_read_cpu(&u, 0x1020, 4, 1), 0x12345678,
+          "IOCSR IPI mailbox readback");
+    latm_uncore_iocsr_write_cpu(&u, 0x1040, (2u << 16) | 3u, 4, 0);
+    check(u.mailbox[2].status & (1u << 3), 1u << 3,
+          "IOCSR IPI send target");
+    latm_uncore_iocsr_write_cpu(&u, 0x1048, (2ull << 16) | (0x55ull << 32),
+                                4, 0);
+    check(latm_uncore_iocsr_read_cpu(&u, 0x1020, 4, 2), 0x55,
+          "IOCSR mail-send buffer");
+
+    /* PCH line 12 cascades through EXTIOI vector 12. */
+    latm_uncore_extioi_route(&u, 12, 1, 5, 1);
+    latm_uncore_pic_raise(&u, 12, 1);
+    check(latm_uncore_cpu_ip(&u, 1), 1u << 13, "PCH→EXTIOI raise");
+    latm_uncore_pic_eoi(&u, 12);
+    check(latm_uncore_cpu_ip(&u, 1), 0, "PCH→EXTIOI EOI");
     /* 0x420 is beyond the eight per-CPU COREISR registers. */
     latm_uncore_iocsr_write(&u, 0x1820, 0xffffffffu, 4);
     check(latm_uncore_iocsr_read(&u, 0x1820, 4), 0,

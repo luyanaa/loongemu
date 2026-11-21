@@ -156,11 +156,13 @@ void latm_uncore_pic_raise(LatmUncore *u, unsigned line, int level)
         __atomic_fetch_or(&u->pic_pending, UINT64_C(1) << line,
                           __ATOMIC_SEQ_CST);
         __atomic_fetch_or(&u->pic_isr, UINT64_C(1) << line, __ATOMIC_SEQ_CST);
+        latm_uncore_extioi_raise(u, line);
     } else {
         __atomic_fetch_and(&u->pic_pending, ~(UINT64_C(1) << line),
                            __ATOMIC_SEQ_CST);
         __atomic_fetch_and(&u->pic_isr, ~(UINT64_C(1) << line),
                            __ATOMIC_SEQ_CST);
+        latm_uncore_extioi_eoi(u, line);
     }
 }
 
@@ -170,6 +172,7 @@ void latm_uncore_pic_eoi(LatmUncore *u, unsigned line)
     __atomic_fetch_and(&u->pic_pending, ~(UINT64_C(1) << line), __ATOMIC_SEQ_CST);
     __atomic_fetch_and(&u->pic_isr, ~(UINT64_C(1) << line), __ATOMIC_SEQ_CST);
     __atomic_fetch_and(&u->pic_ack, ~(UINT64_C(1) << line), __ATOMIC_SEQ_CST);
+    latm_uncore_extioi_eoi(u, line);
 }
 
 int latm_uncore_msi_write(LatmUncore *u, uint32_t gpa, unsigned size,
@@ -280,13 +283,61 @@ static void extioi_apply_coremap(LatmUncore *u, unsigned irq, uint32_t val)
     }
 }
 
+static uint64_t iocsr_ipi_read(LatmUncore *u, unsigned cpu, uint32_t off,
+                               unsigned size)
+{
+    LatmMailbox *m = &u->mailbox[cpu];
+    if (off == 0x00) return read_reg((uint64_t *)&m->status, 0, size);
+    if (off == 0x04) return read_reg((uint64_t *)&m->enable, 0, size);
+    if (off >= 0x20 && off < 0x40) {
+        unsigned idx = (off - 0x20) / 8;
+        return read_reg(&m->buf[idx], off & 7, size);
+    }
+    return 0;
+}
+
+static void iocsr_ipi_write(LatmUncore *u, unsigned cpu, uint32_t off,
+                            uint64_t value, unsigned size)
+{
+    LatmMailbox *m = &u->mailbox[cpu];
+    if (off == 0x04) {
+        write_reg((uint64_t *)&m->enable, 0, size, value);
+    } else if (off == 0x08) {
+        __atomic_fetch_or(&m->status, (uint32_t)value, __ATOMIC_SEQ_CST);
+    } else if (off == 0x0c) {
+        __atomic_fetch_and(&m->status, ~(uint32_t)value, __ATOMIC_SEQ_CST);
+    } else if (off >= 0x20 && off < 0x40) {
+        unsigned idx = (off - 0x20) / 8;
+        write_reg(&m->buf[idx], off & 7, size, value);
+    } else if (off == 0x40) {
+        unsigned target = (unsigned)((value >> 16) & 0x3ff);
+        unsigned vector = (unsigned)(value & 0x1f);
+        if (target < LATM_MAX_CPUS) {
+            __atomic_fetch_or(&u->mailbox[target].status, 1u << vector,
+                              __ATOMIC_SEQ_CST);
+        }
+    } else if (off == 0x48) {
+        unsigned target = (unsigned)((value >> 16) & 0x3ff);
+        uint32_t boff = 0x20 + (uint32_t)(value & 0x1c);
+        if (target < LATM_MAX_CPUS) {
+            LatmMailbox *t = &u->mailbox[target];
+            write_reg(&t->buf[(boff - 0x20) / 8], boff & 7, 4,
+                      value >> 32);
+        }
+    }
+}
+
 uint64_t latm_uncore_iocsr_read_cpu(LatmUncore *u, uint64_t addr,
                                     unsigned size, unsigned cpu)
 {
-    if (!u || addr < 0x1400 || addr >= 0x1d00 || size == 0 || size > 4) {
+    if (!u || size == 0 || size > 4) return 0;
+    if (cpu >= LATM_MAX_CPUS) cpu = 0;
+    if (addr >= 0x1000 && addr < 0x1100) {
+        return iocsr_ipi_read(u, cpu, (uint32_t)(addr - 0x1000), size);
+    }
+    if (addr < 0x1400 || addr >= 0x1d00) {
         return 0;
     }
-    if (cpu >= LATM_MAX_CPUS) cpu = 0;
     unsigned off = (unsigned)(addr - 0x1400);
     uint32_t v = 0;
     if (off >= 0xa0 && off < 0xc0) {
@@ -320,10 +371,15 @@ uint64_t latm_uncore_iocsr_read(LatmUncore *u, uint64_t addr, unsigned size)
 void latm_uncore_iocsr_write_cpu(LatmUncore *u, uint64_t addr, uint64_t value,
                                  unsigned size, unsigned cpu)
 {
-    if (!u || addr < 0x1400 || addr >= 0x1d00 || size == 0 || size > 4) {
+    if (!u || size == 0 || size > 4) return;
+    if (cpu >= LATM_MAX_CPUS) cpu = 0;
+    if (addr >= 0x1000 && addr < 0x1100) {
+        iocsr_ipi_write(u, cpu, (uint32_t)(addr - 0x1000), value, size);
         return;
     }
-    if (cpu >= LATM_MAX_CPUS) cpu = 0;
+    if (addr < 0x1400 || addr >= 0x1d00) {
+        return;
+    }
     unsigned off = (unsigned)(addr - 0x1400);
     uint32_t val = (uint32_t)value;
     if (off >= 0xa0 && off < 0xc0) {
