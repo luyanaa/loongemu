@@ -163,8 +163,9 @@ make test-loongarch-fallback  # objdump：确认 fallback 中完全没有 LBT �
   与翻译后宿主代码及 VMM 状态映射发生碰撞。仅运行可信测试客户机；软件检查路径尚未
   覆盖全部内存操作。
 - 没有可用宿主 GOP 显存时，Bochs fallback 仅提供客户机可见 RAM，不会输出到宿主显示器。
-- 未显式提供宿主读写回调时，物理 7A PCI 配置直通处于关闭状态；黑名单和 errata 处理
-  不能替代 DMA 隔离或 IOMMU 配置。
+- 未显式提供宿主读写回调时，物理 7A PCI 配置直通处于关闭状态；集成启动保持回调为
+  `NULL`，回归测试断言后端关闭。开放前需要独立的 BAR/DMA/IRQ 所有权设计以及
+  IOMMU/DMA 隔离，黑名单和 errata 处理本身不足以保证安全。
 - Makefile 中的工具链路径固定为 Homebrew LLVM 布局，在其他系统上需要覆盖。
 - QEMU 不执行 LBT 指令，因此裸机程序对其进行模拟；硬件路径只能在真实的
   3A6000 系列处理器上验证。

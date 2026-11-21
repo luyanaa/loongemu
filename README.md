@@ -182,8 +182,10 @@ the host test suites are the stable entry point.
 - When no suitable host GOP framebuffer is available, the Bochs fallback is
   guest-visible RAM only; it is not a host display output.
 - Physical 7A PCI configuration passthrough is disabled unless host read/write
-  callbacks are explicitly supplied. The blacklist and errata handling do not
-  replace DMA isolation or IOMMU configuration.
+  callbacks are explicitly supplied. The integrated boot keeps them `NULL`;
+  regression tests assert the backend stays closed. Enabling it requires a
+  separate BAR/DMA/IRQ ownership design plus IOMMU/DMA isolation; the blacklist
+  and errata handling alone are not sufficient.
 - Toolchain paths in the Makefiles are pinned to a Homebrew LLVM layout and
   need overriding on other systems.
 - QEMU does not execute LBT instructions, so the bare-metal harness emulates

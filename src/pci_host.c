@@ -813,6 +813,15 @@ static int bochs_dispi_validate_geometry(const LoongemuBochsDisplay *display,
     if (!display) {
         return 0;
     }
+    /*
+     * The handoff framebuffer is a native 32-bpp GOP surface.  A direct
+     * mapping cannot reinterpret 8/15/16/24-bpp guest pixels, so reject
+     * those modes instead of exposing a silently corrupt display.
+     */
+    if (display->gop.valid &&
+        display->gop.owner == LOONGEMU_FB_OWNER_HOST_GOP && bpp != 32u) {
+        return 0;
+    }
     if (bpp != 8u && bpp != 15u && bpp != 16u && bpp != 24u && bpp != 32u) {
         return 0;
     }

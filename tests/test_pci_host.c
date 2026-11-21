@@ -267,6 +267,12 @@ static void test_bochs_gop_geometry_and_bar0(void)
     loongemu_bochs_mmio_write(&host.display, 0x500u + (2u << 1), 600u, 2u);
     CHECK(loongemu_bochs_mmio_read(&host.display, 0x502u, 2u) == 800u);
     CHECK(loongemu_bochs_mmio_read(&host.display, 0x504u, 2u) == 600u);
+
+    /* Direct GOP backing cannot reinterpret non-32-bpp guest pixels. */
+    loongemu_bochs_mmio_write(&host.display, 0x500u + (3u << 1), 8u, 2u);
+    CHECK(loongemu_bochs_mmio_read(&host.display, 0x506u, 2u) == 32u);
+    loongemu_bochs_mmio_write(&host.display, 0x500u + (3u << 1), 16u, 2u);
+    CHECK(loongemu_bochs_mmio_read(&host.display, 0x506u, 2u) == 32u);
 }
 
 static void test_ls7a_blacklist_flag_dev_fix_and_mrrs(void)

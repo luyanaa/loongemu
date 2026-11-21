@@ -228,6 +228,8 @@ void latx_runtime_init(void);
 void latx_x86_env_init_features(CPUX86State *env);
 void latx_platform_tlb_flush_all(void);
 void latx_platform_tlb_flush_page(uint64_t addr);
+/* noflush: PCID-qualified MOV CR3 that must retain other address-space state. */
+void latx_platform_tlb_switch_cr3(int noflush);
 int latx_gen_prologue(void *code_buf);
 int latx_gen_epilogue(void *code_buf);
 extern ADDR context_switch_bt_to_native;

@@ -233,6 +233,9 @@ uint64_t hv_request_flush_all(void);
 int hv_flush_barrier_ready(uint64_t ticket);
 int hv_release_flush_barrier(uint64_t ticket);
 void hv_cancel_flush_barrier(uint64_t ticket);
+static uint64_t hv_barrier_now(void);
+static uint64_t hv_barrier_timeout_ticks(void);
+static void hv_barrier_watchdog_fail(uint64_t ticket) __attribute__((noreturn));
 static LoongemuMemMap g_mem_map;
 static LoongemuVClock g_vclock;
 static OvmfBoard g_ovmf_board;
@@ -287,6 +290,8 @@ static volatile uint64_t g_hv_barrier_active;
 static volatile uint64_t g_hv_barrier_released;
 static volatile uint64_t g_hv_barrier_targets;
 static volatile uint32_t g_hv_barrier_coordinator;
+static volatile uint64_t g_hv_barrier_last_seen[MAX_VCPUS];
+static volatile uint64_t g_hv_barrier_timeouts;
 static volatile uint64_t g_isolation_violations;
 static volatile uint64_t g_tlb_shootdowns;
 static volatile uint64_t g_ipi_shootdowns_handled;
@@ -1419,8 +1424,14 @@ static int bochs_process_pending_bar_maps(void)
     if (ticket == 0) {
         return -1;
     }
-    while (!hv_flush_barrier_ready(ticket)) {
-        __asm__ volatile("dbar 0x700" ::: "memory");
+    {
+        uint64_t deadline = hv_barrier_now() + hv_barrier_timeout_ticks();
+        while (!hv_flush_barrier_ready(ticket)) {
+            if (hv_barrier_now() > deadline) {
+                hv_barrier_watchdog_fail(ticket);
+            }
+            __asm__ volatile("dbar 0x700" ::: "memory");
+        }
     }
 
     loongemu_spin_lock(&g_bochs_bar_lock);
@@ -2548,6 +2559,58 @@ static uint64_t hv_publish_flush_request(uint32_t pcpu, uint64_t vp_mask,
     return ticket;
 }
 
+static uint64_t hv_barrier_now(void)
+{
+    return vclock_read_host_rdtime(0);
+}
+
+static uint64_t hv_barrier_timeout_ticks(void)
+{
+    uint64_t hz = g_host_timer_hz ? g_host_timer_hz : UINT64_C(100000000);
+
+    return hz * UINT64_C(5); /* five seconds of host time */
+}
+
+static void __attribute__((noreturn))
+hv_barrier_watchdog_fail(uint64_t ticket)
+{
+    uint64_t targets = __atomic_load_n(&g_hv_barrier_targets, __ATOMIC_ACQUIRE);
+    uint32_t coordinator =
+        __atomic_load_n(&g_hv_barrier_coordinator, __ATOMIC_ACQUIRE);
+    uint64_t parked = 0;
+    uint32_t last = UINT32_MAX;
+    uint64_t last_ticks = 0;
+
+    g_hv_barrier_timeouts++;
+    for (uint32_t pcpu = 0; pcpu < MAX_VCPUS; pcpu++) {
+        if (__atomic_load_n(&g_shard[pcpu].hv_barrier_parked,
+                            __ATOMIC_ACQUIRE) >= ticket) {
+            parked |= UINT64_C(1) << pcpu;
+        }
+        if (targets & (UINT64_C(1) << pcpu)) {
+            uint64_t seen =
+                __atomic_load_n(&g_hv_barrier_last_seen[pcpu],
+                                __ATOMIC_ACQUIRE);
+            if (last == UINT32_MAX || seen < last_ticks) {
+                last = pcpu;
+                last_ticks = seen;
+            }
+        }
+    }
+    latx_bare_uart_puts("tb-sys: hv_barrier_timeout gen=");
+    puthex(ticket);
+    latx_bare_uart_puts(" coordinator=");
+    puthex(coordinator);
+    latx_bare_uart_puts(" targets=");
+    puthex(targets);
+    latx_bare_uart_puts(" parked=");
+    puthex(parked);
+    latx_bare_uart_puts(" last_pcpu=");
+    puthex(last);
+    latx_bare_uart_puts("\n");
+    latx_platform_refuse("Hyper-V/VMM barrier watchdog timeout");
+}
+
 /*
  * Called only from a dispatcher-safe point, or from the terminal VMCALL /
  * VMMCALL helper.  An IPI handler only leaves the mailbox pending: an
@@ -2607,12 +2670,18 @@ static int hv_service_flush_requests(void)
     (void)hv_recycle_tb_shard();
     __atomic_store_n(&shard->hv_flush_completed, ticket, __ATOMIC_RELEASE);
     if (barrier_ticket != 0) {
+        __atomic_store_n(&g_hv_barrier_last_seen[self], hv_barrier_now(),
+                         __ATOMIC_RELEASE);
         __atomic_store_n(&shard->hv_barrier_parked, barrier_ticket,
                          __ATOMIC_RELEASE);
         if (self != __atomic_load_n(&g_hv_barrier_coordinator,
                                     __ATOMIC_ACQUIRE)) {
+            uint64_t deadline = hv_barrier_now() + hv_barrier_timeout_ticks();
             while (__atomic_load_n(&g_hv_barrier_released,
                                    __ATOMIC_ACQUIRE) < barrier_ticket) {
+                if (hv_barrier_now() > deadline) {
+                    hv_barrier_watchdog_fail(barrier_ticket);
+                }
                 (void)hv_service_flush_requests();
                 __asm__ volatile("dbar 0x700" ::: "memory");
             }
@@ -2653,12 +2722,18 @@ static void hv_flush_vp_mask(uint64_t mask)
     if (ticket[self] != 0) {
         (void)hv_service_flush_requests();
     }
-    for (uint32_t pcpu = 0; pcpu < MAX_VCPUS; pcpu++) {
-        while (ticket[pcpu] != 0 &&
-               __atomic_load_n(&g_shard[pcpu].hv_flush_completed,
-                               __ATOMIC_ACQUIRE) < ticket[pcpu]) {
-            (void)hv_service_flush_requests();
-            __asm__ volatile("dbar 0x700" ::: "memory");
+    {
+        uint64_t deadline = hv_barrier_now() + hv_barrier_timeout_ticks();
+        for (uint32_t pcpu = 0; pcpu < MAX_VCPUS; pcpu++) {
+            while (ticket[pcpu] != 0 &&
+                   __atomic_load_n(&g_shard[pcpu].hv_flush_completed,
+                                   __ATOMIC_ACQUIRE) < ticket[pcpu]) {
+                if (hv_barrier_now() > deadline) {
+                    hv_barrier_watchdog_fail(ticket[pcpu]);
+                }
+                (void)hv_service_flush_requests();
+                __asm__ volatile("dbar 0x700" ::: "memory");
+            }
         }
     }
 }
@@ -2791,9 +2866,15 @@ void hv_cancel_flush_barrier(uint64_t ticket)
      * request unconsumed: the next barrier could overwrite it and the old
      * target would park forever.  Drain every target before reuse.
      */
-    while (!hv_flush_barrier_ready(ticket)) {
-        (void)hv_service_flush_requests();
-        __asm__ volatile("dbar 0x700" ::: "memory");
+    {
+        uint64_t deadline = hv_barrier_now() + hv_barrier_timeout_ticks();
+        while (!hv_flush_barrier_ready(ticket)) {
+            if (hv_barrier_now() > deadline) {
+                hv_barrier_watchdog_fail(ticket);
+            }
+            (void)hv_service_flush_requests();
+            __asm__ volatile("dbar 0x700" ::: "memory");
+        }
     }
     /* Safe only before the caller commits the remap. */
     __atomic_store_n(&g_hv_barrier_released, ticket, __ATOMIC_RELEASE);
@@ -2810,9 +2891,16 @@ static int hv_wait_for_barrier_release(void)
         __atomic_load_n(&g_hv_barrier_coordinator, __ATOMIC_ACQUIRE) != self) {
         return 0;
     }
-    while (__atomic_load_n(&g_hv_barrier_active, __ATOMIC_ACQUIRE) == ticket) {
-        (void)hv_service_flush_requests();
-        __asm__ volatile("dbar 0x700" ::: "memory");
+    {
+        uint64_t deadline = hv_barrier_now() + hv_barrier_timeout_ticks();
+        while (__atomic_load_n(&g_hv_barrier_active, __ATOMIC_ACQUIRE) ==
+               ticket) {
+            if (hv_barrier_now() > deadline) {
+                hv_barrier_watchdog_fail(ticket);
+            }
+            (void)hv_service_flush_requests();
+            __asm__ volatile("dbar 0x700" ::: "memory");
+        }
     }
 
     /* Discard code translated while a coordinator was waiting on the barrier. */
@@ -2880,6 +2968,21 @@ void latx_platform_tlb_flush_page(uint64_t addr)
             __asm__ volatile("invtlb 0x5, %0, %1" :: "r"(other), "r"(vppn) : "memory");
         }
     }
+}
+
+void latx_platform_tlb_switch_cr3(int noflush)
+{
+    if (!noflush) {
+        latx_platform_tlb_flush_all();
+        return;
+    }
+    /*
+     * PCID-qualified MOV CR3 does not flush other address spaces.  Reuse the
+     * software ASID bank; keep the software TLB keyed by (CR3, PCID), but
+     * discard the single fast-jump root because it is not yet banked.
+     */
+    memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
+    asid_activate(0);
 }
 
 /*
@@ -3516,6 +3619,7 @@ static uint64_t g_hv_hypercall_msr;
 static uint64_t g_hv_apic_assist[MAX_VCPUS];
 static volatile uint8_t g_hv_apic_assist_pending[MAX_VCPUS];
 static volatile uint64_t g_hv_flush_calls;
+static volatile uint32_t g_last_ipi_pcpu = UINT32_MAX;
 
 static void pv_eoi_sync_locked(uint32_t cpu)
 {
@@ -3766,9 +3870,32 @@ static void hv_flush_callback(void *opaque, uint64_t mask,
     hv_flush_vp_mask(mask);
 }
 
-static void hv_send_ipi_callback(void *opaque, uint64_t mask, uint8_t vector)
+static void hv_send_ipi_to_vp_owner(uint32_t vp)
 {
     uint32_t self = cur_pcpu();
+    uint32_t pcpu = hv_vp_owner_pcpu(vp);
+    uint32_t after;
+
+    if (pcpu != self &&
+        __atomic_load_n(&g_pcpu_online[pcpu], __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&g_last_ipi_pcpu, pcpu, __ATOMIC_RELEASE);
+        loongemu_ipi_send(pcpu, 0u);
+    }
+    /*
+     * Ownership can move between the lookup and the IPI.  The new owner must
+     * also observe the already-published LAPIC IRR/kick, so recheck once and
+     * send there as well; duplicate wake IPIs are harmless.
+     */
+    after = hv_vp_owner_pcpu(vp);
+    if (after != pcpu && after != self &&
+        __atomic_load_n(&g_pcpu_online[after], __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&g_last_ipi_pcpu, after, __ATOMIC_RELEASE);
+        loongemu_ipi_send(after, 0u);
+    }
+}
+
+static void hv_send_ipi_callback(void *opaque, uint64_t mask, uint8_t vector)
+{
     (void)opaque;
     loongemu_spin_lock(&g_lapic_lock);
     for (uint32_t v = 0; v < MAX_VCPUS; v++) {
@@ -3778,9 +3905,7 @@ static void hv_send_ipi_callback(void *opaque, uint64_t mask, uint8_t vector)
         }
         lapic_set_irr(v, vector);
         __atomic_store_n(&g_vcpu_halted[v], 0, __ATOMIC_RELEASE);
-        if (v != self && __atomic_load_n(&g_pcpu_online[v], __ATOMIC_ACQUIRE)) {
-            loongemu_ipi_send(v, 0u);
-        }
+        hv_send_ipi_to_vp_owner(v);
     }
     loongemu_spin_unlock(&g_lapic_lock);
 }
@@ -3809,9 +3934,7 @@ void helper_hypercall(CPUX86State *e)
         if (target < MAX_VCPUS) {
             __atomic_store_n(&g_vcpu_kicked[target], 1, __ATOMIC_RELEASE);
             g_vcpu_halted[target] = 0;
-            if (target != self_pcpu && __atomic_load_n(&g_pcpu_online[target], __ATOMIC_ACQUIRE)) {
-                loongemu_ipi_send(target, 0u);
-            }
+            hv_send_ipi_to_vp_owner(target);
         }
         e->regs[R_EAX] = 0;
         return;
@@ -7545,6 +7668,28 @@ void kmain(void)
         r = latx_x86_walk_cached(&env, 0x1000, LATX_X86_ACCESS_WRITE, &t);
         check(r == LATX_X86_WALK_OK, "CR3 write drops the cache");
 
+        /* PCID-qualified CR3 switches reuse the software ASID bank. */
+        {
+            uint64_t saved_cr3 = env.cr[3];
+            uint64_t saved_cr4 = env.cr[4];
+            uint64_t hits_before = g_asid_hits;
+            uint16_t asid_a;
+
+            env.cr[4] |= X86_CR4_PCIDE;
+            cpu_x86_update_cr3(&env,
+                               UINT64_C(0x3000) | (UINT64_C(1) << 63) | 1u);
+            asid_a = g_cur_asid;
+            cpu_x86_update_cr3(&env,
+                               UINT64_C(0x4000) | (UINT64_C(1) << 63) | 2u);
+            cpu_x86_update_cr3(&env,
+                               UINT64_C(0x3000) | (UINT64_C(1) << 63) | 1u);
+            check(g_cur_asid == asid_a && g_asid_hits > hits_before,
+                  "PCID bank reuses an address-space ASID");
+            env.cr[3] = saved_cr3;
+            env.cr[4] = saved_cr4;
+            asid_activate(1);
+        }
+
         /* PS at the PML4 level is a reserved encoding, not a 512 GiB page. */
         *(volatile uint64_t *)gpa_to_host_ptr(0x4000) = 0x83;
         *(volatile uint64_t *)gpa_to_host_ptr(0x2000) = 0x3003 | 0x80;
@@ -7882,6 +8027,8 @@ void kmain(void)
                 check(k_fb == LOONGEMU_MEM_RAM && lk_fb.hpa == h.gop.fb_hpa &&
                       xres == 1024u && yres == 768u && g_pci_host.ls7a.hide_host_dc_gpu == 1,
                       "VMM handoff binds Bochs BAR0 to GOP backing and geometry");
+                check(g_pci_host.ls7a.enabled == 0,
+                      "physical LS7A passthrough remains closed without callbacks");
                 bochs_display_bar_map_cb(0, 0, 0, 0, 0);
                 g_guest_ram_external = saved_external;
                 g_vmm_handoff = saved_handoff;
@@ -8599,6 +8746,55 @@ void kmain(void)
                                   "nested EOI retains underlying ISR");
                             latx_platform_kvm_wrmsr(&env, 0x40000070u, 0u);
                             latx_platform_kvm_wrmsr(&env, 0x40000073u, 0u);
+
+                            /* Synthetic IPIs must use the physical owner, not the VP index. */
+                            {
+                                uint32_t saved_pcpu1 =
+                                    __atomic_load_n(&g_pcpu_online[1],
+                                                    __ATOMIC_ACQUIRE);
+                                uint32_t saved_owner1 =
+                                    __atomic_load_n(&g_vp_owner[1],
+                                                    __ATOMIC_ACQUIRE);
+                                int saved_vcpu1 =
+                                    __atomic_load_n(&g_vcpu_online[1],
+                                                    __ATOMIC_ACQUIRE);
+
+                                __atomic_store_n(&g_pcpu_online[1], 1u,
+                                                 __ATOMIC_RELEASE);
+                                __atomic_store_n(&g_vp_owner[1], 1u,
+                                                 __ATOMIC_RELEASE);
+                                __atomic_store_n(&g_vcpu_online[1], 1,
+                                                 __ATOMIC_RELEASE);
+                                g_last_ipi_pcpu = UINT32_MAX;
+                                hv_send_ipi_callback(0, UINT64_C(2), 0x61u);
+                                check(g_last_ipi_pcpu == 1u &&
+                                      lapic_has_irr(1),
+                                      "Hyper-V synthetic IPI wakes the physical VP owner");
+                                (void)lapic_pop_irr(1);
+
+                                latx_hv_vendor = 0u;
+                                env.regs[R_EAX] = 5u; /* KVM_HC_KICK_CPU */
+                                env.regs[R_EBX] = 0u;
+                                env.regs[R_ECX] = 1u;
+                                __atomic_store_n(&g_vcpu_kicked[1], 0,
+                                                 __ATOMIC_RELEASE);
+                                g_last_ipi_pcpu = UINT32_MAX;
+                                helper_hypercall(&env);
+                                check(g_last_ipi_pcpu == 1u &&
+                                      __atomic_load_n(&g_vcpu_kicked[1],
+                                                      __ATOMIC_ACQUIRE),
+                                      "KVM kick routes to the physical VP owner");
+                                __atomic_store_n(&g_vcpu_kicked[1], 0,
+                                                 __ATOMIC_RELEASE);
+                                __atomic_store_n(&g_vcpu_online[1], saved_vcpu1,
+                                                 __ATOMIC_RELEASE);
+                                __atomic_store_n(&g_vp_owner[1], saved_owner1,
+                                                 __ATOMIC_RELEASE);
+                                __atomic_store_n(&g_pcpu_online[1], saved_pcpu1,
+                                                 __ATOMIC_RELEASE);
+                                /* The remainder of this block is Hyper-V mode. */
+                                latx_hv_vendor = 1u;
+                            }
 
                             /* Hyper-V Hypercalls: FlushVirtualAddressSpace + SendSyntheticClusterIpi */
                             env.regs[R_ECX] = 0x00010002u; /* fast HvCallFlushVirtualAddressSpace */

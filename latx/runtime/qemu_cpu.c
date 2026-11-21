@@ -218,12 +218,13 @@ void cpu_x86_update_cr3(CPUX86State *env, target_ulong new_cr3)
     if (!noflush) {
         if (env->cr[4] & CR4_PGE_MASK) {
             latx_x86_tlb_flush_non_global();
-            latx_platform_tlb_flush_all();
+            latx_platform_tlb_switch_cr3(0);
         } else {
             tlb_flush(0);
         }
     } else {
-        latx_platform_tlb_flush_all();
+        /* PCID-qualified CR3: keep other address-space caches intact. */
+        latx_platform_tlb_switch_cr3(1);
     }
 }
 
@@ -436,6 +437,13 @@ __attribute__((weak)) void latx_platform_tlb_flush_all(void)
 __attribute__((weak)) void latx_platform_tlb_flush_page(uint64_t addr)
 {
     (void)addr;
+}
+
+__attribute__((weak)) void latx_platform_tlb_switch_cr3(int noflush)
+{
+    if (!noflush) {
+        latx_platform_tlb_flush_all();
+    }
 }
 
 void tlb_flush(CPUState *cpu)
