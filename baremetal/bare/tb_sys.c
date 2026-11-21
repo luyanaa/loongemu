@@ -1853,8 +1853,11 @@ typedef struct FastJmpEntry {
 } FastJmpEntry;
 
 #define FAST_JMP_CACHE_SIZE (1u << TB_JMP_CACHE_BITS)
-static FastJmpEntry g_fast_jmp_cache[MAX_VCPUS][FAST_JMP_CACHE_SIZE]
+#define FAST_JMP_BANKS 4u
+static FastJmpEntry g_fast_jmp_cache[MAX_VCPUS][FAST_JMP_BANKS]
+                                    [FAST_JMP_CACHE_SIZE]
     __attribute__((aligned(4096)));
+static uint32_t g_fast_jmp_bank[MAX_VCPUS];
 
 typedef struct LargePageCache {
     uint64_t gpa_base;
@@ -1876,7 +1879,8 @@ static void large_page_cache_invalidate(uint32_t vcpu)
         g_large_page_cache[vcpu].valid = 0;
     }
 }
-#define fast_jmp_cache (g_fast_jmp_cache[g_cur_vcpu])
+#define fast_jmp_cache \
+    (g_fast_jmp_cache[g_cur_vcpu][g_fast_jmp_bank[g_cur_vcpu]])
 
 #define CODE_CACHE_PER_CORE (4 * 1024 * 1024)
 #define CODE_CACHE_SIZE CODE_CACHE_PER_CORE
@@ -2491,6 +2495,7 @@ static void asid_activate(int force_flush)
     uint8_t cpl = (uint8_t)(env.hflags & HF_CPL_MASK);
     uint8_t mmu_flags = current_mmu_flags();
     uint16_t asid = 0;
+    int asid_hit = 0;
 
     if (force_flush) {
         for (int i = 0; i < ASID_SLOTS; i++) {
@@ -2506,6 +2511,7 @@ static void asid_activate(int force_flush)
                 g_asid_slots[i].cr3 == cr3 && g_asid_slots[i].pcid == pcid &&
                 g_asid_slots[i].cpl == cpl && g_asid_slots[i].mmu_flags == mmu_flags) {
                 asid = g_asid_slots[i].asid;
+                asid_hit = 1;
                 g_asid_hits++;
                 break;
             }
@@ -2520,6 +2526,12 @@ static void asid_activate(int force_flush)
     g_cur_asid_pcid = pcid;
     g_cur_asid_cpl = cpl;
     g_cur_asid_mmu_flags = mmu_flags;
+    g_fast_jmp_bank[vcpu] = (uint32_t)(asid & (FAST_JMP_BANKS - 1u));
+    if (!asid_hit) {
+        memset(g_fast_jmp_cache[vcpu][g_fast_jmp_bank[vcpu]], 0,
+               sizeof(g_fast_jmp_cache[0][0]));
+    }
+    env.tb_jmp_cache_ptr = fast_jmp_cache;
     csrwr(0x18, (uint64_t)asid);
 }
 
@@ -2972,7 +2984,7 @@ void latx_platform_tlb_flush_all(void)
         asid_activate(0);
         return;
     }
-    memset(fast_jmp_cache, 0, sizeof(g_fast_jmp_cache[0]));
+    memset(g_fast_jmp_cache[g_cur_vcpu], 0, sizeof(g_fast_jmp_cache[0]));
     large_page_cache_invalidate(g_cur_vcpu);
     asid_activate(1);
 }
@@ -3005,10 +3017,8 @@ void latx_platform_tlb_switch_cr3(int noflush)
     }
     /*
      * PCID-qualified MOV CR3 does not flush other address spaces.  Reuse the
-     * software ASID bank; keep the software TLB keyed by (CR3, PCID), but
-     * discard the single fast-jump root because it is not yet banked.
+     * software ASID bank and switch to that ASID's fast-jump root.
      */
-    memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
     large_page_cache_invalidate(g_cur_vcpu);
     asid_activate(0);
 }
@@ -5137,7 +5147,7 @@ static void smc_flush_local_shard(int32_t *prev_slot_io)
         g_tb_highwater = 0;
         g_tb_by_code_count = 0;
         *prev_slot_io = -1;
-        memset(fast_jmp_cache, 0, sizeof(g_fast_jmp_cache[0]));
+        memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
         code_used = 0x2000;
         __atomic_fetch_add(&g_sync_core_flushes, 1u, __ATOMIC_RELAXED);
         __asm__ volatile("dbar 0\n ibar 0" ::: "memory");
@@ -5191,7 +5201,7 @@ static void smc_flush_local_shard(int32_t *prev_slot_io)
             g_tb_highwater = 0;
             g_tb_by_code_count = 0;
             *prev_slot_io = -1;
-            memset(fast_jmp_cache, 0, sizeof(g_fast_jmp_cache[0]));
+            memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
             code_used = 0x2000;
             __atomic_fetch_add(&g_sync_core_flushes, 1u, __ATOMIC_RELAXED);
             __asm__ volatile("dbar 0\n ibar 0" ::: "memory");
@@ -5232,7 +5242,7 @@ static void run_ap_vcpu_loop(uint32_t pcpu)
     g_smc_dirty = 0;
     g_smc_dirty_count = 0;
     g_smc_dirty_overflow = 0;
-    memset(fast_jmp_cache, 0, sizeof(g_fast_jmp_cache[0]));
+    memset(g_fast_jmp_cache[g_cur_vcpu], 0, sizeof(g_fast_jmp_cache[0]));
     env.tb_jmp_cache_ptr = 0;
     latx_x86_tlb_flush_all();
     asid_activate(1);
@@ -5301,7 +5311,7 @@ static void run_ap_vcpu_loop(uint32_t pcpu)
                 g_tb_highwater = 0;
                 g_tb_by_code_count = 0;
                 prev_slot = -1;
-                memset(fast_jmp_cache, 0, sizeof(g_fast_jmp_cache[0]));
+                memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
                 code_used = 0x2000;
                 __asm__ volatile("ibar 0" ::: "memory");
             }
@@ -5311,7 +5321,7 @@ static void run_ap_vcpu_loop(uint32_t pcpu)
                 g_tb_highwater = 0;
                 g_tb_by_code_count = 0;
                 prev_slot = -1;
-                memset(fast_jmp_cache, 0, sizeof(g_fast_jmp_cache[0]));
+                memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
                 code_used = 0x2000;
                 e = tbc_insert_mode(&tb_cache, before, tb_cs_base, tb_cr3, cpl, tb_mode);
             }
@@ -6571,7 +6581,7 @@ static void unlink_tb_at_pc(uint64_t fault_pc)
         if (unlinked) {
             __asm__ volatile("ibar 0" ::: "memory");
         } else if (map->jmp_slot_off[0] < 0 && map->jmp_slot_off[1] < 0) {
-            memset(fast_jmp_cache, 0, sizeof(g_fast_jmp_cache[0]));
+            memset(fast_jmp_cache, 0, sizeof(fast_jmp_cache));
         }
     }
 }
@@ -7771,8 +7781,9 @@ void kmain(void)
                                UINT64_C(0x4000) | (UINT64_C(1) << 63) | 2u);
             cpu_x86_update_cr3(&env,
                                UINT64_C(0x3000) | (UINT64_C(1) << 63) | 1u);
-            check(g_cur_asid == asid_a && g_asid_hits > hits_before,
-                  "PCID bank reuses an address-space ASID");
+            check(g_cur_asid == asid_a && g_asid_hits > hits_before &&
+                  env.tb_jmp_cache_ptr == (uint64_t)(uintptr_t)fast_jmp_cache,
+                  "PCID bank reuses ASID and its fast-jump root");
             env.cr[3] = saved_cr3;
             env.cr[4] = saved_cr4;
             asid_activate(1);
