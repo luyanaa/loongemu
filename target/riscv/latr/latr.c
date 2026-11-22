@@ -1,5 +1,8 @@
 #include "latr.h"
 #include "translate.h"
+#include "mmu.h"
+#include "loongemu/riscv_sbi.h"
+#include "loongemu/mmio_bus.h"
 
 static __thread TRANSLATION_DATA tr_data_real;
 static __thread ENV lsenv_real;
@@ -20,17 +23,83 @@ const int latr_la_fmap[32] = {
     -1, -1, -1, -1, -1, -1, -1, -1
 };
 
-uint16_t latr_guest_lduw(uint64_t address)
+static CPUArchState *latr_cpu_env(void)
 {
-    const uint8_t *p = (const uint8_t *)(uintptr_t)address;
-    return (uint16_t)p[0] | (uint16_t)p[1] << 8;
+    return (CPUArchState *)lsenv->cpu_state;
 }
 
+/* Fetches one 16-bit half through the page table and physical map. */
+static bool latr_fetch16(uint64_t va, uint16_t *out, int *cause)
+{
+    CPUArchState *env = latr_cpu_env();
+    uint64_t host = 0;
+    uint64_t phys = 0;
+    int fault = latr_translate(env, va, LATR_ACCESS_EXEC, 2, &host, &phys);
+
+    if (fault != 0) {
+        *cause = fault;
+        return false;
+    }
+    if (env->mem_mmio) {
+        /* Execute-in-place through an MMIO bus (pflash) must not dereference
+         * the device address directly. */
+        uint64_t value = 0;
+        env->mem_mmio = 0;
+        if (env->mmio == 0 ||
+            loongemu_mmio_bus_read(env->mmio, phys, 2, &value) != 0) {
+            *cause = LATR_EXCP_INST_ACCESS_FAULT;
+            return false;
+        }
+        *out = (uint16_t)value;
+        return true;
+    }
+    const uint8_t *p = (const uint8_t *)(uintptr_t)host;
+    *out = (uint16_t)(p[0] | (uint16_t)p[1] << 8);
+    return true;
+}
+
+static void latr_record_fetch_fault(uint64_t va, int cause)
+{
+    CPUArchState *env = latr_cpu_env();
+
+    env->fetch_faulted = 1;
+    env->fetch_fault_va = va;
+    env->fetch_fault_cause = (uint64_t)cause;
+}
+
+uint16_t latr_guest_lduw(uint64_t address)
+{
+    CPUArchState *env = latr_cpu_env();
+    uint16_t half = 0;
+
+    int cause = 0;
+
+    env->fetch_faulted = 0;
+    if (!latr_fetch16(address, &half, &cause)) {
+        latr_record_fetch_fault(address, cause);
+    }
+    return half;
+}
+
+/* A 32-bit instruction may straddle two pages: each half walks on its own. */
 uint32_t latr_guest_ldl(uint64_t address)
 {
-    const uint8_t *p = (const uint8_t *)(uintptr_t)address;
-    return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
-           (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+    CPUArchState *env = latr_cpu_env();
+    uint16_t lo = 0;
+    uint16_t hi = 0;
+
+    int cause = 0;
+
+    env->fetch_faulted = 0;
+    if (!latr_fetch16(address, &lo, &cause)) {
+        latr_record_fetch_fault(address, cause);
+        return 0;
+    }
+    if (!latr_fetch16(address + 2, &hi, &cause)) {
+        latr_record_fetch_fault(address + 2, cause);
+        return 0;
+    }
+    return (uint32_t)lo | (uint32_t)hi << 16;
 }
 
 void latr_tr_data_init(CPUArchState *env)
@@ -47,6 +116,7 @@ void tr_init(void *tb)
     TRANSLATION_DATA *data = lsenv->tr_data;
     data->curr_tb = tb;
     ra_free_all();
+    latr_pvir_cache_clear();
     if (data->ir2_inst_array == NULL) {
         data->ir2_inst_array = mm_calloc(400, sizeof(IR2_INST));
         lsassertm(data->ir2_inst_array != NULL, "cannot allocate LATR IR2 array");
@@ -57,6 +127,35 @@ void tr_init(void *tb)
     data->first_ir2 = NULL;
     data->last_ir2 = NULL;
     data->label_num = 0;
+}
+
+/*
+ * VMM-side SBI entry: services an S-mode ECALL trap (mcause = 9 with
+ * mstatus.MPP = S) and resumes the guest at mepc + 4. Returns false when the
+ * pending trap is not an S-mode ECALL, so the caller can handle it normally.
+ */
+bool latr_service_sbi(CPUArchState *env, LoongemuSbi *sbi)
+{
+    unsigned cause = (unsigned)env->exception;
+    unsigned mpp = (unsigned)((env->csr[0x300] >> 11) & 3);
+
+    if (cause != 9 || mpp != LATR_RISCV_PRIV_S || sbi == NULL) {
+        return false;
+    }
+
+    uint64_t args[6] = {
+        env->gpr[10], env->gpr[11], env->gpr[12],
+        env->gpr[13], env->gpr[14], env->gpr[15],
+    };
+    LoongemuSbiRet ret = loongemu_sbi_call(sbi, env->gpr[17], env->gpr[16],
+                                           args);
+
+    env->gpr[10] = (uint64_t)ret.error;
+    env->gpr[11] = ret.value;
+    env->pc = env->csr[0x341] + 4; /* mepc points at the ECALL */
+    env->exception = 0;
+    env->privilege = LATR_RISCV_PRIV_S;
+    return true;
 }
 
 void tr_fini(void)
@@ -177,18 +276,33 @@ bool tr_ir2_generate(TranslationBlock *tb)
     int exit_count = 0;
     int count = tb->icount;
 
+    TRANSLATION_DATA *data = lsenv->tr_data;
+
     uint64_t pc = tb->pc;
     for (int i = 0; i < count; i++) {
         uint16_t half = latr_guest_lduw(pc);
         uint32_t raw = (half & 3) == 3 ? latr_guest_ldl(pc) : half;
+        data->tb_insn_pc[i] = pc;
         if (!latr_decode(pc, raw, &insns[i])) {
-            return false;
+            if (latr_cpu_env()->fetch_faulted) {
+                insns[i].opcode = LATR_RV_FETCH_FAULT;
+                insns[i].fault_va = latr_cpu_env()->fetch_fault_va;
+                insns[i].fault_cause = (int)latr_cpu_env()->fetch_fault_cause;
+                insns[i].raw_len = 4;
+            }
+            data->tb_insn_len[i] = insns[i].raw_len;
+            count = i + 1;
+            pc += insns[i].raw_len;
+            break;
         }
+        data->tb_insn_len[i] = insns[i].raw_len;
         pc += insns[i].raw_len;
     }
+    data->tb_insn_count = count;
 
     for (int i = 0; i <= count; i++) {
         labels[i] = ir2_opnd_new_type(IR2_OPND_LABEL);
+        data->tb_insn_label[i] = ir2_opnd_label_id(&labels[i]);
     }
 
     for (int i = 0; i < count; i++) {
@@ -249,6 +363,31 @@ bool tr_ir2_generate(TranslationBlock *tb)
     return true;
 }
 
+static bool tb_terminator(LatrRiscvOpcode opcode)
+{
+    switch (opcode) {
+    case LATR_RV_JAL:
+    case LATR_RV_JALR:
+    case LATR_RV_BEQ:
+    case LATR_RV_BNE:
+    case LATR_RV_BLT:
+    case LATR_RV_BGE:
+    case LATR_RV_BLTU:
+    case LATR_RV_BGEU:
+    case LATR_RV_MRET:
+    case LATR_RV_SRET:
+    case LATR_RV_ECALL:
+    case LATR_RV_EBREAK:
+    case LATR_RV_FENCE_I:
+    case LATR_RV_VSETVLI:
+    case LATR_RV_VSETVL:
+    case LATR_RV_VSETIVLI:
+        return true;
+    default:
+        return false;
+    }
+}
+
 void target_disasm(TranslationBlock *tb, int *max_insns, CPUState *cpu)
 {
     (void)cpu;
@@ -261,15 +400,31 @@ void target_disasm(TranslationBlock *tb, int *max_insns, CPUState *cpu)
 
     uint64_t pc = tb->pc;
     int count = 0;
+    bool allow_flow = (tb->cflags & LATR_TB_CFLAGS_ALLOW_FLOW) != 0;
+
     while (count < limit) {
         uint16_t half = latr_guest_lduw(pc);
         uint32_t raw = (half & 3) == 3 ? latr_guest_ldl(pc) : half;
         RiscvIR1 ir1;
-        if (!latr_decode(pc, raw, &ir1)) {
+        bool decoded = latr_decode(pc, raw, &ir1);
+        uint32_t raw_len = decoded ? (uint32_t)ir1.raw_len : 2;
+
+        if (!decoded || ir1.raw_len <= 0) {
+            pc += 2;
+            count++;
             break;
         }
-        pc += ir1.raw_len;
+        /* Only the first instruction may cross a 4 KiB page: later
+         * instructions start a new TB at the boundary. */
+        if (count > 0 &&
+            ((pc ^ (pc + raw_len - 1)) & ~UINT64_C(0xfff)) != 0) {
+            break;
+        }
+        pc += raw_len;
         count++;
+        if (!allow_flow && tb_terminator(ir1.opcode)) {
+            break;
+        }
     }
     tb->icount = count;
     tb->size = (uint16_t)(pc - tb->pc);
@@ -324,13 +479,31 @@ void label_dispose(void)
 int tr_ir2_assemble(const void *code_start_addr)
 {
     label_dispose();
+    TRANSLATION_DATA *data = lsenv->tr_data;
     uint32_t *code = (uint32_t *)code_start_addr;
     int count = 0;
-    for (IR2_INST *inst = lsenv->tr_data->first_ir2; inst != NULL; inst = ir2_next(inst)) {
+    uint32_t span_off[LATR_TB_MAP_SPANS + 1];
+
+    for (int i = 0; i <= data->tb_insn_count && i <= LATR_TB_MAP_SPANS; i++) {
+        span_off[i] = 0;
+    }
+    for (IR2_INST *inst = data->first_ir2; inst != NULL; inst = ir2_next(inst)) {
         if (ir2_opcode(inst) == LISA_LABEL) {
+            int id = ir2_opnd_label_id(&inst->_opnd[0]);
+            for (int i = 0; i <= data->tb_insn_count; i++) {
+                if (data->tb_insn_label[i] == id) {
+                    span_off[i] = (uint32_t)(count * 4);
+                }
+            }
             continue;
         }
         code[count++] = ir2_assemble(inst);
+    }
+
+    latr_tb_insn_map_begin((void *)code_start_addr, (uint32_t)count * 4);
+    for (int i = 0; i < data->tb_insn_count; i++) {
+        latr_tb_insn_map_add(data->tb_insn_pc[i], span_off[i],
+                             span_off[i + 1], data->tb_insn_len[i]);
     }
     return count;
 }

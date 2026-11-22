@@ -5,6 +5,11 @@
 #define LATR_WEAK __attribute__((weak))
 
 LATR_WEAK void qemu_log(const char *fmt, ...) { (void)fmt; }
+LATR_WEAK void lata_ir2_debug(unsigned int opcode, unsigned int word)
+{
+    (void)opcode;
+    (void)word;
+}
 LATR_WEAK void latx_bare_assert_fail(const char *expr, const char *file, int line)
 {
     (void)expr;

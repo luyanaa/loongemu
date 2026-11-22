@@ -9,9 +9,11 @@ static bool trans_add(DisasContext *ctx, arg_add *a)
 }
 static bool trans_add_uw(DisasContext *ctx, arg_add_uw *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_ADD_UW;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_addd(DisasContext *ctx, arg_addd *a)
 {
@@ -331,9 +333,11 @@ static bool trans_andi(DisasContext *ctx, arg_andi *a)
 }
 static bool trans_andn(DisasContext *ctx, arg_andn *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_ANDN;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_auipc(DisasContext *ctx, arg_auipc *a)
 {
@@ -344,15 +348,19 @@ static bool trans_auipc(DisasContext *ctx, arg_auipc *a)
 }
 static bool trans_bclr(DisasContext *ctx, arg_bclr *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_BCLR;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_bclri(DisasContext *ctx, arg_bclri *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_BCLRI;
+    ctx->ir1->arg.shamt = a->shamt;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rd = a->rd;
+    return true;
 }
 static bool trans_beq(DisasContext *ctx, arg_beq *a)
 {
@@ -364,15 +372,19 @@ static bool trans_beq(DisasContext *ctx, arg_beq *a)
 }
 static bool trans_bext(DisasContext *ctx, arg_bext *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_BEXT;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_bexti(DisasContext *ctx, arg_bexti *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_BEXTI;
+    ctx->ir1->arg.shamt = a->shamt;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rd = a->rd;
+    return true;
 }
 static bool trans_bge(DisasContext *ctx, arg_bge *a)
 {
@@ -392,15 +404,19 @@ static bool trans_bgeu(DisasContext *ctx, arg_bgeu *a)
 }
 static bool trans_binv(DisasContext *ctx, arg_binv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_BINV;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_binvi(DisasContext *ctx, arg_binvi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_BINVI;
+    ctx->ir1->arg.shamt = a->shamt;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rd = a->rd;
+    return true;
 }
 static bool trans_blt(DisasContext *ctx, arg_blt *a)
 {
@@ -434,15 +450,19 @@ static bool trans_brev8(DisasContext *ctx, arg_brev8 *a)
 }
 static bool trans_bset(DisasContext *ctx, arg_bset *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_BSET;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_bseti(DisasContext *ctx, arg_bseti *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_BSETI;
+    ctx->ir1->arg.shamt = a->shamt;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rd = a->rd;
+    return true;
 }
 static bool trans_c64_illegal(DisasContext *ctx, arg_c64_illegal *a)
 {
@@ -552,27 +572,27 @@ static bool trans_c_zext_w(DisasContext *ctx, arg_c_zext_w *a)
 }
 static bool trans_cbo_clean(DisasContext *ctx, arg_cbo_clean *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_CBO_CLEAN;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_cbo_flush(DisasContext *ctx, arg_cbo_flush *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_CBO_FLUSH;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_cbo_inval(DisasContext *ctx, arg_cbo_inval *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_CBO_INVAL;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_cbo_zero(DisasContext *ctx, arg_cbo_zero *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_CBO_ZERO;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_clmul(DisasContext *ctx, arg_clmul *a)
 {
@@ -594,15 +614,17 @@ static bool trans_clmulr(DisasContext *ctx, arg_clmulr *a)
 }
 static bool trans_clz(DisasContext *ctx, arg_clz *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_CLZ;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_clzw(DisasContext *ctx, arg_clzw *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_CLZW;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_cm_jalt(DisasContext *ctx, arg_cm_jalt *a)
 {
@@ -648,15 +670,17 @@ static bool trans_cm_push(DisasContext *ctx, arg_cm_push *a)
 }
 static bool trans_cpop(DisasContext *ctx, arg_cpop *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_CPOP;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_cpopw(DisasContext *ctx, arg_cpopw *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_CPOPW;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_csrrc(DisasContext *ctx, arg_csrrc *a)
 {
@@ -708,15 +732,17 @@ static bool trans_csrrwi(DisasContext *ctx, arg_csrrwi *a)
 }
 static bool trans_ctz(DisasContext *ctx, arg_ctz *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_CTZ;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_ctzw(DisasContext *ctx, arg_ctzw *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_CTZW;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_czero_eqz(DisasContext *ctx, arg_czero_eqz *a)
 {
@@ -1890,33 +1916,40 @@ static bool trans_lwu(DisasContext *ctx, arg_lwu *a)
 }
 static bool trans_max(DisasContext *ctx, arg_max *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_MAX;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_maxu(DisasContext *ctx, arg_maxu *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_MAXU;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_min(DisasContext *ctx, arg_min *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_MIN;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_minu(DisasContext *ctx, arg_minu *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_MINU;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_mret(DisasContext *ctx, arg_mret *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_MRET;
+    return true;
 }
 static bool trans_mul(DisasContext *ctx, arg_mul *a)
 {
@@ -1974,9 +2007,10 @@ static bool trans_or(DisasContext *ctx, arg_or *a)
 }
 static bool trans_orc_b(DisasContext *ctx, arg_orc_b *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_ORC_B;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_ori(DisasContext *ctx, arg_ori *a)
 {
@@ -1988,9 +2022,11 @@ static bool trans_ori(DisasContext *ctx, arg_ori *a)
 }
 static bool trans_orn(DisasContext *ctx, arg_orn *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_ORN;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_pack(DisasContext *ctx, arg_pack *a)
 {
@@ -2012,9 +2048,8 @@ static bool trans_packw(DisasContext *ctx, arg_packw *a)
 }
 static bool trans_pause(DisasContext *ctx, arg_pause *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_PAUSE;
+    return true;
 }
 static bool trans_rem(DisasContext *ctx, arg_rem *a)
 {
@@ -2068,45 +2103,58 @@ static bool trans_rev8_32(DisasContext *ctx, arg_rev8_32 *a)
 }
 static bool trans_rev8_64(DisasContext *ctx, arg_rev8_64 *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_REV8_64;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_rol(DisasContext *ctx, arg_rol *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_ROL;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_rolw(DisasContext *ctx, arg_rolw *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_ROLW;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_ror(DisasContext *ctx, arg_ror *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_ROR;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_rori(DisasContext *ctx, arg_rori *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_RORI;
+    ctx->ir1->arg.shamt = a->shamt;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rd = a->rd;
+    return true;
 }
 static bool trans_roriw(DisasContext *ctx, arg_roriw *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_RORIW;
+    ctx->ir1->arg.shamt = a->shamt;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rd = a->rd;
+    return true;
 }
 static bool trans_rorw(DisasContext *ctx, arg_rorw *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_RORW;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_sb(DisasContext *ctx, arg_sb *a)
 {
@@ -2146,15 +2194,17 @@ static bool trans_sd(DisasContext *ctx, arg_sd *a)
 }
 static bool trans_sext_b(DisasContext *ctx, arg_sext_b *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_SEXT_B;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_sext_h(DisasContext *ctx, arg_sext_h *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_SEXT_H;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_sfence_inval_ir(DisasContext *ctx, arg_sfence_inval_ir *a)
 {
@@ -2170,9 +2220,10 @@ static bool trans_sfence_vm(DisasContext *ctx, arg_sfence_vm *a)
 }
 static bool trans_sfence_vma(DisasContext *ctx, arg_sfence_vma *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_SFENCE_VMA;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_sfence_w_inval(DisasContext *ctx, arg_sfence_w_inval *a)
 {
@@ -2190,39 +2241,51 @@ static bool trans_sh(DisasContext *ctx, arg_sh *a)
 }
 static bool trans_sh1add(DisasContext *ctx, arg_sh1add *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_SH1ADD;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_sh1add_uw(DisasContext *ctx, arg_sh1add_uw *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_SH1ADD_UW;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_sh2add(DisasContext *ctx, arg_sh2add *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_SH2ADD;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_sh2add_uw(DisasContext *ctx, arg_sh2add_uw *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_SH2ADD_UW;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_sh3add(DisasContext *ctx, arg_sh3add *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_SH3ADD;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_sh3add_uw(DisasContext *ctx, arg_sh3add_uw *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_SH3ADD_UW;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_sha256sig0(DisasContext *ctx, arg_sha256sig0 *a)
 {
@@ -2338,9 +2401,11 @@ static bool trans_slli(DisasContext *ctx, arg_slli *a)
 }
 static bool trans_slli_uw(DisasContext *ctx, arg_slli_uw *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_SLLI_UW;
+    ctx->ir1->arg.shamt = a->shamt;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rd = a->rd;
+    return true;
 }
 static bool trans_sllid(DisasContext *ctx, arg_sllid *a)
 {
@@ -2472,9 +2537,8 @@ static bool trans_sraw(DisasContext *ctx, arg_sraw *a)
 }
 static bool trans_sret(DisasContext *ctx, arg_sret *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_SRET;
+    return true;
 }
 static bool trans_srl(DisasContext *ctx, arg_srl *a)
 {
@@ -2564,27 +2628,39 @@ static bool trans_uret(DisasContext *ctx, arg_uret *a)
 }
 static bool trans_vaadd_vv(DisasContext *ctx, arg_vaadd_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VAADD_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vaadd_vx(DisasContext *ctx, arg_vaadd_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VAADD_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vaaddu_vv(DisasContext *ctx, arg_vaaddu_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VAADDU_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vaaddu_vx(DisasContext *ctx, arg_vaaddu_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VAADDU_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vadc_vim(DisasContext *ctx, arg_vadc_vim *a)
 {
@@ -2606,21 +2682,30 @@ static bool trans_vadc_vxm(DisasContext *ctx, arg_vadc_vxm *a)
 }
 static bool trans_vadd_vi(DisasContext *ctx, arg_vadd_vi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VADD_VI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vadd_vv(DisasContext *ctx, arg_vadd_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VADD_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vadd_vx(DisasContext *ctx, arg_vadd_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VADD_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vaesdf_vs(DisasContext *ctx, arg_vaesdf_vs *a)
 {
@@ -2690,21 +2775,30 @@ static bool trans_vaesz_vs(DisasContext *ctx, arg_vaesz_vs *a)
 }
 static bool trans_vand_vi(DisasContext *ctx, arg_vand_vi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VAND_VI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vand_vv(DisasContext *ctx, arg_vand_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VAND_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vand_vx(DisasContext *ctx, arg_vand_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VAND_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vandn_vv(DisasContext *ctx, arg_vandn_vv *a)
 {
@@ -2720,27 +2814,39 @@ static bool trans_vandn_vx(DisasContext *ctx, arg_vandn_vx *a)
 }
 static bool trans_vasub_vv(DisasContext *ctx, arg_vasub_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VASUB_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vasub_vx(DisasContext *ctx, arg_vasub_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VASUB_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vasubu_vv(DisasContext *ctx, arg_vasubu_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VASUBU_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vasubu_vx(DisasContext *ctx, arg_vasubu_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VASUBU_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vbrev8_v(DisasContext *ctx, arg_vbrev8_v *a)
 {
@@ -2786,15 +2892,19 @@ static bool trans_vclz_v(DisasContext *ctx, arg_vclz_v *a)
 }
 static bool trans_vcompress_vm(DisasContext *ctx, arg_vcompress_vm *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VCOMPRESS_VM;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vcpop_m(DisasContext *ctx, arg_vcpop_m *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VCPOP_M;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vcpop_v(DisasContext *ctx, arg_vcpop_v *a)
 {
@@ -2810,99 +2920,139 @@ static bool trans_vctz_v(DisasContext *ctx, arg_vctz_v *a)
 }
 static bool trans_vdiv_vv(DisasContext *ctx, arg_vdiv_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VDIV_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vdiv_vx(DisasContext *ctx, arg_vdiv_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VDIV_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vdivu_vv(DisasContext *ctx, arg_vdivu_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VDIVU_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vdivu_vx(DisasContext *ctx, arg_vdivu_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VDIVU_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfadd_vf(DisasContext *ctx, arg_vfadd_vf *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFADD_VF;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfadd_vv(DisasContext *ctx, arg_vfadd_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFADD_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfclass_v(DisasContext *ctx, arg_vfclass_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFCLASS_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfcvt_f_x_v(DisasContext *ctx, arg_vfcvt_f_x_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFCVT_F_X_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfcvt_f_xu_v(DisasContext *ctx, arg_vfcvt_f_xu_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFCVT_F_XU_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfcvt_rtz_x_f_v(DisasContext *ctx, arg_vfcvt_rtz_x_f_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFCVT_RTZ_X_F_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfcvt_rtz_xu_f_v(DisasContext *ctx, arg_vfcvt_rtz_xu_f_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFCVT_RTZ_XU_F_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfcvt_x_f_v(DisasContext *ctx, arg_vfcvt_x_f_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFCVT_X_F_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfcvt_xu_f_v(DisasContext *ctx, arg_vfcvt_xu_f_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFCVT_XU_F_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfdiv_vf(DisasContext *ctx, arg_vfdiv_vf *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFDIV_VF;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfdiv_vv(DisasContext *ctx, arg_vfdiv_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFDIV_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfirst_m(DisasContext *ctx, arg_vfirst_m *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFIRST_M;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfmacc_vf(DisasContext *ctx, arg_vfmacc_vf *a)
 {
@@ -2930,33 +3080,48 @@ static bool trans_vfmadd_vv(DisasContext *ctx, arg_vfmadd_vv *a)
 }
 static bool trans_vfmax_vf(DisasContext *ctx, arg_vfmax_vf *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFMAX_VF;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfmax_vv(DisasContext *ctx, arg_vfmax_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFMAX_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfmerge_vfm(DisasContext *ctx, arg_vfmerge_vfm *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFMERGE_VFM;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfmin_vf(DisasContext *ctx, arg_vfmin_vf *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFMIN_VF;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfmin_vv(DisasContext *ctx, arg_vfmin_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFMIN_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfmsac_vf(DisasContext *ctx, arg_vfmsac_vf *a)
 {
@@ -2984,81 +3149,106 @@ static bool trans_vfmsub_vv(DisasContext *ctx, arg_vfmsub_vv *a)
 }
 static bool trans_vfmul_vf(DisasContext *ctx, arg_vfmul_vf *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFMUL_VF;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfmul_vv(DisasContext *ctx, arg_vfmul_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFMUL_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfmv_f_s(DisasContext *ctx, arg_vfmv_f_s *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFMV_F_S;
+    ctx->ir1->arg.rs2 = a->rs2;
+    ctx->ir1->arg.rd = a->rd;
+    return true;
 }
 static bool trans_vfmv_s_f(DisasContext *ctx, arg_vfmv_s_f *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFMV_S_F;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_vfmv_v_f(DisasContext *ctx, arg_vfmv_v_f *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFMV_V_F;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_vfncvt_f_f_w(DisasContext *ctx, arg_vfncvt_f_f_w *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFNCVT_F_F_W;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfncvt_f_x_w(DisasContext *ctx, arg_vfncvt_f_x_w *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFNCVT_F_X_W;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfncvt_f_xu_w(DisasContext *ctx, arg_vfncvt_f_xu_w *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFNCVT_F_XU_W;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfncvt_rod_f_f_w(DisasContext *ctx, arg_vfncvt_rod_f_f_w *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFNCVT_ROD_F_F_W;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfncvt_rtz_x_f_w(DisasContext *ctx, arg_vfncvt_rtz_x_f_w *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFNCVT_RTZ_X_F_W;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfncvt_rtz_xu_f_w(DisasContext *ctx, arg_vfncvt_rtz_xu_f_w *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFNCVT_RTZ_XU_F_W;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfncvt_x_f_w(DisasContext *ctx, arg_vfncvt_x_f_w *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFNCVT_X_F_W;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfncvt_xu_f_w(DisasContext *ctx, arg_vfncvt_xu_f_w *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFNCVT_XU_F_W;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfncvtbf16_f_f_w(DisasContext *ctx, arg_vfncvtbf16_f_f_w *a)
 {
@@ -3128,27 +3318,39 @@ static bool trans_vfrec7_v(DisasContext *ctx, arg_vfrec7_v *a)
 }
 static bool trans_vfredmax_vs(DisasContext *ctx, arg_vfredmax_vs *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFREDMAX_VS;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfredmin_vs(DisasContext *ctx, arg_vfredmin_vs *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFREDMIN_VS;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfredosum_vs(DisasContext *ctx, arg_vfredosum_vs *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFREDOSUM_VS;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfredusum_vs(DisasContext *ctx, arg_vfredusum_vs *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFREDUSUM_VS;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfrsqrt7_v(DisasContext *ctx, arg_vfrsqrt7_v *a)
 {
@@ -3164,39 +3366,57 @@ static bool trans_vfrsub_vf(DisasContext *ctx, arg_vfrsub_vf *a)
 }
 static bool trans_vfsgnj_vf(DisasContext *ctx, arg_vfsgnj_vf *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFSGNJ_VF;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfsgnj_vv(DisasContext *ctx, arg_vfsgnj_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFSGNJ_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfsgnjn_vf(DisasContext *ctx, arg_vfsgnjn_vf *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFSGNJN_VF;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfsgnjn_vv(DisasContext *ctx, arg_vfsgnjn_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFSGNJN_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfsgnjx_vf(DisasContext *ctx, arg_vfsgnjx_vf *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFSGNJX_VF;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfsgnjx_vv(DisasContext *ctx, arg_vfsgnjx_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFSGNJX_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfslide1down_vf(DisasContext *ctx, arg_vfslide1down_vf *a)
 {
@@ -3212,87 +3432,121 @@ static bool trans_vfslide1up_vf(DisasContext *ctx, arg_vfslide1up_vf *a)
 }
 static bool trans_vfsqrt_v(DisasContext *ctx, arg_vfsqrt_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFSQRT_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfsub_vf(DisasContext *ctx, arg_vfsub_vf *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFSUB_VF;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfsub_vv(DisasContext *ctx, arg_vfsub_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFSUB_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfwadd_vf(DisasContext *ctx, arg_vfwadd_vf *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFWADD_VF;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfwadd_vv(DisasContext *ctx, arg_vfwadd_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFWADD_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfwadd_wf(DisasContext *ctx, arg_vfwadd_wf *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFWADD_WF;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfwadd_wv(DisasContext *ctx, arg_vfwadd_wv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFWADD_WV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfwcvt_f_f_v(DisasContext *ctx, arg_vfwcvt_f_f_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFWCVT_F_F_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfwcvt_f_x_v(DisasContext *ctx, arg_vfwcvt_f_x_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFWCVT_F_X_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfwcvt_f_xu_v(DisasContext *ctx, arg_vfwcvt_f_xu_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFWCVT_F_XU_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfwcvt_rtz_x_f_v(DisasContext *ctx, arg_vfwcvt_rtz_x_f_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFWCVT_RTZ_X_F_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfwcvt_rtz_xu_f_v(DisasContext *ctx, arg_vfwcvt_rtz_xu_f_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFWCVT_RTZ_XU_F_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfwcvt_x_f_v(DisasContext *ctx, arg_vfwcvt_x_f_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFWCVT_X_F_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfwcvt_xu_f_v(DisasContext *ctx, arg_vfwcvt_xu_f_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFWCVT_XU_F_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfwcvtbf16_f_f_v(DisasContext *ctx, arg_vfwcvtbf16_f_f_v *a)
 {
@@ -3338,15 +3592,21 @@ static bool trans_vfwmsac_vv(DisasContext *ctx, arg_vfwmsac_vv *a)
 }
 static bool trans_vfwmul_vf(DisasContext *ctx, arg_vfwmul_vf *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFWMUL_VF;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfwmul_vv(DisasContext *ctx, arg_vfwmul_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFWMUL_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfwnmacc_vf(DisasContext *ctx, arg_vfwnmacc_vf *a)
 {
@@ -3374,39 +3634,57 @@ static bool trans_vfwnmsac_vv(DisasContext *ctx, arg_vfwnmsac_vv *a)
 }
 static bool trans_vfwredosum_vs(DisasContext *ctx, arg_vfwredosum_vs *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFWREDOSUM_VS;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfwredusum_vs(DisasContext *ctx, arg_vfwredusum_vs *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFWREDUSUM_VS;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfwsub_vf(DisasContext *ctx, arg_vfwsub_vf *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFWSUB_VF;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfwsub_vv(DisasContext *ctx, arg_vfwsub_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFWSUB_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfwsub_wf(DisasContext *ctx, arg_vfwsub_wf *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFWSUB_WF;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vfwsub_wv(DisasContext *ctx, arg_vfwsub_wv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VFWSUB_WV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vghsh_vv(DisasContext *ctx, arg_vghsh_vv *a)
 {
@@ -3422,15 +3700,18 @@ static bool trans_vgmul_vv(DisasContext *ctx, arg_vgmul_vv *a)
 }
 static bool trans_vid_v(DisasContext *ctx, arg_vid_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VID_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    return true;
 }
 static bool trans_viota_m(DisasContext *ctx, arg_viota_m *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VIOTA_M;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vl1re16_v(DisasContext *ctx, arg_vl1re16_v *a)
 {
@@ -3530,9 +3811,12 @@ static bool trans_vl8re8_v(DisasContext *ctx, arg_vl8re8_v *a)
 }
 static bool trans_vle16_v(DisasContext *ctx, arg_vle16_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VLE16_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vle16ff_v(DisasContext *ctx, arg_vle16ff_v *a)
 {
@@ -3542,9 +3826,12 @@ static bool trans_vle16ff_v(DisasContext *ctx, arg_vle16ff_v *a)
 }
 static bool trans_vle32_v(DisasContext *ctx, arg_vle32_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VLE32_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vle32ff_v(DisasContext *ctx, arg_vle32ff_v *a)
 {
@@ -3554,9 +3841,12 @@ static bool trans_vle32ff_v(DisasContext *ctx, arg_vle32ff_v *a)
 }
 static bool trans_vle64_v(DisasContext *ctx, arg_vle64_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VLE64_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vle64ff_v(DisasContext *ctx, arg_vle64ff_v *a)
 {
@@ -3566,9 +3856,12 @@ static bool trans_vle64ff_v(DisasContext *ctx, arg_vle64ff_v *a)
 }
 static bool trans_vle8_v(DisasContext *ctx, arg_vle8_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VLE8_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vle8ff_v(DisasContext *ctx, arg_vle8ff_v *a)
 {
@@ -3578,57 +3871,90 @@ static bool trans_vle8ff_v(DisasContext *ctx, arg_vle8ff_v *a)
 }
 static bool trans_vlm_v(DisasContext *ctx, arg_vlm_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VLM_V;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_vlse16_v(DisasContext *ctx, arg_vlse16_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VLSE16_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vlse32_v(DisasContext *ctx, arg_vlse32_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VLSE32_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vlse64_v(DisasContext *ctx, arg_vlse64_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VLSE64_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vlse8_v(DisasContext *ctx, arg_vlse8_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VLSE8_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vlxei16_v(DisasContext *ctx, arg_vlxei16_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VLXEI16_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vlxei32_v(DisasContext *ctx, arg_vlxei32_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VLXEI32_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vlxei64_v(DisasContext *ctx, arg_vlxei64_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VLXEI64_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vlxei8_v(DisasContext *ctx, arg_vlxei8_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VLXEI8_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vmacc_vv(DisasContext *ctx, arg_vmacc_vv *a)
 {
@@ -3674,165 +4000,240 @@ static bool trans_vmadd_vx(DisasContext *ctx, arg_vmadd_vx *a)
 }
 static bool trans_vmand_mm(DisasContext *ctx, arg_vmand_mm *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMAND_MM;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmandn_mm(DisasContext *ctx, arg_vmandn_mm *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMANDN_MM;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmax_vv(DisasContext *ctx, arg_vmax_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMAX_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmax_vx(DisasContext *ctx, arg_vmax_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMAX_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmaxu_vv(DisasContext *ctx, arg_vmaxu_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMAXU_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmaxu_vx(DisasContext *ctx, arg_vmaxu_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMAXU_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmerge_vim(DisasContext *ctx, arg_vmerge_vim *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMERGE_VIM;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmerge_vvm(DisasContext *ctx, arg_vmerge_vvm *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMERGE_VVM;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmerge_vxm(DisasContext *ctx, arg_vmerge_vxm *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMERGE_VXM;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmfeq_vf(DisasContext *ctx, arg_vmfeq_vf *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMFEQ_VF;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmfeq_vv(DisasContext *ctx, arg_vmfeq_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMFEQ_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmfge_vf(DisasContext *ctx, arg_vmfge_vf *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMFGE_VF;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmfgt_vf(DisasContext *ctx, arg_vmfgt_vf *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMFGT_VF;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmfle_vf(DisasContext *ctx, arg_vmfle_vf *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMFLE_VF;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmfle_vv(DisasContext *ctx, arg_vmfle_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMFLE_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmflt_vf(DisasContext *ctx, arg_vmflt_vf *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMFLT_VF;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmflt_vv(DisasContext *ctx, arg_vmflt_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMFLT_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmfne_vf(DisasContext *ctx, arg_vmfne_vf *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMFNE_VF;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmfne_vv(DisasContext *ctx, arg_vmfne_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMFNE_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmin_vv(DisasContext *ctx, arg_vmin_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMIN_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmin_vx(DisasContext *ctx, arg_vmin_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMIN_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vminu_vv(DisasContext *ctx, arg_vminu_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMINU_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vminu_vx(DisasContext *ctx, arg_vminu_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMINU_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmnand_mm(DisasContext *ctx, arg_vmnand_mm *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMNAND_MM;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmnor_mm(DisasContext *ctx, arg_vmnor_mm *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMNOR_MM;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmor_mm(DisasContext *ctx, arg_vmor_mm *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMOR_MM;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmorn_mm(DisasContext *ctx, arg_vmorn_mm *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMORN_MM;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmsbc_vvm(DisasContext *ctx, arg_vmsbc_vvm *a)
 {
@@ -3848,153 +4249,225 @@ static bool trans_vmsbc_vxm(DisasContext *ctx, arg_vmsbc_vxm *a)
 }
 static bool trans_vmsbf_m(DisasContext *ctx, arg_vmsbf_m *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSBF_M;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmseq_vi(DisasContext *ctx, arg_vmseq_vi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSEQ_VI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmseq_vv(DisasContext *ctx, arg_vmseq_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSEQ_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmseq_vx(DisasContext *ctx, arg_vmseq_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSEQ_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmsgt_vi(DisasContext *ctx, arg_vmsgt_vi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSGT_VI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmsgt_vx(DisasContext *ctx, arg_vmsgt_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSGT_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmsgtu_vi(DisasContext *ctx, arg_vmsgtu_vi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSGTU_VI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmsgtu_vx(DisasContext *ctx, arg_vmsgtu_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSGTU_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmsif_m(DisasContext *ctx, arg_vmsif_m *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSIF_M;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmsle_vi(DisasContext *ctx, arg_vmsle_vi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSLE_VI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmsle_vv(DisasContext *ctx, arg_vmsle_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSLE_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmsle_vx(DisasContext *ctx, arg_vmsle_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSLE_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmsleu_vi(DisasContext *ctx, arg_vmsleu_vi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSLEU_VI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmsleu_vv(DisasContext *ctx, arg_vmsleu_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSLEU_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmsleu_vx(DisasContext *ctx, arg_vmsleu_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSLEU_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmslt_vv(DisasContext *ctx, arg_vmslt_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSLT_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmslt_vx(DisasContext *ctx, arg_vmslt_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSLT_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmsltu_vv(DisasContext *ctx, arg_vmsltu_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSLTU_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmsltu_vx(DisasContext *ctx, arg_vmsltu_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSLTU_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmsne_vi(DisasContext *ctx, arg_vmsne_vi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSNE_VI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmsne_vv(DisasContext *ctx, arg_vmsne_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSNE_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmsne_vx(DisasContext *ctx, arg_vmsne_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSNE_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmsof_m(DisasContext *ctx, arg_vmsof_m *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMSOF_M;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmul_vv(DisasContext *ctx, arg_vmul_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMUL_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmul_vx(DisasContext *ctx, arg_vmul_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMUL_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmulh_vv(DisasContext *ctx, arg_vmulh_vv *a)
 {
@@ -4058,81 +4531,108 @@ static bool trans_vmv8r_v(DisasContext *ctx, arg_vmv8r_v *a)
 }
 static bool trans_vmv_s_x(DisasContext *ctx, arg_vmv_s_x *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMV_S_X;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_vmv_v_i(DisasContext *ctx, arg_vmv_v_i *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMV_V_I;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_vmv_v_v(DisasContext *ctx, arg_vmv_v_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMV_V_V;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_vmv_v_x(DisasContext *ctx, arg_vmv_v_x *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMV_V_X;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_vmv_x_s(DisasContext *ctx, arg_vmv_x_s *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMV_X_S;
+    ctx->ir1->arg.rs2 = a->rs2;
+    ctx->ir1->arg.rd = a->rd;
+    return true;
 }
 static bool trans_vmxnor_mm(DisasContext *ctx, arg_vmxnor_mm *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMXNOR_MM;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vmxor_mm(DisasContext *ctx, arg_vmxor_mm *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VMXOR_MM;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vnclip_wi(DisasContext *ctx, arg_vnclip_wi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VNCLIP_WI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vnclip_wv(DisasContext *ctx, arg_vnclip_wv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VNCLIP_WV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vnclip_wx(DisasContext *ctx, arg_vnclip_wx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VNCLIP_WX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vnclipu_wi(DisasContext *ctx, arg_vnclipu_wi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VNCLIPU_WI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vnclipu_wv(DisasContext *ctx, arg_vnclipu_wv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VNCLIPU_WV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vnclipu_wx(DisasContext *ctx, arg_vnclipu_wx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VNCLIPU_WX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vnmsac_vv(DisasContext *ctx, arg_vnmsac_vv *a)
 {
@@ -4160,129 +4660,192 @@ static bool trans_vnmsub_vx(DisasContext *ctx, arg_vnmsub_vx *a)
 }
 static bool trans_vnsra_wi(DisasContext *ctx, arg_vnsra_wi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VNSRA_WI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vnsra_wv(DisasContext *ctx, arg_vnsra_wv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VNSRA_WV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vnsra_wx(DisasContext *ctx, arg_vnsra_wx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VNSRA_WX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vnsrl_wi(DisasContext *ctx, arg_vnsrl_wi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VNSRL_WI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vnsrl_wv(DisasContext *ctx, arg_vnsrl_wv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VNSRL_WV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vnsrl_wx(DisasContext *ctx, arg_vnsrl_wx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VNSRL_WX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vor_vi(DisasContext *ctx, arg_vor_vi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VOR_VI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vor_vv(DisasContext *ctx, arg_vor_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VOR_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vor_vx(DisasContext *ctx, arg_vor_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VOR_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vredand_vs(DisasContext *ctx, arg_vredand_vs *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VREDAND_VS;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vredmax_vs(DisasContext *ctx, arg_vredmax_vs *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VREDMAX_VS;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vredmaxu_vs(DisasContext *ctx, arg_vredmaxu_vs *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VREDMAXU_VS;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vredmin_vs(DisasContext *ctx, arg_vredmin_vs *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VREDMIN_VS;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vredminu_vs(DisasContext *ctx, arg_vredminu_vs *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VREDMINU_VS;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vredor_vs(DisasContext *ctx, arg_vredor_vs *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VREDOR_VS;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vredsum_vs(DisasContext *ctx, arg_vredsum_vs *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VREDSUM_VS;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vredxor_vs(DisasContext *ctx, arg_vredxor_vs *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VREDXOR_VS;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vrem_vv(DisasContext *ctx, arg_vrem_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VREM_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vrem_vx(DisasContext *ctx, arg_vrem_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VREM_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vremu_vv(DisasContext *ctx, arg_vremu_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VREMU_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vremu_vx(DisasContext *ctx, arg_vremu_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VREMU_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vrev8_v(DisasContext *ctx, arg_vrev8_v *a)
 {
@@ -4292,27 +4855,39 @@ static bool trans_vrev8_v(DisasContext *ctx, arg_vrev8_v *a)
 }
 static bool trans_vrgather_vi(DisasContext *ctx, arg_vrgather_vi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VRGATHER_VI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vrgather_vv(DisasContext *ctx, arg_vrgather_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VRGATHER_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vrgather_vx(DisasContext *ctx, arg_vrgather_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VRGATHER_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vrgatherei16_vv(DisasContext *ctx, arg_vrgatherei16_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VRGATHEREI16_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vrol_vv(DisasContext *ctx, arg_vrol_vv *a)
 {
@@ -4382,39 +4957,57 @@ static bool trans_vs8r_v(DisasContext *ctx, arg_vs8r_v *a)
 }
 static bool trans_vsadd_vi(DisasContext *ctx, arg_vsadd_vi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSADD_VI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsadd_vv(DisasContext *ctx, arg_vsadd_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSADD_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsadd_vx(DisasContext *ctx, arg_vsadd_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSADD_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsaddu_vi(DisasContext *ctx, arg_vsaddu_vi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSADDU_VI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsaddu_vv(DisasContext *ctx, arg_vsaddu_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSADDU_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsaddu_vx(DisasContext *ctx, arg_vsaddu_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSADDU_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsbc_vvm(DisasContext *ctx, arg_vsbc_vvm *a)
 {
@@ -4430,63 +5023,87 @@ static bool trans_vsbc_vxm(DisasContext *ctx, arg_vsbc_vxm *a)
 }
 static bool trans_vse16_v(DisasContext *ctx, arg_vse16_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSE16_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vse32_v(DisasContext *ctx, arg_vse32_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSE32_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vse64_v(DisasContext *ctx, arg_vse64_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSE64_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vse8_v(DisasContext *ctx, arg_vse8_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSE8_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vsetivli(DisasContext *ctx, arg_vsetivli *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSETIVLI;
+    ctx->ir1->arg.zimm = a->zimm;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rd = a->rd;
+    return true;
 }
 static bool trans_vsetvl(DisasContext *ctx, arg_vsetvl *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSETVL;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsetvli(DisasContext *ctx, arg_vsetvli *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSETVLI;
+    ctx->ir1->arg.zimm = a->zimm;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rd = a->rd;
+    return true;
 }
 static bool trans_vsext_vf2(DisasContext *ctx, arg_vsext_vf2 *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSEXT_VF2;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsext_vf4(DisasContext *ctx, arg_vsext_vf4 *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSEXT_VF4;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsext_vf8(DisasContext *ctx, arg_vsext_vf8 *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSEXT_VF8;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsha2ch_vv(DisasContext *ctx, arg_vsha2ch_vv *a)
 {
@@ -4508,57 +5125,84 @@ static bool trans_vsha2ms_vv(DisasContext *ctx, arg_vsha2ms_vv *a)
 }
 static bool trans_vslide1down_vx(DisasContext *ctx, arg_vslide1down_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSLIDE1DOWN_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vslide1up_vx(DisasContext *ctx, arg_vslide1up_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSLIDE1UP_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vslidedown_vi(DisasContext *ctx, arg_vslidedown_vi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSLIDEDOWN_VI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vslidedown_vx(DisasContext *ctx, arg_vslidedown_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSLIDEDOWN_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vslideup_vi(DisasContext *ctx, arg_vslideup_vi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSLIDEUP_VI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vslideup_vx(DisasContext *ctx, arg_vslideup_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSLIDEUP_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsll_vi(DisasContext *ctx, arg_vsll_vi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSLL_VI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsll_vv(DisasContext *ctx, arg_vsll_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSLL_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsll_vx(DisasContext *ctx, arg_vsll_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSLL_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsm3c_vi(DisasContext *ctx, arg_vsm3c_vi *a)
 {
@@ -4592,9 +5236,10 @@ static bool trans_vsm4r_vv(DisasContext *ctx, arg_vsm4r_vv *a)
 }
 static bool trans_vsm_v(DisasContext *ctx, arg_vsm_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSM_V;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_vsmul_vv(DisasContext *ctx, arg_vsmul_vv *a)
 {
@@ -4610,171 +5255,263 @@ static bool trans_vsmul_vx(DisasContext *ctx, arg_vsmul_vx *a)
 }
 static bool trans_vsra_vi(DisasContext *ctx, arg_vsra_vi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSRA_VI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsra_vv(DisasContext *ctx, arg_vsra_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSRA_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsra_vx(DisasContext *ctx, arg_vsra_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSRA_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsrl_vi(DisasContext *ctx, arg_vsrl_vi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSRL_VI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsrl_vv(DisasContext *ctx, arg_vsrl_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSRL_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsrl_vx(DisasContext *ctx, arg_vsrl_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSRL_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsse16_v(DisasContext *ctx, arg_vsse16_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSSE16_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vsse32_v(DisasContext *ctx, arg_vsse32_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSSE32_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vsse64_v(DisasContext *ctx, arg_vsse64_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSSE64_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vsse8_v(DisasContext *ctx, arg_vsse8_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSSE8_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vssra_vi(DisasContext *ctx, arg_vssra_vi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSSRA_VI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vssra_vv(DisasContext *ctx, arg_vssra_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSSRA_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vssra_vx(DisasContext *ctx, arg_vssra_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSSRA_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vssrl_vi(DisasContext *ctx, arg_vssrl_vi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSSRL_VI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vssrl_vv(DisasContext *ctx, arg_vssrl_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSSRL_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vssrl_vx(DisasContext *ctx, arg_vssrl_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSSRL_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vssub_vv(DisasContext *ctx, arg_vssub_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSSUB_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vssub_vx(DisasContext *ctx, arg_vssub_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSSUB_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vssubu_vv(DisasContext *ctx, arg_vssubu_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSSUBU_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vssubu_vx(DisasContext *ctx, arg_vssubu_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSSUBU_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsub_vv(DisasContext *ctx, arg_vsub_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSUB_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsub_vx(DisasContext *ctx, arg_vsub_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSUB_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vsxei16_v(DisasContext *ctx, arg_vsxei16_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSXEI16_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vsxei32_v(DisasContext *ctx, arg_vsxei32_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSXEI32_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vsxei64_v(DisasContext *ctx, arg_vsxei64_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSXEI64_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vsxei8_v(DisasContext *ctx, arg_vsxei8_v *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VSXEI8_V;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    ctx->ir1->arg.nf = a->nf;
+    return true;
 }
 static bool trans_vwadd_vv(DisasContext *ctx, arg_vwadd_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWADD_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwadd_vx(DisasContext *ctx, arg_vwadd_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWADD_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwadd_wv(DisasContext *ctx, arg_vwadd_wv *a)
 {
@@ -4790,15 +5527,21 @@ static bool trans_vwadd_wx(DisasContext *ctx, arg_vwadd_wx *a)
 }
 static bool trans_vwaddu_vv(DisasContext *ctx, arg_vwaddu_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWADDU_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwaddu_vx(DisasContext *ctx, arg_vwaddu_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWADDU_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwaddu_wv(DisasContext *ctx, arg_vwaddu_wv *a)
 {
@@ -4814,93 +5557,138 @@ static bool trans_vwaddu_wx(DisasContext *ctx, arg_vwaddu_wx *a)
 }
 static bool trans_vwmacc_vv(DisasContext *ctx, arg_vwmacc_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWMACC_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwmacc_vx(DisasContext *ctx, arg_vwmacc_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWMACC_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwmaccsu_vv(DisasContext *ctx, arg_vwmaccsu_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWMACCSU_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwmaccsu_vx(DisasContext *ctx, arg_vwmaccsu_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWMACCSU_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwmaccu_vv(DisasContext *ctx, arg_vwmaccu_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWMACCU_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwmaccu_vx(DisasContext *ctx, arg_vwmaccu_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWMACCU_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwmaccus_vx(DisasContext *ctx, arg_vwmaccus_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWMACCUS_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwmul_vv(DisasContext *ctx, arg_vwmul_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWMUL_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwmul_vx(DisasContext *ctx, arg_vwmul_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWMUL_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwmulsu_vv(DisasContext *ctx, arg_vwmulsu_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWMULSU_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwmulsu_vx(DisasContext *ctx, arg_vwmulsu_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWMULSU_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwmulu_vv(DisasContext *ctx, arg_vwmulu_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWMULU_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwmulu_vx(DisasContext *ctx, arg_vwmulu_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWMULU_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwredsum_vs(DisasContext *ctx, arg_vwredsum_vs *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWREDSUM_VS;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwredsumu_vs(DisasContext *ctx, arg_vwredsumu_vs *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWREDSUMU_VS;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwsll_vi(DisasContext *ctx, arg_vwsll_vi *a)
 {
@@ -4922,15 +5710,21 @@ static bool trans_vwsll_vx(DisasContext *ctx, arg_vwsll_vx *a)
 }
 static bool trans_vwsub_vv(DisasContext *ctx, arg_vwsub_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWSUB_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwsub_vx(DisasContext *ctx, arg_vwsub_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWSUB_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwsub_wv(DisasContext *ctx, arg_vwsub_wv *a)
 {
@@ -4946,15 +5740,21 @@ static bool trans_vwsub_wx(DisasContext *ctx, arg_vwsub_wx *a)
 }
 static bool trans_vwsubu_vv(DisasContext *ctx, arg_vwsubu_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWSUBU_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwsubu_vx(DisasContext *ctx, arg_vwsubu_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VWSUBU_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vwsubu_wv(DisasContext *ctx, arg_vwsubu_wv *a)
 {
@@ -4970,45 +5770,59 @@ static bool trans_vwsubu_wx(DisasContext *ctx, arg_vwsubu_wx *a)
 }
 static bool trans_vxor_vi(DisasContext *ctx, arg_vxor_vi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VXOR_VI;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vxor_vv(DisasContext *ctx, arg_vxor_vv *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VXOR_VV;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vxor_vx(DisasContext *ctx, arg_vxor_vx *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VXOR_VX;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vzext_vf2(DisasContext *ctx, arg_vzext_vf2 *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VZEXT_VF2;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vzext_vf4(DisasContext *ctx, arg_vzext_vf4 *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VZEXT_VF4;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_vzext_vf8(DisasContext *ctx, arg_vzext_vf8 *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_VZEXT_VF8;
+    ctx->ir1->arg.vm = a->vm;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_wfi(DisasContext *ctx, arg_wfi *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_WFI;
+    return true;
 }
 static bool trans_wrs_nto(DisasContext *ctx, arg_wrs_nto *a)
 {
@@ -5024,9 +5838,11 @@ static bool trans_wrs_sto(DisasContext *ctx, arg_wrs_sto *a)
 }
 static bool trans_xnor(DisasContext *ctx, arg_xnor *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_XNOR;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    ctx->ir1->arg.rs2 = a->rs2;
+    return true;
 }
 static bool trans_xor(DisasContext *ctx, arg_xor *a)
 {
@@ -5064,9 +5880,10 @@ static bool trans_zext_h_32(DisasContext *ctx, arg_zext_h_32 *a)
 }
 static bool trans_zext_h_64(DisasContext *ctx, arg_zext_h_64 *a)
 {
-    (void)ctx;
-    (void)a;
-    return false;
+    ctx->ir1->opcode = LATR_RV_ZEXT_H_64;
+    ctx->ir1->arg.rd = a->rd;
+    ctx->ir1->arg.rs1 = a->rs1;
+    return true;
 }
 static bool trans_zip(DisasContext *ctx, arg_zip *a)
 {

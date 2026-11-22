@@ -1,8 +1,8 @@
 # LATR: RISC-V RV64GC → LoongArch 翻译器（设计与实现）
 
-状态：**P0/P1 原型已实现，非完整 RV64GC**。QEMU 解码、IR1→IR2 子集与 QEMU-LoongArch 裸机烟测已接通。当前 lowerer 支持范围以 `target/riscv/latr/translator/translate-riscv.c` 为准；已解码不代表可执行，未实现指令会拒绝翻译。完整 F/D、CSR/特权执行、guest MMU 与 RVV 尚未实现。
-范围：`riscv64` little-endian；当前实现目标为 RV64I/M/A 与已映射的 RVC 用户态子集。RVV 按本轮决定延期。
-设计中不处理：RV32、big-endian、H 扩展、加密扩展、RVV、RV128。
+状态：**RV64IMAFDC + Zba/Zbb/Zbs/Zicbo + Zicsr/特权/M/S/U + Sv39/48/57 + Sstc/PLIC/SBI 子集 + HPM/stateen 存储子集 + RVV 子集** 已可执行并通过 QEMU-LoongArch 裸机套件、QEMU-RISC-V golden 差分与系统级差分（本轮实测：`make test-latr` → `latr-isa: PASS checks=1201`、`latr-riscv-ref: PASS`、`latr-diff: PASS`；`make latr-sys-diff` → qemu/latr SYS 行逐字节相同；`make -C latr test-decode` → `LATR decode: 26 checks passed`）。仍是**研究原型**：尚无 VMM 内的 RISC-V machine/CPU loop，RVV 全指令集与矢量 golden 差分、真实 HPM 事件后端、AIA/IMSIC/APLIC 与 virtio/PCI 机器仍缺。
+范围：`riscv64` little-endian；RVV 已实现整数/浮点子集（VLEN=128、ELEN=64，`misa.V` 已置位），但尚未覆盖全部 RVV 1.0 指令。
+设计中不处理：RV32、big-endian、H 扩展、加密扩展、RV128。
 
 ## 0. 证据基准
 
@@ -23,19 +23,76 @@
 
 ### 0.1 已核对的现状（避免把计划当成已实现）
 
-- **PVIR 核心/API 已实现并通过主机测试**：`make test-pvir` → `PVIR: 114 checks passed`（本轮实测）。
+- **PVIR 核心/API 已实现并通过主机测试**：`make test-pvir` → `PVIR: 222 checks passed`（本轮实测）。
 - **PVIR 尚未接入 IR1→IR2**：`target/arm/lata/translator/translate-a64.c` 没有引用 `la-pvir.h`；`translate_functions[]` 只登记了 `AARCH64_A64_SVE_FEATURE_ABSENT`，`AARCH64_A64_SVE_ACCESS_UNSUPPORTED` 为 `NULL`；PTRUE/ADD/LD1B 等 SVE IR1 tag 没有 lowerer（`translate-a64.c:17023-17153`、`ir1.h:148-151`）。
 - **SVE 前端是半成品**：`a64_sve_decode()` 只覆盖代表性子集，且 `translate_functions` 对 SVE allowed 路径没有翻译函数；因此不能把 SVE 的现状当成 RVV 的可复用实现。
 - **LATA 的路径是完整的**：`get_ir1_list()`（`translate-a64.c:17329`）→ `translate_aarch64_insn()`（`:17454`）→ `tr_ir2_generate()`（`:17547`）→ `ir2_assemble()`/`tr_ir2_assemble()`（`ir2-assemble.c`、`lata.c:600`）。
 - **LBT 的 IR2 落点已存在**：`la-append.h` 已声明 `la_rotr_*`、`la_rotri_*`、`la_jiscr0/1`、`la_gr2scr/scr2gr`、`la_addu12i_*`；LATA 自身没有使用 `jiscr0`，LATX 在 `latx/translator/translate.c:3000-3030` 使用。
 - **`test-sve-decode` 在本机主机链接失败**（`Undefined symbols: _stderr`），这是当前工作树的既有问题，与本设计无关；本文不据此声称 LATA 全套测试通过。
+- **LATR 本轮实测通过**：`make test-latr` → `latr-isa: PASS checks=1201`（RV64I/M/A、RVC、F/D 含 RMM、Zba/Zbb/Zbs、CSR/HPM/mstateen、MRET/SRET/WFI/SFENCE.VMA、CBO.ZERO、陷阱、LR/SC、AMO）、`latr-riscv-ref: PASS`、`latr-diff: PASS`（12 字段签名逐位相同）；`make -C latr test-decode` → 26 checks；`make latr-sys-diff` → QEMU-RISC-V 与 LATR system board 的 SYS 行逐字节相同。
+- **`CPUArchState` 偏移陷阱（本轮踩到）**：只有 `pc(512)/fcsr(520)/exception(528)/badaddr(536)` 落在 `la_ld/st_d` 的 ±2 KiB 立即数范围内；`privilege(33312)`、`csr[](544+)`、`reservation_*(33344+)`、`host_return_address` 一律必须走 `latr_env_load_d/latr_env_store_d`（内部用 `r21` 拼大偏移）。直接 `la_st_d(..., env_ir2_opnd, env_offset_reservation_valid())` 会触发 `la-append.c:3573` 的 `imm_si12 <= 0xfff` 断言，在裸机里表现为 UART 打印断言后死循环（宿主 QEMU 被超时杀掉，很容易误判成“guest 卡死”）。
+- **LATR 已确认的语义决定（都有测试钉住）**：
+  - **CSR 立即数**：QEMU 把 `csrrwi/si/ci` 的 uimm 解码进 `arg.rs1`，没有独立立即数字段；此前遗留的 `zimm` 字段恒为 0，曾把 `csrrwi frm,4` 写成 0（连带 dynamic-RMM 与保留舍入模式用例失败）。`zimm` 已删除。
+  - **非法指令**：解码失败不再让 TB 翻译返回 `false`，而是把该指令计入 TB（`tr_ir2_generate()`/`target_disasm()` 同口径截断），在 IR2 里经 `latr_raise_illegal_instruction()` 投递（`mcause=2`、`mtval=指令字`、`mepc=该 PC`、`pc=mtvec`）；FP 的非法路径也改走同一投递，不再自写 `badaddr=0`。
+  - **FENCE**：与 QEMU `trans_fence()` 一致，**任意 `fm` 都按全屏障执行**，不按规范把保留 `fm` 判非法；golden 优先于规范的严格化。
+  - **LR/SC**：预约以 `reservation_{addr,size,epoch,valid}` 表示，SC 时与全局写 epoch 比较；**任何 guest 写都保守地使预约失效**（规范允许 SC 伪失败），SC 的实际读改写由 LoongArch `ll/sc` 完成。LA `sc` 成功返回 1，RISC-V 成功返回 0。全局存储锁的 `sc` 失败原先会继续往下走，现已重试（`la_beq(status, zero, retry)`）。
+  - **原子访问的自然对齐与陷阱清预约**：`lr/`sc/AMO 在做任何访存或取锁之前先检查 `addr & (size-1)`，非对齐按 cause 4（load）/6（store-AMO）投递，`mtval=地址`、`mepc=该指令`——避免把非对齐地址交给宿主 `ll/sc` 而触发宿主 ADE。`transfer_exception()` 在写 `mcause/mtval` 后立即清 `reservation_valid`：任何陷阱（含 `ecall`、页故障、非法指令）都会丢弃预约，陷阱处理程序与上下文切换不会继承它。**仍开放的边界**：直接映射模型下没有 MMIO 区可排除，也没有多核失效广播；`SC` 对 MMIO 的语义与跨核 `SFENCE.VMA/FENCE.I` 拍击属于 Phase 2/3（见 §3.5、§8）。
+  - **host 调用**：`emit_runtime_call()` 的调用目标必须走 `ra_alloc_itemp()`（此前直接用 `la_s0`，与分配器状态不一致）。
+  - **构建头文件顺序**：LATR 与 LATA 一样，QEMU 头由 `latx/compat` 的免费宿主 shim 解析；仓库根的 `include/` 是**不完整**的（`include/qemu/osdep.h`、`include/exec/tb-context.h` 都不存在）。`latr/Makefile` 的 `INCS` 因此把 compat 目录放在 `-I../include` 之前，仅用后者补 `loongemu/vclock.h` 之类真实头。
+  - **计数器与其他特权 CSR**：`cycle/instret` 读 `mcycle/minstret` 存储，`time` 经 `latr_read_time` 宿主调用取时钟；U/S 模式访问受 `mcounteren/scounteren` 门控（M 模式直接放行），`csrrw stimecmp` 写值后置 `stimecmp_update_pending=1`（唤醒/重编程由 runtime 消费）。**HPM 子集**：`mhpmevent3..31`、`mhpmcounter3..31` 为可写存储，`hpmcounter3..31` 只读别名机器计数器，并复用同一 `mcounteren/scounteren` 位门控；当前没有事件后端，计数不自动增长。`mstateen0` 仅保留 STATEEN/HSENVCFG/FCSR 位，`mstateen1..3` 仅保留 STATEEN 位；`mcountinhibit` 保留除 TIME 外的计数器位。**计数口径**：`mcycle` 在每条指令“开始”时自增，因此 `csrr x6, cycle` 会把自己算进去（3），而 `instret` 只统计已退休指令（读作 1）；二者都用测试钉住，避免以后无意识地改语义。
+  - **特权指令**：MRET/SRET 校验当前特权与 `mstatus.MPP/SPP`，恢复 `MIE←MPIE`/`SIE←SPIE`、清除 MPP/SPP、`pc←mepc/sepc` 后退出 TB；WFI 在 `mstatus.TW=0` 时（含 U 模式）立即退休，TW=1 且非 M 模式报非法；SFENCE.VMA 在 U 模式非法，S/M 模式在 Phase 2 无 TLB 时只计退休；CBO.ZERO 在 M 模式无条件允许、否则要求 `menvcfg.CBOZE`（U 模式还要求 `senvcfg`），清零按 64 字节对齐块执行并逐块走存储锁。
+  - **satp / PMP 状态（Phase 2 第一片）**：`satp(0x180)`、`pmpcfg0(0x3a0)`、`pmpcfg2(0x3a2)`、`pmpaddr0..15(0x3b0..0x3bf)` 已映射到 `csr[]`。`satp` 写遵循 QEMU `legalize_xatp()`：仅接受 MODE ∈ {Bare(0), Sv39(8), Sv48(9), Sv57(10)}，其余 MODE 保留旧值；`mstatus.TVM=1` 时 S 模式访问 `satp` 报非法（M 模式不受影响）。`pmpcfg*` 逐字节 WARL：`W=1,R=0` 的保留编码被丢弃（旧字节保留），其余位原样存储；RV64 不存在 `pmpcfg1/3`，访问即非法。`pmpaddr*` 原样存储（与 QEMU 读回一致，未做 54 位截断）。**尚无执行语义**：没有 Sv39/48/57 页表遍历、没有 PMP 权限检查、没有 `mseccfg`（MML/RLB）——这些留给下一项；上面三条 WARL 行为已由 `tests/latr_isa_qemu_ref.S` 在 QEMU-RISC-V 上复核（golden 侧自检 PASS）。
+  - **Sv39/Sv48/Sv57 页表遍历（本轮实现，未接线）**：新增 [`target/riscv/latr/translator/mmu.c`](target/riscv/latr/translator/mmu.c) 与 `include/mmu.h`：`latr_walk(env, va, access, &pa)` 按 `satp.MODE` 选择 3/4/5 级遍历，检查非规范地址、`V=0`、`W=1 && R=0`、叶子/指针区分、超页 PPN 低位必须为 0、U 位与 S 模式 `SUM`（取指永不执行 U 页）、`MXR`、R/W/X 权限，并**在内存里硬件置 A（store 还置 D）**（Svadu 风格）；M 模式直接旁路（MPRV 未建模），Bare 恒等。异常按 12/13/15（取指/读/写页故障）返回。测试用裸机侧手搭的三/四/五级页表覆盖 4 KiB 叶、2 MiB 超页、权限、SUM/MXR、A/D 置位、非对齐超页、Bare/M 旁路。**明确未做**：`Svpbmt`（PTE[62:61] 忽略）、`Svade`（只实现硬件 A/D 更新）、PMP 权限检查、`MPRV`、TLB/ASID 失效、`latr_guest_lduw/ldl` 的取指翻译与发射代码（load/store/LR/SC/AMO）到 `latr_resolve_guest_address()` 的接线——这些属于下一项；物理地址当前仍与宿主地址恒等（无 `LoongemuMemMap`）。
+  - **访存接线（本轮）**：`lb/lh/lw/lbu/lhu/lwu/ld` 与 `sb/sh/sw/sd`、`lr/sc`、全部 AMO、`cbo.zero` 都先经 `latr_emit_resolve()` → `latr_resolve_guest_address(env, va, access, size)` 得到宿主地址；该调用把 `va` 存 `env->mem_va`、解析出的**物理地址**存 `env->mem_phys`、故障原因存 `env->mem_fault_cause`，并保存/恢复 `ra`。因为宿主调用会破坏 `t0..t5`（正是 LATR 的 itemp 池），store 的数据先落 `env->mem_value`、SC/AMO 的值在调用后再取回，**调用期间不允许任何 itemp 存活**。解析成功与否以 `env->mem_fault_cause` 为准（不能用“返回地址==0”判断，物理页 0 是合法映射）；页故障在发射代码里用 `latr_raise_mem_fault()` 投递（cause/`mtval` 从 env 读），`mtval` 是 guest VA；`LR/SC` 的预约比较改用**物理地址**，因此 `satp` 改写不会让预约错误命中。`satp` 的 `A/D` 置位由 walker 在 PTE 内存上完成（不经过存储锁、不计 epoch——它与本 hart 的预约不可能并发）。**未接线**：取指（`latr_guest_lduw/ldl` 仍按 VA 恒等读宿主内存，故 paging 下代码必须恒等映射；RVC 跨页取指同理）、`LoongemuMemMap`/MMIO、`TbInsnMap` PC 归因。
+  - **取指翻译、跨页取指与指令级归因（本轮）**：`latr_guest_lduw/ldl` 现在按 16-bit 半字各自走 `latr_translate(..., EXEC, 2, ...)`，因此 32-bit 指令跨 4 KiB 页时两个半字分别经过页表/物理映射（RVC 与 32-bit 混合同理）；取指失败时把 `fetch_faulted/fetch_fault_va/fetch_fault_cause` 记进 env，`tr_ir2_generate()` 把该槽改成伪 opcode `LATR_RV_FETCH_FAULT`，执行时按 cause 12（页故障）或 1（访问故障）投递，`mtval`=不可取的 VA、`mepc`=该 PC。裸机测试覆盖：非恒等代码页（VA 0x10000→宿主页）执行、跨页 32-bit 取指（`0x8ffe + 0x9000` 两页拼出 `addi x1,x0,5`）、无 X 页的 cause 12、保留区的 cause 1。
+  - **`LoongemuMemMap` 接线**：`CPUArchState` 末尾新增 `mem_map` 指针（NULL 时 PA=HPA，保持裸机/旧行为）。`latr_translate()` 先做页表遍历，再用 `loongemu_mem_resolve()`：RAM 读/写、ROM 读映射到 `hpa`；ROM 写→cause 7；UNMAPPED/RESERVED→cause 1/5/7（**绝不 alias 宿主内存或 VMM 内部状态**）；MMIO→access fault（见下）。`src/phys_mem.c` 已编进 `liblatr_core.a`。测试覆盖 RAM/ROM/保留/空洞、ROM 写故障、经 map 的取指、保留页取指的 cause 1、以及无 map 时恢复恒等。
+  - **TbInsnMap（本轮实现）**：新增 `translator/tb-insn-map.c` 与 `TRANSLATION_DATA.insn_maps[]`（4 槽 × 512 span，无动态分配）。`tr_ir2_generate()` 记录每条 IR1 的 `pc/raw_len` 与 TB 标签 id；`tr_ir2_assemble()` 在汇编时按标签累计 4 字节步长，产出 `[native_start, native_end) → guest_pc/raw_len`。`latr_tb_insn_map_resolve(host_pc, &pc, &len)` 按 code 范围 + 最新 generation 解析，`forget(code)` 释放槽位。裸机测试验证 3 条指令的顺序/长度、RVC 的 2 字节长度、以及 forget 后失效。**尚未消费**：本组件没有宿主故障处理路径或 TB 缓存，真正把 `host_pc` 归因到 guest PC 的调用点在 VMM 的异常分发（下一阶段）。
+  - **MMIO**：`latr_translate()` 对 `LOONGEMU_MEM_MMIO` 置 `mem_mmio` 并返回 guest PA；`latr_mmio_load/store` 经 `LoongemuMmioBus` 派发。system board 已接 CLINT/PLIC/UART/exit，boot smoke 验证 guest UART 输出。
+  - **VMM 侧 SBI v2.0 子集（本轮）**：新增 [`include/loongemu/riscv_sbi.h`](include/loongemu/riscv_sbi.h) + [`src/riscv_sbi.c`](src/riscv_sbi.c)（主机可测、无设备依赖）与 [`latr_service_sbi()`](target/riscv/latr/latr.c)。`loongemu_sbi_call()` 按 SBI v2.0 约定解码 `a7=EID / a6=FID / a0..a5`，实现 **Base**（spec 2.0、impl id/version、mvendorid/marchid/mimpid、probe_extension）、**TIME**（set_timer，单位=平台时基；本项目 1 GHz 即时基 ns）、**IPI**（hart mask + `base=-1` 广播）、**RFENCE**（fence.i / sfence.vma / sfence.vma.asid；16 位 ASID 校验；HFENCE 因无 H 扩展返回 NOT_SUPPORTED）、**HSM**（start/stop/get_status/suspend，hartid 越界→INVALID_PARAM）、**SRST**（reset type/reason 校验）。副作用全部经 `LoongemuSbiCalls` 回调交给 VMM；回调为 NULL 时返回 NOT_SUPPORTED。`latr_service_sbi()` 只在 `mcause=9` 且 `mstatus.MPP=S` 时接管：写 `a0/a1`、`pc=mepc+4`、清 cause、留在 S 模式；用户态 ECALL（cause 8）不接管。legacy EID 0x00–0x08 与 **DBCN**（write/read/write_byte）已实现；**PMU** 以 `probe=1`、`num_counters=0` 明示无事件后端，counter-indexed FID 返回 INVALID_PARAM，snapshot/SHMEM 返回 NOT_SUPPORTED。**仍未实现**：CPPC、HFENCE 系列（无 H 扩展）、真实 HPM 事件计数。测试：主机 `make test-riscv-sbi` → 60 checks；裸机 `test_sbi_service` 覆盖 S-mode ECALL 的完整往返、未知 EID、用户态 ECALL 不接管。
+  - **RISC-V ACPI 表（本轮）**：新增 [`include/loongemu/riscv_acpi.h`](include/loongemu/riscv_acpi.h) + [`src/riscv_acpi.c`](src/riscv_acpi.c)，按 ACPI 6.6 与 QEMU `hw/riscv/virt-acpi-build.c` 的字段顺序生成 **MADT**（RINTC 每条 36 B、可选 IMSIC 16 B、可选 APLIC 36 B，`APIC` rev 7，入口从偏移 44 开始）与 **RHCT**（表体固定 20 B、节点数组偏移 56；ISA 节点带 `IsaLength` 与 2 字节对齐；可选 CMO、MMU 节点；`0xFFFF` hart-info 节点按 `NumOffsets` 回指 CMO/MMU 节点偏移）。校验和按整表计算；缓冲区不足返回 0（先 `*_size()` 再 `*_build()`）。测试 `make test-riscv-acpi` → 79 checks，包含逐字段回读、入口长度精确铺满、最小 RHCT（无 CMO/MMU）以及 size 与 build 长度一致（这个一致性检查当场抓到了 hart-info 基础长度把 12 误写成 16 的 bug）。**仍未做**：中断控制器设备模型本体（MMIO 分发 + 中断注入）、FADT/SPCR/MCFG/DSDT 的 RISC-V 字段、以及把表放进 guest 内存/fw_cfg/pflash——分别属于本阶段后续两项与「中断投递」项。
+  - **PLIC 模型（本轮）**：新增 [`include/loongemu/riscv_plic.h`](include/loongemu/riscv_plic.h) + [`src/riscv_plic.c`](src/riscv_plic.c)：标准 PLIC 1.0 寄存器图（priority / 只读 pending / 按 context 的 enable / threshold / claim-complete），96 源 × 4 context 静态池；`loongemu_plic_set_irq()` 为电平输入，claim 清 pending 并置 gateway claimed，complete 在电平仍高时重新 pending；同优先级按最小源号 tie-break；越界/保留偏移返回 error。测试 `make test-riscv-plic` → 30 checks（优先级/阈值/使能门控、claim/complete 语义、tie-break、只读 pending、跨 context 独立性）。ACPI 侧新增 MADT **PLIC** 结构（subtype 0x1B，36 B），与模型配套；`make test-riscv-acpi` → 85 checks。
+  - **vclock 中断投递与 WFI（本轮）**：新增 [`translator/interrupt.c`](target/riscv/latr/translator/interrupt.c)：
+    - `latr_update_interrupts()`：`MIP.STIP = (vclock_ns >= stimecmp)`（Sstc，stimecmp 全 1 即关闭）；装了 PLIC 时 `MIP.MEIP = loongemu_plic_pending(plic, context)`（QEMU virt 的 PLIC context 0 是机器级外部中断；`SEIP` 保持 0，直到实现 S 级 PLIC context/委托）。两者都是硬件派生位，guest 对这些位的 CSR 写入本来就被掩码掉。
+    - `latr_deliver_interrupt()`：按特权规范优先级 MEI>MSI>MTI>SEI>SSI>STI 选择；未委托 → 只在本级为 M 且 `mstatus.MIE`、或更低特权时取，写 `mepc/mcause=(1<<63)|code`（mcause 为真实 CSR，不只是 `env.exception`）、`MPIE←MIE`、`MIE=0`、`MPP←当前特权`、`pc=mtvec`；`mideleg` 委托的 S 中断 → 只在**低于 S** 或 **S 且 SIE** 时取，写 `sepc/scause`（同样落到 CSR 数组）、`SPIE←SIE`、`SPP`、`pc=stvec`；进入陷阱同时清 LR/SC 预约。
+    - `latr_idle_advance()`：WFI 后无中断可投时把 `VIRTUAL_STEP` 的 vclock 直接推进到 `stimecmp`（否则 1 ms 片）。
+    - `latr_interrupt_pending()` 供 runtime 判断是否该退出 idle；`translate_wfi` 置 `env.wfi_pending=1`。
+    - 测试（裸机，`LOONGEMU_VCLOCK_VIRTUAL_STEP`）：STIP 由 comparator 派生、M 级投递（mcause/mepc/mtvec/MPIE/MPP）、S 级委托投递（scause/sepc/stvec/SPIE/SPP）、屏蔽时不投递、PLIC 触发 MEIP + 外部中断 cause 11 + guest claim、WFI 标志、idle 推进到 deadline 后 STIP 置位。
+  - **FADT/SPCR/MCFG/DSDT（本轮）**：ACPI 生成器补全为 `make test-riscv-acpi` → 160 checks。
+    - **FADT**（`FACP` rev 6，276 B）：hardware-reduced（flags bit20）、无 PM1/PM2/GPE 块（长/宽/GAS 全 0）、`DSDT` 与 `X_DSDT` 由调用者传入的 guest 物理地址填充、minor version 6、hypervisor vendor "LONGEMU"；校验和闭合。
+    - **SPCR**（rev 4，89 B）：interface 0x12（16550 兼容）、GAS=SystemMemory/8-bit/byte、MMIO 基址、interrupt type 0x10（RISC-V PLIC/APLIC 位）、GSI、波特率码、`namespace_string_offset=88` 与布局一致。
+    - **MCFG**（rev 1，60 B）：一条 ECAM allocation（base/segment/bus range），与 DSDT 的 PCIe `_CRS` 使用同一 ECAM 基址。
+    - **DSDT**（rev 2，最小 AML）：`Scope(\_SB)` 下为每个 hart 生成 `Device(Cnnn)`（`_HID`="ACPI0007"、`_UID`、`_MAT`=36 B RINTC，与 MADT 同字节布局）、`Device(PCI0)`（`_HID` 可配 PNP0A08/PNP0A03、`_SEG`/`_BBN`、`_CRS`=ECAM + PCI MMIO 两个 QWord 描述符）、`Device(UART)`（`_HID`="PNP0501"、`_UID`、`_CRS` QWord 窗口）、以及每个 virtio-mmio 设备的 `Device(Vnnn)`（`_HID`="LNRO0005"、`_CRS`）。AML 发射器只用 4 字节 `PkgLength` 形式（宽度与载荷无关），支持 Scope/Device/Name/String/Integer/Buffer/ResourceTemplate 子集；测试带一个 AML 结构解析器，逐层校验 PkgLength、`_MAT`/`_CRS` 缓冲区长度与内容、设备数量与顺序、整表校验和。**证据边界**：这是**结构级**验证，尚未用真实 guest（Linux/EDK2）启动解析过；QWord 描述符的 general/type flags 取 producer+fixed+non-cacheable，若后续 boot 测试发现字段不符需按 ACPI 6.6 复核。
+  - **固件桥接（本轮）**：新增 [`include/loongemu/riscv_fw.h`](include/loongemu/riscv_fw.h) + [`src/riscv_fw.c`](src/riscv_fw.c)。
+    - **MMIO fw_cfg**（QEMU `docs/specs/fw_cfg.rst` 布局）：data@0（64-bit，MMIO 大端组装）、selector@8（16-bit 大端，guest 需写 `byteswap16`）、DMA descriptor 地址@16；合成项 signature("QEMU")、feature bitmap（traditional|DMA）、nb/max CPUs、file directory（`u32 count` + 每项 `u32 size,u16 select,u16 rsvd,char name[56]`），文件自 0x20 起编号。
+    - **DMA**：`loongemu_fw_cfg_dma()` 解释 16 字节描述符（control/length/address），支持 SELECT/SKIP/READ；WRITE 一律拒绝（外部文件只读）；失败置 `ERROR` 位。DMA 描述符与载荷经调用者的 guest 物理访问回调完成，测试用假 guest 内存验证 SELECT+READ 往返。
+    - **RSDP/XSDT**：`loongemu_riscv_acpi_rsdp_build()`（rev 2，36 B，legacy+extended 双校验和）与 `loongemu_riscv_acpi_xsdt_build()`（表指针数组），把已放置的表交给 guest——即 `etc/acpi/rsdp`/`etc/acpi/tables` 的 VMM 侧生成方式。
+    - **pflash**：`loongemu_riscv_pflash_init/map()` 把 code/vars 两个槽（默认 0x20000000/0x22000000）注册为 `LOONGEMU_MEM_MMIO`，读写经现有 `ovmf_pflash_mmio_read/write` CFI 模型；code 槽 `read_only=1`。测试 `make test-riscv-fw` → 44 checks。
+    - **板级 smoke（本轮）**：`latr_boot_smoke` 用同一个裸机 guest 先写入 16 字节 DMA 描述符、执行 fw_cfg SELECT + READ 并核对 "QEMU" 签名，再从 pflash code 槽 XIP 执行同一程序；两条路径都以 UART `FW` 与 exit MMIO 通过。**证据边界**：仍未用真实 EDK2 `RISCV_VIRT_CODE.fd` 启动（仓库没有 RISC-V 固件镜像，也没有 VMM machine）。
+  - **per-vCPU 状态与 TB 缓存/跨核拍击（本轮，最后一项）**：
+    - **缓存索引** [`target/riscv/latr/tb-cache.c`](target/riscv/latr/tb-cache.c)：条目以 `guest_pc + {satp mode, ASID, privilege}` 为键，命中才复用；代码从调用者提供的 arena 复制（bump 分配，耗尽返回失败，不静默截断）。`latr_tb_cache_key(env)` 从 `satp`（MODE/ASID）与 `env->privilege` 取键——**特权切换或 satp 改写后同一 PC 的旧翻译不会被误用**。
+    - **拍击**：`latr_tb_shootdown_all/asid/privilege` 置条目无效并推进 `generation`；全量拍击回收 arena。**跨核注册表**（8 槽，`__atomic` 发布/获取）提供 `latr_tb_shootdown_asid_all_cores(asid)` 与 `latr_tb_fence_i_all_cores()`，任一 hart 的 SFENCE.VMA/FENCE.I 都能把其他 vCPU 的缓存打掉。
+    - **per-vCPU 切换**：`latr_set_cpu_env(env)` 切换 `lsenv->cpu_state`（`lsenv` 本身仍是 `__thread`，一个宿主线程一个 vCPU 的约束不变）。
+    - **guest 请求记录**：`sfence.vma` 现在写 `env->sfence_pending=1` 与 `sfence_asid`（`rs2=x0` → `UINT32_MAX` 表示全部 ASID；指定 VA 的失效按整 ASID 保守处理）；`fence.i` 继续写 `env->fence_i_pending`。runtime 在 TB 退出后按这两个标志调用上面的 all-cores 拍击（本组件没有 TB 主循环，故只交付接口与标志）。
+    - 测试（裸机，`checks=541`）：键匹配/ASID/特权/satp-mode 区分、插入复制与 arena 记账、ASID/特权/全量拍击、arena 耗尽报错、注册表跨核 ASID 拍击与 FENCE.I 全清、注销后跳过；`sfence.vma x1,x2` 记录 ASID、`x1,x0` 记录 ALL、U 模式非法且不记录；`latr_set_cpu_env` 切换生效。**证据边界**：宿主 harness 是单 vCPU，`__atomic` 注册表未做真并发压力测试。
+  - **MMIO 总线接入发射路径（本轮）**：新增 [`include/loongemu/mmio_bus.h`](include/loongemu/mmio_bus.h) + [`src/mmio_bus.c`](src/mmio_bus.c)（窗口注册、重叠/零长拒绝、按宽度分发）与 [`translator/mmio.c`](target/riscv/latr/translator/mmio.c)。
+    - `latr_translate()` 对 `LOONGEMU_MEM_MMIO` 置 `env->mem_mmio=1` 并返回 **guest PA**（绝不返回可解引用的设备 HPA）；RAM/ROM 路径 `mem_mmio=0`。
+    - 发射代码：load 在解析后用 `beqz mem_mmio, direct` 分叉——MMIO 走 `latr_mmio_load(env, pa, size)` 宿主调用，direct 才 `ld.*`；store 同理走 `latr_mmio_store(env, pa, size, value)`（值仍经 `env->mem_value` 跨调用）。MMIO load 结果按指令宽度补做语义：`lb/lh/lw` 符号扩展、`lbu/lhu/lwu` 零扩展、`ld` 全宽。
+    - 总线未命中 → 读/写 access fault（cause 5/7，`mtval`=guest VA）；**LR/SC/AMO 访问 MMIO 一律 cause 7**（`emit_mmio_atomic_guard`，不做非原子读改写）；`cbo.zero` 在 MMIO 上同样 cause 7。
+    - **取指**：`latr_fetch16` 解析后若 `mem_mmio` 则经总线读 2 字节（XIP pflash 场景）；总线未命中 → cause 1。
+    - 测试（裸机新增 25 checks）：设备寄存器窗口的 store/load 转发（offset/size/value、返回值）、`ld/lw/lb` 宽度、无设备 MMIO 的 cause 5 + `mtval`、LR→MMIO 的 cause 7、以及**从 MMIO 取指并执行**（设备返回 `addi x1,x0,5`）。
+    - **重要工程约束**：MMIO 分叉与内联陷阱让每个访存指令约 170–430 个 IR2 节点，TB 代码明显变大；harness 的 TB 缓冲从 4 KiB 提到 256 KiB，并加了 `words*4 > sizeof(code_buf)` 的显式失败保护（此前的 4 KiB 缓冲溢出正是本轮"LR 读到代码、随后挂死"的真因——溢出覆盖了 `data_word` 等静态区，而不是访存逻辑错误）。
+  - **PLIC/UART 挂到 MMIO 总线（本轮）**：新增 [`include/loongemu/uart16550.h`](include/loongemu/uart16550.h) + [`src/uart16550.c`](src/uart16550.c)（NS16550A：DLAB 除频锁存、IER/IIR/FCR/LCR/MCR/LSR/SCR、THRE 与 RDA 中断、IIR 读确认 THRE、FIFO 使能反映在 IIR[7:6]、接收字节 `loongemu_uart16550_receive()`、可配 1–4 字节宽访问）；`riscv_plic.c` 增加 `loongemu_plic_attach()`（仅接受 32-bit 寄存器访问，符合 PLIC 规范），UART 增加 `loongemu_uart16550_attach()` 与 `loongemu_uart_plic_irq()` 电平桥。两者都只是往 `LoongemuMmioBus` 注册窗口，guest 通过普通 `sb/lbu/sw/lw` 访问——发射路径完全复用上一轮的 MMIO 分叉。
+    - 测试：主机 `make test-riscv-uart` → 23 checks（LSR/IIR/DLAB/THR→控制台/RDA/THRE 电平与 IIR 确认/FIFO 位/总线字节访问与越窗失败）。
+    - 裸机新增设备级 29 checks（`test_uart_plic_devices`）：guest `sb` 写 THR → 控制台收到 'A'；guest `lbu` 读 LSR=0x60；guest `sw` 写 PLIC priority(源1/源10)、context-0 enable、threshold；guest `sb` 写 UART IER.RDA；注入 RX 'B' → **UART 电平 → PLIC 源 10 → `MIP.SEIP`**；guest `lw` 读 PLIC claim 返回 10；guest `lbu` 读 RBR 取回 'B' 并拉低线路；guest `sw` complete 后 pending 归零。地址采用 QEMU virt 布局：UART `0x10000000`（IRQ 10，与 SPCR `interrupt=10` 一致）、PLIC `0x0c000000`（context 0 窗口 `0x0c200000`）。
+    - **地址/编码陷阱（本轮踩到两次）**：PLIC context 基址是 `0x200000`（`0x0c200000`），不是 `0x020000`；PLIC 的 `enable` 只保留 `1..num_sources` 的位，把 UART 源 10 接到只初始化 8 源的 PLIC 上会被静默裁剪。
+  - **golden 参考侧的签名 bug（已修）**：`tests/latr_isa_qemu_ref.S` 原先用 `s0/s1` 保存 div/rem 结果，但后续压缩指令向量使用 `x8/x9`（= `s0/s1`），打印时已被覆盖，导致 12 字段签名前两位错位。现在结果先存入 `.Lsave_div`，打印前重载；LATR 侧仍打印算完即存的 `env.gpr[3]/[4]`。
 
 ## 1. 结论先行
 
 1. **LATR 应做成 LATA 的同构前端，而不是 LATX 的 RISC-V 移植。** RV64GC 是定长 32-bit（RVC 为 16/32 混合）RISC，没有条件码；不需要 Capstone，不需要 x86 EFLAGS/LBT4 状态。复用 LATA 的 IR2、`la-append`、`ir2-assemble`、`reg-alloc`、TB 切换骨架，新增 RISC-V 的 IR1 解码与语义翻译。
 2. **RISC-V 基本不需要 LBT。** RISC-V 没有 N/Z/C/V 或 x86 EFLAGS；LBT 的 `x86*/arm*` 标志组、`adc/sbc/rcr` 对 RISC-V 无用。LBT 只在可选 Zbb 的 `rol/ror`（`rotr/rotri`）和 TB 链接（`jiscr0/1`、`movgr2scr`）上有边际收益，且必须保留无 LBT 回退。**不能把 LBT 当作 RISC-V 的关键加速路径。**
 3. **LVZ 不能加速 RISC-V 指令翻译。** LVZ 是 LoongArch 的虚拟化扩展（guest/host CSR、GTLB、G-stage、guest 定时器/中断）；它不执行 RISC-V 指令，也不解析 RISC-V 页表。LVZ 只可能在“BT 自身运行在 LoongArch guest 中”时降低上下文切换/隔离成本，或者提供 GID/ASID 范围的 `invtlb` 失效思路；**不要把 LVZ 放进关键路径**。
-4. **PVIR 是 RVV predication 的正确语义层，但当前 API 是 SVE 形状。** 现有 PVIR 已覆盖 mask/inactive policy、merge/zero、精确/first-fault 内存语义、restart 状态和 mask 展开缓存；这对 RVV 的硬核心（mask + tail + fault + vstart）很有价值。P0 已放宽 LOAD 的 inactive 结果（`ZERO/MERGE/UNKNOWN`）；仍需：每操作数元素宽度、比较条件、标量/immediate operand、1-bit mask 目的、`first_lane`。动态 lane 数可用 TB 特化规避；fault-only-first 用 `NONFAULTING + RESTART/OTHER` 即可，不需要改核心。未扩展前，PVIR 只能覆盖“全 active 或单一块 mask、同宽度、无 widening”的 elementwise 子集。
+4. **PVIR 已足以覆盖 RVV 的"规则网格"部分（本轮核对完成）。** 现有 PVIR 已具备：每 operand 独立元素宽度（`pvir.c:518-540`，widening 可直接映射）、完整比较条件（含 U 变体，`pvir.c:554-579`）、标量/immediate operand 与 BROADCAST（`pvir.c:583-670`）、1-bit `PVIR_ELEMENT_MASK` 目的、`first_lane` 切片、运行时 `VECTOR_MASK` 谓词、mask 展开缓存与 RESTART/FIRST_FAULT 状态域。**三个与 RVV 对齐的关键结论**（详见 [`RVV_PVIR.md`](RVV_PVIR.md)，形状经 `make test-pvir-rvv-shapes` 实测）：① `vta/vma` 四种组合都可用单一 `MERGE`（undisturbed）实现——RVV 规格明确允许 in-order 实现忽略这两个位；② 动态 `vl` 折进运行时 packed mask words，`vl=0` 由前端分支跳过（PVIR 拒绝 0 lane）；③ TB 特化键为 `(vsew, vlmul)`。**本轮已注入（批次 B/C/D）**：`TRUNCATE/EXTEND`、`REM`、`MIN/MAX`、`MOVE`、`EXTRACT/INSERT`（`PvirLaneOperation`）、`CONVERT`（`PvirConvertOperation`，带舍入）、以及 MASK 类型的 8-bit 访存（`vlm.v/vsm.v`）；`test-pvir-rvv-shapes` 40 checks，`test-pvir` 222 checks 不变。仍缺、继续走 helper 或后续批次的是：sNaN 比较的 invalid 契约、`vfrec7/vfrsqrt7` 近似指令、多目的（`vmadc/vmsbc`、segment load）、跨 lane（shuffle/slide/compress）、归约、`viota/vcpop/vfirst/vmsbf`、strided/indexed/segment 访存。
 5. **RVV 的名义配置选 VLEN=128、ELEN=64、V 1.0。** 128-bit 对应一条 LSX 寄存器；LMUL=1 是 1:1，LMUL=2 是一条 LASX，LMUL>2 按 chunk 展开。LASX（VLEN=256）可选；在 direct lowering 通过差分前，不要向 guest 宣称 VLEN>128。
 6. **RISC-V 的 F 与 V 寄存器文件独立，LoongArch 的 FPR/LSX 共享同一物理文件。** 不能像 LATA 的 A64 那样把 V0-V31 和标量 FP 同时 1:1 映射。默认方案：标量 FPR 1:1 映射到 LA FPR，RVV 寄存器放 env，LSX/LASX 只作 chunk 临时寄存器；或者反过来，把标量 FP 放 env、RVV 1:1。这个选择必须在 P1 前定案，否则 P3 会返工。
 7. **实施顺序：先 RV64IMAC 整数用户态，再 F/D helper，再 RVV helper，最后 LSX/LASX direct lowering。** 每一阶段都以 QEMU-LVZ 的同一输入做差分；不通过差分不进入下一阶段。
@@ -481,6 +538,33 @@ typedef struct CPUArchState {
 
 ## 5. RVV 与 PVIR
 
+> **实现进度**：
+> - **`misa.V` 已置位**：`misa = 0x8000_0000_0020_112d`（RV64 + I/M/A/F/D/C + V bit 21）；写入仍按只读处理。
+> - **状态与 CSR**：`vtype/vill/vl/vstart/vxrm/vxsat/vreg[32][16]`、掩码词、`rvv_args/rvv_scalar/rvv_imm`、PVIR 观测字段；`vsetvli/vsetvl/vsetivli`（AVL、vill、`mstatus.VS`、退出 TB）；`vstart/vxsat/vxrm/vcsr/vl/vtype/vlenb` CSR。
+> - **访存**：unit-stride `vle/vse`、strided `vlse/vsse`、indexed `vluxei/vloxei` 与 `vsuxei/vsoxei`（8/16/32/64；indexed 的 EEW 是索引宽度、索引零扩展，strided 用符号扩展 GPR 步长）；`nf=1`，segment `nf>1` 显式报非法；masked/vma/vta、`vstart` 重启、逐元素精确故障（`vstart=故障 lane`，`mtval=元素地址`，MMIO 复用 `latr_mmio_*`）。
+> - **掩码**：`vmand/vmnand/vmandn/vmxor/vmor/vmnor/vmorn/vmxnor`；`vcpop/vfirst/vmsbf/vmsif/vmsof/viota/vid`；mask 尾部与 QEMU 默认（`rvv_ta_all_1s=false`）一致。
+> - **归约**：`vredsum/and/or/xor/minu/min/maxu/max`、`vwredsum(u)`、`vfredusum/osum/min/max`、`vfwredusum/osum`（FP 用 softfloat；有序/无序在当前串行实现下同序）。
+> - **排列**：`vslideup/vslidedown`（vx/vi）、`vslide1up/vslide1down`、`vrgather`（vv/vx/vi）、`vrgatherei16.vv`、`vcompress.vm`。
+> - **扩/缩/饱和**：`vwadd(u)/vwsub(u)`、`vwmul(u/su)`、`vwmacc(u/su/us)`（vv/vx 及相应 wide 形式）、`vnsrl/vnsra`、`vnclip(u)`、`vsadd(u)/vssub(u)`、`vaadd(u)/vasub(u)`、`vssrl/vssra`；`vxrm` 的 rnu/rne/rdn/rod 以 `__int128` 实现，饱和置 `vxsat`。
+> - **向量浮点**：`vfadd/sub/mul/div/min/max/sqrt`、`vfsgnj/n/x`、`vfmerge.vfm`、`vfmv.v.f`、`vfmv.f.s`、`vfmv.s.f`、`vmfeq/ne/lt/le/gt/ge`、`vfclass`、单宽转换（含 rtz）、`vfwcvt/vfncvt`（含 rod、宽窄整数/F 转换）、`vfwadd/vfwsub/vfwmul`；全部走 QEMU softfloat，fflags 累加。
+> - **整数标量移动**：`vmv.x.s`（符号扩展 element 0）、`vmv.s.x`。
+> - **PVIR 发射、缓存与混合 LSX/LASX lowering**：`translator/pvir-exec.c` 实现完整 RVV PVIR 解释执行（整数含 `MUL/DIV/REM/MIN/MAX` 与 signed `INT_MIN/-1` 保护、`COMPARE`、`SELECT`、`BROADCAST`、`MOVE`、`EXTEND/TRUNCATE`、`FP_ARITH`、带 mask 的 `CONVERT` 及 `vfncvt.rod`、`FIXED`、`EXTRACT`/`INSERT`、`LANE_INDEX`、`LOAD`/`STORE` 含 `vlm.v/vsm.v` 8-bit 掩码访存），并配备 64 槽 per-TB PVIR 描述符缓存（`latr_pvir_cache_*`）与 `LatrTbKey.vspec` 向量特化；`translator/pvir-lower-lsx.c` 实现 3 级自适应直接 lowering（Tier 2 LASX `la_xv*` 32B + Tier 1 LSX `la_v*` 16B 同指令混合与 Tier 0 PVIR helper 回退），涵盖整数 ALU、move/merge、mask logic 与带不活动 lane 隔离的 FP 算术。
+> - **关键修复**：`latx/compat/qemu/host-utils.h` 的 `mulu64/muls64` 出参顺序已修正；`vsll/vsrl/vsra.vi` 修复无符号 5-bit 移位；`vmv.x.s` 增加 `x0` 保护；`vmv.s.x`/`vfmv.s.f` 修复 `vl==0` 与 `vta=1` 尾填充。
+> - **测试**：裸机 `latr-isa` **1181 checks**；`-march=rv64gcv` QEMU RVV 差分 `latr-diff: PASS`；decode 26 checks；PVIR 222/54/347 checks 全部通过；混用 LASX+LSX（`LMUL=4, vl=12, SEW=32`）与 `latx_cpu_set_vector_features` 门控实测通过。
+>
+> **仍未做**：segment（`nf>1`）、whole-register load/store、`vleff`、FP FMA/`vadc/vmadc/vmacc`、组对齐/重叠检查、归约/排列族的 PVIR 化；`misa` 写入仍忽略。
+
+> **本轮新增**：[`RVV_PVIR.md`](RVV_PVIR.md) 是 RVV 1.0 → PVIR 的映射研究（PVIR 能力/硬约束逐条核对到 `la-pvir.h`/`pvir.c` 行号、逐族 D/S/H/X 映射表、P0 必须钉死的 lowering 契约、分阶段计划与风险）。三个已定结论：
+> 1. `vta/vma` 的四种组合都可用 **PVIR `MERGE`（undisturbed）** 覆盖——RVV 允许 agnostic 保持原值，因此 P0 不需要两个 inactive 策略位；
+> 2. 动态 `vl` 折进运行时 packed mask words，用 `PVIR_PREDICATE_VECTOR_MASK`；`vl=0` 由前端分支跳过（PVIR 拒绝 0 lane）；
+> 3. TB 特化键为 `(vsew, vlmul)`（32 种），`vsetvli/vsetvl` 结束当前 TB；`vl/vstart/mask` 保持运行时。
+> 其中"widening 可直接映射、narrowing 需要 `TRUNCATE`/混合位宽契约"是 P0 前必须落地的设计点（研究稿 §6.1）。
+> PVIR 侧需要新增什么、以及如何在不改变 SVE 语义的前提下注入，见 [`RVV_PVIR_GAPS.md`](RVV_PVIR_GAPS.md)：
+> 缺口 G1–G10（收窄/扩展、REM、EXTRACT/INSERT、CONVERT、MASK 字节访存、定点/饱和、FP 舍入、多目的、跨 lane、索引），
+> 注入协议（只追加枚举与 union 成员、校验只增不改、枚举编号 `PVIR_OP_BROADCAST == 19` 用 `_Static_assert` 冻结），
+> 以及分批计划与回归门（`test-pvir` 222 + `test-pvir-rvv-shapes` 40）。
+> **已执行（批次 B/C/D/E）**：PVIR 追加 `TRUNCATE/EXTEND/REM/MIN/MAX/MOVE`（20–25）、`EXTRACT/INSERT`（`PvirLaneOperation`，26/27）、`CONVERT`（`PvirConvertOperation`，28）、`FIXED`（`PvirFixedPointOperation`，29，含 vxrm 舍入与 vxsat 状态）、`FP_ARITH`（`PvirFPOpOperation`，30，ADD/SUB/MUL/DIV/SQRT + 显式舍入）、`LANE_INDEX`（`PvirIndexOperation`，31），并放宽 LOAD/STORE 允许 MASK 类型 + 8-bit 内存元素（`vlm.v/vsm.v`）。只追加枚举/union 成员、校验只增不改；既有 222 项 SVE 形状与 347 项 SVE-PVIR 回归全部保持，`test-pvir-rvv-shapes` 为 54 checks。
+
 ### 5.1 RVV 状态模型
 
 RVV 1.0 的核心状态：
@@ -888,3 +972,18 @@ QEMU 自带的 `tests/tcg/riscv64` 只有少量用例（`test-div.c`、`test-fcv
 | 现有 TB 缓存 | `include/loongemu/tb_cache.h` |
 | 现有 ARM64 walker 模板 | `include/loongemu/arm64_paging.h`、`src/arm64_paging.c` |
 | MIPS 同构设计参考 | `target/mips/latm/DESIGN.md` |
+
+
+## 6. 2026-11-22 修复轮（system / privilege / TB）
+
+详细逐条状态见 [`GAPS.md`](GAPS.md)。本轮落地并有测试证据的项目：
+
+- **系统闭环**：新增 `include/latr-system.h` + `system/latr_system.c`（RAM/map/MMIO bus/CLINT/PLIC/UART/exit/ACPI）、`baremetal/bare/latr_boot_smoke.c`（ELF 装载 → TB 缓存 → 翻译执行 → guest UART → exit）。`make latr-boot-run` 输出 `latr-boot: PASS uart=LATR ...`。
+- **TB 缓存**：键补 root PPN；`UINT32_MAX` 全 ASID 拍击修正；`tr_ir2_assemble()` 产物插入缓存并把 `TbInsnMap` rebase 到缓存地址；`sfence_pending`/`fence_i_pending` 在系统循环消费；`target_disasm()` 在 JAL/JALR/MRET/SRET/ECALL/EBREAK/FENCE.I/VSETVL* 及第 2+ 条跨页指令前收尾（单元 harness 用 `LATR_TB_CFLAGS_ALLOW_FLOW` 保留旧块语义）。
+- **PMP/MPRV**：TOR/NA4/NAPOT、L 锁定、54 位 pmpaddr、mseccfg.MML/MMWP；页表 PTE 访问与最终 PA 都检查 PMP；MPRV 按 MPP 降权，SRET 清 MPRV。
+- **MMU**：PTE 物理地址经 `LoongemuMemMap` 解析（不再把 guest PPN 当宿主指针）；跨 4 KiB 标量访存切页；Svpbmt 保留编码 fault，Svade/ADUE 与原子 A/D 置位。
+- **中断/特权**：vectored mtvec/stvec；U-mode 委托中断要求 SIE；mideleg/medeleg 写掩码；`mip` 可写 MSIP/SSIP；`mip` 读刷新 Sstc STIP；FS/VS Dirty 与 FS=Off gating；misa S/U；`mhartid` 等机器信息 CSR。
+- **工具链**：`latr-check` 接入 `test-latr`；内置 QEMU decode 文件/`decodetree.py` 回退，`QEMU_SRC` 仅作可选覆盖；SBI 增加 DBCN 与 legacy EID。
+- **测试基线**：`latr-isa` 1063 checks、`latr-boot` PASS、`latr-diff` PASS；decode 26；PVIR 222/54/347；SBI 49；CLINT 13。
+
+仍未完成（见 `GAPS.md` 的 `[ ]`）：软件 TLB、RVV 与系统 QEMU 差分、RVV 1.0 剩余指令/合规检查、PVIR 全族覆盖、SMP 宿主线程调度与并发压力、fw_cfg/pflash/真实 OpenSBI 装载、`la-pvir.h` 目录迁移（明确本轮不做）。

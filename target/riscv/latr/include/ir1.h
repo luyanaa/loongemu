@@ -27,13 +27,20 @@ typedef struct RiscvIR1 {
         int32_t imm;
         int shamt;
         int csr;
+        /* vsetvli/vsetivli vtype immediate (QEMU's zimm field). */
         int zimm;
+        /* Vector form bit: 1 = unmasked, 0 = masked by v0. */
+        int vm;
+        int nf;
         int rm;
         int aq;
         int rl;
         int pred;
         int succ;
     } arg;
+    /* Instruction-fetch fault: guest VA and RISC-V exception cause. */
+    uint64_t fault_va;
+    int fault_cause;
 } RiscvIR1;
 
 /* `raw` is the little-endian instruction bits, with the first 16 bits low. */

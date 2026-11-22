@@ -1,6 +1,7 @@
 #include "latr.h"
 #include "translate.h"
 #include "loongemu/vclock.h"
+#include "mmu.h"
 
 #define CSR_FFLAGS       0x001
 #define CSR_FRM          0x002
@@ -16,6 +17,14 @@
 #define CSR_STVAL        0x143
 #define CSR_SIP          0x144
 #define CSR_STIMECMP     LATR_RISCV_CSR_STIMECMP
+#define CSR_SATP         0x180
+#define CSR_VSTART       0x008
+#define CSR_VXSAT        0x009
+#define CSR_VXRM         0x00a
+#define CSR_VCSR         0x00f
+#define CSR_VL           0xc20
+#define CSR_VTYPE        0xc21
+#define CSR_VLENB        0xc22
 #define CSR_MSTATUS      0x300
 #define CSR_MISA         0x301
 #define CSR_MEDELEG      0x302
@@ -24,7 +33,18 @@
 #define CSR_MTVEC        0x305
 #define CSR_MCOUNTEREN   0x306
 #define CSR_MENVCFG      0x30a
+#define CSR_MSECCFG      0x747
 #define CSR_MCOUNTINHIBIT 0x320
+#define CSR_MSTATEEN0    0x30c
+#define CSR_MSTATEEN1    0x30d
+#define CSR_MSTATEEN2    0x30e
+#define CSR_MSTATEEN3    0x30f
+#define CSR_MHPMEVENT3   0x323
+#define CSR_MHPMEVENT31  0x33f
+#define CSR_MHPMCOUNTER3 0xb03
+#define CSR_MHPMCOUNTER31 0xb1f
+#define CSR_HPMCOUNTER3  0xc03
+#define CSR_HPMCOUNTER31 0xc1f
 #define CSR_MSCRATCH     0x340
 #define CSR_MEPC         0x341
 #define CSR_MCAUSE       0x342
@@ -36,6 +56,12 @@
 #define CSR_TIME         0xc01
 #define CSR_INSTRET      0xc02
 
+/* PMP: RV64 has pmpcfg0/pmpcfg2 and pmpaddr0..15; pmpcfg1/3 do not exist. */
+#define CSR_PMPCFG0      0x3a0
+#define CSR_PMPCFG2      0x3a2
+#define CSR_PMPADDR0     0x3b0
+#define CSR_PMPADDR_LAST 0x3bf
+
 #define CSR_USER_CUSTOM_FIRST 0x800
 #define CSR_USER_CUSTOM_LAST  0x8ff
 
@@ -45,6 +71,7 @@
 #define MSTATUS_MPIE  (UINT64_C(1) << 7)
 #define MSTATUS_SPP   (UINT64_C(1) << 8)
 #define MSTATUS_MPP   (UINT64_C(3) << 11)
+#define MSTATUS_VS    (UINT64_C(3) << 9)
 #define MSTATUS_FS    (UINT64_C(3) << 13)
 #define MSTATUS_XS    (UINT64_C(3) << 15)
 #define MSTATUS_MPRV  (UINT64_C(1) << 17)
@@ -57,15 +84,24 @@
 #define MSTATUS_SXL  (UINT64_C(2) << 34)
 
 #define SSTATUS_WRITE_MASK (MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | \
-                            MSTATUS_FS | MSTATUS_SUM | MSTATUS_MXR)
+                            MSTATUS_VS | MSTATUS_FS | MSTATUS_SUM | \
+                            MSTATUS_MXR)
 #define MSTATUS_WRITE_MASK (SSTATUS_WRITE_MASK | MSTATUS_MIE | MSTATUS_MPIE | \
                             MSTATUS_MPP | MSTATUS_MPRV | MSTATUS_TVM | \
                             MSTATUS_TW | MSTATUS_TSR)
 #define MIE_WRITABLE_MASK (UINT64_C(0xaaa))
-#define MIP_WRITABLE_MASK (UINT64_C(1) << 1)
-#define ENVCFG_WRITABLE_MASK ((UINT64_C(1) << 63) | UINT64_C(0xf0))
+#define MIP_WRITABLE_MASK ((UINT64_C(1) << 1) | (UINT64_C(1) << 3))
+#define MIDELEG_WRITABLE_MASK UINT64_C(0x222)
+#define MEDELEG_WRITABLE_MASK UINT64_C(0xb3ff)
+#define ENVCFG_WRITABLE_MASK ((UINT64_C(1) << 63) | (UINT64_C(1) << 62) | \
+                              (UINT64_C(1) << 61) | UINT64_C(0xf0))
 #define SENVCFG_WRITABLE_MASK UINT64_C(0xf0)
-#define MISA_RV64GC (UINT64_C(0x800000000000112d))
+#define MISA_RV64GC (UINT64_C(0x800000000034112d)) /* S + U + V */
+#define CSR_MVENDORID 0xf11
+#define CSR_MARCHID   0xf12
+#define CSR_MIMPID    0xf13
+#define CSR_MHARTID   0xf14
+#define CSR_MCONFIGPTR 0xf15
 
 typedef enum LatrCsrKind {
     LATR_CSR_FFLAGS,
@@ -81,6 +117,16 @@ typedef enum LatrCsrKind {
     LATR_CSR_TIME,
     LATR_CSR_INSTRET,
     LATR_CSR_USER_CUSTOM,
+    LATR_CSR_HPMCOUNTER,
+    LATR_CSR_VSTART,
+    LATR_CSR_VXSAT,
+    LATR_CSR_VXRM,
+    LATR_CSR_VCSR,
+    LATR_CSR_VL,
+    LATR_CSR_VTYPE,
+    LATR_CSR_VLENB,
+    LATR_CSR_MHARTID,
+    LATR_CSR_MZERO,
 } LatrCsrKind;
 
 static bool csr_kind(int csr, LatrCsrKind *kind)
@@ -105,6 +151,7 @@ static bool csr_kind(int csr, LatrCsrKind *kind)
     case CSR_SCAUSE:
     case CSR_STVAL:
     case CSR_STIMECMP:
+    case CSR_SATP:
     case CSR_MSTATUS:
     case CSR_MEDELEG:
     case CSR_MIDELEG:
@@ -112,6 +159,7 @@ static bool csr_kind(int csr, LatrCsrKind *kind)
     case CSR_MTVEC:
     case CSR_MCOUNTEREN:
     case CSR_MENVCFG:
+    case CSR_MSECCFG:
     case CSR_MCOUNTINHIBIT:
     case CSR_MSCRATCH:
     case CSR_MEPC:
@@ -121,7 +169,38 @@ static bool csr_kind(int csr, LatrCsrKind *kind)
     case CSR_MINSTRET:
         *kind = LATR_CSR_STORAGE;
         return true;
+    case CSR_VSTART: *kind = LATR_CSR_VSTART; return true;
+    case CSR_VXSAT:  *kind = LATR_CSR_VXSAT; return true;
+    case CSR_VXRM:   *kind = LATR_CSR_VXRM; return true;
+    case CSR_VCSR:   *kind = LATR_CSR_VCSR; return true;
+    case CSR_VL:     *kind = LATR_CSR_VL; return true;
+    case CSR_VTYPE:  *kind = LATR_CSR_VTYPE; return true;
+    case CSR_VLENB:  *kind = LATR_CSR_VLENB; return true;
+    case CSR_HPMCOUNTER3 ... CSR_HPMCOUNTER31:
+        *kind = LATR_CSR_HPMCOUNTER;
+        return true;
+    case CSR_MHARTID: *kind = LATR_CSR_MHARTID; return true;
+    case CSR_MVENDORID:
+    case CSR_MARCHID:
+    case CSR_MIMPID:
+    case CSR_MCONFIGPTR:
+        *kind = LATR_CSR_MZERO;
+        return true;
     default:
+        if ((csr >= CSR_MHPMEVENT3 && csr <= CSR_MHPMEVENT31) ||
+            (csr >= CSR_MHPMCOUNTER3 && csr <= CSR_MHPMCOUNTER31) ||
+            (csr >= CSR_MSTATEEN0 && csr <= CSR_MSTATEEN3)) {
+            *kind = LATR_CSR_STORAGE;
+            return true;
+        }
+        if (csr >= CSR_PMPADDR0 && csr <= CSR_PMPADDR_LAST) {
+            *kind = LATR_CSR_STORAGE;
+            return true;
+        }
+        if (csr == CSR_PMPCFG0 || csr == CSR_PMPCFG2) {
+            *kind = LATR_CSR_STORAGE;
+            return true;
+        }
         /* PMP has no placeholder storage; other unknown CSRs trap illegal. */
         if (csr >= CSR_USER_CUSTOM_FIRST && csr <= CSR_USER_CUSTOM_LAST) {
             *kind = LATR_CSR_USER_CUSTOM;
@@ -131,6 +210,13 @@ static bool csr_kind(int csr, LatrCsrKind *kind)
     }
 }
 
+static bool csr_is_vector(int csr)
+{
+    return csr == CSR_VSTART || csr == CSR_VXSAT || csr == CSR_VXRM ||
+           csr == CSR_VCSR || csr == CSR_VL || csr == CSR_VTYPE ||
+           csr == CSR_VLENB;
+}
+
 static bool csr_is_read_only(int csr)
 {
     return (csr & 0xc00) == 0xc00 || csr == CSR_MISA;
@@ -138,7 +224,8 @@ static bool csr_is_read_only(int csr)
 
 static bool csr_is_counter(int csr)
 {
-    return csr == CSR_CYCLE || csr == CSR_TIME || csr == CSR_INSTRET;
+    return csr == CSR_CYCLE || csr == CSR_TIME || csr == CSR_INSTRET ||
+           (csr >= CSR_HPMCOUNTER3 && csr <= CSR_HPMCOUNTER31);
 }
 
 static void emit_runtime_call(uintptr_t function)
@@ -151,6 +238,36 @@ static void emit_runtime_call(uintptr_t function)
     la_jirl(ra_ir2_opnd, call_target, 0);
     ra_free_temp(call_target);
     latr_env_load_d(ra_ir2_opnd, env_offset_host_return_address());
+}
+
+/* Resolves a guest VA through the page walker. After the call a0 holds the
+ * host address (0 on fault, recorded in env), and every itemp register has
+ * been clobbered: callers must not keep temps live across this sequence. */
+void latr_emit_resolve(IR2_OPND address, unsigned access, unsigned size)
+{
+    IR2_OPND target = ra_alloc_itemp();
+
+    latr_env_store_d(address, env_offset_mem_va());
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    la_mov64(a1_ir2_opnd, address);
+    li_d(a2_ir2_opnd, access);
+    li_d(a3_ir2_opnd, size);
+    latr_env_store_d(ra_ir2_opnd, env_offset_host_return_address());
+    li_d(target, (int64_t)(uintptr_t)&latr_resolve_guest_address);
+    la_jirl(ra_ir2_opnd, target, 0);
+    ra_free_temp(target);
+    latr_env_load_d(ra_ir2_opnd, env_offset_host_return_address());
+}
+
+/* Branches to `fault` when the last resolve failed (host address 0 may be a
+ * legitimate physical page, so the fault flag is authoritative). */
+void latr_emit_branch_on_fault(IR2_OPND fault)
+{
+    IR2_OPND cause = ra_alloc_itemp();
+
+    latr_env_load_d(cause, env_offset_mem_fault_cause());
+    la_bne(cause, zero_ir2_opnd, fault);
+    ra_free_temp(cause);
 }
 
 static uint64_t latr_read_time(CPUArchState *env)
@@ -213,14 +330,16 @@ static void load_csr(IR2_OPND dst, LatrCsrKind kind, int csr)
         ra_free_temp(tmp);
         break;
     case LATR_CSR_SIP:
-        latr_env_load_d(dst, env_offset_csr(CSR_MIP));
+        emit_runtime_call((uintptr_t)latr_read_mip);
+        la_mov64(dst, a0_ir2_opnd);
         tmp = ra_alloc_itemp();
         latr_env_load_d(tmp, env_offset_csr(CSR_MIDELEG));
         la_and(dst, dst, tmp);
         ra_free_temp(tmp);
         break;
     case LATR_CSR_MIP:
-        latr_env_load_d(dst, env_offset_csr(CSR_MIP));
+        emit_runtime_call((uintptr_t)latr_read_mip);
+        la_mov64(dst, a0_ir2_opnd);
         break;
     case LATR_CSR_MISA:
         li_d(dst, (int64_t)MISA_RV64GC);
@@ -234,6 +353,47 @@ static void load_csr(IR2_OPND dst, LatrCsrKind kind, int csr)
         break;
     case LATR_CSR_INSTRET:
         latr_env_load_d(dst, env_offset_csr(CSR_MINSTRET));
+        break;
+    case LATR_CSR_VSTART:
+        latr_env_load_d(dst, env_offset_vstart());
+        break;
+    case LATR_CSR_VXSAT:
+        latr_env_load_d(dst, env_offset_vxsat());
+        break;
+    case LATR_CSR_VXRM:
+        latr_env_load_d(dst, env_offset_vxrm());
+        break;
+    case LATR_CSR_VCSR:
+        latr_env_load_d(dst, env_offset_vxrm());
+        la_slli_d(dst, dst, 1);
+        tmp = ra_alloc_itemp();
+        latr_env_load_d(tmp, env_offset_vxsat());
+        la_or(dst, dst, tmp);
+        ra_free_temp(tmp);
+        break;
+    case LATR_CSR_VL:
+        latr_env_load_d(dst, env_offset_vl());
+        break;
+    case LATR_CSR_VTYPE:
+        latr_env_load_d(dst, env_offset_vtype());
+        tmp = ra_alloc_itemp();
+        latr_env_load_d(tmp, env_offset_vill());
+        la_slli_d(tmp, tmp, 63);
+        la_or(dst, dst, tmp);
+        ra_free_temp(tmp);
+        break;
+    case LATR_CSR_VLENB:
+        li_d(dst, LATR_RVV_VLENB);
+        break;
+    case LATR_CSR_HPMCOUNTER:
+        /* User/supervisor view aliases the machine counter. */
+        latr_env_load_d(dst, env_offset_csr(csr - 0x100));
+        break;
+    case LATR_CSR_MHARTID:
+        latr_env_load_d(dst, env_offset_hartid());
+        break;
+    case LATR_CSR_MZERO:
+        li_d(dst, 0);
         break;
     case LATR_CSR_USER_CUSTOM:
     case LATR_CSR_STORAGE:
@@ -268,6 +428,42 @@ static void store_masked_csr(IR2_OPND value, int csr, uint64_t writable_mask)
     ra_free_temp(old_value);
 }
 
+static void emit_mark_fs_dirty(void)
+{
+    IR2_OPND status = ra_alloc_itemp();
+    IR2_OPND bits = ra_alloc_itemp();
+
+    latr_env_load_d(status, env_offset_csr(CSR_MSTATUS));
+    li_d(bits, (int64_t)MSTATUS_FS);
+    la_or(status, status, bits);
+    latr_env_store_d(status, env_offset_csr(CSR_MSTATUS));
+    ra_free_temp(bits);
+    ra_free_temp(status);
+}
+
+static void emit_mark_vs_dirty(void)
+{
+    IR2_OPND status = ra_alloc_itemp();
+    IR2_OPND bits = ra_alloc_itemp();
+
+    latr_env_load_d(status, env_offset_csr(CSR_MSTATUS));
+    li_d(bits, (int64_t)MSTATUS_VS);
+    la_or(status, status, bits);
+    latr_env_store_d(status, env_offset_csr(CSR_MSTATUS));
+    ra_free_temp(bits);
+    ra_free_temp(status);
+}
+
+void latr_emit_mark_fs_dirty(void)
+{
+    emit_mark_fs_dirty();
+}
+
+void latr_emit_mark_vs_dirty(void)
+{
+    emit_mark_vs_dirty();
+}
+
 static void store_csr(IR2_OPND value, LatrCsrKind kind, int csr)
 {
     IR2_OPND state, mask, old_value, delegated, inverse_mask, filtered, field;
@@ -280,6 +476,7 @@ static void store_csr(IR2_OPND value, LatrCsrKind kind, int csr)
         la_bstrins_d(state, value, 4, 0);
         la_st_d(state, env_ir2_opnd, env_offset_fcsr());
         ra_free_temp(state);
+        emit_mark_fs_dirty();
         break;
     case LATR_CSR_FRM:
         state = ra_alloc_itemp();
@@ -288,12 +485,14 @@ static void store_csr(IR2_OPND value, LatrCsrKind kind, int csr)
         la_bstrins_d(state, value, 7, 5);
         la_st_d(state, env_ir2_opnd, env_offset_fcsr());
         ra_free_temp(state);
+        emit_mark_fs_dirty();
         break;
     case LATR_CSR_FCSR:
         state = ra_alloc_itemp();
         la_bstrpick_d(state, value, 7, 0);
         la_st_d(state, env_ir2_opnd, env_offset_fcsr());
         ra_free_temp(state);
+        emit_mark_fs_dirty();
         break;
     case LATR_CSR_SSTATUS:
         store_masked_csr(value, CSR_MSTATUS, SSTATUS_WRITE_MASK);
@@ -327,6 +526,46 @@ static void store_csr(IR2_OPND value, LatrCsrKind kind, int csr)
     case LATR_CSR_TIME:
     case LATR_CSR_INSTRET:
         break;
+    case LATR_CSR_VSTART:
+        state = ra_alloc_itemp();
+        mask = ra_alloc_itemp();
+        li_d(mask, (int64_t)LATR_RVV_VSTART_MASK);
+        la_and(state, value, mask);
+        latr_env_store_d(state, env_offset_vstart());
+        ra_free_temp(mask);
+        ra_free_temp(state);
+        emit_mark_vs_dirty();
+        break;
+    case LATR_CSR_VXSAT:
+        latr_env_store_d(value, env_offset_vxsat());
+        emit_mark_vs_dirty();
+        break;
+    case LATR_CSR_VXRM:
+        latr_env_store_d(value, env_offset_vxrm());
+        emit_mark_vs_dirty();
+        break;
+    case LATR_CSR_VCSR:
+        state = ra_alloc_itemp();
+        mask = ra_alloc_itemp();
+        la_srli_d(state, value, 1);
+        li_d(mask, 3);
+        la_and(state, state, mask);
+        latr_env_store_d(state, env_offset_vxrm());
+        li_d(mask, 1);
+        la_and(state, value, mask);
+        latr_env_store_d(state, env_offset_vxsat());
+        ra_free_temp(mask);
+        ra_free_temp(state);
+        emit_mark_vs_dirty();
+        break;
+    case LATR_CSR_VL:
+    case LATR_CSR_VTYPE:
+    case LATR_CSR_VLENB:
+    case LATR_CSR_HPMCOUNTER:
+    case LATR_CSR_MHARTID:
+    case LATR_CSR_MZERO:
+        /* Read-only; the write-intent check already traps. */
+        break;
     case LATR_CSR_USER_CUSTOM:
         latr_env_store_d(value, env_offset_csr(csr));
         break;
@@ -357,15 +596,108 @@ static void store_csr(IR2_OPND value, LatrCsrKind kind, int csr)
             latr_env_store_d(state, env_offset_stimecmp_update_pending());
             ra_free_temp(state);
             break;
+        case CSR_SATP: {
+            /* QEMU's legalize_xatp(): accept the write only when MODE is a
+             * supported translation mode (Bare/Sv39/Sv48/Sv57); otherwise
+             * keep the previous value. There is no TLB to flush yet. */
+            IR2_OPND mode = ra_alloc_itemp();
+            IR2_OPND supported = ra_alloc_itemp();
+            IR2_OPND accept = ir2_opnd_new_type(IR2_OPND_LABEL);
+            IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
+
+            la_srli_d(mode, value, 60);
+            la_beqz(mode, accept);
+            li_d(supported, 8);
+            la_beq(mode, supported, accept);
+            li_d(supported, 9);
+            la_beq(mode, supported, accept);
+            li_d(supported, 10);
+            la_beq(mode, supported, accept);
+            la_b(done);
+            la_label(accept);
+            latr_env_store_d(value, env_offset_csr(csr));
+            la_label(done);
+            ra_free_temp(supported);
+            ra_free_temp(mode);
+            break;
+        }
+        case CSR_PMPCFG0:
+        case CSR_PMPCFG2:
+            /* Per-byte WARL: a locked byte (L=1) is immutable; an entry
+             * with W=1,R=0 is reserved while mseccfg.MML=0. Keep the old
+             * byte in both cases. */
+            state = ra_alloc_itemp();
+            field = ra_alloc_itemp();
+            mask = ra_alloc_itemp();
+            latr_env_load_d(state, env_offset_csr(csr));
+            li_d(mask, 2);
+            for (int i = 0; i < 8; i++) {
+                IR2_OPND keep_byte = ir2_opnd_new_type(IR2_OPND_LABEL);
+                la_bstrpick_d(field, state, 7 + 8 * i, 8 * i);
+                la_andi(field, field, 0x80);
+                la_bnez(field, keep_byte);
+                la_bstrpick_d(field, value, 7 + 8 * i, 8 * i);
+                la_andi(field, field, 3);
+                la_beq(field, mask, keep_byte);
+                la_bstrpick_d(field, value, 7 + 8 * i, 8 * i);
+                la_bstrins_d(state, field, 7 + 8 * i, 8 * i);
+                la_label(keep_byte);
+            }
+            latr_env_store_d(state, env_offset_csr(csr));
+            ra_free_temp(mask);
+            ra_free_temp(field);
+            ra_free_temp(state);
+            break;
+        case CSR_PMPADDR0 ... CSR_PMPADDR_LAST: {
+            unsigned pmp_index = (unsigned)(csr - CSR_PMPADDR0);
+            int cfg_csr = pmp_index < 8 ? CSR_PMPCFG0 : CSR_PMPCFG2;
+            unsigned shift = 8 * (pmp_index & 7u);
+            IR2_OPND skip = ir2_opnd_new_type(IR2_OPND_LABEL);
+            IR2_OPND masked = ra_alloc_itemp();
+
+            state = ra_alloc_itemp();
+            field = ra_alloc_itemp();
+            mask = ra_alloc_itemp();
+            latr_env_load_d(state, env_offset_csr(cfg_csr));
+            la_bstrpick_d(field, state, (int)shift + 7, (int)shift);
+            la_andi(field, field, 0x80);
+            la_bnez(field, skip);
+            li_d(mask, (int64_t)((UINT64_C(1) << 54) - 1));
+            la_and(masked, value, mask);
+            latr_env_store_d(masked, env_offset_csr(csr));
+            la_label(skip);
+            ra_free_temp(mask);
+            ra_free_temp(masked);
+            ra_free_temp(field);
+            ra_free_temp(state);
+            break;
+        }
+        case CSR_MSECCFG:
+            store_masked_csr(value, csr, 3);
+            break;
+        case CSR_MSTATEEN0:
+            /* STATEEN, HSENVCFG and FCSR gating bits are modelled as
+             * storage; unsupported extension bits read as zero. */
+            store_masked_csr(value, csr,
+                             (UINT64_C(1) << 63) | (UINT64_C(1) << 62) |
+                             (UINT64_C(1) << 1));
+            break;
+        case CSR_MSTATEEN1:
+        case CSR_MSTATEEN2:
+        case CSR_MSTATEEN3:
+            store_masked_csr(value, csr, UINT64_C(1) << 63);
+            break;
         case CSR_MIE:
             store_masked_csr(value, csr, MIE_WRITABLE_MASK);
             break;
         case CSR_MCOUNTEREN:
         case CSR_SCOUNTEREN:
-            store_masked_csr(value, csr, UINT64_C(7));
+            store_masked_csr(value, csr, UINT64_C(0xffffffff));
             break;
         case CSR_MCOUNTINHIBIT:
-            store_masked_csr(value, csr, UINT64_C(5));
+            /* TIME (bit 1) is not implemented; all other counter inhibit
+             * bits are storage until the event backend exists. */
+            store_masked_csr(value, csr, UINT64_C(0xfffffffd));
             break;
         case CSR_MENVCFG:
             store_masked_csr(value, csr, ENVCFG_WRITABLE_MASK);
@@ -375,6 +707,12 @@ static void store_csr(IR2_OPND value, LatrCsrKind kind, int csr)
             break;
         case CSR_MIP:
             store_masked_csr(value, csr, MIP_WRITABLE_MASK);
+            break;
+        case CSR_MIDELEG:
+            store_masked_csr(value, csr, MIDELEG_WRITABLE_MASK);
+            break;
+        case CSR_MEDELEG:
+            store_masked_csr(value, csr, MEDELEG_WRITABLE_MASK);
             break;
         case CSR_MTVEC:
         case CSR_STVEC:
@@ -471,6 +809,10 @@ static void transfer_exception(IR2_OPND cause, uint64_t pc,
 
     la_st_d(cause, env_ir2_opnd, env_offset_exception());
     la_st_d(trap_value, env_ir2_opnd, env_offset_badaddr());
+    /* Any trap invalidates an LR reservation (context switches, signals and
+     * the trap handler itself must not inherit it). The field sits past
+     * csr[4096], so it needs the large-offset store helper. */
+    latr_env_store_d(zero_ir2_opnd, env_offset_reservation_valid());
     latr_env_load_d(privilege, env_offset_privilege());
     li_d(tmp, LATR_RISCV_PRIV_M);
     la_beq(privilege, tmp, machine);
@@ -496,6 +838,40 @@ void latr_raise_illegal_instruction(const RiscvIR1 *ir1)
 
     li_d(cause, 2);
     li_d(trap_value, ir1->insn);
+    transfer_exception(cause, ir1->pc, trap_value);
+}
+
+/* Causes 4 and 6: load / store-AMO address misaligned, with mtval = address. */
+void latr_raise_misaligned(const RiscvIR1 *ir1, IR2_OPND address, bool is_store)
+{
+    IR2_OPND cause = a0_ir2_opnd;
+    IR2_OPND trap_value = a1_ir2_opnd;
+
+    la_mov64(trap_value, address);
+    li_d(cause, is_store ? 6 : 4);
+    transfer_exception(cause, ir1->pc, trap_value);
+}
+
+/* Instruction-fetch page fault: the translator could not fetch the bytes. */
+void latr_raise_fetch_fault(const RiscvIR1 *ir1)
+{
+    IR2_OPND cause = a0_ir2_opnd;
+    IR2_OPND trap_value = a1_ir2_opnd;
+
+    li_d(cause, ir1->fault_cause > 0 ? ir1->fault_cause
+                                     : LATR_EXCP_INST_PAGE_FAULT);
+    li_d(trap_value, (int64_t)ir1->fault_va);
+    transfer_exception(cause, ir1->pc, trap_value);
+}
+
+/* Page fault recorded by latr_resolve_guest_address(); mtval = guest VA. */
+void latr_raise_mem_fault(const RiscvIR1 *ir1)
+{
+    IR2_OPND cause = a0_ir2_opnd;
+    IR2_OPND trap_value = a1_ir2_opnd;
+
+    latr_env_load_d(cause, env_offset_mem_fault_cause());
+    latr_env_load_d(trap_value, env_offset_mem_va());
     transfer_exception(cause, ir1->pc, trap_value);
 }
 
@@ -556,6 +932,32 @@ static void emit_csr_access_checks(int csr, IR2_OPND illegal)
         la_label(supervisor);
     }
 
+    if (csr == CSR_FFLAGS || csr == CSR_FRM || csr == CSR_FCSR) {
+        /* QEMU require_fp: FP CSRs are illegal while FS == Off. */
+        latr_env_load_d(value, env_offset_csr(CSR_MSTATUS));
+        la_bstrpick_d(value, value, 14, 13);
+        la_beq(value, zero_ir2_opnd, illegal);
+    }
+
+    if (csr_is_vector(csr)) {
+        /* QEMU's `vs` predicate: vector CSRs are illegal while VS is Off. */
+        latr_env_load_d(value, env_offset_csr(CSR_MSTATUS));
+        li_d(mask, (int64_t)MSTATUS_VS);
+        la_and(value, value, mask);
+        la_beq(value, zero_ir2_opnd, illegal);
+    }
+
+    if (csr == CSR_SATP) {
+        /* mstatus.TVM traps S-mode satp access; M-mode is unaffected. */
+        IR2_OPND not_supervisor = ir2_opnd_new_type(IR2_OPND_LABEL);
+        li_d(value, LATR_RISCV_PRIV_S);
+        la_bne(privilege, value, not_supervisor);
+        latr_env_load_d(value, env_offset_csr(CSR_MSTATUS));
+        la_bstrpick_d(value, value, 20, 20);
+        la_bne(value, zero_ir2_opnd, illegal);
+        la_label(not_supervisor);
+    }
+
     ra_free_temp(mask);
     ra_free_temp(value);
     ra_free_temp(privilege);
@@ -589,7 +991,7 @@ static bool translate_csr(const RiscvIR1 *ir1)
 
     int csr = ir1->arg.csr;
     int rd = ir1->arg.rd;
-    int source_index = immediate ? ir1->arg.zimm : ir1->arg.rs1;
+    int source_index = ir1->arg.rs1;
     LatrCsrKind kind;
     if (csr < 0 || csr >= LATR_RISCV_CSR_COUNT || rd < 0 || rd >= 32 ||
         source_index < 0 || source_index >= 32 || !csr_kind(csr, &kind)) {
@@ -798,6 +1200,8 @@ static void translate_sret(const RiscvIR1 *ir1)
     li_d(tmp, 1);
     la_bstrins_d(status, tmp, 5, 5);
     la_bstrins_d(status, zero_ir2_opnd, 8, 8);
+    /* SRET returns to S/U; MPRV must not leak into the new mode. */
+    la_bstrins_d(status, zero_ir2_opnd, 17, 17);
     latr_env_store_d(status, env_offset_csr(CSR_MSTATUS));
     latr_env_store_d(new_privilege, env_offset_privilege());
     latr_env_load_d(target, env_offset_csr(CSR_SEPC));
@@ -833,7 +1237,10 @@ static void translate_wfi(const RiscvIR1 *ir1)
     la_bstrpick_d(status, status, 21, 21);
     la_bne(status, zero_ir2_opnd, illegal);
     la_label(valid);
-    /* WFI is permitted to resume immediately; phase 3 supplies wakeups. */
+    /* WFI resumes immediately here; the runtime sees wfi_pending and may
+     * fast-forward the vclock until an interrupt is deliverable. */
+    li_d(tmp, 1);
+    latr_env_store_d(tmp, env_offset_wfi_pending());
     latr_emit_instret();
     la_b(done);
 
@@ -865,7 +1272,24 @@ static void translate_sfence_vma(const RiscvIR1 *ir1)
     la_bstrpick_d(status, status, 20, 20);
     la_bne(status, zero_ir2_opnd, illegal);
     la_label(supervisor);
-    /* Phase 2 adds a TLB; there is no translation cache to fence yet. */
+    /* Record the shootdown request; the runtime invalidates TBs after exit.
+     * rs2 == x0 means "all ASIDs"; a specific ASID invalidates that ASID's
+     * TBs (a VA-specific invalidation is conservative: whole ASID). */
+    {
+        IR2_OPND request = ra_alloc_itemp();
+
+        li_d(tmp, 1);
+        latr_env_store_d(tmp, env_offset_sfence_pending());
+        if (ir1->arg.rs2 == 0) {
+            li_d(request, (int64_t)UINT32_MAX);
+        } else {
+            IR2_OPND asid = alloc_gpr_src(ir1->arg.rs2);
+            la_bstrpick_d(request, asid, 15, 0);
+            free_alloc_gpr(asid);
+        }
+        latr_env_store_d(request, env_offset_sfence_asid());
+        ra_free_temp(request);
+    }
     latr_emit_instret();
     la_b(done);
 
@@ -889,18 +1313,38 @@ static void translate_cbo(const RiscvIR1 *ir1)
         IR2_OPND base = alloc_gpr_src(ir1->arg.rs1);
         IR2_OPND aligned = ra_alloc_itemp();
         IR2_OPND mask = ra_alloc_itemp();
+        IR2_OPND fault = ir2_opnd_new_type(IR2_OPND_LABEL);
+        IR2_OPND zero_ok = ir2_opnd_new_type(IR2_OPND_LABEL);
 
         la_dbar(0);
         li_d(mask, (int64_t)~UINT64_C(63));
         la_and(aligned, base, mask);
+        free_alloc_gpr(base);
+        /* A 64-byte aligned block never straddles a 4 KiB page. */
+        latr_emit_resolve(aligned, LATR_ACCESS_STORE, 8);
+        latr_emit_branch_on_fault(fault);
+        {
+            IR2_OPND mmio_flag = ra_alloc_itemp();
+            IR2_OPND not_mmio = ir2_opnd_new_type(IR2_OPND_LABEL);
+            latr_env_load_d(mmio_flag, env_offset_mem_mmio());
+            la_beqz(mmio_flag, not_mmio);
+            li_d(mmio_flag, LATR_EXCP_STORE_ACCESS_FAULT);
+            latr_env_store_d(mmio_flag, env_offset_mem_fault_cause());
+            la_b(fault);
+            la_label(not_mmio);
+            ra_free_temp(mmio_flag);
+        }
         for (int offset = 0; offset < 64; offset += 8) {
-            latr_emit_store(aligned, zero_ir2_opnd, 8);
-            la_addi_d(aligned, aligned, 8);
+            latr_emit_store(a0_ir2_opnd, zero_ir2_opnd, 8);
+            la_addi_d(a0_ir2_opnd, a0_ir2_opnd, 8);
         }
         la_dbar(0);
         ra_free_temp(mask);
         ra_free_temp(aligned);
-        free_alloc_gpr(base);
+        la_b(zero_ok);
+        la_label(fault);
+        latr_raise_mem_fault(ir1);
+        la_label(zero_ok);
     } else {
         /* There are no data caches in this memory model. */
         la_dbar(0);

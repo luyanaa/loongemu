@@ -61,7 +61,7 @@ def main():
             prototypes[name] = arg_name
 
     ir1_fields = {"rd", "rs1", "rs2", "rs3", "imm", "shamt", "csr", "zimm",
-                  "rm", "aq", "rl", "pred", "succ"}
+                  "vm", "nf", "rm", "aq", "rl", "pred", "succ"}
     out = ["/* Generated from QEMU decodetree declarations; do not edit. */"]
     for name, arg_name in sorted(prototypes.items()):
         if arg_name not in arg_fields:

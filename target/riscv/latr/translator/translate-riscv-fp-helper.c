@@ -102,6 +102,24 @@ static void latr_fp_store_s(CPUArchState *env, uint64_t rd, uint32_t value)
     env->fpr[rd] = UINT64_C(0xffffffff00000000) | value;
 }
 
+/* Shared softfloat status setup for scalar and vector FP helpers. */
+void latr_fp_status_begin(CPUArchState *env, float_status *status, int rtz)
+{
+    set_float_exception_flags(0, status);
+    set_float_detect_tininess(float_tininess_after_rounding, status);
+    set_flush_to_zero(false, status);
+    set_flush_inputs_to_zero(false, status);
+    set_default_nan_mode(true, status);
+    set_snan_bit_is_one(false, status);
+    set_no_signaling_nans(false, status);
+    (void)latr_fp_set_rounding(status, env, rtz ? 1 : 7);
+}
+
+void latr_fp_status_end(CPUArchState *env, float_status *status)
+{
+    env->fcsr |= latr_fp_riscv_flags(status);
+}
+
 int latr_riscv_fp_rmm(CPUArchState *env, uint64_t opcode, uint64_t rd,
                       uint64_t rs1, uint64_t rs2, uint64_t rs3,
                       uint64_t rm, uint64_t pc)

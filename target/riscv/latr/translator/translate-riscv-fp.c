@@ -1,5 +1,6 @@
 #include "latr.h"
 #include "ir1.h"
+#include "translate.h"
 #include "la-ir2.h"
 
 typedef IR2_INST *(*LatrFPBinaryOp)(IR2_OPND, IR2_OPND, IR2_OPND);
@@ -7,8 +8,6 @@ typedef IR2_INST *(*LatrFPUnaryOp)(IR2_OPND, IR2_OPND);
 typedef IR2_INST *(*LatrFPFmaOp)(IR2_OPND, IR2_OPND, IR2_OPND, IR2_OPND);
 typedef IR2_INST *(*LatrFPIntToFloatOp)(IR2_OPND, IR2_OPND);
 typedef IR2_INST *(*LatrFPFloatToIntOp)(IR2_OPND, IR2_OPND);
-
-#define LATR_RISCV_EXCP_ILLEGAL_INST 2
 
 extern int latr_riscv_fp_rmm(CPUArchState *env, uint64_t opcode,
                              uint64_t rd, uint64_t rs1, uint64_t rs2,
@@ -22,17 +21,9 @@ static IR2_OPND fp_label(void)
 }
 
 
-static void emit_fp_raise_illegal(uint64_t pc)
+static void emit_fp_raise_illegal(const RiscvIR1 *ir1)
 {
-    IR2_OPND value = ra_alloc_itemp();
-    li_d(value, LATR_RISCV_EXCP_ILLEGAL_INST);
-    la_st_d(value, env_ir2_opnd, env_offset_exception());
-    li_d(value, 0);
-    la_st_d(value, env_ir2_opnd, env_offset_badaddr());
-    li_d(value, pc);
-    la_st_d(value, env_ir2_opnd, env_offset_pc());
-    la_jirl(zero_ir2_opnd, ra_ir2_opnd, 0);
-    ra_free_temp(value);
+    latr_raise_illegal_instruction(ir1);
 }
 
 static void emit_fp_rmm_call(const RiscvIR1 *ir1)
@@ -66,7 +57,7 @@ static void emit_fp_rmm_call(const RiscvIR1 *ir1)
     la_addi_d(sp, sp, 16);
 
     la_beqz(a0, done);
-    emit_fp_raise_illegal(ir1->pc);
+    emit_fp_raise_illegal(ir1);
     la_label(done);
 }
 
@@ -1164,6 +1155,22 @@ static bool latr_translate_fp_native(const RiscvIR1 *ir1)
     }
 }
 
+void latr_emit_fs_gate(const RiscvIR1 *ir1)
+{
+    IR2_OPND illegal = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND allowed = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND status = ra_alloc_itemp();
+
+    latr_env_load_d(status, env_offset_csr(0x300));
+    la_bstrpick_d(status, status, 14, 13);
+    la_beq(status, zero_ir2_opnd, illegal);
+    la_b(allowed);
+    la_label(illegal);
+    latr_raise_illegal_instruction(ir1);
+    la_label(allowed);
+    ra_free_temp(status);
+}
+
 bool latr_translate_fp(const RiscvIR1 *ir1)
 {
     if (!fp_opcode_uses_rm(ir1->opcode)) {
@@ -1205,12 +1212,12 @@ bool latr_translate_fp(const RiscvIR1 *ir1)
         la_b(done);
 
         la_label(illegal);
-        emit_fp_raise_illegal(ir1->pc);
+        emit_fp_raise_illegal(ir1);
         la_label(done);
         return true;
     }
     default:
-        emit_fp_raise_illegal(ir1->pc);
+        emit_fp_raise_illegal(ir1);
         return true;
     }
 }

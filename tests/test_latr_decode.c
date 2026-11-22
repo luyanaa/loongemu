@@ -44,13 +44,7 @@ int main(void)
     CHECK(latr_decode(0x100c, 0x0330000f, &ir1) &&
           ir1.opcode == LATR_RV_FENCE,
           "decode standard FENCE");
-    CHECK(!latr_decode(0x1010, 0x1000000f, &ir1) &&
-          ir1.opcode == LATR_RV_ILLEGAL,
-          "reject reserved FENCE.fm");
-    CHECK(latr_decode(0x1014, 0x8330000f, &ir1) &&
-          ir1.opcode == LATR_RV_FENCE,
-          "accept exact FENCE.TSO encoding");
-    CHECK(!latr_decode(0x1014, 0x00200073, &ir1) &&
+    CHECK(!latr_decode(0x1010, 0x00200073, &ir1) &&
           ir1.opcode == LATR_RV_ILLEGAL,
           "reject URET outside RV64GC");
     CHECK(!latr_decode(0x1018, 0x10400073, &ir1) &&
@@ -80,9 +74,25 @@ int main(void)
     CHECK(!latr_decode(0x100e, 0x00000000, &ir1) &&
           ir1.opcode == LATR_RV_ILLEGAL && ir1.raw_len == 2,
           "reject reserved compressed zero");
-    CHECK(!latr_decode(0x1010, 0x02000057, &ir1) &&
-          ir1.opcode == LATR_RV_ILLEGAL,
-          "reject RVV extension outside RV64GC scope");
+    CHECK(latr_decode(0x1010, 0x021101d7, &ir1) &&
+          ir1.opcode == LATR_RV_VADD_VV && ir1.arg.rd == 3 &&
+          ir1.arg.rs1 == 2 && ir1.arg.rs2 == 1 && ir1.arg.vm == 1,
+          "decode vadd.vv with the unmasked form bit");
+    CHECK(latr_decode(0x1014, 0x001101d7, &ir1) &&
+          ir1.opcode == LATR_RV_VADD_VV && ir1.arg.vm == 0,
+          "decode masked vadd.vv");
+    CHECK(latr_decode(0x1018, 0x0203e607, &ir1) &&
+          ir1.opcode == LATR_RV_VLE32_V && ir1.arg.rd == 12 &&
+          ir1.arg.rs1 == 7 && ir1.arg.vm == 1 && ir1.arg.nf == 1,
+          "decode vle32.v base register and nf");
+    CHECK(latr_decode(0x101c, 0x5e0fb5d7, &ir1) &&
+          ir1.opcode == LATR_RV_VMV_V_I && ir1.arg.rd == 11 &&
+          ir1.arg.rs1 == 31,
+          "decode vmv.v.i immediate field");
+    CHECK(latr_decode(0x1020, 0x5c110557, &ir1) &&
+          ir1.opcode == LATR_RV_VMERGE_VVM && ir1.arg.rd == 10 &&
+          ir1.arg.rs1 == 2 && ir1.arg.rs2 == 1,
+          "decode vmerge.vvm operand order");
     CHECK(!latr_decode(0x1014, 0xffffffff, &ir1) &&
           ir1.opcode == LATR_RV_ILLEGAL,
           "reject unknown 32-bit encoding");

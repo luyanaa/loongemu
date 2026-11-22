@@ -1,5 +1,6 @@
 #include "latr.h"
 #include "translate.h"
+#include "mmu.h"
 
 typedef IR2_INST *(*LatrBinaryOp)(IR2_OPND, IR2_OPND, IR2_OPND);
 typedef IR2_INST *(*LatrAmoOp)(IR2_OPND, IR2_OPND, IR2_OPND);
@@ -112,23 +113,132 @@ static void emit_binary(const RiscvIR1 *ir1, LatrBinaryOp op)
     free_alloc_gpr(lhs);
 }
 
+static unsigned latr_mem_size(LatrRiscvOpcode opcode)
+{
+    switch (opcode) {
+    case LATR_RV_LB: case LATR_RV_LBU: case LATR_RV_SB: return 1;
+    case LATR_RV_LH: case LATR_RV_LHU: case LATR_RV_SH: return 2;
+    case LATR_RV_LW: case LATR_RV_LWU: case LATR_RV_SW: return 4;
+    default: return 8;
+    }
+}
+
 static void emit_load(const RiscvIR1 *ir1)
 {
     IR2_OPND base = alloc_gpr_src(ir1->arg.rs1);
-    IR2_OPND dst = alloc_gpr_dst(ir1->arg.rd);
-    switch (ir1->opcode) {
-    case LATR_RV_LB:  la_ld_b(dst, base, ir1->arg.imm); break;
-    case LATR_RV_LH:  la_ld_h(dst, base, ir1->arg.imm); break;
-    case LATR_RV_LW:  la_ld_w(dst, base, ir1->arg.imm); break;
-    case LATR_RV_LBU: la_ld_bu(dst, base, ir1->arg.imm); break;
-    case LATR_RV_LHU: la_ld_hu(dst, base, ir1->arg.imm); break;
-    case LATR_RV_LWU: la_ld_wu(dst, base, ir1->arg.imm); break;
-    case LATR_RV_LD:  la_ld_d(dst, base, ir1->arg.imm); break;
-    default: lsassertm(0, "invalid LATR load opcode");
-    }
-    store_gpr_dst(ir1->arg.rd, dst);
-    free_alloc_gpr(dst);
+    IR2_OPND address = ra_alloc_itemp();
+    IR2_OPND fault = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND direct = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND after = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND slow = ir2_opnd_new_type(IR2_OPND_LABEL);
+    unsigned size = latr_mem_size(ir1->opcode);
+
+    li_d(address, ir1->arg.imm);
+    la_add_d(address, base, address);
     free_alloc_gpr(base);
+    if (size > 1) {
+        IR2_OPND offset = ra_alloc_itemp();
+        IR2_OPND limit = ra_alloc_itemp();
+        la_andi(offset, address, 0xfff);
+        li_d(limit, (int64_t)(0x1000 - size));
+        la_bltu(limit, offset, slow);
+        ra_free_temp(limit);
+        ra_free_temp(offset);
+    }
+    latr_emit_resolve(address, LATR_ACCESS_LOAD, size);
+    latr_emit_branch_on_fault(fault);
+
+    {
+        IR2_OPND mmio = ra_alloc_itemp();
+        latr_env_load_d(mmio, env_offset_mem_mmio());
+        la_beqz(mmio, direct);
+        ra_free_temp(mmio);
+    }
+    {
+        /* a0 carries the guest physical address; a1 receives it. */
+        IR2_OPND target = ra_alloc_itemp();
+        la_mov64(a1_ir2_opnd, a0_ir2_opnd);
+        li_d(a2_ir2_opnd, size);
+        la_mov64(a0_ir2_opnd, env_ir2_opnd);
+        latr_env_store_d(ra_ir2_opnd, env_offset_host_return_address());
+        li_d(target, (int64_t)(uintptr_t)&latr_mmio_load);
+        la_jirl(ra_ir2_opnd, target, 0);
+        ra_free_temp(target);
+        latr_env_load_d(ra_ir2_opnd, env_offset_host_return_address());
+    }
+    latr_emit_branch_on_fault(fault);
+    {
+        /* The helper returns the raw device value; apply the same width
+         * semantics as a direct load. */
+        IR2_OPND dst = alloc_gpr_dst(ir1->arg.rd);
+        switch (ir1->opcode) {
+        case LATR_RV_LB:  la_ext_w_b(dst, a0_ir2_opnd); break;
+        case LATR_RV_LH:  la_ext_w_h(dst, a0_ir2_opnd); break;
+        case LATR_RV_LW:  la_mov32_sx(dst, a0_ir2_opnd); break;
+        case LATR_RV_LBU: la_bstrpick_d(dst, a0_ir2_opnd, 7, 0); break;
+        case LATR_RV_LHU: la_bstrpick_d(dst, a0_ir2_opnd, 15, 0); break;
+        case LATR_RV_LWU: la_bstrpick_d(dst, a0_ir2_opnd, 31, 0); break;
+        case LATR_RV_LD:  la_mov64(dst, a0_ir2_opnd); break;
+        default: lsassertm(0, "invalid LATR MMIO load opcode");
+        }
+        store_gpr_dst(ir1->arg.rd, dst);
+        free_alloc_gpr(dst);
+    }
+    la_b(done);
+
+    la_label(direct);
+    {
+        IR2_OPND dst = alloc_gpr_dst(ir1->arg.rd);
+        switch (ir1->opcode) {
+        case LATR_RV_LB:  la_ld_b(dst, a0_ir2_opnd, 0); break;
+        case LATR_RV_LH:  la_ld_h(dst, a0_ir2_opnd, 0); break;
+        case LATR_RV_LW:  la_ld_w(dst, a0_ir2_opnd, 0); break;
+        case LATR_RV_LBU: la_ld_bu(dst, a0_ir2_opnd, 0); break;
+        case LATR_RV_LHU: la_ld_hu(dst, a0_ir2_opnd, 0); break;
+        case LATR_RV_LWU: la_ld_wu(dst, a0_ir2_opnd, 0); break;
+        case LATR_RV_LD:  la_ld_d(dst, a0_ir2_opnd, 0); break;
+        default: lsassertm(0, "invalid LATR load opcode");
+        }
+        store_gpr_dst(ir1->arg.rd, dst);
+        free_alloc_gpr(dst);
+    }
+    la_label(done);
+    la_b(after);
+
+    la_label(slow);
+    {
+        IR2_OPND target = ra_alloc_itemp();
+        IR2_OPND dst;
+        la_mov64(a1_ir2_opnd, address);
+        li_d(a2_ir2_opnd, size);
+        la_mov64(a0_ir2_opnd, env_ir2_opnd);
+        latr_env_store_d(ra_ir2_opnd, env_offset_host_return_address());
+        li_d(target, (int64_t)(uintptr_t)&latr_cross_load);
+        la_jirl(ra_ir2_opnd, target, 0);
+        ra_free_temp(target);
+        latr_env_load_d(ra_ir2_opnd, env_offset_host_return_address());
+        latr_emit_branch_on_fault(fault);
+        dst = alloc_gpr_dst(ir1->arg.rd);
+        switch (ir1->opcode) {
+        case LATR_RV_LB:  la_ext_w_b(dst, a0_ir2_opnd); break;
+        case LATR_RV_LH:  la_ext_w_h(dst, a0_ir2_opnd); break;
+        case LATR_RV_LW:  la_mov32_sx(dst, a0_ir2_opnd); break;
+        case LATR_RV_LBU: la_bstrpick_d(dst, a0_ir2_opnd, 7, 0); break;
+        case LATR_RV_LHU: la_bstrpick_d(dst, a0_ir2_opnd, 15, 0); break;
+        case LATR_RV_LWU: la_bstrpick_d(dst, a0_ir2_opnd, 31, 0); break;
+        case LATR_RV_LD:  la_mov64(dst, a0_ir2_opnd); break;
+        default: lsassertm(0, "invalid cross-page load opcode");
+        }
+        store_gpr_dst(ir1->arg.rd, dst);
+        free_alloc_gpr(dst);
+    }
+    free_alloc_gpr(address);
+    la_b(after);
+
+    la_label(fault);
+    latr_raise_mem_fault(ir1);
+    la_label(after);
 }
 
 static void emit_store(const RiscvIR1 *ir1)
@@ -136,21 +246,89 @@ static void emit_store(const RiscvIR1 *ir1)
     IR2_OPND base = alloc_gpr_src(ir1->arg.rs1);
     IR2_OPND value = alloc_gpr_src(ir1->arg.rs2);
     IR2_OPND address = ra_alloc_itemp();
-    unsigned size;
+    IR2_OPND fault = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND direct = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND after = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND slow = ir2_opnd_new_type(IR2_OPND_LABEL);
+    unsigned size = latr_mem_size(ir1->opcode);
 
     li_d(address, ir1->arg.imm);
     la_add_d(address, base, address);
-    switch (ir1->opcode) {
-    case LATR_RV_SB: size = 1; break;
-    case LATR_RV_SH: size = 2; break;
-    case LATR_RV_SW: size = 4; break;
-    case LATR_RV_SD: size = 8; break;
-    default: lsassertm(0, "invalid LATR store opcode"); size = 0;
-    }
-    latr_emit_store(address, value, size);
-    ra_free_temp(address);
-    free_alloc_gpr(value);
     free_alloc_gpr(base);
+    /* The value does not survive the resolver/MMIO helper calls. */
+    latr_env_store_d(value, env_offset_mem_value());
+    free_alloc_gpr(value);
+    if (size > 1) {
+        IR2_OPND offset = ra_alloc_itemp();
+        IR2_OPND limit = ra_alloc_itemp();
+        la_andi(offset, address, 0xfff);
+        li_d(limit, (int64_t)(0x1000 - size));
+        la_bltu(limit, offset, slow);
+        ra_free_temp(limit);
+        ra_free_temp(offset);
+    }
+    latr_emit_resolve(address, LATR_ACCESS_STORE, size);
+    latr_emit_branch_on_fault(fault);
+
+    {
+        IR2_OPND mmio = ra_alloc_itemp();
+        latr_env_load_d(mmio, env_offset_mem_mmio());
+        la_beqz(mmio, direct);
+        ra_free_temp(mmio);
+    }
+    {
+        IR2_OPND stored = ra_alloc_itemp();
+        IR2_OPND target = ra_alloc_itemp();
+
+        latr_env_load_d(stored, env_offset_mem_value());
+        la_mov64(a1_ir2_opnd, a0_ir2_opnd); /* guest physical address */
+        li_d(a2_ir2_opnd, size);
+        la_mov64(a3_ir2_opnd, stored);
+        ra_free_temp(stored);
+        la_mov64(a0_ir2_opnd, env_ir2_opnd);
+        latr_env_store_d(ra_ir2_opnd, env_offset_host_return_address());
+        li_d(target, (int64_t)(uintptr_t)&latr_mmio_store);
+        la_jirl(ra_ir2_opnd, target, 0);
+        ra_free_temp(target);
+        latr_env_load_d(ra_ir2_opnd, env_offset_host_return_address());
+    }
+    latr_emit_branch_on_fault(fault);
+    la_b(done);
+
+    la_label(direct);
+    {
+        IR2_OPND stored = ra_alloc_itemp();
+        latr_env_load_d(stored, env_offset_mem_value());
+        latr_emit_store(a0_ir2_opnd, stored, size);
+        ra_free_temp(stored);
+    }
+    la_label(done);
+    la_b(after);
+
+    la_label(slow);
+    {
+        IR2_OPND target = ra_alloc_itemp();
+        IR2_OPND stored = ra_alloc_itemp();
+        latr_env_load_d(stored, env_offset_mem_value());
+        la_mov64(a1_ir2_opnd, address);
+        li_d(a2_ir2_opnd, size);
+        la_mov64(a3_ir2_opnd, stored);
+        ra_free_temp(stored);
+        la_mov64(a0_ir2_opnd, env_ir2_opnd);
+        latr_env_store_d(ra_ir2_opnd, env_offset_host_return_address());
+        li_d(target, (int64_t)(uintptr_t)&latr_cross_store);
+        la_jirl(ra_ir2_opnd, target, 0);
+        ra_free_temp(target);
+        latr_env_load_d(ra_ir2_opnd, env_offset_host_return_address());
+        latr_emit_branch_on_fault(fault);
+    }
+    free_alloc_gpr(address);
+    la_b(after);
+
+    la_label(fault);
+    latr_raise_mem_fault(ir1);
+    la_label(after);
 }
 
 static void emit_immediate_logic(const RiscvIR1 *ir1, LatrBinaryOp op)
@@ -240,16 +418,61 @@ static void emit_division(const RiscvIR1 *ir1)
     }
 }
 
+/* LR/SC/AMO must be naturally aligned; the check must precede any access
+ * so that a misaligned atomic traps instead of reaching the host LL/SC. */
+static void emit_aligned_or_trap(const RiscvIR1 *ir1, IR2_OPND address,
+                                 unsigned size, bool is_store)
+{
+    IR2_OPND scratch = ra_alloc_itemp();
+    IR2_OPND ok = ir2_opnd_new_type(IR2_OPND_LABEL);
+
+    li_d(scratch, (int64_t)(size - 1));
+    la_and(scratch, address, scratch);
+    la_beqz(scratch, ok);
+    latr_raise_misaligned(ir1, address, is_store);
+    la_label(ok);
+    ra_free_temp(scratch);
+}
+
+/* Atomics to MMIO are not supported: they trap as store/AMO access faults. */
+static void emit_mmio_atomic_guard(const RiscvIR1 *ir1)
+{
+    IR2_OPND mmio = ra_alloc_itemp();
+    IR2_OPND ok = ir2_opnd_new_type(IR2_OPND_LABEL);
+
+    latr_env_load_d(mmio, env_offset_mem_mmio());
+    la_beqz(mmio, ok);
+    li_d(mmio, LATR_EXCP_STORE_ACCESS_FAULT);
+    latr_env_store_d(mmio, env_offset_mem_fault_cause());
+    latr_raise_mem_fault(ir1);
+    la_label(ok);
+    ra_free_temp(mmio);
+}
+
 static void emit_amo(const RiscvIR1 *ir1, LatrAmoOp op, bool word)
 {
     IR2_OPND address = alloc_gpr_src(ir1->arg.rs1);
     IR2_OPND source = alloc_gpr_src(ir1->arg.rs2);
+    IR2_OPND fault = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
+    unsigned size = word ? 4 : 8;
+
+    emit_aligned_or_trap(ir1, address, size, true);
+    latr_env_store_d(source, env_offset_mem_value());
+    free_alloc_gpr(source);
+    latr_emit_resolve(address, LATR_ACCESS_STORE, size);
+    latr_emit_branch_on_fault(fault);
+    emit_mmio_atomic_guard(ir1);
+
     IR2_OPND result = alloc_gpr_dst(ir1->arg.rd);
+    IR2_OPND value = ra_alloc_itemp();
     LatrStoreLock lock = emit_store_lock_acquire();
+
+    latr_env_load_d(value, env_offset_mem_value());
     if (ir1->arg.rl) {
         la_dbar(0);
     }
-    op(result, source, address);
+    op(result, value, a0_ir2_opnd);
     if (ir1->arg.aq) {
         la_dbar(0);
     }
@@ -259,122 +482,150 @@ static void emit_amo(const RiscvIR1 *ir1, LatrAmoOp op, bool word)
     emit_store_lock_release(lock);
     store_gpr_dst(ir1->arg.rd, result);
     free_alloc_gpr(result);
-    free_alloc_gpr(source);
-    free_alloc_gpr(address);
+    ra_free_temp(value);
+    la_b(done);
+    la_label(fault);
+    latr_raise_mem_fault(ir1);
+    la_label(done);
 }
 
 /*
- * Phase 2 must resolve virtual addresses through a narrow run-time API:
- * bool latr_resolve_guest_address(CPUArchState *env, uint64_t guest_va,
- *     unsigned access_type, unsigned size, uintptr_t *host_addr,
- *     uint64_t *physical_addr, uint64_t *fault_cause).
- * It must validate translation, permissions, and alignment before access;
- * on failure the caller enters the common delegated trap path with
- * fault_cause and guest_va. Use physical_addr for LR/SC comparisons.
- * Until then, the direct-mapped core treats the effective address as both
- * the host and physical address.
+ * Address translation is delegated to latr_resolve_guest_address(); the
+ * reservation records the *physical* address so it survives a satp change,
+ * and every page fault traps with mtval = guest VA.
  */
 
 static void emit_lr(const RiscvIR1 *ir1, bool word)
 {
     IR2_OPND address = alloc_gpr_src(ir1->arg.rs1);
+    IR2_OPND fault = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND inval = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND set_done = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND tail = ir2_opnd_new_type(IR2_OPND_LABEL);
+    unsigned size = word ? 4 : 8;
+
+    emit_aligned_or_trap(ir1, address, size, false);
+    latr_emit_resolve(address, LATR_ACCESS_LOAD, size);
+    latr_emit_branch_on_fault(fault);
+    emit_mmio_atomic_guard(ir1);
+
     IR2_OPND result = alloc_gpr_dst(ir1->arg.rd);
-    IR2_OPND lock_address = a0_ir2_opnd;
-    IR2_OPND before = a1_ir2_opnd;
-    IR2_OPND after = a2_ir2_opnd;
-    IR2_OPND scratch = a3_ir2_opnd;
-    IR2_OPND invalid = ir2_opnd_new_type(IR2_OPND_LABEL);
-    IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND lock_address = ra_alloc_itemp();
+    IR2_OPND before = ra_alloc_itemp();
+    IR2_OPND after = ra_alloc_itemp();
+    IR2_OPND scratch = ra_alloc_itemp();
 
     la_dbar(0);
     li_d(lock_address, (int64_t)(uintptr_t)&latr_guest_store_lock);
     la_ld_d(before, lock_address, 0);
     if (word) {
-        la_ld_w(result, address, 0);
+        la_ld_w(result, a0_ir2_opnd, 0);
         la_mov32_sx(result, result);
     } else {
-        la_ld_d(result, address, 0);
+        la_ld_d(result, a0_ir2_opnd, 0);
     }
     la_dbar(0);
     la_ld_d(after, lock_address, 0);
     la_andi(scratch, before, 1);
-    la_bne(scratch, zero_ir2_opnd, invalid);
-    la_bne(before, after, invalid);
+    la_bne(scratch, zero_ir2_opnd, inval);
+    la_bne(before, after, inval);
 
-    li_d(scratch, word ? 4 : 8);
-    latr_env_store_d(address, env_offset_reservation_addr());
+    latr_env_load_d(scratch, env_offset_mem_phys());
+    latr_env_store_d(scratch, env_offset_reservation_addr());
+    li_d(scratch, size);
     latr_env_store_d(scratch, env_offset_reservation_size());
     latr_env_store_d(before, env_offset_reservation_epoch());
     li_d(scratch, 1);
     latr_env_store_d(scratch, env_offset_reservation_valid());
-    la_b(done);
+    la_b(set_done);
 
-    la_label(invalid);
+    la_label(inval);
     li_d(scratch, 0);
     latr_env_store_d(scratch, env_offset_reservation_valid());
-    la_label(done);
+    la_label(set_done);
     if (ir1->arg.aq) {
         la_dbar(0);
     }
     store_gpr_dst(ir1->arg.rd, result);
     free_alloc_gpr(result);
-    free_alloc_gpr(address);
+    ra_free_temp(scratch);
+    ra_free_temp(after);
+    ra_free_temp(before);
+    ra_free_temp(lock_address);
+    la_b(tail);
+    la_label(fault);
+    latr_raise_mem_fault(ir1);
+    la_label(tail);
 }
 
 static void emit_sc(const RiscvIR1 *ir1, bool word)
 {
     IR2_OPND address = alloc_gpr_src(ir1->arg.rs1);
     IR2_OPND value = alloc_gpr_src(ir1->arg.rs2);
-    IR2_OPND result = ra_alloc_itemp();
-    LatrStoreLock lock = emit_store_lock_acquire();
-    IR2_OPND valid = a0_ir2_opnd;
-    IR2_OPND reserved_address = a1_ir2_opnd;
-    IR2_OPND reserved_size = a2_ir2_opnd;
-    IR2_OPND reserved_epoch = a3_ir2_opnd;
-    IR2_OPND expected_size = a4_ir2_opnd;
+    IR2_OPND fault = ir2_opnd_new_type(IR2_OPND_LABEL);
     IR2_OPND failed = ir2_opnd_new_type(IR2_OPND_LABEL);
-    IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND sc_done = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND tail = ir2_opnd_new_type(IR2_OPND_LABEL);
+    unsigned size = word ? 4 : 8;
+
+    emit_aligned_or_trap(ir1, address, size, true);
+    latr_env_store_d(value, env_offset_mem_value());
+    free_alloc_gpr(value);
+    latr_emit_resolve(address, LATR_ACCESS_STORE, size);
+    latr_emit_branch_on_fault(fault);
+    emit_mmio_atomic_guard(ir1);
+
+    /* Five live temporaries at most: result, scratch and the three lock
+     * registers. The comparison reuses result/scratch so the six-register
+     * itemp pool never overflows. */
+    IR2_OPND result = ra_alloc_itemp();
+    IR2_OPND scratch = ra_alloc_itemp();
+    LatrStoreLock lock = emit_store_lock_acquire();
 
     if (ir1->arg.rl) {
         la_dbar(0);
     }
-    latr_env_load_d(valid, env_offset_reservation_valid());
-    la_beq(valid, zero_ir2_opnd, failed);
-    latr_env_load_d(reserved_address, env_offset_reservation_addr());
-    la_bne(reserved_address, address, failed);
-    latr_env_load_d(reserved_size, env_offset_reservation_size());
-    li_d(expected_size, word ? 4 : 8);
-    la_bne(reserved_size, expected_size, failed);
-    latr_env_load_d(reserved_epoch, env_offset_reservation_epoch());
-    la_bne(reserved_epoch, lock.epoch, failed);
+    latr_env_load_d(scratch, env_offset_reservation_valid());
+    la_beq(scratch, zero_ir2_opnd, failed);
+    latr_env_load_d(result, env_offset_reservation_addr());
+    latr_env_load_d(scratch, env_offset_mem_phys());
+    la_bne(result, scratch, failed);
+    latr_env_load_d(scratch, env_offset_reservation_size());
+    la_addi_d(result, scratch, -(int)size);
+    la_bne(result, zero_ir2_opnd, failed);
+    latr_env_load_d(scratch, env_offset_reservation_epoch());
+    la_bne(scratch, lock.epoch, failed);
 
-    li_d(expected_size, 0);
-    latr_env_store_d(expected_size, env_offset_reservation_valid());
-    la_mov64(result, value);
+    li_d(scratch, 0);
+    latr_env_store_d(scratch, env_offset_reservation_valid());
+    latr_env_load_d(result, env_offset_mem_value());
     if (word) {
-        la_ll_w(valid, address, 0);
-        la_sc_w(result, address, 0);
+        la_ll_w(scratch, a0_ir2_opnd, 0);
+        la_sc_w(result, a0_ir2_opnd, 0);
     } else {
-        la_ll_d(valid, address, 0);
-        la_sc_d(result, address, 0);
+        la_ll_d(scratch, a0_ir2_opnd, 0);
+        la_sc_d(result, a0_ir2_opnd, 0);
     }
     /* LoongArch SC reports 1 on success; RISC-V SC reports 0. */
     la_xori(result, result, 1);
-    la_b(done);
+    la_b(sc_done);
 
     la_label(failed);
     li_d(result, 1);
-    li_d(expected_size, 0);
-    latr_env_store_d(expected_size, env_offset_reservation_valid());
-    la_label(done);
+    li_d(scratch, 0);
+    latr_env_store_d(scratch, env_offset_reservation_valid());
+    la_label(sc_done);
     if (ir1->arg.aq) {
         la_dbar(0);
     }
     store_gpr_dst(ir1->arg.rd, result);
     emit_store_lock_release_sc(lock, result);
+    ra_free_temp(scratch);
     ra_free_temp(result);
-    free_alloc_gpr(value);
-    free_alloc_gpr(address);
+    la_b(tail);
+    la_label(fault);
+    latr_raise_mem_fault(ir1);
+    la_label(tail);
 }
 
 static void emit_branch(const LatrTranslateContext *ctx)
@@ -561,7 +812,7 @@ static void emit_zbb(const RiscvIR1 *ir1)
     case LATR_RV_MINU: case LATR_RV_MAXU:
         emit_minmax(ir1, ir1->opcode == LATR_RV_MAXU, true);
         return;
-    case LATR_RV_ORCB:
+    case LATR_RV_ORC_B:
         lhs = alloc_gpr_src(ir1->arg.rs1);
         dst = alloc_gpr_dst(ir1->arg.rd);
         la_mov64(dst, lhs);
@@ -727,6 +978,13 @@ bool latr_translate_ir1(LatrTranslateContext *ctx)
 #define LATR_RETIRE() do { latr_emit_instret(); return true; } while (0)
 
     emit_mcycle();
+    /* FP instruction gate: mstatus.FS must not be Off. */
+    if (ir1->opcode >= LATR_RV_FLW && ir1->opcode <= LATR_RV_FMV_D_X) {
+        latr_emit_fs_gate(ir1);
+    }
+    if (latr_translate_rvv(ir1)) {
+        return true;
+    }
     if (latr_translate_privileged(ir1)) {
         return true;
     }
@@ -739,15 +997,23 @@ bool latr_translate_ir1(LatrTranslateContext *ctx)
         bool handled = latr_translate_fp(ir1);
         emit_store_lock_release(lock);
         if (handled) {
+            latr_emit_mark_fs_dirty();
             latr_emit_instret();
         }
         return handled;
     }
     if (latr_translate_fp(ir1)) {
+        latr_emit_mark_fs_dirty();
         latr_emit_instret();
         return true;
     }
     switch (ir1->opcode) {
+    case LATR_RV_ILLEGAL:
+        latr_raise_illegal_instruction(ir1);
+        return true;
+    case LATR_RV_FETCH_FAULT:
+        latr_raise_fetch_fault(ir1);
+        return true;
     case LATR_RV_LUI:
         dst = alloc_gpr_dst(ir1->arg.rd);
         li_d(dst, ir1->arg.imm);
@@ -868,7 +1134,7 @@ bool latr_translate_ir1(LatrTranslateContext *ctx)
     case LATR_RV_CLZ: case LATR_RV_CTZ: case LATR_RV_CPOP:
     case LATR_RV_MIN: case LATR_RV_MAX: case LATR_RV_MINU: case LATR_RV_MAXU:
     case LATR_RV_SEXT_B: case LATR_RV_SEXT_H: case LATR_RV_ZEXT_H_64:
-    case LATR_RV_ROL: case LATR_RV_ROR: case LATR_RV_ORCB:
+    case LATR_RV_ROL: case LATR_RV_ROR: case LATR_RV_ORC_B:
     case LATR_RV_REV8_64: case LATR_RV_CLZW: case LATR_RV_CTZW:
     case LATR_RV_CPOPW: case LATR_RV_ROLW: case LATR_RV_RORW:
         emit_zbb(ir1);

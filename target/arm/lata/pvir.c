@@ -472,7 +472,18 @@ static bool vector_opcode_arity(PvirOpcode opcode, uint8_t *arity)
     case PVIR_OP_SELECT:
         *arity = 3;
         return true;
+    case PVIR_OP_TRUNCATE:
+    case PVIR_OP_EXTEND:
+    case PVIR_OP_MOVE:
+        *arity = 1;
+        return true;
+    case PVIR_OP_REM:
+    case PVIR_OP_MIN:
+    case PVIR_OP_MAX:
+        *arity = 2;
+        return true;
     case PVIR_OP_NOT:
+    case PVIR_OP_BROADCAST:
         *arity = 1;
         return true;
     case PVIR_OP_LOAD:
@@ -629,7 +640,8 @@ static bool valid_operation_operands(PvirOpcode opcode,
     }
 
     if (operation->compare_condition != PVIR_COMPARE_NONE ||
-        operation->type.kind == PVIR_ELEMENT_MASK) {
+        (operation->type.kind == PVIR_ELEMENT_MASK &&
+         opcode != PVIR_OP_LOAD && opcode != PVIR_OP_STORE)) {
         return false;
     }
     switch (opcode) {
@@ -663,8 +675,50 @@ static bool valid_operation_operands(PvirOpcode opcode,
         return operation->operand_kinds[0] == PVIR_OPERAND_VECTOR &&
                operation->operand_kinds[1] == PVIR_OPERAND_VECTOR &&
                operation->operand_kinds[2] == PVIR_OPERAND_VECTOR;
+    case PVIR_OP_TRUNCATE:
+        return operation->operand_kinds[0] == PVIR_OPERAND_VECTOR &&
+               operation->type.kind == PVIR_ELEMENT_INTEGER &&
+               operand_types[0].kind == PVIR_ELEMENT_INTEGER &&
+               operand_types[0].element_bits > operation->type.element_bits;
+    case PVIR_OP_EXTEND:
+        return operation->operand_kinds[0] == PVIR_OPERAND_VECTOR &&
+               operation->type.kind == PVIR_ELEMENT_INTEGER &&
+               operand_types[0].kind == PVIR_ELEMENT_INTEGER &&
+               operand_types[0].element_bits < operation->type.element_bits;
+    case PVIR_OP_MOVE:
+        return operation->operand_kinds[0] == PVIR_OPERAND_VECTOR &&
+               same_vector_type(operand_types[0], operation->type);
+    case PVIR_OP_REM:
+        if (operation->type.kind != PVIR_ELEMENT_INTEGER ||
+            operation->operand_kinds[0] != PVIR_OPERAND_VECTOR) {
+            return false;
+        }
+        if (operation->operand_kinds[1] == PVIR_OPERAND_IMMEDIATE) {
+            return immediate_fits(operation->operand_immediates[1],
+                                  operand_types[0].element_bits);
+        }
+        return operation->operand_kinds[1] == PVIR_OPERAND_VECTOR ||
+               operation->operand_kinds[1] == PVIR_OPERAND_SCALAR;
+    case PVIR_OP_MIN:
+    case PVIR_OP_MAX:
+        /* Integer only: FP min/max carries NaN-propagation and sNaN rules
+         * that need their own op/payload rather than an implicit quiet form. */
+        if (operation->type.kind != PVIR_ELEMENT_INTEGER) {
+            return false;
+        }
+        if (operation->operand_kinds[0] != PVIR_OPERAND_VECTOR) {
+            return false;
+        }
+        if (operation->operand_kinds[1] == PVIR_OPERAND_IMMEDIATE) {
+            return immediate_fits(operation->operand_immediates[1],
+                                  operand_types[0].element_bits);
+        }
+        return operation->operand_kinds[1] == PVIR_OPERAND_VECTOR ||
+               operation->operand_kinds[1] == PVIR_OPERAND_SCALAR;
     case PVIR_OP_NOT:
         return operation->operand_kinds[0] == PVIR_OPERAND_VECTOR;
+    case PVIR_OP_BROADCAST:
+        return operation->operand_kinds[0] == PVIR_OPERAND_SCALAR;
     default:
         return false;
     }
@@ -761,11 +815,16 @@ static bool valid_predicate_generator(const PvirInstruction *instruction)
 
     switch (operation->kind) {
     case PVIR_PREDICATE_GENERATOR_CONSTANT:
+        /*
+         * A constant generator may also write PSTATE flags (PTRUES): the
+         * PredTest result follows from form/active_lanes, so no extra payload
+         * is needed. The generic status_state check above already validated
+         * the shape of that write.
+         */
         if (operation->compare_condition != PVIR_COMPARE_NONE ||
             operation->scalar_bits != 0 ||
             operation->scalar_start != PVIR_NO_VALUE ||
             operation->scalar_limit != PVIR_NO_VALUE ||
-            operation->status_state.present ||
             operation->source_state.present) {
             return false;
         }
@@ -851,6 +910,231 @@ static bool instruction_has_float_elements(
     return false;
 }
 
+static bool valid_lane_operation(const PvirInstruction *instruction)
+{
+    const PvirLaneOperation *operation = &instruction->operation.lane;
+    size_t lanes;
+
+    if (instruction->effects.memory.access != PVIR_MEMORY_NONE ||
+        instruction->effects.fault.behavior != PVIR_FAULT_NONE ||
+        instruction->effects.side_effects != 0 ||
+        instruction->effects.fp_exceptions != PVIR_FP_EXCEPTIONS_NONE ||
+        instruction->effects.arch_state.present) {
+        return false;
+    }
+    if (operation->source == PVIR_NO_VALUE ||
+        operation->destination == PVIR_NO_VALUE ||
+        operation->vector_type.kind == PVIR_ELEMENT_MASK ||
+        pvir_vector_type_lanes(operation->vector_type, &lanes) !=
+            PVIR_STATUS_OK ||
+        operation->lane >= lanes) {
+        return false;
+    }
+    if (instruction->opcode == PVIR_OP_EXTRACT) {
+        return operation->merge_value == PVIR_NO_VALUE;
+    }
+    return operation->merge_value != PVIR_NO_VALUE;
+}
+
+static bool valid_convert_operation(const PvirInstruction *instruction)
+{
+    const PvirConvertOperation *operation = &instruction->operation.convert;
+    size_t source_lanes;
+    size_t destination_lanes;
+    bool has_float;
+
+    if (instruction->effects.memory.access != PVIR_MEMORY_NONE ||
+        instruction->effects.fault.behavior != PVIR_FAULT_NONE ||
+        instruction->effects.side_effects != 0 ||
+        instruction->effects.arch_state.present ||
+        operation->source == PVIR_NO_VALUE ||
+        operation->destination == PVIR_NO_VALUE ||
+        operation->rounding < PVIR_ROUND_DEFAULT ||
+        operation->rounding > PVIR_ROUND_RNV ||
+        operation->source_type.kind == PVIR_ELEMENT_MASK ||
+        operation->destination_type.kind == PVIR_ELEMENT_MASK ||
+        pvir_vector_type_lanes(operation->source_type, &source_lanes) !=
+            PVIR_STATUS_OK ||
+        pvir_vector_type_lanes(operation->destination_type,
+                               &destination_lanes) != PVIR_STATUS_OK ||
+        source_lanes != destination_lanes) {
+        return false;
+    }
+    has_float = operation->source_type.kind == PVIR_ELEMENT_FLOAT ||
+                operation->destination_type.kind == PVIR_ELEMENT_FLOAT;
+    if (!has_float) {
+        /* Integer width changes belong to TRUNCATE/EXTEND. */
+        return false;
+    }
+    return instruction->effects.fp_exceptions ==
+           PVIR_FP_EXCEPTIONS_ACTIVE_LANES_ONLY;
+}
+
+static bool valid_fixed_rounding(PvirRounding rounding)
+{
+    return rounding == PVIR_ROUND_RNU || rounding == PVIR_ROUND_NE ||
+           rounding == PVIR_ROUND_RDN || rounding == PVIR_ROUND_ROD;
+}
+
+/* Shared checks for the new vector-shaped payloads (no memory/effects). */
+static bool valid_plain_vector_facts(const PvirInstruction *instruction,
+                                     const PvirVectorType *type,
+                                     const PvirPredicate *predicate,
+                                     size_t *lanes)
+{
+    if (instruction->effects.memory.access != PVIR_MEMORY_NONE ||
+        instruction->effects.fault.behavior != PVIR_FAULT_NONE ||
+        instruction->effects.side_effects != 0) {
+        return false;
+    }
+    if (pvir_vector_type_lanes(*type, lanes) != PVIR_STATUS_OK ||
+        predicate->lanes != *lanes ||
+        pvir_predicate_validate(predicate) != PVIR_STATUS_OK) {
+        return false;
+    }
+    return true;
+}
+
+static bool valid_inactive_policy(PvirInactivePolicy policy,
+                                  PvirValueId merge_value, bool is_store)
+{
+    switch (policy) {
+    case PVIR_INACTIVE_NOT_APPLICABLE:
+        return is_store && merge_value == PVIR_NO_VALUE;
+    case PVIR_INACTIVE_MERGE:
+        return !is_store && merge_value != PVIR_NO_VALUE;
+    case PVIR_INACTIVE_ZERO:
+    case PVIR_INACTIVE_UNKNOWN:
+        return !is_store && merge_value == PVIR_NO_VALUE;
+    default:
+        return false;
+    }
+}
+
+static bool valid_fixed_operation(const PvirInstruction *instruction)
+{
+    const PvirFixedPointOperation *operation =
+        &instruction->operation.fixed;
+    size_t lanes;
+    size_t i;
+
+    if (!valid_plain_vector_facts(instruction, &operation->type,
+                                  &operation->predicate, &lanes) ||
+        operation->type.kind != PVIR_ELEMENT_INTEGER ||
+        !valid_inactive_policy(operation->inactive_policy,
+                               operation->merge_value, false) ||
+        operation->destination == PVIR_NO_VALUE ||
+        instruction->effects.fp_exceptions != PVIR_FP_EXCEPTIONS_NONE ||
+        operation->kind < PVIR_FIXED_AVG_ADD ||
+        operation->kind > PVIR_FIXED_CLIP ||
+        operation->operand_kinds[0] != PVIR_OPERAND_VECTOR ||
+        operation->operands[0] == PVIR_NO_VALUE) {
+        return false;
+    }
+    if (operation->operand_kinds[1] == PVIR_OPERAND_IMMEDIATE) {
+        if (!immediate_fits(operation->operand_immediates[1],
+                            operation->type.element_bits)) {
+            return false;
+        }
+    } else if (operation->operand_kinds[1] != PVIR_OPERAND_VECTOR &&
+               operation->operand_kinds[1] != PVIR_OPERAND_SCALAR) {
+        return false;
+    }
+    if (operation->operand_kinds[1] != PVIR_OPERAND_IMMEDIATE &&
+        operation->operands[1] == PVIR_NO_VALUE) {
+        return false;
+    }
+    for (i = 0; i < 2; i++) {
+        if (operation->operand_immediates[i] != 0 &&
+            operation->operand_kinds[i] != PVIR_OPERAND_IMMEDIATE) {
+            return false;
+        }
+    }
+    /* AVG_* and SCALE_SHIFT/CLIP round; SAT_* do not. */
+    switch (operation->kind) {
+    case PVIR_FIXED_AVG_ADD:
+    case PVIR_FIXED_AVG_SUB:
+    case PVIR_FIXED_SCALE_SHIFT:
+    case PVIR_FIXED_CLIP:
+        if (!valid_fixed_rounding(operation->rounding)) {
+            return false;
+        }
+        break;
+    default:
+        if (operation->rounding != PVIR_ROUND_DEFAULT) {
+            return false;
+        }
+        break;
+    }
+    if (operation->saturating) {
+        if (!instruction->effects.arch_state.present ||
+            instruction->effects.arch_state.domain !=
+                PVIR_ARCH_STATE_DOMAIN_OTHER ||
+            instruction->effects.arch_state.action !=
+                PVIR_ARCH_STATE_UPDATE ||
+            operation->sat_state.output_value == PVIR_NO_VALUE) {
+            return false;
+        }
+    } else if (instruction->effects.arch_state.present) {
+        return false;
+    }
+    return true;
+}
+
+static bool valid_fp_operation(const PvirInstruction *instruction)
+{
+    const PvirFPOpOperation *operation = &instruction->operation.fp;
+    size_t lanes;
+
+    if (!valid_plain_vector_facts(instruction, &operation->type,
+                                  &operation->predicate, &lanes) ||
+        operation->type.kind != PVIR_ELEMENT_FLOAT ||
+        !valid_inactive_policy(operation->inactive_policy,
+                               operation->merge_value, false) ||
+        operation->destination == PVIR_NO_VALUE ||
+        instruction->effects.arch_state.present ||
+        instruction->effects.fp_exceptions !=
+            PVIR_FP_EXCEPTIONS_ACTIVE_LANES_ONLY ||
+        operation->kind < PVIR_FP_ADD || operation->kind > PVIR_FP_SQRT ||
+        operation->rounding < PVIR_ROUND_DEFAULT ||
+        operation->rounding > PVIR_ROUND_ROD) {
+        return false;
+    }
+    if (operation->operand_kinds[0] != PVIR_OPERAND_VECTOR ||
+        operation->operands[0] == PVIR_NO_VALUE) {
+        return false;
+    }
+    if (operation->kind == PVIR_FP_SQRT) {
+        /* SQRT is unary: the second operand slot must be unused. */
+        return operation->operands[1] == PVIR_NO_VALUE;
+    }
+    if (operation->operand_kinds[1] != PVIR_OPERAND_VECTOR &&
+        operation->operand_kinds[1] != PVIR_OPERAND_SCALAR) {
+        return false;
+    }
+    return operation->operands[1] != PVIR_NO_VALUE;
+}
+
+static bool valid_index_operation(const PvirInstruction *instruction)
+{
+    const PvirIndexOperation *operation = &instruction->operation.index;
+    size_t lanes;
+
+    if (!valid_plain_vector_facts(instruction, &operation->type,
+                                  &operation->predicate, &lanes) ||
+        operation->type.kind != PVIR_ELEMENT_INTEGER ||
+        !valid_inactive_policy(operation->inactive_policy,
+                               operation->merge_value, false) ||
+        operation->destination == PVIR_NO_VALUE ||
+        operation->start_value == PVIR_NO_VALUE ||
+        instruction->effects.arch_state.present ||
+        instruction->effects.fp_exceptions != PVIR_FP_EXCEPTIONS_NONE) {
+        return false;
+    }
+    /* step_value == PVIR_NO_VALUE means the constant 1. */
+    return true;
+}
+
 PvirStatus pvir_instruction_validate(const PvirInstruction *instruction)
 {
     size_t lanes;
@@ -881,6 +1165,32 @@ PvirStatus pvir_instruction_validate(const PvirInstruction *instruction)
                    ? PVIR_STATUS_OK
                    : PVIR_STATUS_INVALID_ARGUMENT;
     }
+    if (instruction->opcode == PVIR_OP_EXTRACT ||
+        instruction->opcode == PVIR_OP_INSERT) {
+        return valid_lane_operation(instruction)
+                   ? PVIR_STATUS_OK
+                   : PVIR_STATUS_INVALID_ARGUMENT;
+    }
+    if (instruction->opcode == PVIR_OP_CONVERT) {
+        return valid_convert_operation(instruction)
+                   ? PVIR_STATUS_OK
+                   : PVIR_STATUS_INVALID_ARGUMENT;
+    }
+    if (instruction->opcode == PVIR_OP_FIXED) {
+        return valid_fixed_operation(instruction)
+                   ? PVIR_STATUS_OK
+                   : PVIR_STATUS_INVALID_ARGUMENT;
+    }
+    if (instruction->opcode == PVIR_OP_FP_ARITH) {
+        return valid_fp_operation(instruction)
+                   ? PVIR_STATUS_OK
+                   : PVIR_STATUS_INVALID_ARGUMENT;
+    }
+    if (instruction->opcode == PVIR_OP_LANE_INDEX) {
+        return valid_index_operation(instruction)
+                   ? PVIR_STATUS_OK
+                   : PVIR_STATUS_INVALID_ARGUMENT;
+    }
 
     if (!vector_opcode_arity(instruction->opcode, &expected_arity)) {
         return PVIR_STATUS_INVALID_ARGUMENT;
@@ -896,10 +1206,19 @@ PvirStatus pvir_instruction_validate(const PvirInstruction *instruction)
     if (instruction->opcode == PVIR_OP_LOAD ||
         instruction->opcode == PVIR_OP_STORE) {
         if (!valid_memory_address(&operation->memory_address) ||
-            !valid_element_bits(operation->memory_element_bits) ||
-            operation->memory_element_bits > operation->type.element_bits ||
-            operation->type.element_bits % operation->memory_element_bits !=
-                0) {
+            !valid_element_bits(operation->memory_element_bits)) {
+            return PVIR_STATUS_INVALID_ARGUMENT;
+        }
+        if (operation->type.kind == PVIR_ELEMENT_MASK) {
+            /* Packed mask bytes (RVV vlm.v/vsm.v): one bit per lane, eight
+             * lanes per byte, lane i maps to bit i%8 of byte i/8. */
+            if (operation->memory_element_bits != 8) {
+                return PVIR_STATUS_INVALID_ARGUMENT;
+            }
+        } else if (operation->memory_element_bits >
+                       operation->type.element_bits ||
+                   operation->type.element_bits %
+                           operation->memory_element_bits != 0) {
             return PVIR_STATUS_INVALID_ARGUMENT;
         }
     } else if (operation->memory_address.present ||

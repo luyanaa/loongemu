@@ -71,6 +71,12 @@ const int reg_ftemp_reverse_map[32] = {
 };
 const int reg_statics_map[1] = {la_s8};
 
+/* LATR has no vector cache window, so every f-temp stays available. */
+int ra_ftemp_pool_size(void)
+{
+    return (int)(sizeof(reg_ftemp_map) / sizeof(int));
+}
+
 static int allocate_temp(uint16_t *status, const int *map, int count)
 {
     for (int i = 0; i < count; i++) {

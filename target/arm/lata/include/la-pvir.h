@@ -136,6 +136,33 @@ typedef enum {
     PVIR_OP_STORE,
     PVIR_OP_ARCH_STATE,
     PVIR_OP_PREDICATE_GENERATE,
+    /* Scalar broadcast: every lane receives the SCALAR operand. */
+    PVIR_OP_BROADCAST,
+    /*
+     * Additions driven by RVV. Appended after the SVE-era opcodes so the
+     * existing numbering and semantics are frozen. Generic operations; no ISA
+     * mode flag is implied.
+     */
+    /* Narrow an integer vector: operand width > result width, same lanes. */
+    PVIR_OP_TRUNCATE,
+    /* Widen an integer vector: operand width < result width, same lanes. */
+    PVIR_OP_EXTEND,
+    PVIR_OP_REM,
+    PVIR_OP_MIN,
+    PVIR_OP_MAX,
+    /* Copy a vector value (identity element conversion, same type). */
+    PVIR_OP_MOVE,
+    /* Move one element between a vector and a scalar (PvirLaneOperation). */
+    PVIR_OP_EXTRACT,
+    PVIR_OP_INSERT,
+    /* Integer/FP or FP/FP conversion (PvirConvertOperation). */
+    PVIR_OP_CONVERT,
+    /* Fixed-point/saturating integer arithmetic (PvirFixedPointOperation). */
+    PVIR_OP_FIXED,
+    /* FP arithmetic with explicit rounding (PvirFPOpOperation). */
+    PVIR_OP_FP_ARITH,
+    /* Generate a lane-index vector (PvirIndexOperation). */
+    PVIR_OP_LANE_INDEX,
 } PvirOpcode;
 
 typedef enum {
@@ -389,6 +416,111 @@ typedef struct {
     PvirArchStateEffect arch_state;
 } PvirEffectMetadata;
 
+typedef enum {
+    /* No rounding control: the implementation's default; SVE-era ops use it. */
+    PVIR_ROUND_DEFAULT,
+    PVIR_ROUND_NE,
+    PVIR_ROUND_RTZ,
+    PVIR_ROUND_RDN,
+    PVIR_ROUND_RUP,
+    PVIR_ROUND_RMM,
+    PVIR_ROUND_RNV,
+    /* Fixed-point (RVV vxrm) rounding modes. */
+    PVIR_ROUND_RNU, /* round to nearest, ties away from zero */
+    PVIR_ROUND_ROD, /* round to odd */
+} PvirRounding;
+
+/*
+ * Single-element transfer. EXTRACT reads lane `lane` of the vector value into
+ * a scalar value; INSERT writes a scalar value into one lane and preserves the
+ * remaining lanes from `merge_value` (an explicit old-vector value id).
+ */
+typedef struct {
+    PvirValueId source;      /* vector for EXTRACT, scalar for INSERT */
+    PvirValueId destination; /* scalar for EXTRACT, vector for INSERT */
+    PvirValueId merge_value; /* INSERT only: lanes other than `lane` */
+    PvirVectorType vector_type;
+    uint16_t lane;           /* immediate element index, < lanes */
+} PvirLaneOperation;
+
+/*
+ * Conversion between element representations; at least one side is FLOAT so
+ * integer width changes stay in TRUNCATE/EXTEND. `rounding` applies when an FP
+ * value is converted (FP to integer or FP to narrower/broader FP).
+ */
+typedef struct {
+    PvirValueId source;
+    PvirValueId destination;
+    PvirVectorType source_type;
+    PvirVectorType destination_type;
+    PvirRounding rounding;
+} PvirConvertOperation;
+
+/*
+ * Fixed-point and saturating integer operations (RVV vaadd/vssrl/vnclip/
+ * vsadd/vsmul families). `rounding` applies to AVG_* and SCALE_SHIFT/CLIP;
+ * `saturating` requires `sat_state.output_value` to carry the vxsat update.
+ */
+typedef enum {
+    PVIR_FIXED_AVG_ADD,
+    PVIR_FIXED_AVG_SUB,
+    PVIR_FIXED_SAT_ADD,
+    PVIR_FIXED_SAT_SUB,
+    PVIR_FIXED_SAT_MUL,
+    PVIR_FIXED_SCALE_SHIFT,
+    PVIR_FIXED_CLIP,
+} PvirFixedPointKind;
+
+typedef struct {
+    PvirVectorType type;
+    PvirPredicate predicate;
+    PvirInactivePolicy inactive_policy;
+    PvirValueId destination;
+    PvirValueId merge_value;
+    PvirValueId operands[2];
+    PvirOperandKind operand_kinds[2];
+    uint64_t operand_immediates[2];
+    PvirFixedPointKind kind;
+    PvirRounding rounding;
+    bool saturating;
+    PvirArchStateOperation sat_state;
+} PvirFixedPointOperation;
+
+/* FP arithmetic with an explicit rounding mode; SQRT takes one operand. */
+typedef enum {
+    PVIR_FP_ADD,
+    PVIR_FP_SUB,
+    PVIR_FP_MUL,
+    PVIR_FP_DIV,
+    PVIR_FP_SQRT,
+} PvirFPKind;
+
+typedef struct {
+    PvirVectorType type;
+    PvirPredicate predicate;
+    PvirInactivePolicy inactive_policy;
+    PvirValueId destination;
+    PvirValueId merge_value;
+    PvirValueId operands[2];
+    PvirOperandKind operand_kinds[2];
+    PvirFPKind kind;
+    PvirRounding rounding;
+} PvirFPOpOperation;
+
+/*
+ * Lane-index vector: element i = start + i * step, where start is a scalar
+ * value and step is a scalar value or PVIR_NO_VALUE for a constant 1.
+ */
+typedef struct {
+    PvirVectorType type;
+    PvirPredicate predicate;
+    PvirInactivePolicy inactive_policy;
+    PvirValueId destination;
+    PvirValueId merge_value;
+    PvirValueId start_value;
+    PvirValueId step_value;
+} PvirIndexOperation;
+
 typedef struct {
     PvirOpcode opcode;
     PvirEffectMetadata effects;
@@ -396,6 +528,11 @@ typedef struct {
         PvirVectorOperation vector;
         PvirArchStateOperation arch_state;
         PvirPredicateGeneratorOperation predicate_generator;
+        PvirLaneOperation lane;
+        PvirConvertOperation convert;
+        PvirFixedPointOperation fixed;
+        PvirFPOpOperation fp;
+        PvirIndexOperation index;
     } operation;
 } PvirInstruction;
 

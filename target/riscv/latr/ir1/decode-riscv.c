@@ -72,14 +72,6 @@ bool latr_decode(uint64_t pc, uint32_t raw, RiscvIR1 *out)
         : decode_insn32(&ctx, raw);
     if (decoded) {
         switch (out->opcode) {
-        case LATR_RV_FENCE: {
-            unsigned fm = (raw >> 28) & 0xf;
-            unsigned pred = (raw >> 24) & 0xf;
-            unsigned succ = (raw >> 20) & 0xf;
-            decoded = fm == 0 ||
-                (fm == 8 && pred == 3 && succ == 3);
-            break;
-        }
         case LATR_RV_SLLI:
         case LATR_RV_SRLI:
         case LATR_RV_SRAI:

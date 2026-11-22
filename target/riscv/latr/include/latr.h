@@ -10,7 +10,41 @@
 #include "la-append.h"
 #include "macro-inst.h"
 #include "riscv-env.h"
+#include "loongemu/riscv_sbi.h"
 
+/* Unit harnesses may translate through control-flow terminators and page
+ * crossings in one block; the real TB dispatcher leaves this clear. */
+#define LATR_TB_CFLAGS_ALLOW_FLOW (UINT32_C(1) << 30)
+
+
+/* TB cache key: a translation is valid for one ASID/privilege/satp mode/RVV config. */
+typedef struct LatrTbKey {
+    uint32_t satp_mode;
+    uint32_t privilege;
+    uint32_t asid;
+    uint32_t vspec;
+    uint64_t root_ppn;
+} LatrTbKey;
+
+/* Native-offset -> guest-PC spans for precise exception attribution. */
+#define LATR_TB_MAP_SLOTS 4
+#define LATR_TB_MAP_SPANS 512
+
+typedef struct LatrTbInsnSpan {
+    uint64_t guest_pc;
+    uint32_t native_start;
+    uint32_t native_end;
+    uint32_t raw_len;
+} LatrTbInsnSpan;
+
+typedef struct LatrTbInsnMap {
+    uintptr_t code_base;
+    uint32_t code_size;
+    uint32_t count;
+    uint32_t generation;
+    bool valid;
+    LatrTbInsnSpan spans[LATR_TB_MAP_SPANS];
+} LatrTbInsnMap;
 
 typedef struct TRANSLATION_DATA {
     void *curr_tb;
@@ -30,6 +64,17 @@ typedef struct TRANSLATION_DATA {
         };
     };
     uint8_t curr_ir1_skipped_eflags;
+
+    /* Filled by tr_ir2_generate(), consumed by tr_ir2_assemble(). */
+    int tb_insn_count;
+    uint64_t tb_insn_pc[LATR_TB_MAP_SPANS];
+    uint32_t tb_insn_len[LATR_TB_MAP_SPANS];
+    int tb_insn_label[LATR_TB_MAP_SPANS + 1];
+
+    /* Native-offset -> guest-PC attribution for precise exceptions. */
+    LatrTbInsnMap insn_maps[LATR_TB_MAP_SLOTS];
+    uint32_t insn_map_generation;
+    LatrTbInsnMap *active_insn_map;
 } TRANSLATION_DATA;
 
 typedef struct ENV {
@@ -39,7 +84,78 @@ typedef struct ENV {
 
 #include "reg-alloc.h"
 
+/*
+ * Per-vCPU TB cache. The VMM owns the code arena; entries are keyed by
+ * guest PC plus {satp mode, ASID, privilege} and dropped by shootdowns.
+ */
+#define LATR_TB_CACHE_ENTRIES 64
+
+typedef struct LatrTbEntry {
+    uint64_t guest_pc;
+    uint8_t *code;
+    uint32_t code_size;
+    uint32_t icount;
+    LatrTbKey key;
+    int valid;
+} LatrTbEntry;
+
+typedef struct LatrTbCache {
+    LatrTbEntry entries[LATR_TB_CACHE_ENTRIES];
+    uint8_t *arena;
+    uint32_t arena_size;
+    uint32_t arena_used;
+    uint32_t count;
+    uint64_t generation;
+} LatrTbCache;
+
+void latr_tb_cache_init(LatrTbCache *cache, uint8_t *arena, uint32_t size);
+LatrTbKey latr_tb_cache_key(const CPUArchState *env);
+LatrTbEntry *latr_tb_cache_lookup(LatrTbCache *cache, uint64_t pc,
+                                  LatrTbKey key);
+LatrTbEntry *latr_tb_cache_insert(LatrTbCache *cache, uint64_t pc,
+                                  LatrTbKey key, const void *code,
+                                  uint32_t code_size, uint32_t icount);
+/* Bumps the generation and drops matching entries (ASID 0 drops all). */
+void latr_tb_shootdown_all(LatrTbCache *cache);
+void latr_tb_shootdown_asid(LatrTbCache *cache, uint32_t asid);
+void latr_tb_shootdown_privilege(LatrTbCache *cache, uint32_t privilege);
+
+/* Switches the runtime to another vCPU's environment. */
+void latr_set_cpu_env(CPUArchState *env);
+
+/*
+ * Cross-core shootdowns: every registered vCPU cache is invalidated. The VMM
+ * registers one cache per vCPU and calls these after an SFENCE.VMA/FENCE.I
+ * retires on any core (guest flags: env->sfence_pending/sfence_asid and
+ * env->fence_i_pending).
+ */
+int latr_tb_cache_register(LatrTbCache *cache);
+void latr_tb_cache_unregister(LatrTbCache *cache);
+void latr_tb_shootdown_asid_all_cores(uint32_t asid);
+void latr_tb_fence_i_all_cores(void);
+void latr_pvir_cache_clear(void);
+
+void latr_tb_insn_map_begin(void *code, uint32_t code_size);
+void latr_tb_insn_map_add(uint64_t guest_pc, uint32_t native_start,
+                          uint32_t native_end, uint32_t raw_len);
+bool latr_tb_insn_map_resolve(uintptr_t host_pc, uint64_t *guest_pc,
+                              uint32_t *raw_len);
+void latr_tb_insn_map_rebase(void *old_code, void *new_code);
+void latr_tb_insn_map_forget(void *code);
+
 void latr_tr_data_init(CPUArchState *env);
+
+/* Services an S-mode ECALL through the VMM-side SBI dispatcher. */
+bool latr_service_sbi(CPUArchState *env, LoongemuSbi *sbi);
+
+/* RVV vsetvl helper: validates vtype, updates vl/vtype/vstart/vill. */
+uint64_t latr_rvv_vsetvl(CPUArchState *env, uint64_t s1, uint64_t vtype);
+
+/* Interrupt state maintenance and delivery (Sstc + PLIC + VMM mip writes). */
+void latr_update_interrupts(CPUArchState *env);
+bool latr_interrupt_pending(CPUArchState *env);
+bool latr_deliver_interrupt(CPUArchState *env);
+void latr_idle_advance(CPUArchState *env);
 void tr_init(void *tb);
 void tr_fini(void);
 int tr_ir2_assemble(const void *code_start_addr);

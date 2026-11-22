@@ -11,11 +11,12 @@ else
 AR ?= $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/llvm-ar,llvm-ar)
 endif
 OBJDUMP ?= $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/llvm-objdump,llvm-objdump)
+OBJCOPY ?= $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/llvm-objcopy,llvm-objcopy)
 LLD_PREFIX ?= $(shell brew --prefix lld 2>/dev/null)
 LD_LLD   ?= $(if $(LLD_PREFIX),$(LLD_PREFIX)/bin/ld.lld,ld.lld)
 QEMU_PREFIX ?= $(shell brew --prefix qemu 2>/dev/null)
 
-.PHONY: all test test-pvir test-sve-decode test-sve-pvir test-arm-state test-cpu test-lapaging test-pci-host test-hyperv test-tbc test-soft-ras test-p0 test-plv3-isolation tb-sys-run tb-sys-smp-run vmm-efi vmm-boot vmm-integrated vmm-integrated-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot test-latr latr-core latr-isa-image latr-isa-run latr-riscv-ref test-latm test-latm-decode latm-core latm-isa-image latm-isa-run latm-riscv-ref clean
+.PHONY: all test test-pvir test-riscv-sbi test-riscv-acpi test-riscv-plic test-riscv-uart test-riscv-clint test-riscv-fw test-sve-decode test-sve-pvir test-vcache test-arm-state test-cpu test-lapaging test-pci-host test-hyperv test-tbc test-soft-ras test-p0 test-plv3-isolation tb-sys-run tb-sys-smp-run vmm-efi vmm-boot vmm-integrated vmm-integrated-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot test-latr latr-core latr-isa-image latr-isa-run latr-riscv-ref latr-check latr-boot-image latr-boot-run latr-sys-ref latr-sys-run latr-sys-diff test-latm test-latm-decode latm-core latm-isa-image latm-isa-run latm-riscv-ref clean
 
 all: test
 
@@ -35,6 +36,72 @@ build/test_pvir: tests/test_pvir.c target/arm/lata/pvir.c \
 
 test-pvir: build/test_pvir
 	./build/test_pvir
+
+test-pvir-rvv-shapes: build/test_pvir_rvv_shapes
+	./build/test_pvir_rvv_shapes
+
+build/test_pvir_rvv_shapes: tests/test_pvir_rvv_shapes.c target/arm/lata/pvir.c \
+                           target/arm/lata/include/la-pvir.h
+	@mkdir -p build
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I target/arm/lata/include \
+	      target/arm/lata/pvir.c tests/test_pvir_rvv_shapes.c -o $@
+
+test-riscv-sbi: build/test_riscv_sbi
+	./build/test_riscv_sbi
+
+test-riscv-acpi: build/test_riscv_acpi
+	./build/test_riscv_acpi
+
+test-riscv-clint: build/test_riscv_clint
+	./build/test_riscv_clint
+
+build/test_riscv_clint: tests/test_riscv_clint.c src/riscv_clint.c \
+                        src/mmio_bus.c include/loongemu/riscv_clint.h \
+                        include/loongemu/mmio_bus.h
+	$(CC) $(CFLAGS) -I include tests/test_riscv_clint.c src/riscv_clint.c \
+	      src/mmio_bus.c -o $@
+
+test-riscv-plic: build/test_riscv_plic
+	./build/test_riscv_plic
+
+test-riscv-uart: build/test_riscv_uart
+	./build/test_riscv_uart
+
+build/test_riscv_uart: tests/test_riscv_uart.c src/uart16550.c src/mmio_bus.c \
+                       src/riscv_plic.c include/loongemu/uart16550.h
+	@mkdir -p build
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I include \
+	      tests/test_riscv_uart.c src/uart16550.c src/mmio_bus.c \
+	      src/riscv_plic.c -o $@
+
+test-riscv-fw: build/test_riscv_fw
+	./build/test_riscv_fw
+
+build/test_riscv_fw: tests/test_riscv_fw.c src/riscv_fw.c src/riscv_acpi.c \
+                     src/ovmf_board.c src/phys_mem.c \
+                     include/loongemu/riscv_fw.h include/loongemu/riscv_acpi.h
+	@mkdir -p build
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I include \
+	      tests/test_riscv_fw.c src/riscv_fw.c src/riscv_acpi.c \
+	      src/ovmf_board.c src/phys_mem.c -o $@
+
+build/test_riscv_plic: tests/test_riscv_plic.c src/riscv_plic.c \
+                       include/loongemu/riscv_plic.h
+	@mkdir -p build
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I include \
+	      tests/test_riscv_plic.c src/riscv_plic.c src/mmio_bus.c -o $@
+
+build/test_riscv_acpi: tests/test_riscv_acpi.c src/riscv_acpi.c \
+                       include/loongemu/riscv_acpi.h
+	@mkdir -p build
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I include \
+	      tests/test_riscv_acpi.c src/riscv_acpi.c -o $@
+
+build/test_riscv_sbi: tests/test_riscv_sbi.c src/riscv_sbi.c \
+                      include/loongemu/riscv_sbi.h
+	@mkdir -p build
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I include \
+	      tests/test_riscv_sbi.c src/riscv_sbi.c -o $@
 
 build/test_sve_decode: tests/test_sve_decode.c \
                        target/arm/lata/ir1/sve-decode.c \
@@ -106,6 +173,11 @@ test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging buil
 	./build/test_soft_ras
 	./build/test_hyperv
 	./build/test_pvir
+	./build/test_riscv_sbi
+	./build/test_riscv_acpi
+	./build/test_riscv_plic
+	./build/test_riscv_uart
+	./build/test_riscv_fw
 	./build/test_sve_decode
 	./build/test_sve_pvir
 	./build/test_arm_state
@@ -436,10 +508,14 @@ LATR_BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdl
                -I latr/compat -I target/riscv/latr/include -I . \
                -I target/arm/lata/include -I target/arm/lata \
                -I latx/compat -I latx/compat/include -I latx/upstream/include \
+               -I include \
                -isystem $(shell $(CLANG) -print-resource-dir)/include
 
 build/latr_isa_test.o: baremetal/bare/latr_isa_test.c \
                        target/riscv/latr/include/riscv-env.h \
+                       target/riscv/latr/include/latr.h \
+                       target/riscv/latr/include/mmu.h \
+                       target/riscv/latr/include/translate.h \
                        tests/latr_isa_diff_vectors.h
 	@mkdir -p build
 	$(CLANG) $(LATR_BARE_CFLAGS) -c $< -o $@
@@ -461,9 +537,101 @@ build/bare_latr_isa.elf: build/latr_isa_test.o build/latr_miniglib.o \
 	   build/latr_isa_test.o build/latr_miniglib.o build/latr_libc_min.o \
 	   latr/build/liblatr_core.a -o $@
 
+build/latr_system_guest.elf: tests/latr_system_guest.c tests/latr_system_guest.ld
+	@mkdir -p build
+	$(CLANG) --target=riscv64-unknown-elf -march=rv64gc -mabi=lp64 \
+	         -mcmodel=medany -ffreestanding -nostdlib -fno-builtin -O2 \
+	         -mno-relax -c $< -o build/latr_system_guest.o
+	$(LD_LLD) -T tests/latr_system_guest.ld --no-relax \
+	         -o $@ build/latr_system_guest.o
+
+build/latr_system_guest_elf.c: build/latr_system_guest.elf
+	@python3 -c 'import sys; d=open(sys.argv[1],"rb").read(); \
+print("const unsigned char latr_system_guest_elf[] = {" + ",".join(str(b) for b in d) + "};"); \
+print("const unsigned int latr_system_guest_elf_len = %d;" % len(d))' $< > $@
+
+latr-sys-ref: build/latr_system_guest.elf
+	@rm -f build/latr_system_guest_qemu.log
+	@timeout 15 $(QEMU_RISCV64) -M virt -cpu rv64 -m 128M -bios none \
+	     -kernel $< -display none -monitor none \
+	     -serial file:build/latr_system_guest_qemu.log -no-reboot 2>/dev/null || true
+	@grep -a 'SYS:' build/latr_system_guest_qemu.log | tail -1
+
+latr-sys-image: build/bare_latr_sys_diff.elf
+
+build/bare_latr_sys_diff.elf: baremetal/bare/latr_sys_diff.c \
+                              build/latr_system_guest_elf.c latr-core \
+                              build/latr_miniglib.o build/latr_libc_min.o \
+                              baremetal/bare/bare.lds
+	@mkdir -p build
+	$(CLANG) $(LATR_BARE_CFLAGS) -I build -c $< -o build/latr_sys_diff.o
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	   build/latr_sys_diff.o build/latr_miniglib.o build/latr_libc_min.o \
+	   latr/build/liblatr_core.a -o $@
+
+latr-sys-run: latr-sys-image
+	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_latr_sys_diff.elf" \
+	     QEMU_LOG="build/latr_sys_diff.log" QEMU_DONE="latr-sys: done" \
+	     QEMU_TIMEOUT=60 CPU=la464 \
+	     bash scripts/run_qemu_lata.sh
+	@grep -a "latr-sys" build/latr_sys_diff.log | head -10
+	@grep -qa "latr-sys: PASS" build/latr_sys_diff.log
+
+latr-sys-diff: latr-sys-ref latr-sys-run
+	@q=$$(grep -a 'SYS:' build/latr_system_guest_qemu.log | tail -1 | sed 's/.*SYS:/SYS:/'); \
+	 l=$$(grep -a 'latr-sys: guest=' build/latr_sys_diff.log | tail -1 | sed 's/.*guest=//'); \
+	 echo "qemu: $$q"; echo "latr: $$l"; \
+	 test -n "$$q" && test "$$q" = "$$l" && echo "latr-sys-diff: PASS"
+
+latr-boot-image: build/bare_latr_boot.elf
+
+build/latr_boot_guest.elf: tests/latr_boot_guest.S
+	@mkdir -p build
+	$(CLANG) --target=riscv64-unknown-elf -march=rv64i -mabi=lp64 \
+	         -mcmodel=medany -ffreestanding -nostdlib -fno-builtin \
+	         -fuse-ld=lld -Wl,-Ttext=0x80000000 -Wl,-e,_start \
+	         -Wl,--no-relax $< -o $@
+
+build/latr_boot_guest.bin: build/latr_boot_guest.elf
+	$(OBJCOPY) -O binary $< $@
+
+build/latr_boot_guest_blob.c: build/latr_boot_guest.bin
+	@python3 -c 'import sys; d=open(sys.argv[1],"rb").read(); \
+print("const unsigned char latr_boot_guest[] = {" + ",".join(str(b) for b in d) + "};"); \
+print("const unsigned int latr_boot_guest_len = %d;" % len(d))' $< > $@
+
+build/latr_boot_guest_blob.o: build/latr_boot_guest_blob.c
+	@mkdir -p build
+	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
+	         -fno-builtin -O2 -c $< -o $@
+
+build/bare_latr_boot.elf: baremetal/bare/latr_boot_smoke.c latr-core \
+                          target/riscv/latr/include/latr-system.h \
+                          target/riscv/latr/include/latr.h \
+                          build/latr_boot_guest_blob.o \
+                          build/latr_miniglib.o build/latr_libc_min.o \
+                          baremetal/bare/bare.lds
+	@mkdir -p build
+	$(CLANG) $(LATR_BARE_CFLAGS) -I build -c baremetal/bare/latr_boot_smoke.c -o build/latr_boot_smoke.o
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	   build/latr_boot_smoke.o build/latr_boot_guest_blob.o \
+	   build/latr_miniglib.o build/latr_libc_min.o \
+	   latr/build/liblatr_core.a -o $@
+
+latr-boot-run: latr-boot-image
+	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_latr_boot.elf" \
+	     QEMU_LOG="build/latr_boot.log" QEMU_DONE="latr-boot: done" \
+	     QEMU_TIMEOUT=30 CPU=la464 \
+	     bash scripts/run_qemu_lata.sh
+	@grep -a "latr-boot" build/latr_boot.log | head -10
+	@grep -qa "latr-boot: PASS" build/latr_boot.log
+
 latr-isa-image: build/bare_latr_isa.elf
 
-test-latr: latr-isa-run latr-riscv-ref
+latr-check:
+	$(MAKE) -C latr check
+
+test-latr: latr-check latr-isa-run latr-riscv-ref latr-boot-run
 	@latr_sig=$$(grep -aEo 'latr-diff=[0-9a-f]+' build/latr_isa.log | tail -1); \
 	 qemu_sig=$$(grep -aEo 'latr-diff=[0-9a-f]+' build/latr_riscv_ref.log | tail -1); \
 	 test -n "$$latr_sig" && test "$$latr_sig" = "$$qemu_sig" && \
@@ -480,7 +648,7 @@ latr-isa-run: latr-isa-image
 build/latr_riscv_ref.elf: tests/latr_isa_qemu_ref.S \
                           tests/latr_isa_diff_vectors.h
 	@mkdir -p build
-	$(CLANG) --target=riscv64-unknown-elf -march=rv64gc -mabi=lp64d \
+	$(CLANG) --target=riscv64-unknown-elf -march=rv64gcv -mabi=lp64d \
 	         -ffreestanding -nostdlib -fno-builtin -O2 -fuse-ld=lld \
 	         -I tests -Wl,-Ttext=0x80000000 -Wl,-e,_start $< -o $@
 

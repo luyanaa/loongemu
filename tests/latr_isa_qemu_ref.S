@@ -13,8 +13,11 @@ _start:
     bne     x3, t0, .Lfail
     li      t0, 5
     bne     x4, t0, .Lfail
-    mv      s0, x3
-    mv      s1, x4
+    /* The compressed vectors below use x8/x9 (= s0/s1), so park the
+     * div/rem results in memory and reload them at print time. */
+    la      t0, .Lsave_div
+    sd      x3, 0(t0)
+    sd      x4, 8(t0)
 
     li      x1, 0x7fffffff
     li      x2, 0x7fffffff
@@ -196,6 +199,140 @@ _start:
     li      t2, 8
     bne     x4, t2, .Lfail
 
+    /* satp/PMP WARL: cross-check the LATR constants against this engine.
+     * Enabling paging in the golden run would translate the next fetch, so
+     * only Bare and an unsupported MODE (rejected) are exercised here. */
+    li      x1, 0x999
+    csrw    satp, x1
+    csrr    x5, satp
+    li      t0, 0x999
+    bne     x5, t0, .Lfail
+    li      x1, 0xb000000000000abc    /* MODE=11 is not supported */
+    csrw    satp, x1
+    csrr    x5, satp
+    li      t0, 0x999
+    bne     x5, t0, .Lfail
+    csrw    satp, x0
+
+    li      x1, 0x123456789
+    csrw    pmpaddr0, x1
+    csrr    x5, pmpaddr0
+    bne     x5, x1, .Lfail
+    li      x1, 0x0018020f            /* entry1 = 0x02: W without R */
+    csrw    pmpcfg0, x1
+    csrr    x5, pmpcfg0
+    li      t0, 0x0018000f
+    bne     x5, t0, .Lfail
+    csrw    pmpcfg0, x0
+    csrw    pmpaddr0, x0
+
+    /* Zba/Zbb/Zbs: the same vectors and expected values are asserted by
+     * the LATR harness, so this run cross-checks those constants. */
+    li      x1, 0x010100ff
+    .word   0x2870d293          /* orc.b x5, x1 */
+    li      t0, 0xffff00ff
+    bne     x5, t0, .Lfail
+
+    li      x1, 1
+    .word   0x60009293          /* clz x5, x1 */
+    li      t0, 63
+    bne     x5, t0, .Lfail
+
+    li      x1, 0x100
+    .word   0x60109293          /* ctz x5, x1 */
+    li      t0, 8
+    bne     x5, t0, .Lfail
+
+    li      x1, 0xf0f0
+    .word   0x60209293          /* cpop x5, x1 */
+    li      t0, 8
+    bne     x5, t0, .Lfail
+
+    li      x1, 0x80000000
+    li      x2, 1
+    .word   0x602092bb          /* rolw x5, x1, x2 */
+    li      t0, 1
+    bne     x5, t0, .Lfail
+
+    li      x1, 0x80
+    .word   0x60409293          /* sext.b x5, x1 */
+    li      t0, -128
+    bne     x5, t0, .Lfail
+
+    li      x1, 0xffff0000ffff
+    .word   0x0800c2bb          /* zext.h x5, x1 */
+    li      t0, 0xffff
+    bne     x5, t0, .Lfail
+
+    li      x1, 0x1122334455667788
+    .word   0x6b80d293          /* rev8 x5, x1 */
+    li      t0, 0x8877665544332211
+    bne     x5, t0, .Lfail
+
+    li      x1, -1
+    li      x2, 1
+    .word   0x0a20c2b3          /* min x5, x1, x2 */
+    bne     x5, x1, .Lfail
+    .word   0x0a20f2b3          /* maxu x5, x1, x2 */
+    bne     x5, x1, .Lfail
+
+    li      x1, 0x20
+    .word   0x4850d293          /* bexti x5, x1, 5 */
+    li      t0, 1
+    bne     x5, t0, .Lfail
+
+    li      x1, 0
+    .word   0x28309293          /* bseti x5, x1, 3 */
+    li      t0, 8
+    bne     x5, t0, .Lfail
+
+    li      x1, 1
+    .word   0x68009293          /* binvi x5, x1, 0 */
+    bnez    x5, .Lfail
+
+    li      x1, 3
+    li      x2, 5
+    .word   0x2020a2b3          /* sh1add x5, x1, x2 */
+    li      t0, 11
+    bne     x5, t0, .Lfail
+
+    li      x1, 0xffffffff
+    li      x2, 1
+    .word   0x082082bb          /* add.uw x5, x1, x2 */
+    li      t0, 0x100000000
+    bne     x5, t0, .Lfail
+
+    li      x1, 0xffffffff
+    .word   0x0840929b          /* slli.uw x5, x1, 4 */
+    li      t0, 0xffffffff0
+    bne     x5, t0, .Lfail
+
+    li      x1, 0xf
+    .word   0x6040d29b          /* roriw x5, x1, 4 */
+    li      t0, 0xfffffffff0000000
+    bne     x5, t0, .Lfail
+
+    /* RVV golden differential sequence (-march=rv64gcv). */
+    li      t0, 0x600
+    csrs    mstatus, t0
+    .word   LATR_DIFF_RVV_VSETIVLI_4
+    li      t0, 3
+    li      t1, -5
+    .word   LATR_DIFF_RVV_VMV_V_I_V1_7
+    .word   LATR_DIFF_RVV_VMV_V_X_V2_T0
+    .word   LATR_DIFF_RVV_VMUL_VV_V3
+    .word   LATR_DIFF_RVV_VADD_VX_V3_T1
+    .word   LATR_DIFF_RVV_VMAX_VV_V3
+    .word   LATR_DIFF_RVV_VSLL_VI_V4_2
+    .word   LATR_DIFF_RVV_VDIV_VV_V5
+    .word   LATR_DIFF_RVV_VREM_VV_V6
+    .word   LATR_DIFF_RVV_VXOR_VV_V3
+    .word   LATR_DIFF_RVV_VMV_V_I_V7_0
+    .word   LATR_DIFF_RVV_VREDSUM_V7
+    .word   LATR_DIFF_RVV_VMV_X_S_T0_V7
+    la      t1, .Lsave_div
+    sd      t0, 16(t1)
+
 
     li      t0, 0x10000000
     la      t1, .Lprefix
@@ -208,9 +345,10 @@ _start:
 .Lprint_diff:
     li      a1, 0x10000000
     la      a2, .Lhex_digits
-    mv      a0, s0
+    la      t0, .Lsave_div
+    ld      a0, 0(t0)
     jal     ra, .Lprint_hex64
-    mv      a0, s1
+    ld      a0, 8(t0)
     jal     ra, .Lprint_hex64
     mv      a0, s2
     jal     ra, .Lprint_hex64
@@ -231,6 +369,9 @@ _start:
     mv      a0, s10
     jal     ra, .Lprint_hex64
     mv      a0, s11
+    jal     ra, .Lprint_hex64
+    la      t0, .Lsave_div
+    ld      a0, 16(t0)
     jal     ra, .Lprint_hex64
     li      t0, 10
     sb      t0, 0(a1)
@@ -287,3 +428,10 @@ _start:
     .asciz "latr-riscv-ref: PASS\n"
 .Lfailure:
     .asciz "latr-riscv-ref: FAIL\n"
+
+    .section .data
+    .align 3
+.Lsave_div:
+    .dword 0
+    .dword 0
+    .dword 0

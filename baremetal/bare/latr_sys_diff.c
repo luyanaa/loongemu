@@ -1,0 +1,133 @@
+/*
+ * LATR side of the RISC-V virt system differential:
+ *   embedded guest ELF -> LATR system board -> UART log.
+ */
+#include <stdint.h>
+#include "latr.h"
+#include "latr-system.h"
+#include "translate.h"
+#include "latr_system_guest_elf.c"
+
+extern void latr_enter_tb(void *env, void *code);
+
+__asm__(
+".text\n"
+".globl latr_enter_tb\n"
+"latr_enter_tb:\n"
+"  addi.d $sp, $sp, -16\n"
+"  st.d   $ra, $sp, 0\n"
+"  st.d   $s8, $sp, 8\n"
+"  move   $s8, $a0\n"
+"  jirl   $ra, $a1, 0\n"
+"  ld.d   $ra, $sp, 0\n"
+"  ld.d   $s8, $sp, 8\n"
+"  addi.d $sp, $sp, 16\n"
+"  jirl   $zero, $ra, 0\n");
+
+#define UART0_THR ((volatile uint8_t *)0x1fe001e0)
+void latx_bare_uart_putc(int c) { *UART0_THR = (uint8_t)c; }
+void latx_bare_uart_puts(const char *s)
+{
+    while (*s) {
+        latx_bare_uart_putc(*s++);
+    }
+}
+
+
+void kmain(void);
+__asm__(".text\n.globl _start\n_start:\n  la $sp, latr_sys_stack\n"
+        "  lu12i.w $t0, 128\n  add.d $sp, $sp, $t0\n  bl kmain\n1: b 1b\n");
+static uint8_t latr_sys_stack[512u << 10] __attribute__((aligned(16), used));
+
+static uint8_t ram[16u << 20] __attribute__((aligned(4096)));
+static uint8_t code_buf[1u << 18] __attribute__((aligned(4096)));
+static uint8_t cache_arena[1u << 20] __attribute__((aligned(4096)));
+static LatrSystem sys;
+static LatrTbCache cache;
+static TranslationBlock tb;
+static CPUState cpu;
+
+void kmain(void)
+{
+    uint64_t entry = 0;
+    int halted = 0;
+
+    latx_bare_uart_puts("latr-sys: begin\n");
+    if (!latr_system_init(&sys, ram, sizeof(ram), 0)) {
+        latx_bare_uart_puts("latr-sys: FAIL init\n");
+        return;
+    }
+    latr_tr_data_init(&sys.env);
+    latr_tb_cache_init(&cache, cache_arena, sizeof(cache_arena));
+    latr_tb_cache_register(&cache);
+    if (!latr_system_load_elf(&sys, latr_system_guest_elf,
+                              latr_system_guest_elf_len, &entry)) {
+        latx_bare_uart_puts("latr-sys: FAIL elf\n");
+        return;
+    }
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.env_ptr = &sys.env;
+
+    for (int tbs = 0; tbs < 20000; tbs++) {
+        LatrTbKey key;
+        LatrTbEntry *ent;
+        uint64_t code;
+
+        latr_system_update(&sys);
+        if (latr_deliver_interrupt(&sys.env)) {
+            sys.env.exception = 0;
+        }
+        key = latr_tb_cache_key(&sys.env);
+        ent = latr_tb_cache_lookup(&cache, sys.env.pc, key);
+        if (ent == NULL) {
+            int limit = 64;
+            int words;
+            memset(&tb, 0, sizeof(tb));
+            tb.pc = sys.env.pc;
+            tb.tc.ptr = code_buf;
+            tb.cflags = 0;
+            target_disasm(&tb, &limit, &cpu);
+            if (tb.icount == 0) {
+                break;
+            }
+            tr_init(&tb);
+            if (!tr_ir2_generate(&tb)) {
+                tr_fini();
+                break;
+            }
+            words = tr_ir2_assemble(code_buf);
+            ent = latr_tb_cache_insert(&cache, tb.pc, key, code_buf,
+                                       (uint32_t)words * 4, tb.icount);
+            if (ent != NULL) {
+                latr_tb_insn_map_rebase(code_buf, ent->code);
+            }
+            tr_fini();
+        }
+        code = ent != NULL ? (uint64_t)(uintptr_t)ent->code
+                           : (uint64_t)(uintptr_t)code_buf;
+        latr_enter_tb(&sys.env, (void *)(uintptr_t)code);
+        if (sys.env.sfence_pending) {
+            latr_tb_shootdown_asid(&cache, (uint32_t)sys.env.sfence_asid);
+            sys.env.sfence_pending = 0;
+        }
+        if (sys.env.fence_i_pending) {
+            latr_tb_shootdown_all(&cache);
+            sys.env.fence_i_pending = 0;
+        }
+        if (sys.env.wfi_pending) {
+            latr_idle_advance(&sys.env);
+            sys.env.wfi_pending = 0;
+        }
+        if (sys.env.exception) {
+            sys.env.exception = 0;
+        }
+        if (sys.exit_request) {
+            halted = 1;
+            break;
+        }
+    }
+    latx_bare_uart_puts(" latr-sys: guest=");
+    latx_bare_uart_puts(latr_system_uart_log(&sys));
+    latx_bare_uart_puts(halted ? "\nlatr-sys: PASS\n" : "\nlatr-sys: FAIL\n");
+    latx_bare_uart_puts("latr-sys: done\n");
+}
