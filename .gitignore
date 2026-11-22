@@ -2,9 +2,13 @@ qemu-system-loongarch64
 # Host and cross build outputs
 /build/
 /baremetal/build/
+/lata/build/
+/latr/build/
 
 # Editor / tooling scratch
 .commandcode/
+# WorkBuddy workspace data (project memory, local agent state)
+.workbuddy/
 
 # Build products anywhere
 *.o
