@@ -42,6 +42,21 @@ A64SVEDecodeStatus a64_sve_decode(uint32_t insn,
                                   A64SVEIR1Instruction *decoded);
 
 /*
+ * One representative encoding per decodable instruction type, derived from the
+ * decoder's own pattern table.
+ *
+ * The pattern table is the definition of "decodable", so a test that walks the
+ * encoding space by hand will silently miss forms as the table grows. This
+ * enumerates the table instead: each pattern contributes its canonical value,
+ * and where a `valid()` predicate rejects that, a bounded deterministic search
+ * over the don't-care bits finds an accepted encoding. Types that no pattern
+ * can produce are simply absent, which the caller can detect by counting.
+ *
+ * Returns the number written (at most `cap`).
+ */
+size_t a64_sve_decode_corpus(uint32_t *out, size_t cap);
+
+/*
  * Classify feature presence and a separately supplied architectural control
  * result. This is a pure classifier; it does not emit an architectural trap.
  */

@@ -16,7 +16,7 @@ LLD_PREFIX ?= $(shell brew --prefix lld 2>/dev/null)
 LD_LLD   ?= $(if $(LLD_PREFIX),$(LLD_PREFIX)/bin/ld.lld,ld.lld)
 QEMU_PREFIX ?= $(shell brew --prefix qemu 2>/dev/null)
 
-.PHONY: all test test-pvir test-riscv-sbi test-riscv-acpi test-riscv-plic test-riscv-uart test-riscv-clint test-riscv-fw test-sve-decode test-sve-pvir test-vcache test-arm-state test-cpu test-lapaging test-pci-host test-hyperv test-tbc test-soft-ras test-p0 test-plv3-isolation tb-sys-run tb-sys-smp-run vmm-efi vmm-boot vmm-integrated vmm-integrated-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot test-latr latr-core latr-isa-image latr-isa-run latr-riscv-ref latr-check latr-boot-image latr-boot-run latr-sys-ref latr-sys-run latr-sys-diff latr-opensbi-image latr-opensbi-run latr-opensbi-trace latr-opensbi-trace-run latr-opensbi-test test-latm test-latm-decode latm-core latm-isa-image latm-isa-run latm-riscv-ref clean
+.PHONY: all test test-pvir test-riscv-sbi test-riscv-virtio test-riscv-acpi test-riscv-plic test-riscv-uart test-riscv-clint test-riscv-fw test-sve-decode test-sve-pvir test-sve-helper-support test-vcache test-arm-state test-cpu test-lapaging test-pci-host test-hyperv test-tbc test-soft-ras test-p0 test-plv3-isolation tb-sys-run tb-sys-smp-run vmm-efi vmm-boot vmm-integrated vmm-integrated-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot test-latr latr-core latr-isa-image latr-isa-run latr-riscv-ref latr-check latr-boot-image latr-boot-run latr-sys-ref latr-sys-run latr-sys-diff latr-opensbi-image latr-opensbi-run latr-opensbi-trace latr-opensbi-trace-run latr-opensbi-test test-latm test-latm-decode latm-core latm-isa-image latm-isa-run latm-riscv-ref clean
 
 all: test
 
@@ -48,6 +48,19 @@ build/test_pvir_rvv_shapes: tests/test_pvir_rvv_shapes.c target/arm/lata/pvir.c 
 
 test-riscv-sbi: build/test_riscv_sbi
 	./build/test_riscv_sbi
+
+test-riscv-virtio: build/test_riscv_virtio_blk
+	./build/test_riscv_virtio_blk
+
+build/test_riscv_virtio_blk: tests/test_riscv_virtio_blk.c \
+                             src/riscv_virtio_blk.c src/guest_dma.c \
+                             src/phys_mem.c src/mmio_bus.c \
+                             include/loongemu/riscv_virtio_blk.h \
+                             include/loongemu/guest_dma.h \
+                             include/loongemu/phys_mem.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) tests/test_riscv_virtio_blk.c src/riscv_virtio_blk.c \
+	      src/guest_dma.c src/phys_mem.c src/mmio_bus.c -o $@
 
 test-riscv-acpi: build/test_riscv_acpi
 	./build/test_riscv_acpi
@@ -141,6 +154,30 @@ build/test_sve_pvir: tests/test_sve_pvir.c target/arm/lata/ir1/sve-pvir.c \
 test-sve-pvir: build/test_sve_pvir
 	./build/test_sve_pvir
 
+# No decodable SVE encoding may fall through all three lowering tiers into a
+# silent no-op; see tests/test_sve_helper_support.c.
+build/test_sve_helper_support: tests/test_sve_helper_support.c \
+                               target/arm/lata/translator/sve-helper-support.c \
+                               target/arm/lata/ir1/sve-pvir.c \
+                               target/arm/lata/ir1/sve-decode.c \
+                               target/arm/lata/pvir.c \
+                               target/arm/lata/translator/sve-lasx-lower.h \
+                               target/arm/lata/ir1/sve-pvir.h \
+                               target/arm/lata/ir1/sve-decode.h \
+                               target/arm/lata/include/la-pvir.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Wno-gnu-empty-struct -I. \
+	      -Ilata/compat -iquote latx/compat \
+	      -Itarget/arm/lata/include -Itarget/arm/lata/ir1 \
+	      -Itarget/arm/lata/translator \
+	      target/arm/lata/pvir.c target/arm/lata/ir1/sve-decode.c \
+	      target/arm/lata/ir1/sve-pvir.c latx/runtime/cpu_features.c \
+	      target/arm/lata/translator/sve-helper-support.c \
+	      tests/test_sve_helper_support.c -o $@
+
+test-sve-helper-support: build/test_sve_helper_support
+	./build/test_sve_helper_support
+
 build/test_vcache: tests/test_vcache.c lata/vcache.c \
                    target/arm/lata/include/lata-vcache.h
 	@mkdir -p build
@@ -190,7 +227,8 @@ test-soft-ras: build/test_soft_ras
 
 test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging build/test_x86_64_paging \
       build/test_pci_host build/test_hyperv build/test_tb_cache build/test_soft_ras build/test_pvir build/test_sve_decode build/test_sve_pvir build/test_vcache build/test_arm_state build/test_lata_context \
-      build/test_latm_decode
+      build/test_latm_decode build/test_riscv_virtio_blk \
+      build/test_sve_helper_support
 	./build/test_loongbt
 	./build/test_loongbt_cpu
 	./build/test_loongarch_paging
@@ -207,6 +245,8 @@ test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging buil
 	./build/test_riscv_fw
 	./build/test_sve_decode
 	./build/test_sve_pvir
+	./build/test_sve_helper_support
+	./build/test_riscv_virtio_blk
 	./build/test_vcache
 	./build/test_arm_state
 	./build/test_lata_context

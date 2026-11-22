@@ -1,0 +1,92 @@
+#include "loongemu/guest_dma.h"
+
+#include <string.h>
+
+void loongemu_guest_dma_init(LoongemuGuestDma *dma, const LoongemuMemMap *map,
+                             LoongemuGuestWriteNotify notify, void *opaque)
+{
+    if (dma == NULL) {
+        return;
+    }
+    dma->map = map;
+    dma->notify = notify;
+    dma->notify_opaque = opaque;
+}
+
+bool loongemu_guest_dma_ptr(const LoongemuGuestDma *dma, uint64_t gpa,
+                            uint64_t len, uint8_t **out)
+{
+    LoongemuMemLookup lookup;
+
+    if (out != NULL) {
+        *out = NULL;
+    }
+    if (dma == NULL || dma->map == NULL || len == 0 || out == NULL) {
+        return false;
+    }
+    if (loongemu_mem_resolve(dma->map, gpa, len, &lookup) !=
+        LOONGEMU_MEM_RAM) {
+        return false;
+    }
+    *out = (uint8_t *)(uintptr_t)lookup.hpa;
+    return true;
+}
+
+int loongemu_guest_dma_read(const LoongemuGuestDma *dma, uint64_t gpa,
+                            void *buf, uint64_t len)
+{
+    uint8_t *host;
+
+    if (buf == NULL || !loongemu_guest_dma_ptr(dma, gpa, len, &host)) {
+        return -1;
+    }
+    memcpy(buf, host, (size_t)len);
+    return 0;
+}
+
+static void dma_notify(LoongemuGuestDma *dma, uint64_t gpa, uint64_t len)
+{
+    if (dma->notify != NULL) {
+        dma->notify(dma->notify_opaque, gpa, len);
+    }
+}
+
+int loongemu_guest_dma_write(LoongemuGuestDma *dma, uint64_t gpa,
+                             const void *buf, uint64_t len)
+{
+    uint8_t *host;
+
+    if (buf == NULL || !loongemu_guest_dma_ptr(dma, gpa, len, &host)) {
+        return -1;
+    }
+    memcpy(host, buf, (size_t)len);
+    dma_notify(dma, gpa, len);
+    return 0;
+}
+
+int loongemu_guest_dma_fill(LoongemuGuestDma *dma, uint64_t gpa, uint8_t value,
+                            uint64_t len)
+{
+    uint8_t *host;
+
+    if (!loongemu_guest_dma_ptr(dma, gpa, len, &host)) {
+        return -1;
+    }
+    memset(host, value, (size_t)len);
+    dma_notify(dma, gpa, len);
+    return 0;
+}
+
+int loongemu_guest_dma_write_le(LoongemuGuestDma *dma, uint64_t gpa,
+                                uint64_t value, unsigned size)
+{
+    uint8_t bytes[8];
+
+    if (size == 0 || size > sizeof(bytes)) {
+        return -1;
+    }
+    for (unsigned i = 0; i < size; i++) {
+        bytes[i] = (uint8_t)(value >> (8u * i));
+    }
+    return loongemu_guest_dma_write(dma, gpa, bytes, size);
+}

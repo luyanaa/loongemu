@@ -2,6 +2,7 @@
 #define LATR_SYSTEM_H
 
 #include "latr.h"
+#include "loongemu/guest_dma.h"
 #include "loongemu/mmio_bus.h"
 #include "loongemu/phys_mem.h"
 #include "loongemu/riscv_clint.h"
@@ -30,6 +31,9 @@ typedef struct LatrSystem {
     CPUArchState env;
     LoongemuMemMap map;
     LoongemuMmioBus bus;
+    /* Device-side view of guest RAM: every DMA store is published through it so
+     * the LR/SC reservation domain is invalidated for the touched range. */
+    LoongemuGuestDma dma;
     LoongemuClint clint;
     LoongemuPlic plic;
     LoongemuUart16550 uart;

@@ -258,7 +258,7 @@ int latr_machine_attach_disk(LatrMachine *m, uint8_t *image, uint64_t len)
                               0, LOONGEMU_MEM_MMIO, "virtio")) {
         return 0;
     }
-    if (!loongemu_virtio_blk_init(&m->virtio_blk, &m->sys.map, image, len,
+    if (!loongemu_virtio_blk_init(&m->virtio_blk, &m->sys.dma, image, len,
                                   LATR_MACHINE_VIRTIO_IRQ_BASE,
                                   machine_virtio_irq, m)) {
         return 0;

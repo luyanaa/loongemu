@@ -2003,3 +2003,76 @@ a64_sve_access_disposition(bool sve_implemented, A64SVEControlState state)
 
     return A64_SVE_ACCESS_CONTROL_UNSUPPORTED;
 }
+
+/* How many distinct encodings to keep per instruction type. One is enough to
+ * prove the type exists, but types with several shapes (element sizes, subops)
+ * need more before a lowering gap in one of them is visible. */
+#define CORPUS_PER_TYPE 4
+
+size_t a64_sve_decode_corpus(uint32_t *out, size_t cap)
+{
+    struct {
+        AARCH64_INSN_TYPE_A64 type;
+        unsigned count;
+    } seen[256];
+    size_t seen_count = 0;
+    size_t written = 0;
+    uint32_t lcg = 0x1234567u;
+
+    if (out == NULL || cap == 0) {
+        return 0;
+    }
+
+    for (unsigned i = 0;
+         i < sizeof(sve_patterns) / sizeof(sve_patterns[0]) && written < cap;
+         i++) {
+        const SveDecodePattern *pattern = &sve_patterns[i];
+        uint32_t free_bits = ~pattern->mask;
+        A64SVEIR1Instruction decoded;
+
+        for (unsigned attempt = 0; attempt < 512; attempt++) {
+            uint32_t candidate = pattern->value;
+
+            if (attempt != 0) {
+                /* Deterministic fill of the don't-care bits: the `valid()`
+                 * predicates test a handful of field encodings, so a few
+                 * hundred tries cover them without a real search. */
+                lcg = lcg * 1664525u + 1013904223u;
+                candidate |= lcg & free_bits;
+            }
+            if ((candidate & pattern->mask) != pattern->value) {
+                continue;
+            }
+            if (pattern->valid != NULL && !pattern->valid(candidate)) {
+                continue;
+            }
+            if (a64_sve_decode(candidate, &decoded) != A64_SVE_DECODE_MATCH ||
+                decoded.insn_type != pattern->insn_type) {
+                continue;
+            }
+            size_t match = seen_count;
+            for (size_t s = 0; s < seen_count; s++) {
+                if (seen[s].type == decoded.insn_type) {
+                    match = s;
+                    break;
+                }
+            }
+            if (match == seen_count) {
+                if (seen_count >= sizeof(seen) / sizeof(seen[0])) {
+                    break;
+                }
+                seen[seen_count].type = decoded.insn_type;
+                seen[seen_count].count = 1;
+                seen_count++;
+            } else if (seen[match].count >= CORPUS_PER_TYPE) {
+                /* Enough samples of this type already. */
+                break;
+            } else {
+                seen[match].count++;
+            }
+            out[written++] = candidate;
+            break;
+        }
+    }
+    return written;
+}

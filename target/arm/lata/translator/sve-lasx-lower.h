@@ -10,6 +10,40 @@
 
 struct DisasContext;
 
+/*
+ * Result of executing one PVIR instruction in the scalar helper.
+ *
+ * Before this existed the helper returned 0 for both "done" and "I do not
+ * implement this opcode", so pvir_instruction_validate() succeeding said
+ * nothing about whether the fallback could actually run the instruction: a
+ * valid PVIR shape that neither LSX lowering nor the helper covered became a
+ * silent no-op, and the guest kept running with a stale destination register.
+ *
+ * The values double as the ABI with generated code, so keep them stable and
+ * non-zero for everything that is not success.
+ */
+typedef enum LataSVEHelperStatus {
+    LATA_SVE_HELPER_OK = 0,
+    /* An architectural exception was raised; the generated code must take the
+     * guest fault path with the PC the helper stored. */
+    LATA_SVE_HELPER_FAULT = 1,
+    /* The opcode or the shape was not implemented. Translation is supposed to
+     * refuse these, so reaching it at run time is a bug: report loudly instead
+     * of pretending the instruction executed. */
+    LATA_SVE_HELPER_UNSUPPORTED = 2,
+    /* Internal inconsistency (bad register id, missing description data). */
+    LATA_SVE_HELPER_INTERNAL = 3,
+} LataSVEHelperStatus;
+
+/* Why the helper cannot execute an instruction; the reason only exists to make
+ * a translation-time refusal self-explanatory in logs and tests. */
+typedef enum LataSVEHelperSupport {
+    LATA_SVE_HELPER_SUPPORTED = 0,
+    LATA_SVE_HELPER_UNSUPPORTED_OPCODE,
+    LATA_SVE_HELPER_UNSUPPORTED_SHAPE,
+    LATA_SVE_HELPER_INVALID_PVIR,
+} LataSVEHelperSupport;
+
 typedef struct LataSVEHelperDesc {
     PvirInstruction pvir;
     bool has_source;
@@ -26,7 +60,30 @@ typedef struct LataSVEHelperDesc {
 const LataSVEHelperDesc *lata_sve_alloc_helper_desc(
     const struct DisasContext *s, const PvirInstruction *instruction,
     const A64SVEIR1Instruction *source);
+
+/*
+ * Translate-time query: can the scalar helper execute this instruction?
+ *
+ * A caller that is about to fall back to the helper must check this first and
+ * refuse to translate when it says no, because the alternative is generating
+ * code that runs and does nothing.
+ */
+LataSVEHelperSupport lata_sve_helper_support(
+    const PvirInstruction *instruction, const A64SVEIR1Instruction *source);
+
+/* Status-returning entry point, used by generated code and by tests. */
+LataSVEHelperStatus lata_sve_exec_helper_status(void *env_ptr,
+                                                const LataSVEHelperDesc *desc);
+
+/* Compatibility wrapper: 0 on success, non-zero (LataSVEHelperStatus) else. */
 uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *desc);
+
+/* Called from generated code when the helper reported UNSUPPORTED/INTERNAL at
+ * run time, which the translate-time query is supposed to make impossible.
+ * Raises an undefined instruction so the instruction cannot look executed. */
+void lata_sve_helper_unexpected(void *env_ptr, const LataSVEHelperDesc *desc,
+                                uint64_t status);
+
 void lata_sve_helper_list_free(void *head);
 
 /* Lower one validated PVIR instruction (source optional for direct PVIR ops). */

@@ -2,6 +2,7 @@
 #define LOONGEMU_RISCV_VIRTIO_BLK_H
 
 #include <stdint.h>
+#include "loongemu/guest_dma.h"
 #include "loongemu/mmio_bus.h"
 #include "loongemu/phys_mem.h"
 
@@ -34,7 +35,7 @@ extern "C" {
 typedef void (*LoongemuVirtioIrqFn)(void *opaque, uint32_t irq, int level);
 
 typedef struct LoongemuVirtioBlk {
-    const LoongemuMemMap *map;
+    LoongemuGuestDma dma;
     uint8_t *disk;
     uint64_t disk_size;
     uint64_t capacity_sectors;
@@ -53,15 +54,25 @@ typedef struct LoongemuVirtioBlk {
     uint64_t queue_desc;
     uint64_t queue_driver;
     uint64_t queue_device;
-    uint32_t last_avail;
+    /* Split-virtqueue indices are 16-bit and wrap. Keeping this in 16 bits is
+     * what makes `last_avail != avail.idx` terminate: as a 32-bit counter it
+     * never equals the wrapped index again after 65536 requests. */
+    uint16_t last_avail;
     uint32_t requests;
     uint32_t bytes;
+    /* Requests refused without touching the rings (avail.idx ran away). */
+    uint32_t dropped;
     int irq_level;
 } LoongemuVirtioBlk;
 
-/* `disk` must stay alive for the device's lifetime; it is the sector store. */
+/*
+ * `disk` must stay alive for the device's lifetime; it is the sector store.
+ * `dma` describes how the device reaches guest RAM and carries the LR/SC
+ * invalidation hook, so a device cannot be created without deciding how guest
+ * writes are published.
+ */
 int loongemu_virtio_blk_init(LoongemuVirtioBlk *dev,
-                             const LoongemuMemMap *map, uint8_t *disk,
+                             const LoongemuGuestDma *dma, uint8_t *disk,
                              uint64_t disk_size, uint32_t irq,
                              LoongemuVirtioIrqFn irq_fn, void *irq_opaque);
 

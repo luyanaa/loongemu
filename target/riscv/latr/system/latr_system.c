@@ -75,27 +75,28 @@ static void sys_pflash_write(void *opaque, uint64_t offset, uint64_t value,
     ovmf_pflash_mmio_write(flash, offset, value, size);
 }
 
+static void system_dma_notify(void *opaque, uint64_t gpa, uint64_t len)
+{
+    (void)opaque;
+    /* A device DMA store is a guest-memory write from outside the CPU store
+     * path: advance the LR/SC epoch so an outstanding reservation cannot
+     * succeed against the value the device just replaced. */
+    latr_reservation_notify_write(gpa, len);
+}
+
 static int fw_dma_read(void *opaque, uint64_t gpa, void *buf, uint32_t len)
 {
     LatrSystem *sys = opaque;
-    if (gpa < sys->ram_base || gpa + len > sys->ram_base + sys->ram_size) {
-        return -1;
-    }
-    memcpy(buf, sys->ram + (gpa - sys->ram_base), len);
-    return 0;
+
+    return loongemu_guest_dma_read(&sys->dma, gpa, buf, len) == 0 ? 0 : -1;
 }
 
 static int fw_dma_write(void *opaque, uint64_t gpa, const void *buf,
                         uint32_t len)
 {
     LatrSystem *sys = opaque;
-    if (gpa < sys->ram_base || gpa + len > sys->ram_base + sys->ram_size) {
-        return -1;
-    }
-    memcpy(sys->ram + (gpa - sys->ram_base), buf, len);
-    /* Device DMA is a guest-memory write from outside the CPU store path. */
-    latr_reservation_notify_write(gpa, len);
-    return 0;
+
+    return loongemu_guest_dma_write(&sys->dma, gpa, buf, len) == 0 ? 0 : -1;
 }
 
 static int system_init(LatrSystem *sys, uint8_t *ram, uint64_t ram_size,
@@ -131,6 +132,7 @@ static int system_init(LatrSystem *sys, uint8_t *ram, uint64_t ram_size,
         return 0;
     }
     loongemu_mmio_bus_init(&sys->bus);
+    loongemu_guest_dma_init(&sys->dma, &sys->map, system_dma_notify, sys);
     loongemu_clint_init(&sys->clint, 8);
     if (!loongemu_clint_attach(&sys->bus, &sys->clint,
                                LATR_SYSTEM_CLINT_BASE)) {

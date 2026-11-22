@@ -51,6 +51,10 @@ typedef struct VqDesc {
     uint16_t next;
 } VqDesc;
 
+/* Ring and request structures are little-endian on both sides. Only loads are
+ * open-coded: every store into guest memory has to go through
+ * loongemu_guest_dma_write()/write_le() so the LR/SC reservation domain is
+ * notified, so there is deliberately no st16/st32/st64 here. */
 static uint16_t ld16(const uint8_t *p)
 {
     return (uint16_t)(p[0] | (uint16_t)p[1] << 8);
@@ -67,40 +71,16 @@ static uint64_t ld64(const uint8_t *p)
     return (uint64_t)ld32(p) | (uint64_t)ld32(p + 4) << 32;
 }
 
-static void st16(uint8_t *p, uint16_t v)
-{
-    p[0] = (uint8_t)v;
-    p[1] = (uint8_t)(v >> 8);
-}
-
-static void st32(uint8_t *p, uint32_t v)
-{
-    p[0] = (uint8_t)v;
-    p[1] = (uint8_t)(v >> 8);
-    p[2] = (uint8_t)(v >> 16);
-    p[3] = (uint8_t)(v >> 24);
-}
-
-static void st64(uint8_t *p, uint64_t v)
-{
-    st32(p, (uint32_t)v);
-    st32(p + 4, (uint32_t)(v >> 32));
-}
-
 /* Resolves a guest physical range to a host pointer inside guest RAM. */
 static uint8_t *gpa_host(const LoongemuVirtioBlk *dev, uint64_t gpa,
                          uint64_t len)
 {
-    LoongemuMemLookup lookup;
+    uint8_t *host = NULL;
 
-    if (dev->map == NULL || len == 0) {
+    if (!loongemu_guest_dma_ptr(&dev->dma, gpa, len, &host)) {
         return NULL;
     }
-    if (loongemu_mem_resolve(dev->map, gpa, len, &lookup) !=
-        LOONGEMU_MEM_RAM) {
-        return NULL;
-    }
-    return (uint8_t *)(uintptr_t)lookup.hpa;
+    return host;
 }
 
 static void raise_irq(LoongemuVirtioBlk *dev)
@@ -135,20 +115,21 @@ static void device_reset(LoongemuVirtioBlk *dev)
     dev->queue_driver = 0;
     dev->queue_device = 0;
     dev->last_avail = 0;
+    dev->dropped = 0;
     lower_irq(dev);
 }
 
 int loongemu_virtio_blk_init(LoongemuVirtioBlk *dev,
-                             const LoongemuMemMap *map, uint8_t *disk,
+                             const LoongemuGuestDma *dma, uint8_t *disk,
                              uint64_t disk_size, uint32_t irq,
                              LoongemuVirtioIrqFn irq_fn, void *irq_opaque)
 {
-    if (dev == NULL || disk == NULL ||
+    if (dev == NULL || dma == NULL || dma->map == NULL || disk == NULL ||
         disk_size < LOONGEMU_VIRTIO_BLK_SECTOR) {
         return 0;
     }
     memset(dev, 0, sizeof(*dev));
-    dev->map = map;
+    dev->dma = *dma;
     dev->disk = disk;
     dev->disk_size = disk_size - disk_size % LOONGEMU_VIRTIO_BLK_SECTOR;
     dev->capacity_sectors = dev->disk_size / LOONGEMU_VIRTIO_BLK_SECTOR;
@@ -176,6 +157,12 @@ static int read_desc(const LoongemuVirtioBlk *dev, uint32_t index, VqDesc *out)
     if (index >= dev->queue_num) {
         return 0;
     }
+    /* The descriptor table is guest-supplied; reject a base address that would
+     * wrap the 64-bit addition below instead of aliasing it to another page. */
+    if (dev->queue_desc >
+        UINT64_MAX - (uint64_t)index * sizeof(VqDesc) - sizeof(VqDesc)) {
+        return 0;
+    }
     p = gpa_host(dev, dev->queue_desc + (uint64_t)index * 16u, 16);
     if (p == NULL) {
         return 0;
@@ -187,87 +174,184 @@ static int read_desc(const LoongemuVirtioBlk *dev, uint32_t index, VqDesc *out)
     return 1;
 }
 
+/* A collected descriptor chain, bounded by the queue size. */
+typedef struct VqChain {
+    VqDesc desc[LOONGEMU_VIRTIO_BLK_QUEUE_MAX];
+    uint32_t index[LOONGEMU_VIRTIO_BLK_QUEUE_MAX];
+    uint32_t count;
+    /* Descriptor that ended the chain without VIRTQ_DESC_F_NEXT, or -1 when the
+     * walk was cut short (loop, out-of-range link, unreadable descriptor). */
+    int32_t tail;
+} VqChain;
+
+/*
+ * Walk the chain starting at `head`. A malicious or corrupted driver can point
+ * NEXT at itself, at a descriptor already in the chain, or off the end of the
+ * table; each of those must terminate the walk rather than spin, so the walk
+ * is bounded by the queue size and every hop is range-checked.
+ */
+static bool collect_chain(const LoongemuVirtioBlk *dev, uint32_t head,
+                          VqChain *chain)
+{
+    uint32_t index = head;
+
+    chain->count = 0;
+    chain->tail = -1;
+    if (head >= dev->queue_num) {
+        return false;
+    }
+    while (chain->count < dev->queue_num &&
+           chain->count < LOONGEMU_VIRTIO_BLK_QUEUE_MAX) {
+        VqDesc *d = &chain->desc[chain->count];
+
+        if (!read_desc(dev, index, d)) {
+            return false;
+        }
+        chain->index[chain->count] = index;
+        chain->count++;
+        if ((d->flags & VIRTQ_DESC_F_NEXT) == 0) {
+            chain->tail = (int32_t)(chain->count - 1);
+            return true;
+        }
+        if (d->next >= dev->queue_num) {
+            return false;
+        }
+        for (uint32_t i = 0; i < chain->count; i++) {
+            if (chain->index[i] == d->next) {
+                return false;
+            }
+        }
+        index = d->next;
+    }
+    return false;
+}
+
+/*
+ * Publish the status byte into the last descriptor.
+ *
+ * Called on success *and* on every failure path: a driver that never sees a
+ * status byte waits forever for the request to complete. When the tail is not
+ * device-writable (or is an inaccessible descriptor) there is nowhere to put
+ * it, and the used-ring entry posted by process_queue() is the only completion
+ * signal left. Returns true when the byte was written.
+ */
+static bool report_status(LoongemuVirtioBlk *dev, const VqChain *chain,
+                          uint8_t status)
+{
+    const VqDesc *tail;
+
+    if (chain->count == 0) {
+        return false;
+    }
+    tail = &chain->desc[chain->count - 1];
+    if ((tail->flags & VIRTQ_DESC_F_WRITE) == 0 || tail->len < 1) {
+        return false;
+    }
+    return loongemu_guest_dma_write(&dev->dma, tail->addr, &status, 1) == 0;
+}
+
 /* Copies one request chain. Returns the virtio-blk status byte. */
 static uint8_t handle_chain(LoongemuVirtioBlk *dev, uint32_t head,
                             uint32_t *used_len)
 {
-    VqDesc descs[LOONGEMU_VIRTIO_BLK_QUEUE_MAX];
-    uint32_t count = 0;
-    uint32_t index = head;
+    VqChain chain;
+    uint8_t status = LOONGEMU_VIRTIO_BLK_S_OK;
     uint32_t type;
     uint64_t sector;
-    uint64_t offset = 0;
-    uint8_t status = LOONGEMU_VIRTIO_BLK_S_OK;
+    uint64_t offset;
+    uint64_t moved = 0;
     uint8_t *header;
-    uint8_t *status_addr;
-    bool terminated = false;
 
-    while (count < dev->queue_num &&
-           count < LOONGEMU_VIRTIO_BLK_QUEUE_MAX) {
-        if (!read_desc(dev, index, &descs[count])) {
-            return LOONGEMU_VIRTIO_BLK_S_IOERR;
-        }
-        count++;
-        if ((descs[count - 1].flags & VIRTQ_DESC_F_NEXT) == 0) {
-            terminated = true;
-            break;
-        }
-        index = descs[count - 1].next;
-    }
-    if (!terminated || count < 2) {
+    *used_len = 0;
+    if (!collect_chain(dev, head, &chain)) {
+        /* Nothing usable to report into: the tail is unknown, so the used-ring
+         * entry is the only signal. */
+        dev->requests++;
         return LOONGEMU_VIRTIO_BLK_S_IOERR;
     }
 
-    header = gpa_host(dev, descs[0].addr, 16);
+    /* Header descriptor: device-readable, at least struct virtio_blk_req. */
+    if (chain.count < 2 || (chain.desc[0].flags & VIRTQ_DESC_F_WRITE) != 0 ||
+        chain.desc[0].len < 16) {
+        status = LOONGEMU_VIRTIO_BLK_S_IOERR;
+        goto report;
+    }
+    header = gpa_host(dev, chain.desc[0].addr, 16);
     if (header == NULL) {
-        return LOONGEMU_VIRTIO_BLK_S_IOERR;
+        status = LOONGEMU_VIRTIO_BLK_S_IOERR;
+        goto report;
     }
     type = ld32(header);
     sector = ld64(header + 8);
-    offset = sector * LOONGEMU_VIRTIO_BLK_SECTOR;
 
-    for (uint32_t i = 0; i < count; i++) {
-        *used_len += descs[i].len;
+    /* Status descriptor: device-writable, at least one byte. Checking it up
+     * front means a rejected request still returns a status the driver can
+     * read, instead of leaving the request outstanding. */
+    if ((chain.desc[chain.count - 1].flags & VIRTQ_DESC_F_WRITE) == 0 ||
+        chain.desc[chain.count - 1].len < 1) {
+        status = LOONGEMU_VIRTIO_BLK_S_IOERR;
+        goto report;
     }
 
-    for (uint32_t i = 1; i + 1 < count; i++) {
-        uint64_t len = descs[i].len;
-        uint8_t *buf;
-
-        if (type == LOONGEMU_VIRTIO_BLK_T_IN) {
-            if ((descs[i].flags & VIRTQ_DESC_F_WRITE) == 0) {
-                continue;
-            }
-            buf = gpa_host(dev, descs[i].addr, len);
-            if (buf == NULL || offset + len > dev->disk_size) {
-                status = LOONGEMU_VIRTIO_BLK_S_IOERR;
-                break;
-            }
-            memcpy(buf, dev->disk + offset, len);
-            offset += len;
-        } else if (type == LOONGEMU_VIRTIO_BLK_T_OUT) {
-            if (descs[i].flags & VIRTQ_DESC_F_WRITE) {
-                continue;
-            }
-            buf = gpa_host(dev, descs[i].addr, len);
-            if (buf == NULL || offset + len > dev->disk_size) {
-                status = LOONGEMU_VIRTIO_BLK_S_IOERR;
-                break;
-            }
-            memcpy(dev->disk + offset, buf, len);
-            offset += len;
+    if (type == LOONGEMU_VIRTIO_BLK_T_IN || type == LOONGEMU_VIRTIO_BLK_T_OUT) {
+        /* Reject a sector past the end before multiplying: `sector * 512` on a
+         * wild sector would wrap and silently address the start of the disk.
+         * capacity_sectors is derived from the host buffer, so a sector below
+         * it cannot overflow the product. */
+        if (sector >= dev->capacity_sectors) {
+            status = LOONGEMU_VIRTIO_BLK_S_IOERR;
+            goto report;
         }
-    }
-    if (type != LOONGEMU_VIRTIO_BLK_T_IN && type != LOONGEMU_VIRTIO_BLK_T_OUT &&
-        type != LOONGEMU_VIRTIO_BLK_T_FLUSH) {
+        offset = sector * LOONGEMU_VIRTIO_BLK_SECTOR;
+
+        for (uint32_t i = 1; i + 1 < chain.count; i++) {
+            const VqDesc *d = &chain.desc[i];
+            bool writable = (d->flags & VIRTQ_DESC_F_WRITE) != 0;
+
+            /* Direction is part of the contract: a read buffer must be
+             * device-writable and a write buffer device-readable. Skipping a
+             * descriptor with the wrong direction would report success while
+             * transferring fewer bytes than the driver asked for. */
+            if (writable != (type == LOONGEMU_VIRTIO_BLK_T_IN)) {
+                status = LOONGEMU_VIRTIO_BLK_S_IOERR;
+                goto report;
+            }
+            if (d->len == 0) {
+                continue;
+            }
+            /* `offset + len` in this form cannot overflow, and `offset` stays
+             * <= disk_size because it only advances by lengths that passed. */
+            if ((uint64_t)d->len > dev->disk_size - offset) {
+                status = LOONGEMU_VIRTIO_BLK_S_IOERR;
+                goto report;
+            }
+            if (type == LOONGEMU_VIRTIO_BLK_T_IN) {
+                if (loongemu_guest_dma_write(&dev->dma, d->addr,
+                                             dev->disk + offset, d->len) != 0) {
+                    status = LOONGEMU_VIRTIO_BLK_S_IOERR;
+                    goto report;
+                }
+                /* Only reads move data *into* guest memory, so only they count
+                 * toward used.len (the spec's "bytes written into the
+                 * device-writable part"). */
+                moved += d->len;
+            } else if (loongemu_guest_dma_read(&dev->dma, d->addr,
+                                               dev->disk + offset,
+                                               d->len) != 0) {
+                status = LOONGEMU_VIRTIO_BLK_S_IOERR;
+                goto report;
+            }
+            offset += d->len;
+        }
+    } else if (type != LOONGEMU_VIRTIO_BLK_T_FLUSH) {
         status = LOONGEMU_VIRTIO_BLK_S_UNSUPP;
     }
 
-    status_addr = gpa_host(dev, descs[count - 1].addr, 1);
-    if (status_addr == NULL) {
-        return LOONGEMU_VIRTIO_BLK_S_IOERR;
+report:
+    if (report_status(dev, &chain, status)) {
+        moved += 1;
     }
-    *status_addr = status;
+    *used_len = (uint32_t)moved;
     dev->requests++;
     return status;
 }
@@ -277,7 +361,9 @@ static void process_queue(LoongemuVirtioBlk *dev)
     uint8_t *avail;
     uint8_t *used;
     uint16_t avail_idx;
-    uint32_t used_idx;
+    uint16_t used_idx;
+    uint16_t pending;
+    bool processed = false;
 
     if (!dev->queue_ready || dev->queue_num == 0) {
         return;
@@ -291,21 +377,46 @@ static void process_queue(LoongemuVirtioBlk *dev)
     }
     avail_idx = ld16(avail + 2);
     used_idx = ld16(used + 2);
+
+    /*
+     * avail.idx is guest-writable and wraps at 16 bits. A driver can only ever
+     * have queue_num requests outstanding, so anything further is corruption
+     * or an attack: processing "until we catch up" would run up to 65535
+     * chains inside one register write, each with a full descriptor walk.
+     * Drop the queue position instead and resynchronise on the next notify.
+     */
+    pending = (uint16_t)(avail_idx - dev->last_avail);
+    if (pending > dev->queue_num) {
+        dev->dropped += pending;
+        dev->last_avail = avail_idx;
+        return;
+    }
+
     while (dev->last_avail != avail_idx) {
         uint32_t slot = dev->last_avail % dev->queue_num;
         uint16_t head = ld16(avail + 4 + 2 * slot);
         uint32_t used_len = 0;
-        uint8_t *entry;
 
         (void)handle_chain(dev, head, &used_len);
-        entry = used + 4 + 8 * (used_idx % dev->queue_num);
-        st32(entry, head);
-        st32(entry + 4, used_len);
-        used_idx++;
-        st16(used + 2, (uint16_t)used_idx);
-        dev->last_avail++;
+        if (loongemu_guest_dma_write_le(&dev->dma,
+                                         dev->queue_device + 4 +
+                                             8u * (used_idx % dev->queue_num),
+                                         head, 4) != 0 ||
+            loongemu_guest_dma_write_le(&dev->dma,
+                                         dev->queue_device + 8 +
+                                             8u * (used_idx % dev->queue_num),
+                                         used_len, 4) != 0) {
+            /* The used ring went away mid-request; stop rather than spinning. */
+            dev->last_avail = avail_idx;
+            return;
+        }
+        used_idx = (uint16_t)(used_idx + 1);
+        loongemu_guest_dma_write_le(&dev->dma, dev->queue_device + 2,
+                                    used_idx, 2);
+        dev->last_avail = (uint16_t)(dev->last_avail + 1);
+        processed = true;
     }
-    if (dev->status & VIRTIO_STATUS_DRIVER_OK) {
+    if (processed && (dev->status & VIRTIO_STATUS_DRIVER_OK)) {
         dev->interrupt_status |= 1u;
         raise_irq(dev);
     }

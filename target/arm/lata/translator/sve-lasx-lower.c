@@ -1854,6 +1854,7 @@ static bool emit_sve_helper_call(DisasContext *s,
 {
     const LataSVEHelperDesc *desc;
     IR2_OPND no_fault = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND fault = ir2_opnd_new_type(IR2_OPND_LABEL);
     uint64_t next_pc = (s->base != NULL) ? s->base->pc_next : (s->pc_curr + 4u);
 
     desc = lata_sve_alloc_helper_desc(s, instruction, source);
@@ -1879,6 +1880,20 @@ static bool emit_sve_helper_call(DisasContext *s,
         la_armmtflag(t1_ir2_opnd, 0x39);
     }
     la_beqz(t2_ir2_opnd, no_fault);
+
+    /* 1 is an architectural exception the helper already latched; anything
+     * larger means it declined the instruction. That must not fall through to
+     * "resume at pc_next", which is exactly the silent no-op the status
+     * encoding exists to remove. */
+    li_d(t1_ir2_opnd, LATA_SVE_HELPER_FAULT);
+    la_beq(t2_ir2_opnd, t1_ir2_opnd, fault);
+    la_mov64(a0_ir2_opnd, s8_ir2_opnd);
+    li_d(a1_ir2_opnd, (int64_t)(uintptr_t)desc);
+    la_mov64(a2_ir2_opnd, t2_ir2_opnd);
+    li_d(t0_ir2_opnd, (int64_t)(uintptr_t)lata_sve_helper_unexpected);
+    la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
+
+    la_label(fault);
     li_d(t0_ir2_opnd, (int64_t)(uintptr_t)&lata_vreg_published);
     li_d(t1_ir2_opnd, 1);
     la_st_w(t1_ir2_opnd, t0_ir2_opnd, 0);
@@ -5895,6 +5910,35 @@ static bool lower_sve_lasx_dispatch(DisasContext *s,
     }
 }
 
+/*
+ * Fall back to the scalar helper, or refuse to translate.
+ *
+ * Refusing is the half that used to be missing. A validated PVIR instruction is
+ * not automatically executable by the helper: the shape may be one the helper
+ * does not implement, and generated code for such a shape runs and does
+ * nothing. Returning false makes the caller raise an undefined instruction,
+ * which is the architectural answer for an instruction we do not implement --
+ * and it is visible, unlike a no-op.
+ *
+ * The same path serves both the LSX and LASX backends so that "lowering failed"
+ * always means the same thing regardless of host SIMD width.
+ */
+static bool sve_helper_fallback(DisasContext *s, const PvirInstruction *insn,
+                                const A64SVEIR1Instruction *source,
+                                bool ftemp_exhausted)
+{
+    if (ftemp_exhausted) {
+        ra_ftemp_note_fallback();
+    }
+    if (pvir_instruction_validate(insn) != PVIR_STATUS_OK) {
+        return false;
+    }
+    if (lata_sve_helper_support(insn, source) != LATA_SVE_HELPER_SUPPORTED) {
+        return false;
+    }
+    return emit_sve_helper_call(s, insn, source);
+}
+
 bool a64_sve_lower_pvir_instruction(DisasContext *s,
                                     const PvirInstruction *instruction,
                                     const A64SVEIR1Instruction *source)
@@ -5902,6 +5946,8 @@ bool a64_sve_lower_pvir_instruction(DisasContext *s,
     A64SVEPvirBuilder bsnap;
     LataIr2Snapshot ir2_snap;
     A64SVEBackendMode backend;
+    bool lowered;
+    bool ftemp_exhausted;
 
     if (!sve_context_valid(s) || instruction == NULL) {
         return false;
@@ -5911,10 +5957,7 @@ bool a64_sve_lower_pvir_instruction(DisasContext *s,
     backend = a64_sve_select_backend();
 
     if (backend == A64_SVE_BACKEND_SCALAR_HELPER) {
-        if (pvir_instruction_validate(instruction) != PVIR_STATUS_OK) {
-            return false;
-        }
-        return emit_sve_helper_call(s, instruction, source);
+        return sve_helper_fallback(s, instruction, source, false);
     }
 
     bsnap = *s->sve_pvir_builder;
@@ -5922,41 +5965,21 @@ bool a64_sve_lower_pvir_instruction(DisasContext *s,
     ra_ftemp_clear_failed();
 
     if (backend == A64_SVE_BACKEND_LSX) {
-        bool lsx_ok = lower_sve_lsx_core(s, instruction, source);
-        bool ftemp_exhausted = ra_ftemp_alloc_failed();
-        if (lsx_ok && !ftemp_exhausted) {
-            return true;
-        }
-        *s->sve_pvir_builder = bsnap;
-        lata_ir2_snapshot_rollback(&ir2_snap);
-        ra_ftemp_clear_failed();
-        if (ftemp_exhausted) {
-            ra_ftemp_note_fallback();
-        }
-        if (pvir_instruction_validate(instruction) != PVIR_STATUS_OK) {
-            return false;
-        }
-        return emit_sve_helper_call(s, instruction, source);
+        lowered = lower_sve_lsx_core(s, instruction, source);
+    } else {
+        lowered = lower_sve_lasx_dispatch(s, instruction, source);
+    }
+    ftemp_exhausted = ra_ftemp_alloc_failed();
+    if (lowered && !ftemp_exhausted) {
+        return true;
     }
 
-    {
-        bool lasx_ok = lower_sve_lasx_dispatch(s, instruction, source);
-        bool ftemp_exhausted = ra_ftemp_alloc_failed();
-        if (lasx_ok && !ftemp_exhausted) {
-            return true;
-        }
-        *s->sve_pvir_builder = bsnap;
-        lata_ir2_snapshot_rollback(&ir2_snap);
-        ra_ftemp_clear_failed();
-        if (ftemp_exhausted) {
-            ra_ftemp_note_fallback();
-            if (pvir_instruction_validate(instruction) != PVIR_STATUS_OK) {
-                return false;
-            }
-            return emit_sve_helper_call(s, instruction, source);
-        }
-    }
-    return false;
+    /* Roll the half-emitted block back before re-lowering it another way;
+     * leaving it in place would run both versions. */
+    *s->sve_pvir_builder = bsnap;
+    lata_ir2_snapshot_rollback(&ir2_snap);
+    ra_ftemp_clear_failed();
+    return sve_helper_fallback(s, instruction, source, ftemp_exhausted);
 }
 
 static bool translate_sve_pvir(DisasContext *s)

@@ -3,9 +3,16 @@
 #include "target/arm/lata/include/lata.h"
 #include "target/arm/lata/include/lata-mem.h"
 #include "target/arm/lata/include/translate.h"
+#include "target/arm/tcg/translate.h"
+#include "qemu/log.h"
 
 #include <limits.h>
 #include <string.h>
+
+/* helper-proto.h declares this with no prototype; the definition below matches
+ * the real signature, exactly as mem.c does. */
+void helper_exception_with_syndrome(CPUARMState *env, uint32_t excp,
+                                    uint32_t syndrome);
 
 typedef struct LataSVEHelperNode {
     struct LataSVEHelperNode *next;
@@ -1000,14 +1007,15 @@ static bool instruction_writes_nzcv(const PvirInstruction *ins,
     return false;
 }
 
-uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
+LataSVEHelperStatus lata_sve_exec_helper_status(void *env_ptr,
+                                                const LataSVEHelperDesc *d)
 {
     CPUARMState *env = (CPUARMState *)env_ptr;
     const PvirInstruction *ins;
     size_t vl_bytes;
 
     if (env == NULL || d == NULL) {
-        return 0;
+        return LATA_SVE_HELPER_INTERNAL;
     }
     ins = &d->pvir;
     vl_bytes = d->vl_bytes;
@@ -1039,7 +1047,8 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
         case AARCH64_A64_SVE_LDNF1SB:
         case AARCH64_A64_SVE_LDNF1SH:
         case AARCH64_A64_SVE_LDNF1SW:
-            return exec_fault_or_contiguous_mem(env, d);
+            return exec_fault_or_contiguous_mem(env, d)
+                   ? LATA_SVE_HELPER_FAULT : LATA_SVE_HELPER_OK;
         case AARCH64_A64_SVE_LD1_SCALAR:
         case AARCH64_A64_SVE_ST1_SCALAR:
         case AARCH64_A64_SVE_LDN:
@@ -1050,14 +1059,15 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
         case AARCH64_A64_SVE_SCATTER_ST:
         case AARCH64_A64_SVE_LDNT1:
         case AARCH64_A64_SVE_STNT1:
-            return exec_mem_ext(env, d);
+            return exec_mem_ext(env, d) ? LATA_SVE_HELPER_FAULT
+                                        : LATA_SVE_HELPER_OK;
         case AARCH64_A64_SVE_SETFFR:
             memset(env->sve.ffr, 0xff, vl_bytes / 8u);
-            return 0;
+            return LATA_SVE_HELPER_OK;
         case AARCH64_A64_SVE_WRFFR:
             memcpy(env->sve.ffr, env->sve.pregs[d->source.arg.f_sve_ffr.pn],
                    vl_bytes / 8u);
-            return 0;
+            return LATA_SVE_HELPER_OK;
         case AARCH64_A64_SVE_RDFFR: {
             const arg_sve_ffr *f = &d->source.arg.f_sve_ffr;
             size_t pb = vl_bytes / 8u;
@@ -1070,13 +1080,13 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
                 h_predtest(env, vl_bytes, 8, env->sve.pregs[f->pg],
                            env->sve.pregs[f->pd]);
             }
-            return 0;
+            return LATA_SVE_HELPER_OK;
         }
         case AARCH64_A64_SVE_PTEST: {
             const arg_sve_pred_op *p = &d->source.arg.f_sve_pred_op;
             h_predtest(env, vl_bytes, 8, env->sve.pregs[p->pg],
                        env->sve.pregs[p->pn]);
-            return 0;
+            return LATA_SVE_HELPER_OK;
         }
         case AARCH64_A64_SVE_BRK:
         case AARCH64_A64_SVE_PFIRST:
@@ -1160,7 +1170,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
                            (p->subop == SVE_PRED_OP_PNEXT) ? p->element_bits : 8u,
                            env->sve.pregs[p->pg], env->sve.pregs[p->pd]);
             }
-            return 0;
+            return LATA_SVE_HELPER_OK;
         }
         case AARCH64_A64_SVE_CNTP:
         case AARCH64_A64_SVE_CNT_SCALAR: {
@@ -1232,7 +1242,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
                     }
                 }
             }
-            return 0;
+            return LATA_SVE_HELPER_OK;
         }
         case AARCH64_A64_SVE_LAST: {
             const arg_sve_last *la = &d->source.arg.f_sve_last;
@@ -1268,7 +1278,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
                     env->xregs[la->rd_zd] = val & mask_bits(eb <= 4 ? 32 : 64);
                 }
             }
-            return 0;
+            return LATA_SVE_HELPER_OK;
         }
         case AARCH64_A64_SVE_DUP: {
             const arg_sve_dup *du = &d->source.arg.f_sve_dup;
@@ -1278,7 +1288,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
             for (size_t l = 0; l < lanes; ++l) {
                 write_elem_u64(env->sve.zregs[du->zd], l, eb, v);
             }
-            return 0;
+            return LATA_SVE_HELPER_OK;
         }
         case AARCH64_A64_SVE_FABS:
         case AARCH64_A64_SVE_FNEG: {
@@ -1298,7 +1308,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
                 write_elem_u64(out, l, eb, v);
             }
             memcpy(env->sve.zregs[u->zd], out, vl_bytes);
-            return 0;
+            return LATA_SVE_HELPER_OK;
         }
         case AARCH64_A64_SVE_SHIFT_IMM: {
             const arg_sve_ext_op *ex = &d->source.arg.f_sve_ext_op;
@@ -1331,7 +1341,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
                 write_elem_u64(out, l, eb, r);
             }
             memcpy(env->sve.zregs[ex->zd_pd], out, vl_bytes);
-            return 0;
+            return LATA_SVE_HELPER_OK;
         }
         case AARCH64_A64_SVE_INT_UNARY: {
             const arg_sve_general *g = &d->source.arg.f_sve_general;
@@ -1405,7 +1415,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
                 write_elem_u64(out, l, eb, r & mask_bits(ebits));
             }
             memcpy(env->sve.zregs[g->zd], out, vl_bytes);
-            return 0;
+            return LATA_SVE_HELPER_OK;
         }
         case AARCH64_A64_SVE_WMUL: {
             const arg_sve_general *g = &d->source.arg.f_sve_general;
@@ -1430,7 +1440,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
                 write_elem_u64(out, l, dst_eb, prod);
             }
             memcpy(env->sve.zregs[g->zd], out, vl_bytes);
-            return 0;
+            return LATA_SVE_HELPER_OK;
         }
         case AARCH64_A64_SVE_IMM_BIN: {
             const arg_sve_general *g = &d->source.arg.f_sve_general;
@@ -1458,7 +1468,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
                 }
             }
             memcpy(env->sve.zregs[g->zd], out, vl_bytes);
-            return 0;
+            return LATA_SVE_HELPER_OK;
         }
         default:
             break;
@@ -1482,7 +1492,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
             uint32_t pd = g->state_id - A64_SVE_PVIR_P_STATE_BASE;
             memcpy(env->sve.pregs[pd], env->sve.ffr, vl_bytes / 8u);
         }
-        return 0;
+        return LATA_SVE_HELPER_OK;
     }
     case PVIR_OP_ARCH_STATE:
         if (ins->effects.arch_state.domain == PVIR_ARCH_STATE_DOMAIN_FIRST_FAULT &&
@@ -1492,10 +1502,11 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
                 memcpy(env->sve.ffr, env->sve.pregs[pn], vl_bytes / 8u);
             }
         }
-        return 0;
+        return LATA_SVE_HELPER_OK;
     case PVIR_OP_LOAD:
     case PVIR_OP_STORE:
-        return exec_fault_or_contiguous_mem(env, d);
+        return exec_fault_or_contiguous_mem(env, d)
+                   ? LATA_SVE_HELPER_FAULT : LATA_SVE_HELPER_OK;
     case PVIR_OP_NOT: {
         const PvirVectorOperation *op = &ins->operation.vector;
         uint8_t eb = (uint8_t)(op->type.element_bits / 8u);
@@ -1516,7 +1527,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
             }
         }
         memcpy(env->sve.zregs[zd], out, vl_bytes);
-        return 0;
+        return LATA_SVE_HELPER_OK;
     }
     case PVIR_OP_BROADCAST: {
         const PvirVectorOperation *op = &ins->operation.vector;
@@ -1532,7 +1543,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
         for (size_t l = 0; l < lanes; ++l) {
             write_elem_u64(env->sve.zregs[zd], l, eb, v);
         }
-        return 0;
+        return LATA_SVE_HELPER_OK;
     }
     case PVIR_OP_COMPARE: {
         const PvirVectorOperation *op = &ins->operation.vector;
@@ -1571,7 +1582,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
             uint8_t *pg_ptr = (pg >= 0) ? env->sve.pregs[pg] : out;
             h_predtest(env, vl_bytes, (uint8_t)ebits, pg_ptr, out);
         }
-        return 0;
+        return LATA_SVE_HELPER_OK;
     }
     case PVIR_OP_SELECT: {
         const PvirVectorOperation *op = &ins->operation.vector;
@@ -1591,7 +1602,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
             write_elem_u64(out, l, eb, v);
         }
         memcpy(env->sve.zregs[zd], out, vl_bytes);
-        return 0;
+        return LATA_SVE_HELPER_OK;
     }
     case PVIR_OP_FMA: {
         const PvirVectorOperation *op = &ins->operation.vector;
@@ -1649,7 +1660,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
             write_elem_u64(out, l, eb, r);
         }
         memcpy(env->sve.zregs[zd], out, vl_bytes);
-        return 0;
+        return LATA_SVE_HELPER_OK;
     }
     case PVIR_OP_FP_ARITH: {
         PvirFPKind fkind = ins->operation.fp.kind;
@@ -1683,7 +1694,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
             }
         }
         memcpy(env->sve.zregs[zd], out, vl_bytes);
-        return 0;
+        return LATA_SVE_HELPER_OK;
     }
     case PVIR_OP_ADD:
     case PVIR_OP_SUB:
@@ -1744,7 +1755,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
             }
         }
         memcpy(env->sve.zregs[zd], out, vl_bytes);
-        return 0;
+        return LATA_SVE_HELPER_OK;
     }
     case PVIR_OP_CONVERT: {
         const PvirConvertOperation *c = &ins->operation.convert;
@@ -1811,7 +1822,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
             }
         }
         memcpy(env->sve.zregs[zd], out, vl_bytes);
-        return 0;
+        return LATA_SVE_HELPER_OK;
     }
     case PVIR_OP_FIXED: {
         const PvirFixedPointOperation *fx = &ins->operation.fixed;
@@ -1891,7 +1902,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
             write_elem_u64(out, l, eb, r);
         }
         memcpy(env->sve.zregs[zd], out, vl_bytes);
-        return 0;
+        return LATA_SVE_HELPER_OK;
     }
     case PVIR_OP_REDUCE: {
         const PvirReduceOperation *red = &ins->operation.reduce;
@@ -1962,7 +1973,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
             memset(env->sve.zregs[zd], 0, vl_bytes);
             write_elem_u64(env->sve.zregs[zd], 0, rdb, acc);
         }
-        return 0;
+        return LATA_SVE_HELPER_OK;
     }
     case PVIR_OP_PERMUTE: {
         const PvirPermuteOperation *p = &ins->operation.permute;
@@ -2054,7 +2065,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
             }
         }
         memcpy(env->sve.zregs[zd], out, vl_bytes);
-        return 0;
+        return LATA_SVE_HELPER_OK;
     }
     case PVIR_OP_LANE_INDEX: {
         const PvirIndexOperation *idx = &ins->operation.index;
@@ -2074,7 +2085,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
         for (size_t l = 0; l < lanes; ++l) {
             write_elem_u64(env->sve.zregs[zd], l, eb, start + l * step);
         }
-        return 0;
+        return LATA_SVE_HELPER_OK;
     }
     case PVIR_OP_INSERT: {
         const PvirLaneOperation *op = &ins->operation.lane;
@@ -2089,7 +2100,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
                                read_elem_u64(env->sve.zregs[g->zd], l - 2u, eb));
             }
             write_elem_u64(env->sve.zregs[g->zd], 0, eb, ins_val);
-            return 0;
+            return LATA_SVE_HELPER_OK;
         }
         int zd = h_find_zreg(d, op->destination);
         int zsrc = h_find_zreg(d, op->merge_value);
@@ -2101,7 +2112,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
             uint64_t val = (gpr >= 0 && gpr < 31) ? env->xregs[gpr] : 0u;
             write_elem_u64(env->sve.zregs[zd], op->lane, eb, val);
         }
-        return 0;
+        return LATA_SVE_HELPER_OK;
     }
     case PVIR_OP_EXTRACT: {
         const PvirLaneOperation *op = &ins->operation.lane;
@@ -2112,7 +2123,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
         if (dg >= 0 && dg < 31) env->xregs[dg] = val;
         else if (dz >= 0) write_elem_u64(env->sve.zregs[dz], 0, eb, val);
         else env->xregs[0] = val;
-        return 0;
+        return LATA_SVE_HELPER_OK;
     }
     case PVIR_OP_EXTEND:
     case PVIR_OP_MOVE: {
@@ -2141,7 +2152,7 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
             write_elem_u64(out, l, eb, v);
         }
         memcpy(env->sve.zregs[zd], out, vl_bytes);
-        return 0;
+        return LATA_SVE_HELPER_OK;
     }
     case PVIR_OP_TRUNCATE: {
         const PvirVectorOperation *op = &ins->operation.vector;
@@ -2155,9 +2166,44 @@ uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
             write_elem_u64(out, l, deb, read_elem_u64(env->sve.zregs[zn], l, seb));
         }
         memcpy(env->sve.zregs[zd], out, vl_bytes);
-        return 0;
+        return LATA_SVE_HELPER_OK;
     }
     default:
-        return 0;
+        /* Neither the source-type switch nor the opcode switch claimed this
+         * instruction. If the translate-time query said it was supported, the
+         * two have drifted apart -- report INTERNAL so the caller traps instead
+         * of the old behaviour, which returned success for work that never
+         * happened. */
+        return lata_sve_helper_support(ins,
+                                       d->has_source ? &d->source : NULL) ==
+                       LATA_SVE_HELPER_SUPPORTED
+                   ? LATA_SVE_HELPER_INTERNAL
+                   : LATA_SVE_HELPER_UNSUPPORTED;
     }
+}
+
+uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *d)
+{
+    return (uint64_t)lata_sve_exec_helper_status(env_ptr, d);
+}
+
+void lata_sve_helper_unexpected(void *env_ptr, const LataSVEHelperDesc *d,
+                                uint64_t status)
+{
+    CPUARMState *env = (CPUARMState *)env_ptr;
+
+    qemu_log_mask(LOG_UNIMP,
+                  "sve-helper: unexpected status %u for opcode %u at 0x%llx\n",
+                  (unsigned)status, (unsigned)(d != NULL ? d->pvir.opcode : 0),
+                  (unsigned long long)(d != NULL ? d->pc_curr : 0));
+    if (env == NULL) {
+        return;
+    }
+    /*
+     * The instruction did not execute. Continuing at pc_next would leave the
+     * destination register holding whatever it had before -- the exact silent
+     * no-op this whole status path exists to prevent -- so trap instead.
+     */
+    env->pc = (d != NULL) ? d->pc_curr : env->pc;
+    helper_exception_with_syndrome(env, EXCP_UDEF, syn_uncategorized());
 }

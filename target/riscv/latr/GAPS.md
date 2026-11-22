@@ -26,7 +26,7 @@
 - [x] **`misa` S/U 位**：RV64 的 misa 补齐 S(18)/U(20)；同步测试期望值。
 - [x] **机器信息 CSR**：`mhartid/mvendorid/marchid/mimpid/mconfigptr` 可读；`mhartid` 可配置，用于 SMP/EDK2。
 - [x] **页表遍历走 `mem_map`**：PTE 物理地址先经 `LoongemuMemMap` 解析，禁止把 guest PPN 当宿主指针解引用；A/D 写回同样受限。
-- [x] **统一访存接口与 LR/SC 预约域**：标量慢路径、跨页、RVV lane、PVIR lane 全部走 `latr_guest_load/store`（按 4 KiB 切块，逐块翻译/PMP/MMIO）；所有 CPU 写路径与设备 DMA（`latr_reservation_notify_write`）共用 `latr_guest_store_lock` 的写锁 + epoch 字，任何写都使预约失效。`guest_atomic_*` 没有 C 调用者：A 扩展的 LR/SC/AMO 仍由发射代码在同一个锁/epoch 域内实现。
+- [x] **统一访存接口与 LR/SC 预约域**：标量慢路径、跨页、RVV lane、PVIR lane 全部走 `latr_guest_load/store`（按 4 KiB 切块，逐块翻译/PMP/MMIO）；所有 CPU 写路径与设备 DMA 共用 `latr_guest_store_lock` 的写锁 + epoch 字，任何写都使预约失效。设备侧现在统一走 `include/loongemu/guest_dma.h`（`loongemu_guest_dma_write/fill/write_le`），通知放在接口内部而不是各调用点，virtio-blk 的 DMA 写、used ring、status byte 与 fw_cfg 的 DMA 写都因此自动生效；`guest_atomic_*` 没有 C 调用者，A 扩展的 LR/SC/AMO 仍由发射代码在同一个锁/epoch 域内实现。
 
 ## P1 — 特权/中断/工具链兼容
 
@@ -42,7 +42,7 @@
 - [x] **TLS / 翻译器上下文**：`lsenv`/`tr_data` 改为 `LATR_TLS`，新增 `LatrTranslatorContext`（IR2 数组、ENV、CPU 指针、TB cache、PVIR cache、代码缓冲）与 bootstrap 兼容上下文；`latr_context_bind/create/destroy/safepoint` 支持每 vCPU 隔离。
 - [x] **TB arena 回收安全点**：TB 缓存加自旋锁；shootdown 只失效条目不回收 arena；耗尽时置 `reclaim_pending`，由 owner 在 `latr_tb_cache_safepoint()`（两次 TB 之间）回收；`latr_tb_cache_reclaim_all()` 处理插入失败重试。
 - [x] **PVIR cache 并发**：PVIR 描述符缓存从全局改为 per-context（64 槽，无 context 时退回静态 cache）；shootdown 不再清别的 hart 的缓存，改由 context safepoint 在 TB generation 变化时 reset。
-- [x] **virtio-mmio block**：新增 `src/riscv_virtio_blk.c` + `include/loongemu/riscv_virtio_blk.h`（modern virtio-mmio v2、单 split virtqueue、RAM 后端、IN/OUT/FLUSH、level IRQ→PLIC 1）；machine 自动加 MMIO window、DTB 节点并支持 `latr_machine_attach_disk()` 的“无盘”降级。smoke 通过真实描述符链读/写扇区并验证 IRQ/ACK。
+- [x] **virtio-mmio block**：新增 `src/riscv_virtio_blk.c` + `include/loongemu/riscv_virtio_blk.h`（modern virtio-mmio v2、单 split virtqueue、RAM 后端、IN/OUT/FLUSH、level IRQ→PLIC 1）；machine 自动加 MMIO window、DTB 节点并支持 `latr_machine_attach_disk()` 的“无盘”降级。描述符链按 queue size 定界并逐跳校验（自环、越界 next、非表内索引都会终止），header/status 方向与长度、`sector * 512` 溢出、`offset + len` 跨盘尾全部拒绝并**仍写入 status byte**；`avail.idx` 超前超过 queue size 时整队丢弃（`dropped` 计数）而不是在前一次 MMIO 写里跑满 65536 条链，`last_avail` 改回 16 位以支持索引回绕。回归见 `make test-riscv-virtio`（88 checks）。
 
 - [x] **中断/委托细节**：U-mode 委托中断不受 SIE 门控（仅 S-mode 本级检查 SIE）；mideleg/medeleg 写掩码；`mip` 可写 MSIP/SSIP 规则；`mip.STIP` 在 CSR 读时刷新；异步投递同时写 `mcause/scause`；PLIC `2*hart` context 驱动 `MIP.MEIP`（cause 11），`2*hart+1` context 驱动 `MIP.SEIP`（cause 9）。
 - [~] **ACPI/固件桥接**：`riscv_acpi.c`/`riscv_fw.c`/`ovmf_board.c` 已进 LATR core；system board 生成 MADT/RHCT/FADT/SPCR/XSDT/RSDP、挂接 fw_cfg 与 pflash 槽；boot smoke 已从 guest 执行 fw_cfg DMA SELECT+READ 并从 pflash XIP 执行同一程序。真实 OpenSBI/EDK2 镜像启动仍未接。

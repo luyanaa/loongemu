@@ -25,7 +25,8 @@ SRCS := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \
         $(LATA)/ir1/ir1.c $(LATA)/ir1/sve-decode.c $(LATA)/ir1/sve-pvir.c \
         $(LATX)/runtime/cpu_features.c vcache.c \
         $(LATA)/translator/reg-alloc.c $(LATA)/translator/macro-helper.c \
-        $(LATA)/translator/sve-helper.c $(LATA)/translator/sve-lasx-lower.c \
+        $(LATA)/translator/sve-helper.c $(LATA)/translator/sve-helper-support.c \
+        $(LATA)/translator/sve-lasx-lower.c \
         $(LATA)/translator/translate-a64.c
 
 .PHONY: all probe clean
