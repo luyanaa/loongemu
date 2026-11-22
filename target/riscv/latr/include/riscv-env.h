@@ -29,6 +29,23 @@ typedef struct LoongemuPlic LoongemuPlic;
 typedef struct LoongemuMmioBus LoongemuMmioBus;
 
 
+#define LATR_TLB_ENTRIES 64u
+
+/*
+ * Software translation cache. An entry is only used while the leaf PTE still
+ * holds the recorded value, so guest page-table edits are observed even
+ * without an SFENCE; SFENCE.VMA/FENCE.I still flush entries explicitly.
+ */
+typedef struct LatrTlbEntry {
+    uint64_t va_page;   /* VA >> 12 */
+    uint64_t satp;      /* exact satp value (mode/ASID/root) */
+    uint64_t pte;       /* validated leaf PTE contents */
+    uint64_t pte_host;  /* host address of the leaf PTE */
+    uint64_t pa_page;   /* leaf PPN << 12 */
+    uint64_t page_mask; /* VA/PA offset mask for the leaf level */
+    uint32_t valid;
+} LatrTlbEntry;
+
 typedef struct CPUArchState CPUArchState;
 
 struct CPUArchState {
@@ -119,6 +136,12 @@ struct CPUArchState {
     uint64_t pvir_direct_count;
     uint64_t pvir_lsx_chunks;
     uint64_t pvir_lasx_chunks;
+
+    /* Software TLB (shared by data and instruction translations). */
+    LatrTlbEntry tlb[LATR_TLB_ENTRIES];
+    uint64_t tlb_hits;
+    uint64_t tlb_flush_seq;  /* bumped by SFENCE.VMA/FENCE.I */
+    uint64_t tlb_flush_seen; /* last sequence applied to the TLB */
 };
 
 static inline int env_offset_gpr(int reg)
@@ -254,6 +277,11 @@ static inline int env_offset_wfi_pending(void)
 static inline int env_offset_sfence_pending(void)
 {
     return (int)offsetof(CPUArchState, sfence_pending);
+}
+
+static inline int env_offset_tlb_flush_seq(void)
+{
+    return (int)offsetof(CPUArchState, tlb_flush_seq);
 }
 
 static inline int env_offset_sfence_asid(void)

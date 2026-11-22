@@ -623,22 +623,61 @@ static void store_csr(IR2_OPND value, LatrCsrKind kind, int csr)
         }
         case CSR_PMPCFG0:
         case CSR_PMPCFG2:
-            /* Per-byte WARL: a locked byte (L=1) is immutable; an entry
-             * with W=1,R=0 is reserved while mseccfg.MML=0. Keep the old
-             * byte in both cases. */
+            /* Per-byte WARL (Smepmp aware):
+             *  - an existing L=1 entry is immutable unless mseccfg.RLB;
+             *  - with mseccfg.MML=0, RW=01 is reserved;
+             *  - with mseccfg.MML=1, adding an M-only executable rule
+             *    (L=1,X=1) or a shared-data rule with X set (L=0,RWX=011)
+             *    is refused unless mseccfg.RLB.
+             * Refused bytes keep their previous value. */
             state = ra_alloc_itemp();
             field = ra_alloc_itemp();
             mask = ra_alloc_itemp();
             latr_env_load_d(state, env_offset_csr(csr));
-            li_d(mask, 2);
+            latr_env_load_d(mask, env_offset_csr(CSR_MSECCFG));
             for (int i = 0; i < 8; i++) {
+                IR2_OPND old_unlocked = ir2_opnd_new_type(IR2_OPND_LABEL);
+                IR2_OPND non_mml = ir2_opnd_new_type(IR2_OPND_LABEL);
+                IR2_OPND mml_accept = ir2_opnd_new_type(IR2_OPND_LABEL);
+                IR2_OPND accept = ir2_opnd_new_type(IR2_OPND_LABEL);
                 IR2_OPND keep_byte = ir2_opnd_new_type(IR2_OPND_LABEL);
+
+                /* Locked entries ignore writes unless RLB is set. */
                 la_bstrpick_d(field, state, 7 + 8 * i, 8 * i);
                 la_andi(field, field, 0x80);
-                la_bnez(field, keep_byte);
+                la_beqz(field, old_unlocked);
+                la_andi(field, mask, 1);
+                la_bnez(field, old_unlocked);
+                la_b(keep_byte);
+                la_label(old_unlocked);
+
+                la_andi(field, mask, 4);
+                la_beqz(field, non_mml);
+
+                /* MML: RLB lifts the new-rule restrictions. */
+                la_andi(field, mask, 1);
+                la_bnez(field, mml_accept);
+                la_bstrpick_d(field, value, 7 + 8 * i, 8 * i);
+                la_andi(field, field, 0x84);   /* L=1 && X=1 */
+                la_addi_d(field, field, -0x84);
+                la_beqz(field, keep_byte);
+                la_bstrpick_d(field, value, 7 + 8 * i, 8 * i);
+                la_andi(field, field, 0x80);
+                la_bnez(field, accept);        /* L=1 without X */
+                la_bstrpick_d(field, value, 7 + 8 * i, 8 * i);
+                la_andi(field, field, 7);
+                la_addi_d(field, field, -6);   /* RWX=011 */
+                la_beqz(field, keep_byte);
+                la_b(mml_accept);
+
+                la_label(non_mml);
                 la_bstrpick_d(field, value, 7 + 8 * i, 8 * i);
                 la_andi(field, field, 3);
-                la_beq(field, mask, keep_byte);
+                la_addi_d(field, field, -2);   /* RW=01 is reserved */
+                la_beqz(field, keep_byte);
+
+                la_label(mml_accept);
+                la_label(accept);
                 la_bstrpick_d(field, value, 7 + 8 * i, 8 * i);
                 la_bstrins_d(state, field, 7 + 8 * i, 8 * i);
                 la_label(keep_byte);
@@ -673,7 +712,21 @@ static void store_csr(IR2_OPND value, LatrCsrKind kind, int csr)
             break;
         }
         case CSR_MSECCFG:
-            store_masked_csr(value, csr, 3);
+            /* Smepmp: RLB is writable, MMWP and MML are sticky once set. */
+            state = ra_alloc_itemp();
+            field = ra_alloc_itemp();
+            mask = ra_alloc_itemp();
+            latr_env_load_d(state, env_offset_csr(csr));
+            li_d(mask, 6);
+            la_and(field, value, mask);
+            la_or(state, state, field);
+            li_d(mask, 1);
+            la_and(field, value, mask);
+            la_bstrins_d(state, field, 0, 0);
+            latr_env_store_d(state, env_offset_csr(csr));
+            ra_free_temp(mask);
+            ra_free_temp(field);
+            ra_free_temp(state);
             break;
         case CSR_MSTATEEN0:
             /* STATEEN, HSENVCFG and FCSR gating bits are modelled as
@@ -1290,6 +1343,11 @@ static void translate_sfence_vma(const RiscvIR1 *ir1)
         latr_env_store_d(request, env_offset_sfence_asid());
         ra_free_temp(request);
     }
+    /* Bump the software-TLB sequence even if the runtime clears the request
+     * flags before the next translation. */
+    latr_env_load_d(tmp, env_offset_tlb_flush_seq());
+    la_addi_d(tmp, tmp, 1);
+    latr_env_store_d(tmp, env_offset_tlb_flush_seq());
     latr_emit_instret();
     la_b(done);
 
@@ -1393,6 +1451,9 @@ bool latr_translate_privileged(const RiscvIR1 *ir1)
             la_st_d(value, env_ir2_opnd, env_offset_pc());
             li_d(value, 1);
             latr_env_store_d(value, env_offset_fence_i_pending());
+            latr_env_load_d(value, env_offset_tlb_flush_seq());
+            la_addi_d(value, value, 1);
+            latr_env_store_d(value, env_offset_tlb_flush_seq());
             ra_free_temp(value);
         }
         latr_emit_instret();

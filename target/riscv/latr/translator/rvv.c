@@ -506,62 +506,17 @@ void latr_rvv_merge(CPUArchState *env)
     rvv_tail_ones(env, vd, sew);
 }
 
-/* Load/store one lane through the page/MMIO path. */
+/* Load/store one lane through the unified page/MMIO path. */
 static uint64_t rvv_load_lane(CPUArchState *env, uint64_t addr, unsigned bytes,
                               uint64_t *value)
 {
-    uint64_t host = 0;
-    uint64_t phys = 0;
-    unsigned b;
-    int cause = latr_translate(env, addr, LATR_ACCESS_LOAD, bytes,
-                               &host, &phys);
-
-    if (cause) {
-        env->mem_fault_cause = cause;
-        env->mem_va = addr;
-        return (uint64_t)cause;
-    }
-    if (env->mem_mmio) {
-        *value = latr_mmio_load(env, phys, bytes);
-        if (env->mem_fault_cause) {
-            env->mem_va = addr;
-            return env->mem_fault_cause;
-        }
-        return 0;
-    }
-    *value = 0;
-    for (b = 0; b < bytes; b++) {
-        *value |= (uint64_t)((const uint8_t *)(uintptr_t)host)[b] << (8 * b);
-    }
-    return 0;
+    return (uint64_t)latr_guest_load(env, addr, bytes, value);
 }
 
 static uint64_t rvv_store_lane(CPUArchState *env, uint64_t addr,
                                unsigned bytes, uint64_t value)
 {
-    uint64_t host = 0;
-    uint64_t phys = 0;
-    unsigned b;
-    int cause = latr_translate(env, addr, LATR_ACCESS_STORE, bytes,
-                               &host, &phys);
-
-    if (cause) {
-        env->mem_fault_cause = cause;
-        env->mem_va = addr;
-        return (uint64_t)cause;
-    }
-    if (env->mem_mmio) {
-        latr_mmio_store(env, phys, bytes, value);
-        if (env->mem_fault_cause) {
-            env->mem_va = addr;
-            return env->mem_fault_cause;
-        }
-        return 0;
-    }
-    for (b = 0; b < bytes; b++) {
-        ((uint8_t *)(uintptr_t)host)[b] = (uint8_t)(value >> (8 * b));
-    }
-    return 0;
+    return (uint64_t)latr_guest_store(env, addr, bytes, value);
 }
 
 /*

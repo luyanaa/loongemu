@@ -4,10 +4,14 @@
 #include "loongemu/riscv_sbi.h"
 #include "loongemu/mmio_bus.h"
 
-static __thread TRANSLATION_DATA tr_data_real;
-static __thread ENV lsenv_real;
-__thread TRANSLATION_DATA *tr_data;
-__thread ENV *lsenv;
+/* One context per vCPU. With LATR_ENABLE_TLS each host thread sees its own
+ * bootstrap; without it (freestanding build) a single hart is bound at a
+ * time, which is all the bare-metal harness needs. */
+static LATR_TLS LatrTranslatorContext latr_bootstrap_context;
+static LATR_TLS bool latr_bootstrap_ready;
+LATR_TLS LatrTranslatorContext *latr_active_context;
+LATR_TLS TRANSLATION_DATA *tr_data;
+LATR_TLS ENV *lsenv;
 bool latr_dump;
 
 const int latr_la_map[32] = {
@@ -102,12 +106,98 @@ uint32_t latr_guest_ldl(uint64_t address)
     return (uint32_t)lo | (uint32_t)hi << 16;
 }
 
+LatrTranslatorContext *latr_context_create(CPUArchState *cpu,
+                                           struct LatrTbCache *tb_cache,
+                                           uint8_t *code_buf,
+                                           uint32_t code_buf_size)
+{
+    LatrTranslatorContext *ctx = mm_calloc(1, sizeof(*ctx));
+
+    if (ctx == NULL) {
+        return NULL;
+    }
+    ctx->pvir_cache = latr_pvir_cache_create();
+    if (ctx->pvir_cache == NULL) {
+        mm_free(ctx);
+        return NULL;
+    }
+    ctx->cpu = cpu;
+    ctx->tb_cache = tb_cache;
+    ctx->code_buf = code_buf;
+    ctx->code_buf_size = code_buf_size;
+    ctx->env.cpu_state = cpu;
+    ctx->env.tr_data = &ctx->tr_data;
+    return ctx;
+}
+
+void latr_context_destroy(LatrTranslatorContext *ctx)
+{
+    if (ctx == NULL || ctx == &latr_bootstrap_context) {
+        return;
+    }
+    if (latr_active_context == ctx) {
+        latr_active_context = NULL;
+        tr_data = NULL;
+        lsenv = NULL;
+    }
+    if (ctx->tr_data.ir2_inst_array != NULL) {
+        mm_free(ctx->tr_data.ir2_inst_array);
+    }
+    latr_pvir_cache_destroy(ctx->pvir_cache);
+    mm_free(ctx);
+}
+
+void latr_context_bind(LatrTranslatorContext *ctx)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    latr_active_context = ctx;
+    lsenv = &ctx->env;
+    tr_data = &ctx->tr_data;
+    ctx->env.tr_data = &ctx->tr_data;
+    ctx->env.cpu_state = ctx->cpu;
+    env_ir2_opnd = ir2_opnd_new(IR2_OPND_GPR, la_s8);
+}
+
+LatrTranslatorContext *latr_context_current(void)
+{
+    return latr_active_context;
+}
+
+void latr_context_safepoint(LatrTranslatorContext *ctx)
+{
+    uint64_t generation;
+
+    if (ctx == NULL) {
+        return;
+    }
+    latr_tb_cache_safepoint(ctx->tb_cache);
+    generation = ctx->tb_cache != NULL ? ctx->tb_cache->generation : 0;
+    if (generation != ctx->pvir_generation) {
+        latr_pvir_cache_reset(ctx->pvir_cache);
+        ctx->pvir_generation = generation;
+    }
+}
+
 void latr_tr_data_init(CPUArchState *env)
 {
-    lsenv = &lsenv_real;
-    lsenv_real.cpu_state = env;
-    lsenv_real.tr_data = &tr_data_real;
-    tr_data = &tr_data_real;
+    LatrTranslatorContext *ctx = latr_active_context;
+
+    if (ctx == NULL) {
+        if (!latr_bootstrap_ready) {
+            memset(&latr_bootstrap_context, 0,
+                   sizeof(latr_bootstrap_context));
+            latr_bootstrap_context.pvir_cache = latr_pvir_cache_create();
+            latr_bootstrap_ready = true;
+        }
+        ctx = &latr_bootstrap_context;
+        latr_context_bind(ctx);
+    }
+    ctx->cpu = env;
+    lsenv->cpu_state = env;
+    lsenv->tr_data = &ctx->tr_data;
+    tr_data = &ctx->tr_data;
     env_ir2_opnd = ir2_opnd_new(IR2_OPND_GPR, la_s8);
 }
 

@@ -1,4 +1,5 @@
 #include "latr.h"
+#include <string.h>
 #include "mmu.h"
 #include "translate.h"
 #include "loongemu/phys_mem.h"
@@ -24,8 +25,12 @@
 #define PMP_A 0x18u
 #define PMP_L 0x80u
 #define PMP_ADDR_MASK ((UINT64_C(1) << 54) - 1)
+#define MSECCFG_RLB_BIT  0
+#define MSECCFG_MMWP_BIT 1
+#define MSECCFG_MML_BIT  2
 #define SATP_MODE(v) ((unsigned)((v) >> 60))
 #define SATP_ROOT(v) (((v) & LATR_PTE_PPN_MASK) << 12)
+#define SATP_ASID(v) ((uint32_t)(((v) >> 44) & 0xffffu))
 
 static int fault_cause(unsigned access)
 {
@@ -80,57 +85,120 @@ static uint64_t pmp_addr(const CPUArchState *env, unsigned index)
     return env->csr[CSR_PMPADDR0 + index] & PMP_ADDR_MASK;
 }
 
+/* Decode a PMP entry into a half-open [lo, hi) range. Returns false for
+ * A=OFF and for inactive TOR/NA4/NAPOT encodings (empty range). */
+static bool pmp_entry_range(const CPUArchState *env, unsigned index,
+                            uint8_t cfg, uint64_t *lo, uint64_t *hi)
+{
+    uint64_t base = pmp_addr(env, index) << 2;
+
+    switch (cfg & PMP_A) {
+    case 0x08: /* TOR */
+        *lo = index == 0 ? 0 : (pmp_addr(env, index - 1) << 2);
+        *hi = base;
+        break;
+    case 0x10: /* NA4 */
+        *lo = base;
+        *hi = base + 4;
+        break;
+    case 0x18: { /* NAPOT; QEMU pmp_decode_napot */
+        uint64_t nar = base | 3u;
+        *lo = nar & (nar + 1);
+        *hi = (nar | (nar + 1)) + 1;
+        break;
+    }
+    default:
+        return false;
+    }
+    return *hi > *lo;
+}
+
+/* Smepmp truth table indexed by L:R:W:X. */
+static bool pmp_mml_allows(uint8_t cfg, unsigned perm, unsigned privilege)
+{
+    static const uint8_t m_mode[16] = {
+        0, 0, PMP_R | PMP_W, PMP_R | PMP_W,
+        0, 0, 0, 0,
+        0, PMP_X, PMP_X, PMP_R | PMP_X,
+        PMP_R, PMP_R | PMP_X, PMP_R | PMP_W, PMP_R,
+    };
+    static const uint8_t su_mode[16] = {
+        0, PMP_X, PMP_R, PMP_R | PMP_W,
+        PMP_R, PMP_R | PMP_X, PMP_R | PMP_W, PMP_R | PMP_W | PMP_X,
+        0, 0, PMP_X, PMP_X,
+        0, 0, 0, PMP_R,
+    };
+    unsigned op = ((cfg & PMP_L) ? 8u : 0u) |
+                  ((cfg & PMP_R) ? 4u : 0u) |
+                  ((cfg & PMP_W) ? 2u : 0u) |
+                  ((cfg & PMP_X) ? 1u : 0u);
+
+    return ((privilege == LATR_RISCV_PRIV_M ? m_mode[op] : su_mode[op]) &
+            perm) != 0;
+}
+
+static int pmp_entry_check(uint8_t cfg, unsigned perm,
+                           unsigned access, unsigned privilege, bool mml)
+{
+    if (!mml) {
+        /* An unlocked rule does not constrain M-mode. */
+        if (privilege == LATR_RISCV_PRIV_M && (cfg & PMP_L) == 0) {
+            return 0;
+        }
+        return ((cfg & (PMP_R | PMP_W | PMP_X)) & perm) != 0
+                   ? 0 : pmp_access_fault(access);
+    }
+    return pmp_mml_allows(cfg, perm, privilege) ? 0 : pmp_access_fault(access);
+}
+
 int latr_pmp_check(const CPUArchState *env, uint64_t pa, unsigned size,
                    unsigned access, unsigned privilege)
 {
     uint64_t mseccfg = env->csr[CSR_MSECCFG];
+    bool mml = (mseccfg >> MSECCFG_MML_BIT) & 1u;
     unsigned perm = access == LATR_ACCESS_STORE ? PMP_W
                   : access == LATR_ACCESS_EXEC ? PMP_X
                                                : PMP_R;
+    uint64_t end;
     unsigned i;
-    int matched = 0;
 
     if (size == 0) {
         size = 1;
     }
+    end = pa + (size - 1);
+    if (end < pa) {
+        end = UINT64_MAX;
+    }
 
+    /* The lowest-numbered entry that matches any byte decides the access.
+     * It must cover every byte, even when it grants no permission at all:
+     * a partial match fails and never falls through to a later entry. */
     for (i = 0; i < 16; i++) {
         uint8_t cfg = pmp_cfg_byte(env, i);
-        unsigned a = cfg & PMP_A;
-        uint64_t lo = 0, hi = 0;
-        int match = 0;
+        uint64_t lo, hi;
 
-        if (a == 0) {
+        if (!pmp_entry_range(env, i, cfg, &lo, &hi)) {
             continue;
         }
-        if ((cfg & (PMP_R | PMP_W | PMP_X)) == 0) {
+        if (pa >= hi || end < lo) {
             continue;
         }
-        if (a == 0x08) { /* TOR */
-            lo = i == 0 ? 0 : (pmp_addr(env, i - 1) << 2);
-            hi = pmp_addr(env, i) << 2;
-        } else if (a == 0x10) { /* NA4 */
-            lo = pmp_addr(env, i) << 2;
-            hi = lo + 4;
-        } else if (a == 0x18) { /* NAPOT, QEMU pmp_decode_napot */
-            uint64_t nar = (pmp_addr(env, i) << 2) | 3u;
-            lo = nar & (nar + 1);
-            hi = (nar | (nar + 1)) + 1;
+        if (pa < lo || end >= hi) {
+            return pmp_access_fault(access);
         }
-        if (hi > lo && pa >= lo && pa + size <= hi) {
-            matched = 1;
-            if ((cfg & perm) == 0) {
-                return pmp_access_fault(access);
-            }
-            break;
-        }
+        return pmp_entry_check(cfg, perm, access, privilege, mml);
     }
 
-    if (matched) {
-        return 0;
+    /* No matching rule. */
+    if (mseccfg & (UINT64_C(1) << MSECCFG_MMWP_BIT)) {
+        return pmp_access_fault(access);
     }
-    /* No matching rule: MMWP/MML deny; otherwise only M-mode succeeds. */
-    if ((mseccfg & (UINT64_C(1) << 1)) || (mseccfg & 1u)) {
+    if (mml) {
+        /* MML denies execution from unmatched regions; M-mode R/W is the
+         * base-PMP default. S/U never succeeds without a matching rule. */
+        if (privilege == LATR_RISCV_PRIV_M && access != LATR_ACCESS_EXEC) {
+            return 0;
+        }
         return pmp_access_fault(access);
     }
     if (privilege == LATR_RISCV_PRIV_M) {
@@ -180,11 +248,163 @@ static int satp_geometry(unsigned mode, int *levels, int *va_bits)
     }
 }
 
+static bool pte_pbmt_ok(const CPUArchState *env, uint64_t pte)
+{
+    unsigned pbmt = (unsigned)((pte >> 61) & 3u);
+
+    if (pbmt == 0) {
+        return true;
+    }
+    if (!(env->csr[CSR_MENVCFG] & (UINT64_C(1) << MENVCFG_PBMTE_BIT))) {
+        return false;
+    }
+    return pbmt != 3; /* encoding 3 is reserved */
+}
+
+static bool pte_permits(const CPUArchState *env, uint64_t pte,
+                        unsigned access, unsigned privilege)
+{
+    uint64_t status = env->csr[CSR_MSTATUS_ADDR];
+    bool sum = (status >> MSTATUS_SUM_BIT) & 1;
+    bool mxr = (status >> MSTATUS_MXR_BIT) & 1;
+    bool user_page = (pte & LATR_PTE_U) != 0;
+
+    if (privilege == LATR_RISCV_PRIV_U) {
+        if (!user_page) {
+            return false;
+        }
+    } else if (access == LATR_ACCESS_EXEC) {
+        if (user_page) {
+            return false;
+        }
+    } else if (user_page && !sum) {
+        return false;
+    }
+
+    if (access == LATR_ACCESS_LOAD) {
+        return (pte & LATR_PTE_R) != 0 || (mxr && (pte & LATR_PTE_X) != 0);
+    }
+    if (access == LATR_ACCESS_STORE) {
+        return (pte & LATR_PTE_W) != 0;
+    }
+    return (pte & LATR_PTE_X) != 0;
+}
+
+static void tlb_flush_all(CPUArchState *env)
+{
+    memset(env->tlb, 0, sizeof(env->tlb));
+}
+
+/* Honours outstanding SFENCE.VMA/FENCE.I requests. The runtime clears these
+ * flags after retiring the TB; until then every walk re-applies the flush. */
+static void tlb_flush_asid(CPUArchState *env, uint32_t asid)
+{
+    unsigned i;
+
+    for (i = 0; i < LATR_TLB_ENTRIES; i++) {
+        if (env->tlb[i].valid &&
+            SATP_ASID(env->tlb[i].satp) == asid) {
+            env->tlb[i].valid = 0;
+        }
+    }
+}
+
+static void tlb_apply_pending_flush(CPUArchState *env)
+{
+    bool all = env->fence_i_pending != 0;
+    uint32_t asid = UINT32_MAX;
+
+    if (env->tlb_flush_seq != env->tlb_flush_seen) {
+        uint64_t delta = env->tlb_flush_seq - env->tlb_flush_seen;
+
+        /* A single unscoped SFENCE can still flush just its ASID; anything
+         * else (FENCE.I, several pending requests, or the runtime already
+         * clearing the flags) conservatively flushes everything. */
+        if (delta == 1 && !all && env->sfence_pending &&
+            env->sfence_asid != UINT32_MAX) {
+            asid = env->sfence_asid;
+        } else {
+            all = true;
+        }
+        env->tlb_flush_seen = env->tlb_flush_seq;
+    } else if (env->sfence_pending) {
+        if (env->sfence_asid == UINT32_MAX) {
+            all = true;
+        } else {
+            asid = env->sfence_asid;
+        }
+    }
+    if (all) {
+        tlb_flush_all(env);
+    } else if (asid != UINT32_MAX) {
+        tlb_flush_asid(env, asid);
+    }
+}
+
+/* Returns 0 on a hit, a fault cause, or 1 on a miss. */
+static int tlb_lookup(CPUArchState *env, uint64_t va, unsigned access,
+                      unsigned privilege, uint64_t *pa_out)
+{
+    LatrTlbEntry *e = &env->tlb[(va >> 12) & (LATR_TLB_ENTRIES - 1)];
+    uint64_t pte;
+    uint64_t required;
+
+    if (!e->valid || e->va_page != (va >> 12) ||
+        e->satp != env->csr[CSR_SATP_ADDR]) {
+        return 1;
+    }
+    /* Re-read the leaf PTE so an unsynchronised table edit cannot produce a
+     * stale translation. */
+    pte = *(volatile uint64_t *)(uintptr_t)e->pte_host;
+    if (pte != e->pte) {
+        e->valid = 0;
+        return 1;
+    }
+    if (!pte_pbmt_ok(env, pte) || !pte_permits(env, pte, access, privilege)) {
+        return fault_cause(access);
+    }
+    required = LATR_PTE_A;
+    if (access == LATR_ACCESS_STORE) {
+        required |= LATR_PTE_D;
+    }
+    if ((pte & required) != required) {
+        return 1; /* the walker updates A/D and re-inserts */
+    }
+    {
+        uint64_t pa = e->pa_page | (va & e->page_mask);
+        int pmp = latr_pmp_check(env, pa, 1, access, privilege);
+
+        if (pmp != 0) {
+            return pmp;
+        }
+        env->tlb_hits++;
+        *pa_out = pa;
+        return 0;
+    }
+}
+
+static void tlb_insert(CPUArchState *env, uint64_t va, uint64_t pte,
+                       uint64_t pte_host, uint64_t ppn, int level)
+{
+    LatrTlbEntry *e = &env->tlb[(va >> 12) & (LATR_TLB_ENTRIES - 1)];
+
+    e->valid = 0;
+    e->va_page = va >> 12;
+    e->satp = env->csr[CSR_SATP_ADDR];
+    e->pte = pte;
+    e->pte_host = pte_host;
+    e->pa_page = ppn << 12;
+    e->page_mask = (UINT64_C(1) << (12 + 9 * level)) - 1;
+    e->valid = 1;
+}
+
 int latr_walk(CPUArchState *env, uint64_t va, unsigned access, uint64_t *pa_out)
 {
     unsigned mode = SATP_MODE(env->csr[CSR_SATP_ADDR]);
     unsigned privilege = effective_privilege(env, access);
     int levels, va_bits;
+
+    tlb_apply_pending_flush(env);
 
     if (mode == 0 || privilege == LATR_RISCV_PRIV_M) {
         int pmp = latr_pmp_check(env, va, 1, access, privilege);
@@ -203,25 +423,32 @@ int latr_walk(CPUArchState *env, uint64_t va, unsigned access, uint64_t *pa_out)
         return fault_cause(access);
     }
 
+    {
+        int cached = tlb_lookup(env, va, access, privilege, pa_out);
+        if (cached <= 0) {
+            return cached;
+        }
+    }
+
     uint64_t table = SATP_ROOT(env->csr[CSR_SATP_ADDR]);
-    uint64_t status = env->csr[CSR_MSTATUS_ADDR];
-    bool sum = (status >> MSTATUS_SUM_BIT) & 1;
-    bool mxr = (status >> MSTATUS_MXR_BIT) & 1;
     for (int level = levels - 1; level >= 0; level--) {
         uint64_t vpn = (va >> (12 + 9 * level)) & 0x1ff;
         uint64_t pte_addr = table + vpn * sizeof(uint64_t);
         uint64_t pte_host = 0;
         uint64_t pte;
+        /* Implicit page-table accesses use S-mode PMP checks regardless of
+         * the effective privilege of the original access, and a violation
+         * raises an access fault matching the original access type. */
         int pmp = latr_pmp_check(env, pte_addr, 8, LATR_ACCESS_LOAD,
-                                 privilege);
+                                 LATR_RISCV_PRIV_S);
         int host_cause;
 
         if (pmp != 0) {
-            return pmp;
+            return pmp_access_fault(access);
         }
         host_cause = pte_host_pointer(env, pte_addr, 0, &pte_host);
         if (host_cause != 0) {
-            return host_cause;
+            return pmp_access_fault(access);
         }
         pte = *(volatile uint64_t *)(uintptr_t)pte_host;
         uint64_t ppn = (pte >> LATR_PTE_PPN_SHIFT) & LATR_PTE_PPN_MASK;
@@ -231,8 +458,7 @@ int latr_walk(CPUArchState *env, uint64_t va, unsigned access, uint64_t *pa_out)
             ((pte & (LATR_PTE_R | LATR_PTE_W)) == LATR_PTE_W)) {
             return fault_cause(access);
         }
-        if ((pte & PTE_PBMT_MASK) != 0 &&
-            !(env->csr[CSR_MENVCFG] & (UINT64_C(1) << MENVCFG_PBMTE_BIT))) {
+        if (!pte_pbmt_ok(env, pte)) {
             return fault_cause(access);
         }
 
@@ -248,30 +474,7 @@ int latr_walk(CPUArchState *env, uint64_t va, unsigned access, uint64_t *pa_out)
             return fault_cause(access);
         }
 
-        bool user_page = (pte & LATR_PTE_U) != 0;
-        if (privilege == LATR_RISCV_PRIV_U) {
-            if (!user_page) {
-                return fault_cause(access);
-            }
-        } else {
-            if (access == LATR_ACCESS_EXEC) {
-                if (user_page) {
-                    return fault_cause(access);
-                }
-            } else if (user_page && !sum) {
-                return fault_cause(access);
-            }
-        }
-
-        if (access == LATR_ACCESS_LOAD) {
-            if (!(pte & LATR_PTE_R) && !(mxr && (pte & LATR_PTE_X))) {
-                return fault_cause(access);
-            }
-        } else if (access == LATR_ACCESS_STORE) {
-            if (!(pte & LATR_PTE_W)) {
-                return fault_cause(access);
-            }
-        } else if (!(pte & LATR_PTE_X)) {
+        if (!pte_permits(env, pte, access, privilege)) {
             return fault_cause(access);
         }
 
@@ -288,11 +491,19 @@ int latr_walk(CPUArchState *env, uint64_t va, unsigned access, uint64_t *pa_out)
                 }
                 {
                     uint64_t write_host = 0;
-                    int write_cause = pte_host_pointer(env, pte_addr, 1,
-                                                       &write_host);
+                    int write_pmp = latr_pmp_check(env, pte_addr, 8,
+                                                   LATR_ACCESS_STORE,
+                                                   LATR_RISCV_PRIV_S);
+                    int write_cause;
                     volatile uint64_t *slot;
+
+                    if (write_pmp != 0) {
+                        return pmp_access_fault(access);
+                    }
+                    write_cause = pte_host_pointer(env, pte_addr, 1,
+                                                   &write_host);
                     if (write_cause != 0) {
-                        return write_cause;
+                        return pmp_access_fault(access);
                     }
                     slot = (volatile uint64_t *)(uintptr_t)write_host;
                     uint64_t old = __atomic_load_n(slot, __ATOMIC_RELAXED);
@@ -305,6 +516,7 @@ int latr_walk(CPUArchState *env, uint64_t va, unsigned access, uint64_t *pa_out)
                         }
                     }
                 }
+                pte |= required;
             }
         }
 
@@ -315,6 +527,7 @@ int latr_walk(CPUArchState *env, uint64_t va, unsigned access, uint64_t *pa_out)
             if (pmp != 0) {
                 return pmp;
             }
+            tlb_insert(env, va, pte, pte_host, ppn, level);
             *pa_out = pa;
             return 0;
         }
@@ -335,10 +548,62 @@ static int access_fault_cause(unsigned access)
     }
 }
 
-static uint64_t cross_access(CPUArchState *env, uint64_t va, unsigned size,
-                             unsigned access, uint64_t value, int is_load)
+/* Bit 0 of the epoch word is the writer lock; the release below advances the
+ * epoch by two so LR/SC observes a changed generation after every write. */
+volatile uint64_t latr_guest_store_lock;
+
+static uint64_t reservation_lock(void)
+{
+    uint64_t old;
+
+    for (;;) {
+        old = __atomic_load_n(&latr_guest_store_lock, __ATOMIC_ACQUIRE);
+        if (old & 1u) {
+            continue;
+        }
+        if (__atomic_compare_exchange_n(&latr_guest_store_lock, &old,
+                                        old + 1, false,
+                                        __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) {
+            return old;
+        }
+    }
+}
+
+static void reservation_unlock(uint64_t epoch)
+{
+    __atomic_store_n(&latr_guest_store_lock, epoch + 2, __ATOMIC_RELEASE);
+}
+
+/* Non-CPU writers (device DMA) invalidate LR/SC by advancing the epoch. The
+ * lock is not taken when it is already held: the active CPU writer releases
+ * with epoch+2, which is exactly the invalidation a reservation needs, and
+ * spinning here would deadlock when DMA is triggered from a guest store. */
+void latr_reservation_notify_write(uint64_t pa, unsigned size)
+{
+    uint64_t old = __atomic_load_n(&latr_guest_store_lock, __ATOMIC_ACQUIRE);
+
+    (void)pa;
+    (void)size;
+    while (!(old & 1u)) {
+        if (__atomic_compare_exchange_n(&latr_guest_store_lock, &old,
+                                        old + 1, false,
+                                        __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&latr_guest_store_lock, old + 2, __ATOMIC_RELEASE);
+            return;
+        }
+    }
+}
+
+static int guest_access(CPUArchState *env, uint64_t va, unsigned size,
+                        unsigned access, uint64_t value, bool is_load,
+                        uint64_t *result)
 {
     unsigned done = 0;
+    uint64_t acc = 0;
+    uint64_t write_epoch = 0;
+    bool write_locked = false;
 
     env->mem_fault_cause = 0;
     while (done < size) {
@@ -353,30 +618,38 @@ static uint64_t cross_access(CPUArchState *env, uint64_t va, unsigned size,
             chunk = size - done;
         }
         cause = latr_translate(env, addr, access, chunk, &host, &phys);
-        if (cause) {
+        if (cause != 0) {
+            if (write_locked) {
+                reservation_unlock(write_epoch);
+            }
             env->mem_fault_cause = cause;
             env->mem_va = addr;
-            return 0;
+            return cause;
+        }
+        if (!is_load && !write_locked) {
+            write_epoch = reservation_lock();
+            write_locked = true;
         }
         if (env->mem_mmio) {
             if (is_load) {
                 uint64_t part = latr_mmio_load(env, phys, chunk);
                 if (env->mem_fault_cause) {
                     env->mem_va = addr;
-                    return 0;
+                    return env->mem_fault_cause;
                 }
-                value |= part << (8 * done);
+                acc |= part << (8 * done);
             } else {
                 latr_mmio_store(env, phys, chunk, value >> (8 * done));
                 if (env->mem_fault_cause) {
+                    reservation_unlock(write_epoch);
                     env->mem_va = addr;
-                    return 0;
+                    return env->mem_fault_cause;
                 }
             }
         } else if (is_load) {
             for (i = 0; i < chunk; i++) {
-                value |= (uint64_t)((const uint8_t *)(uintptr_t)host)[i]
-                         << (8 * (done + i));
+                acc |= (uint64_t)((const uint8_t *)(uintptr_t)host)[i]
+                       << (8 * (done + i));
             }
         } else {
             for (i = 0; i < chunk; i++) {
@@ -386,18 +659,53 @@ static uint64_t cross_access(CPUArchState *env, uint64_t va, unsigned size,
         }
         done += chunk;
     }
-    return value;
+    if (write_locked) {
+        reservation_unlock(write_epoch);
+    }
+    if (is_load) {
+        *result = acc;
+    }
+    return 0;
+}
+
+int latr_guest_load(CPUArchState *env, uint64_t va, unsigned size,
+                    uint64_t *value)
+{
+    if (size == 0 || size > 8) {
+        env->mem_fault_cause = LATR_EXCP_LOAD_ACCESS_FAULT;
+        env->mem_va = va;
+        return env->mem_fault_cause;
+    }
+    return guest_access(env, va, size, LATR_ACCESS_LOAD, 0, true, value);
+}
+
+int latr_guest_store(CPUArchState *env, uint64_t va, unsigned size,
+                     uint64_t value)
+{
+    uint64_t ignored = 0;
+
+    if (size == 0 || size > 8) {
+        env->mem_fault_cause = LATR_EXCP_STORE_ACCESS_FAULT;
+        env->mem_va = va;
+        return env->mem_fault_cause;
+    }
+    return guest_access(env, va, size, LATR_ACCESS_STORE, value, false,
+                        &ignored);
 }
 
 uint64_t latr_cross_load(CPUArchState *env, uint64_t va, unsigned size)
 {
-    return cross_access(env, va, size, LATR_ACCESS_LOAD, 0, 1);
+    uint64_t value = 0;
+
+    (void)latr_guest_load(env, va, size, &value);
+    return value;
 }
 
 uint64_t latr_cross_store(CPUArchState *env, uint64_t va, unsigned size,
                           uint64_t value)
 {
-    return cross_access(env, va, size, LATR_ACCESS_STORE, value, 0);
+    (void)latr_guest_store(env, va, size, value);
+    return 0;
 }
 
 int latr_translate(CPUArchState *env, uint64_t va, unsigned access,

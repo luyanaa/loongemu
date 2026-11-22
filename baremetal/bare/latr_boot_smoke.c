@@ -10,6 +10,8 @@
 #include <stdint.h>
 #include "latr.h"
 #include "latr-system.h"
+#include "latr-machine.h"
+#include "mmu.h"
 #include "translate.h"
 #include "qemu/cpu-features.h"
 
@@ -178,6 +180,183 @@ static int prepare_board(void)
     return 1;
 }
 
+/* --- QEMU-virt-style machine boot chain --- */
+
+static LatrMachine machine;
+static uint8_t machine_work[256u << 10] __attribute__((aligned(16)));
+
+/* Minimal OpenSBI stand-in: set MPP=S, delegate all traps, mret to the image
+ * at 0x80200000 with a0/a1 (hartid/DTB) untouched. */
+static const uint32_t machine_firmware[] = {
+    0x000012b7, /* lui t0, 1 */
+    0x0012d293, /* srli t0, t0, 1 */
+    0x3002a073, /* csrs mstatus, t0 */
+    0xfff00293, /* addi t0, x0, -1 */
+    0x30229073, /* csrw medeleg, t0 */
+    0x22200293, /* addi t0, x0, 0x222 */
+    0x30329073, /* csrw mideleg, t0 */
+    0x802002b7, /* lui t0, 0x80200 */
+    0x34129073, /* csrw mepc, t0 */
+    0x30200073, /* mret */
+};
+
+/* S-mode payload: print 'K' on the UART, then write the exit device. */
+static const uint32_t machine_kernel[] = {
+    0x100002b7, /* lui t0, 0x10000 */
+    0x04b00313, /* addi t1, x0, 'K' */
+    0x00628023, /* sb t1, 0(t0) */
+    0x001002b7, /* lui t0, 0x100 */
+    0x00100313, /* addi t1, x0, 1 */
+    0x0062a023, /* sw t1, 0(t0) */
+    0x0000006f, /* jal x0, 0 */
+};
+
+static void machine_enter_tb(void *env, void *code)
+{
+    latr_enter_tb(env, code);
+}
+
+static void machine_fail(const char *where)
+{
+    latx_bare_uart_puts("latr-boot: machine fail at ");
+    latx_bare_uart_puts(where);
+    latx_bare_uart_puts(" pc=");
+    puthex64((uint32_t)machine.harts[0].env.pc);
+    latx_bare_uart_puts(" exc=");
+    puthex64((uint32_t)machine.harts[0].env.exception);
+    latx_bare_uart_puts(" fault=");
+    puthex64((uint32_t)machine.harts[0].env.mem_fault_cause);
+    latx_bare_uart_puts(" trap-pc=");
+    puthex64((uint32_t)machine.first_trap_pc);
+    latx_bare_uart_puts(" trap=");
+    puthex64((uint32_t)machine.first_trap_cause);
+    latx_bare_uart_puts(" fva=");
+    puthex64((uint32_t)machine.harts[0].env.fetch_fault_va);
+    latx_bare_uart_puts(" fcause=");
+    puthex64((uint32_t)machine.harts[0].env.fetch_fault_cause);
+    latx_bare_uart_puts(" bad=");
+    puthex64((uint32_t)machine.first_trap_bad);
+    latx_bare_uart_puts(" fetch=");
+    puthex64((uint32_t)machine.first_trap_fetch);
+    latx_bare_uart_puts(" mem=");
+    puthex64((uint32_t)machine.first_trap_mem);
+    latx_bare_uart_puts(" kfc=");
+    puthex64((uint32_t)machine.kernel_fetch_cause);
+    latx_bare_uart_puts(" kcs=");
+    puthex64((uint32_t)machine.kernel_cpu_state);
+    latx_bare_uart_puts(" kenv=");
+    puthex64((uint32_t)machine.kernel_env);
+    latx_bare_uart_puts(" kpriv=");
+    puthex64((uint32_t)machine.kernel_priv);
+    latx_bare_uart_puts(" priv=");
+    puthex64((uint32_t)machine.harts[0].env.privilege);
+    latx_bare_uart_puts(" mstatus=");
+    puthex64((uint32_t)machine.harts[0].env.csr[0x300]);
+    latx_bare_uart_puts(" uart=");
+    latx_bare_uart_puts(machine.sys.uart_log);
+    latx_bare_uart_puts("\n");
+}
+
+static void machine_probe(void)
+{
+    uint64_t host = 0;
+    uint64_t phys = 0;
+    int cause = latr_translate(&machine.harts[0].env, UINT64_C(0x80200000),
+                               LATR_ACCESS_EXEC, 2, &host, &phys);
+
+    latx_bare_uart_puts("probe cause=");
+    puthex64((uint32_t)cause);
+    latx_bare_uart_puts(" priv=");
+    puthex64((uint32_t)machine.harts[0].env.privilege);
+    latx_bare_uart_puts(" pmpcfg0=");
+    puthex64((uint32_t)machine.harts[0].env.csr[0x3a0]);
+    latx_bare_uart_puts(" pmpaddr0=");
+    puthex64((uint32_t)machine.harts[0].env.csr[0x3b0]);
+    latx_bare_uart_puts(" map=");
+    puthex64((uint32_t)(uintptr_t)machine.harts[0].env.mem_map);
+    machine.harts[0].env.privilege = LATR_RISCV_PRIV_S;
+    cause = latr_translate(&machine.harts[0].env, UINT64_C(0x80200000),
+                           LATR_ACCESS_EXEC, 2, &host, &phys);
+    latx_bare_uart_puts(" s-cause=");
+    puthex64((uint32_t)cause);
+    latx_bare_uart_puts(" pmp=");
+    puthex64((uint32_t)latr_pmp_check(&machine.harts[0].env,
+                                      UINT64_C(0x80200000), 2,
+                                      LATR_ACCESS_EXEC,
+                                      LATR_RISCV_PRIV_S));
+    latx_bare_uart_puts(" satp=");
+    puthex64((uint32_t)machine.harts[0].env.csr[0x180]);
+    machine.harts[0].env.privilege = LATR_RISCV_PRIV_M;
+    latx_bare_uart_puts("\n");
+}
+
+static int run_machine_phase(void)
+{
+    uint64_t dtb_off;
+    int rc;
+
+    if (!latr_machine_init(&machine, ram, sizeof(ram), 1, machine_work,
+                           sizeof(machine_work))) {
+        latx_bare_uart_puts("latr-boot: machine fail init\n");
+        return 0;
+    }
+    machine.harts[0].cpu.env_ptr = &machine.harts[0].env;
+    latr_machine_set_enter_tb(&machine, machine_enter_tb);
+    if (!latr_machine_set_bootargs(&machine,
+                                   "console=ttyS0 earlycon=uart8250,mmio,"
+                                   "0x10000000 keep_bootcon")) {
+        latx_bare_uart_puts("latr-boot: machine fail bootargs\n");
+        return 0;
+    }
+    if (!latr_machine_load_firmware(&machine,
+                                    (const uint8_t *)machine_firmware,
+                                    sizeof(machine_firmware))) {
+        machine_fail("firmware");
+        return 0;
+    }
+    if (!latr_machine_load_kernel(&machine, (const uint8_t *)machine_kernel,
+                                  sizeof(machine_kernel))) {
+        machine_fail("kernel");
+        return 0;
+    }
+    if (!latr_machine_build_dtb(&machine)) {
+        machine_fail("dtb");
+        return 0;
+    }
+    if (!latr_machine_boot(&machine)) {
+        machine_fail("boot");
+        return 0;
+    }
+    machine_probe();
+    rc = latr_machine_run(&machine, 256);
+    if (rc != 1) {
+        machine_fail("run");
+        return 0;
+    }
+    dtb_off = machine.dtb_addr - LATR_SYSTEM_RAM_BASE;
+    if (machine.sys.exit_request != 1) {
+        machine_fail("exit");
+        return 0;
+    }
+    if (machine.sys.uart_log[0] != 'K') {
+        machine_fail("uart");
+        return 0;
+    }
+    if (machine.harts[0].env.gpr[10] != 0 ||
+        machine.harts[0].env.gpr[11] != machine.dtb_addr ||
+        machine.harts[0].env.privilege != LATR_RISCV_PRIV_S) {
+        machine_fail("state");
+        return 0;
+    }
+    if (ram[dtb_off + 0] != 0xd0 || ram[dtb_off + 1] != 0x0d ||
+        ram[dtb_off + 2] != 0xfe || ram[dtb_off + 3] != 0xed ||
+        machine.dtb_size == 0) {
+        machine_fail("dtb-magic");
+        return 0;
+    }
+    return 1;
+}
+
 void kmain(void)
 {
     latx_bare_uart_puts("latr-boot: begin\n");
@@ -233,6 +412,13 @@ void kmain(void)
     }
     if (run_guest() != 0x5555 || !guest_ok() || pflash_tb_hits == 0) {
         latx_bare_uart_puts("latr-boot: FAIL pflash guest\n");
+        return;
+    }
+
+    /* Phase 3: M-mode firmware -> S-mode payload through the virt machine,
+     * with a generated DTB passed in a1. */
+    if (!run_machine_phase()) {
+        latx_bare_uart_puts("latr-boot: FAIL machine\n");
         return;
     }
 

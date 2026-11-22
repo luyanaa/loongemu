@@ -34,8 +34,8 @@ typedef struct LatrStoreLock {
     IR2_OPND status;
 } LatrStoreLock;
 
-/* Every guest write conservatively invalidates all outstanding reservations. */
-static volatile uint64_t latr_guest_store_lock;
+/* Every guest write conservatively invalidates all outstanding reservations.
+ * The word itself lives in mmu.c so C memory paths share the same domain. */
 
 static LatrStoreLock emit_store_lock_acquire(void)
 {

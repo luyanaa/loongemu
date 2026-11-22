@@ -24,7 +24,36 @@ typedef struct {
     PvirInstruction insn;
 } LatrPvirCacheEntry;
 
-static LatrPvirCacheEntry latr_pvir_cache[LATR_PVIR_CACHE_SLOTS];
+/* One descriptor cache per vCPU: latr_context_create() allocates it so two
+ * harts never share descriptors or clear each other's entries. */
+struct LatrPvirCache {
+    LatrPvirCacheEntry entries[LATR_PVIR_CACHE_SLOTS];
+};
+
+/* Unit tests and the pre-context bootstrap fall back to this cache. */
+static LatrPvirCache latr_pvir_fallback;
+
+LatrPvirCache *latr_pvir_cache_create(void)
+{
+    return mm_calloc(1, sizeof(LatrPvirCache));
+}
+
+void latr_pvir_cache_destroy(LatrPvirCache *cache)
+{
+    if (cache != NULL) {
+        mm_free(cache);
+    }
+}
+
+static LatrPvirCache *pvir_cache_current(void)
+{
+    LatrTranslatorContext *ctx = latr_context_current();
+
+    if (ctx != NULL && ctx->pvir_cache != NULL) {
+        return ctx->pvir_cache;
+    }
+    return &latr_pvir_fallback;
+}
 
 static uint32_t pvir_cache_slot(uint64_t key_hash, uint64_t vtype,
                                 uint64_t vl)
@@ -34,16 +63,24 @@ static uint32_t pvir_cache_slot(uint64_t key_hash, uint64_t vtype,
     return (uint32_t)((h ^ (h >> 32)) & (LATR_PVIR_CACHE_SLOTS - 1u));
 }
 
+void latr_pvir_cache_reset(LatrPvirCache *cache)
+{
+    if (cache != NULL) {
+        memset(cache, 0, sizeof(*cache));
+    }
+}
+
 void latr_pvir_cache_clear(void)
 {
-    memset(latr_pvir_cache, 0, sizeof(latr_pvir_cache));
+    latr_pvir_cache_reset(pvir_cache_current());
 }
 
 bool latr_pvir_cache_lookup(uint64_t key_hash, uint64_t vtype, uint64_t vl,
                             PvirInstruction *out)
 {
+    LatrPvirCache *cache = pvir_cache_current();
     const LatrPvirCacheEntry *entry =
-        &latr_pvir_cache[pvir_cache_slot(key_hash, vtype, vl)];
+        &cache->entries[pvir_cache_slot(key_hash, vtype, vl)];
 
     if (!entry->valid || entry->key_hash != key_hash ||
         entry->vtype != vtype || entry->vl != vl) {
@@ -58,12 +95,14 @@ bool latr_pvir_cache_lookup(uint64_t key_hash, uint64_t vtype, uint64_t vl,
 void latr_pvir_cache_store(uint64_t key_hash, uint64_t vtype, uint64_t vl,
                            const PvirInstruction *insn)
 {
+    LatrPvirCache *cache;
     LatrPvirCacheEntry *entry;
 
     if (insn == NULL) {
         return;
     }
-    entry = &latr_pvir_cache[pvir_cache_slot(key_hash, vtype, vl)];
+    cache = pvir_cache_current();
+    entry = &cache->entries[pvir_cache_slot(key_hash, vtype, vl)];
     entry->key_hash = key_hash;
     entry->vtype = vtype;
     entry->vl = vl;
@@ -526,41 +565,15 @@ static uint64_t pvir_fixed_eval(CPUArchState *env,
 static uint64_t pvir_mem_rw_lane(CPUArchState *env, uint64_t addr,
                                  unsigned bytes, int is_write, uint64_t val)
 {
-    uint64_t host = 0;
-    uint64_t phys = 0;
-    unsigned b;
-    int cause = latr_translate(env, addr,
-                               is_write ? LATR_ACCESS_STORE : LATR_ACCESS_LOAD,
-                               bytes, &host, &phys);
-
-    if (cause) {
-        env->mem_fault_cause = cause;
-        env->mem_va = addr;
-        return 0;
-    }
-    if (env->mem_mmio) {
-        if (is_write) {
-            latr_mmio_store(env, phys, bytes, val);
-        } else {
-            val = latr_mmio_load(env, phys, bytes);
-        }
-        if (env->mem_fault_cause) {
-            env->mem_va = addr;
-            return 0;
-        }
-        return val;
-    }
     if (is_write) {
-        for (b = 0; b < bytes; b++) {
-            ((uint8_t *)(uintptr_t)host)[b] = (uint8_t)(val >> (8u * b));
-        }
+        (void)latr_guest_store(env, addr, bytes, val);
         return 0;
     }
-    val = 0;
-    for (b = 0; b < bytes; b++) {
-        val |= (uint64_t)((const uint8_t *)(uintptr_t)host)[b] << (8u * b);
+    {
+        uint64_t value = 0;
+        (void)latr_guest_load(env, addr, bytes, &value);
+        return value;
     }
-    return val;
 }
 
 static uint64_t pvir_resolve_base(const CPUArchState *env,

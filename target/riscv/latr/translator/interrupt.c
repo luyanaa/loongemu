@@ -69,14 +69,21 @@ static void update_timer_interrupt(CPUArchState *env)
 
 static void update_external_interrupt(CPUArchState *env)
 {
-    int level = 0;
+    int m_level = 0;
+    int s_level = 0;
 
     if (env->plic != NULL) {
-        level = loongemu_plic_pending(env->plic, (uint32_t)env->plic_context);
+        /* QEMU virt convention: context 2*hart is M-mode and 2*hart+1 is
+         * S-mode. plic_context holds the hart's M-mode context. */
+        m_level = loongemu_plic_pending(env->plic,
+                                        (uint32_t)env->plic_context);
+        if (env->plic_context + 1 < env->plic->num_contexts) {
+            s_level = loongemu_plic_pending(env->plic,
+                                            (uint32_t)env->plic_context + 1);
+        }
     }
-    /* PLIC context 0 is the machine-level external interrupt (QEMU virt). */
-    set_mip_bit(env, MIP_MEIP, level);
-    set_mip_bit(env, MIP_SEIP, 0);
+    set_mip_bit(env, MIP_MEIP, m_level);
+    set_mip_bit(env, MIP_SEIP, s_level);
 }
 
 void latr_update_interrupts(CPUArchState *env)
@@ -124,10 +131,12 @@ bool latr_deliver_interrupt(CPUArchState *env)
             continue;
         }
         if (supervisor && (deleg & IRQ_BIT(cause))) {
-            /* Delegated S interrupt: not taken in M-mode; in U/S the
-             * S-mode global enable (SIE) must be set. */
+            /* A delegated S interrupt is never taken in M-mode. U-mode is
+             * lower than the S target, so sstatus.SIE does not gate it;
+             * SIE is only consulted when the hart already runs in S-mode. */
             if (privilege == LATR_RISCV_PRIV_M ||
-                !(status & MSTATUS_SIE)) {
+                (privilege == LATR_RISCV_PRIV_S &&
+                 !(status & MSTATUS_SIE))) {
                 continue;
             }
             env->csr[CSR_SEPC_ADDR] = env->pc;

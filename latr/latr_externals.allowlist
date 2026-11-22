@@ -10,5 +10,6 @@ realloc
 stderr
 sprintf
 strcat
+strcmp
 strcpy
 strlen

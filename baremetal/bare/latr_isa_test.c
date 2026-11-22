@@ -3,10 +3,12 @@
 #include <stdio.h>
 #include "exec/exec-all.h"
 #include "latr.h"
+#include "translate.h"
 #include "fpu/softfloat.h"
 #include "qemu/host-utils.h"
 #include "riscv-env.h"
 #include "mmu.h"
+#include "latr-system.h"
 #include "loongemu/phys_mem.h"
 #include "loongemu/riscv_sbi.h"
 #include "loongemu/riscv_plic.h"
@@ -76,6 +78,8 @@ extern uint64_t latr_rvv_vsetvl(CPUArchState *env, uint64_t s1,
                                 uint64_t vtype);
 extern void latr_rvv_mv(CPUArchState *env);
 extern void latr_rvv_mask_scan(CPUArchState *env);
+extern uint64_t latr_rvv_mem(CPUArchState *env);
+extern uint64_t latr_rvv_stride_mem(CPUArchState *env);
 
 
 __asm__(
@@ -1048,6 +1052,87 @@ static void test_atomics(void)
     check(env.exception, 6, "misaligned AMOADD.D raises store-misaligned");
     check(env.badaddr, odd, "misaligned AMOADD.D reports the address");
     check(data_word, 0, "misaligned AMOADD.D leaves memory unchanged");
+
+    /* Writes through the unified guest interface must join the same
+     * reservation domain as scalar stores. */
+    data_word = UINT64_C(0x1122334455667788);
+    other_data_word = 0;
+    reset_guest_state();
+    env.gpr[6] = (uint64_t)(uintptr_t)&data_word;
+    check(latr_execute_block(lr_only, 1), 1,
+          "LR before guest_store translates");
+    check(env.reservation_valid, 1, "LR arms the reservation");
+    check(latr_guest_store(&env, (uint64_t)(uintptr_t)&other_data_word, 8,
+                           UINT64_C(0x55)), 0,
+          "guest_store joins the reservation domain");
+    check(latr_execute_block(sc_only, 1), 1,
+          "SC after guest_store translates");
+    check(env.gpr[7], 1, "guest_store invalidates the reservation");
+    check(data_word, UINT64_C(0x1122334455667788),
+          "failed SC after guest_store leaves memory unchanged");
+    check(other_data_word, UINT64_C(0x55), "guest_store wrote its target");
+
+    /* The vector store path funnels through guest_store as well. */
+    data_word = UINT64_C(0x1122334455667788);
+    other_data_word = 0;
+    reset_guest_state();
+    env.gpr[6] = (uint64_t)(uintptr_t)&data_word;
+    check(latr_execute_block(lr_only, 1), 1,
+          "LR before RVV store translates");
+    env.vtype = 0x18; /* SEW=64, LMUL=1 */
+    env.vl = 1;
+    env.vstart = 0;
+    env.rvv_args[0] = (uint64_t)(uintptr_t)&other_data_word;
+    env.rvv_args[1] = 8; /* vd */
+    env.rvv_args[2] = 3; /* EEW=64 */
+    env.rvv_args[3] = 0; /* store */
+    env.rvv_args[4] = 1; /* unmasked */
+    env.rvv_args[5] = 0;
+    for (int i = 0; i < 8; i++) {
+        env.vreg[8][i] = (uint8_t)(0x60 + i);
+    }
+    check(latr_rvv_mem(&env), 0, "RVV store after LR runs");
+    check(latr_execute_block(sc_only, 1), 1,
+          "SC after RVV store translates");
+    check(env.gpr[7], 1, "RVV store invalidates the reservation");
+    check(data_word, UINT64_C(0x1122334455667788),
+          "failed SC after RVV store leaves memory unchanged");
+    check(other_data_word, UINT64_C(0x6766656463626160),
+          "RVV store wrote its target");
+
+    /* Non-CPU writers use the explicit notification entry point. */
+    data_word = UINT64_C(0x1122334455667788);
+    reset_guest_state();
+    env.gpr[6] = (uint64_t)(uintptr_t)&data_word;
+    check(latr_execute_block(lr_only, 1), 1,
+          "LR before device notification translates");
+    latr_reservation_notify_write((uint64_t)(uintptr_t)&other_data_word, 8);
+    check(latr_execute_block(sc_only, 1), 1,
+          "SC after device notification translates");
+    check(env.gpr[7], 1, "device notification invalidates the reservation");
+    check(data_word, UINT64_C(0x1122334455667788),
+          "failed SC after device notification leaves memory unchanged");
+
+    /* A notification raised while a writer holds the lock must return without
+     * spinning; the holder's own release advances the epoch. */
+    data_word = UINT64_C(0x1122334455667788);
+    reset_guest_state();
+    env.gpr[6] = (uint64_t)(uintptr_t)&data_word;
+    uint64_t held_epoch = latr_guest_store_lock;
+    check(latr_execute_block(lr_only, 1), 1,
+          "LR before nested notification translates");
+    check(env.reservation_valid, 1, "LR arms before the nested notification");
+    latr_guest_store_lock = held_epoch + 1; /* writer in flight */
+    latr_reservation_notify_write((uint64_t)(uintptr_t)&other_data_word, 8);
+    check(latr_guest_store_lock, held_epoch + 1,
+          "notification leaves a held lock untouched");
+    latr_guest_store_lock = held_epoch + 2; /* writer release */
+    check(latr_execute_block(sc_only, 1), 1,
+          "SC after nested notification translates");
+    check(env.gpr[7], 1,
+          "writer release after nested notification invalidates the reservation");
+    check(data_word, UINT64_C(0x1122334455667788),
+          "failed SC after nested notification leaves memory unchanged");
 }
 
 static void test_bitmanip(void)
@@ -2082,6 +2167,140 @@ static void test_mmu_walk(void)
           "resolve stores the fault cause");
 }
 
+static void test_tlb(void)
+{
+    uint64_t pa = 0;
+    uint64_t hits;
+
+    clear_page_tables();
+    reset_guest_state();
+    env.privilege = 1;
+    env.csr[0x180] = (UINT64_C(8) << 60) |
+                     ((uint64_t)(uintptr_t)pte_table[0] >> 12);
+    map_page(8, UINT64_C(0x1000), UINT64_C(0x2000),
+             LATR_PTE_V | LATR_PTE_R | LATR_PTE_W |
+             LATR_PTE_A | LATR_PTE_D);
+    check(latr_walk(&env, UINT64_C(0x1000), LATR_ACCESS_LOAD, &pa), 0,
+          "TLB cold walk resolves");
+    check(env.tlb_hits, 0, "cold walk misses the TLB");
+    check(latr_walk(&env, UINT64_C(0x1234), LATR_ACCESS_LOAD, &pa), 0,
+          "TLB hit resolves");
+    check(pa, UINT64_C(0x2234), "TLB hit preserves the page offset");
+    check(env.tlb_hits, 1, "second walk hits the TLB");
+
+    /* A leaf edit without SFENCE is observed by PTE validation. */
+    pte_table[2][1] = LATR_PTE_V | LATR_PTE_R | LATR_PTE_A;
+    check(latr_walk(&env, UINT64_C(0x1000), LATR_ACCESS_STORE, &pa),
+          LATR_EXCP_STORE_PAGE_FAULT,
+          "TLB validation observes a removed W bit");
+    check(env.tlb_hits, 1, "invalidated TLB entry does not count as a hit");
+
+    /* All-ASID SFENCE bypasses the cache, then caching resumes. */
+    map_page(8, UINT64_C(0x1000), UINT64_C(0x3000),
+             LATR_PTE_V | LATR_PTE_R | LATR_PTE_W |
+             LATR_PTE_A | LATR_PTE_D);
+    env.sfence_pending = 1;
+    env.sfence_asid = UINT32_MAX;
+    check(latr_walk(&env, UINT64_C(0x1000), LATR_ACCESS_LOAD, &pa), 0,
+          "SFENCE-all walk resolves");
+    check(env.tlb_hits, 1, "SFENCE-all bypasses the cached entry");
+    env.sfence_pending = 0;
+    check(latr_walk(&env, UINT64_C(0x1000), LATR_ACCESS_LOAD, &pa), 0,
+          "walk after SFENCE resolves");
+    check(env.tlb_hits, 2, "caching resumes after the flush");
+
+    /* ASID-scoped SFENCE leaves other address spaces cached. */
+    env.csr[0x180] = (UINT64_C(5) << 44) | (UINT64_C(8) << 60) |
+                     ((uint64_t)(uintptr_t)pte_table[0] >> 12);
+    check(latr_walk(&env, UINT64_C(0x1000), LATR_ACCESS_LOAD, &pa), 0,
+          "new ASID walk resolves");
+    check(env.tlb_hits, 2, "new ASID misses the previous entry");
+    env.sfence_pending = 1;
+    env.sfence_asid = 6;
+    check(latr_walk(&env, UINT64_C(0x1000), LATR_ACCESS_LOAD, &pa), 0,
+          "other-ASID SFENCE walk resolves");
+    check(env.tlb_hits, 3, "other-ASID SFENCE keeps the entry");
+    env.sfence_asid = 5;
+    check(latr_walk(&env, UINT64_C(0x1000), LATR_ACCESS_LOAD, &pa), 0,
+          "matching-ASID SFENCE walk resolves");
+    check(env.tlb_hits, 3, "matching-ASID SFENCE drops the entry");
+    env.sfence_pending = 0;
+    check(latr_walk(&env, UINT64_C(0x1000), LATR_ACCESS_LOAD, &pa), 0,
+          "walk caches before a cleared-flag flush");
+    check(env.tlb_hits, 4, "walk hits before the sequence bump");
+
+    /* The TLB flush sequence survives the runtime clearing the flags. */
+    env.tlb_flush_seq++;
+    env.sfence_pending = 0;
+    check(latr_walk(&env, UINT64_C(0x1000), LATR_ACCESS_LOAD, &pa), 0,
+          "sequence-only flush walk resolves");
+    check(env.tlb_hits, 4, "cleared-flag SFENCE still flushes the TLB");
+
+    /* MXR and SUM are re-evaluated on every hit. */
+    map_page(8, UINT64_C(0x4000), UINT64_C(0x5000),
+             LATR_PTE_V | LATR_PTE_X | LATR_PTE_A | LATR_PTE_D);
+    check(latr_walk(&env, UINT64_C(0x4000), LATR_ACCESS_EXEC, &pa), 0,
+          "execute-only page caches for fetch");
+    check(latr_walk(&env, UINT64_C(0x4000), LATR_ACCESS_LOAD, &pa),
+          LATR_EXCP_LOAD_PAGE_FAULT,
+          "hit re-checks MXR and rejects a read");
+    env.csr[0x300] |= UINT64_C(1) << 19; /* MXR */
+    hits = env.tlb_hits;
+    check(latr_walk(&env, UINT64_C(0x4000), LATR_ACCESS_LOAD, &pa), 0,
+          "MXR makes the cached page readable");
+    check(env.tlb_hits, hits + 1, "MXR-allowed load is a TLB hit");
+    env.csr[0x300] &= ~(UINT64_C(1) << 19);
+
+    map_page(8, UINT64_C(0x6000), UINT64_C(0x7000),
+             LATR_PTE_V | LATR_PTE_R | LATR_PTE_U |
+             LATR_PTE_A | LATR_PTE_D);
+    check(latr_walk(&env, UINT64_C(0x6000), LATR_ACCESS_LOAD, &pa),
+          LATR_EXCP_LOAD_PAGE_FAULT, "SUM=0 rejects a user page");
+    env.csr[0x300] |= UINT64_C(1) << 18; /* SUM */
+    hits = env.tlb_hits;
+    check(latr_walk(&env, UINT64_C(0x6000), LATR_ACCESS_LOAD, &pa), 0,
+          "SUM=1 allows the user page");
+    check(env.tlb_hits, hits, "SUM-allowed load fills the TLB");
+    check(latr_walk(&env, UINT64_C(0x6000), LATR_ACCESS_LOAD, &pa), 0,
+          "second SUM-allowed load resolves");
+    check(env.tlb_hits, hits + 1, "SUM-allowed load hits the TLB");
+    env.csr[0x300] &= ~(UINT64_C(1) << 18);
+
+    /* A store hit still needs D; a miss lets the walker set it. */
+    map_page(8, UINT64_C(0xa000), UINT64_C(0xb000),
+             LATR_PTE_V | LATR_PTE_R | LATR_PTE_W | LATR_PTE_A);
+    check(latr_walk(&env, UINT64_C(0xa000), LATR_ACCESS_LOAD, &pa), 0,
+          "A-only page caches for loads");
+    check(latr_walk(&env, UINT64_C(0xa000), LATR_ACCESS_LOAD, &pa), 0,
+          "A-only page hits for loads");
+    hits = env.tlb_hits;
+    check(latr_walk(&env, UINT64_C(0xa000), LATR_ACCESS_STORE, &pa), 0,
+          "store falls back to set D");
+    check(env.tlb_hits, hits, "D-missing store is not a hit");
+    check(pte_table[2][10] & LATR_PTE_D, LATR_PTE_D,
+          "store walk sets the D bit");
+    check(latr_walk(&env, UINT64_C(0xa000), LATR_ACCESS_STORE, &pa), 0,
+          "second store resolves");
+    check(env.tlb_hits, hits + 1, "second store hits the TLB");
+
+    /* PMP is re-checked even when the translation is cached. */
+    map_page(8, UINT64_C(0x8000), UINT64_C(0x9000),
+             LATR_PTE_V | LATR_PTE_R | LATR_PTE_W |
+             LATR_PTE_A | LATR_PTE_D);
+    check(latr_walk(&env, UINT64_C(0x8000), LATR_ACCESS_LOAD, &pa), 0,
+          "PMP test page resolves");
+    env.csr[0x3a0] = 0x0f | (UINT64_C(0x10) << 8) |
+                     (UINT64_C(0x0f) << 16);
+    env.csr[0x3b0] = UINT64_C(0x9000) >> 2;
+    env.csr[0x3b1] = UINT64_C(0x9000) >> 2;
+    env.csr[0x3b2] = (UINT64_C(1) << 54) - 1;
+    hits = env.tlb_hits;
+    check(latr_walk(&env, UINT64_C(0x8000), LATR_ACCESS_LOAD, &pa),
+          LATR_EXCP_LOAD_ACCESS_FAULT,
+          "PMP denies a cached translation");
+    check(env.tlb_hits, hits, "PMP-denied lookup is not a hit");
+}
+
 static void test_mmu_data_path(void)
 {
     uint64_t pa_page = (uint64_t)(uintptr_t)&data_word & ~UINT64_C(0xfff);
@@ -2286,7 +2505,7 @@ static void test_interrupts(void)
     check(latr_deliver_interrupt(&env), 1, "vectored machine timer taken");
     check(env.pc, 0x80001014, "mtvec vector offset is 4*cause");
 
-    /* Vectored stvec and U-mode SIE requirement. */
+    /* Vectored stvec and privilege-dependent SIE gating. */
     reset_guest_state();
     env.vclock = &test_vclock;
     env.privilege = 1;
@@ -2299,6 +2518,7 @@ static void test_interrupts(void)
     check(latr_deliver_interrupt(&env), 1, "vectored supervisor timer taken");
     check(env.pc, 0x80002014, "stvec vector offset is 4*cause");
 
+    /* U-mode is below the delegated S target, so SIE does not gate it. */
     reset_guest_state();
     env.vclock = &test_vclock;
     env.privilege = 0;                    /* U-mode */
@@ -2308,8 +2528,13 @@ static void test_interrupts(void)
     env.csr[0x303] = 1ULL << 5;
     env.csr[0x304] = 1ULL << 5;
     env.csr[0x14d] = 0;
-    check(latr_deliver_interrupt(&env), 0,
-          "U-mode delegated interrupt requires SIE");
+    check(latr_deliver_interrupt(&env), 1,
+          "U-mode delegated interrupt ignores SIE");
+    check(env.csr[0x141], 0x80000500, "U-mode trap records sepc");
+    check(env.csr[0x142], (1ULL << 63) | 5, "U-mode trap records scause");
+    check(env.privilege, 1, "U-mode trap enters S-mode");
+    check((env.csr[0x300] >> 8) & 1, 0, "SPP records U-mode origin");
+    check((env.csr[0x300] >> 5) & 1, 0, "SPIE captures SIE=0");
 
     /* Disabled interrupts do not trap. */
     reset_guest_state();
@@ -2355,6 +2580,58 @@ static void test_interrupts(void)
     loongemu_plic_set_irq(&test_plic, 3, 0);
     latr_update_interrupts(&env);
     check(env.csr[0x344] & (1ULL << 11), 0, "MEIP drops with the line");
+
+    /* Two contexts: context 1 is the S-mode context and drives SEIP. */
+    check(loongemu_plic_init(&test_plic, 8, 2), 1,
+          "PLIC dual-context initialises");
+    {
+        int err = 0;
+        loongemu_plic_write32(&test_plic, LOONGEMU_PLIC_PRIORITY_BASE + 4 * 3,
+                              2, &err);
+        loongemu_plic_write32(&test_plic,
+                              LOONGEMU_PLIC_ENABLE_BASE +
+                              LOONGEMU_PLIC_ENABLE_STRIDE,
+                              1u << 3, &err);
+    }
+    reset_guest_state();
+    env.vclock = &test_vclock;
+    env.plic = &test_plic;
+    env.plic_context = 0;
+    loongemu_plic_set_irq(&test_plic, 3, 1);
+    latr_update_interrupts(&env);
+    check(env.csr[0x344] & (1ULL << 9), 1ULL << 9,
+          "S-context pending raises SEIP");
+    check(env.csr[0x344] & (1ULL << 11), 0,
+          "S-context does not raise MEIP");
+    env.privilege = 1;
+    env.csr[0x105] = 0x80004000;
+    env.csr[0x303] = 1ULL << 9;           /* delegate SEI */
+    env.csr[0x304] = 1ULL << 9;           /* sie.SEIE */
+    env.csr[0x300] = 1ULL << 1;           /* SIE */
+    check(latr_deliver_interrupt(&env), 1,
+          "delegated S external interrupt taken");
+    check(env.csr[0x142], (1ULL << 63) | 9,
+          "scause is a supervisor external interrupt");
+    check(env.pc, 0x80004000, "S external trap vectors to stvec");
+    {
+        int err = 0;
+        check(loongemu_plic_read32(&test_plic,
+                                   LOONGEMU_PLIC_CONTEXT_BASE +
+                                   LOONGEMU_PLIC_CONTEXT_STRIDE + 4, &err),
+              3, "S-context claim returns the source");
+    }
+    latr_update_interrupts(&env);
+    check(env.csr[0x344] & (1ULL << 9), 0, "claimed source drops SEIP");
+    {
+        int err = 0;
+        loongemu_plic_write32(&test_plic,
+                              LOONGEMU_PLIC_CONTEXT_BASE +
+                              LOONGEMU_PLIC_CONTEXT_STRIDE + 4, 3, &err);
+    }
+    latr_update_interrupts(&env);
+    check(env.csr[0x344] & (1ULL << 9), 1ULL << 9,
+          "completion re-pends the asserted line");
+    loongemu_plic_set_irq(&test_plic, 3, 0);
 
     /* WFI marks the hart idle for the runtime. */
     static const uint32_t wfi[] = {0x10500073};
@@ -2448,7 +2725,13 @@ static void test_tb_cache(void)
     latr_tb_shootdown_all(&tb_cache);
     check(latr_tb_cache_lookup(&tb_cache, 0x3000, key1) == 0, 1,
           "global shootdown drops everything");
-    check(tb_cache.arena_used, 0, "global shootdown frees the arena");
+    check(tb_cache.arena_used, sizeof(blob),
+          "global shootdown keeps code mapped until a safe point");
+    check(tb_cache.reclaim_pending, 1,
+          "global shootdown requests reclamation");
+    latr_tb_cache_safepoint(&tb_cache);
+    check(tb_cache.arena_used, 0, "safe point frees the arena");
+    check(tb_cache.reclaim_pending, 0, "safe point clears the request");
     check(tb_cache.generation > 1, 1, "shootdowns bump the generation");
 
     /* Arena exhaustion is reported, not silently truncated. */
@@ -2502,6 +2785,90 @@ static void test_tb_cache(void)
     latr_set_cpu_env(&env);
     check(lsenv->cpu_state == (void *)&env, 1,
           "runtime env switches back");
+}
+
+static void test_translator_context(void)
+{
+    static CPUArchState ctx_env_a;
+    static CPUArchState ctx_env_b;
+    static uint8_t ctx_code_a[4096];
+    static uint8_t ctx_code_b[4096];
+    static uint8_t ctx_arena_a[4096];
+    static uint8_t ctx_arena_b[4096];
+    static LatrTbCache ctx_cache_a;
+    static LatrTbCache ctx_cache_b;
+    static TranslationBlock ctx_tb_a;
+    static TranslationBlock ctx_tb_b;
+    PvirInstruction insn = { 0 };
+    LatrTranslatorContext *saved = latr_context_current();
+    LatrTranslatorContext *a;
+    LatrTranslatorContext *b;
+    LatrTbKey key;
+    void *array_a;
+
+    check(saved != 0, 1, "bootstrap context is bound");
+    memset(&ctx_env_a, 0, sizeof(ctx_env_a));
+    memset(&ctx_env_b, 0, sizeof(ctx_env_b));
+    ctx_env_a.privilege = 3;
+    ctx_env_b.privilege = 1;
+    latr_tb_cache_init(&ctx_cache_a, ctx_arena_a, sizeof(ctx_arena_a));
+    latr_tb_cache_init(&ctx_cache_b, ctx_arena_b, sizeof(ctx_arena_b));
+    key = latr_tb_cache_key(&ctx_env_a);
+    a = latr_context_create(&ctx_env_a, &ctx_cache_a, ctx_code_a,
+                            sizeof(ctx_code_a));
+    b = latr_context_create(&ctx_env_b, &ctx_cache_b, ctx_code_b,
+                            sizeof(ctx_code_b));
+    check(a != 0 && b != 0, 1, "translator contexts allocate");
+    check(a->pvir_cache != b->pvir_cache, 1,
+          "each context owns its PVIR cache");
+
+    latr_context_bind(a);
+    latr_tr_data_init(&ctx_env_a);
+    tr_init(&ctx_tb_a);
+    array_a = tr_data->ir2_inst_array;
+    check(lsenv->cpu_state == (void *)&ctx_env_a, 1,
+          "context A binds its env");
+    check(array_a != 0, 1, "context A allocates its IR2 array");
+
+    latr_context_bind(b);
+    latr_tr_data_init(&ctx_env_b);
+    tr_init(&ctx_tb_b);
+    check(tr_data->ir2_inst_array != array_a, 1,
+          "context B gets a separate IR2 array");
+    check(lsenv->cpu_state == (void *)&ctx_env_b, 1,
+          "context B binds its env");
+
+    latr_pvir_cache_store(UINT64_C(0xa5a5), 0x11, 4, &insn);
+    check(latr_pvir_cache_lookup(UINT64_C(0xa5a5), 0x11, 4, 0), 1,
+          "context B stores into its own PVIR cache");
+    latr_context_bind(a);
+    check(!latr_pvir_cache_lookup(UINT64_C(0xa5a5), 0x11, 4, 0), 1,
+          "context A does not see B's PVIR entries");
+    latr_pvir_cache_store(UINT64_C(0x5a5a), 0x22, 8, &insn);
+    check(latr_context_current() == a, 1, "bind reports the active context");
+    check(tr_data->ir2_inst_array == array_a, 1,
+          "rebinding restores context A's IR2 array");
+
+    latr_tb_cache_insert(a->tb_cache, 0x9000, key, ctx_code_a, 4, 1);
+    check(latr_tb_cache_lookup(b->tb_cache, 0x9000, key) == 0, 1,
+          "TB caches are per context");
+
+    latr_tb_shootdown_all(a->tb_cache);
+    check(latr_tb_cache_lookup(b->tb_cache, 0x9000, key) == 0, 1,
+          "shootdown on A leaves B's cache alone");
+    check(latr_pvir_cache_lookup(UINT64_C(0x5a5a), 0x22, 8, 0), 1,
+          "PVIR entry survives until the safe point");
+    latr_context_safepoint(a);
+    check(!latr_pvir_cache_lookup(UINT64_C(0x5a5a), 0x22, 8, 0), 1,
+          "safe point drops the hart's PVIR cache");
+    check(a->pvir_generation == a->tb_cache->generation, 1,
+          "safe point records the TB generation");
+
+    latr_context_bind(saved);
+    latr_context_destroy(a);
+    latr_context_destroy(b);
+    check(latr_context_current() == saved, 1,
+          "binding restores the test hart");
 }
 
 static void test_sfence_shootdown(void)
@@ -4456,6 +4823,7 @@ static void test_pmp(void)
 {
     uint64_t host = 0;
     uint64_t phys = 0;
+    uint64_t pa = 0;
 
     reset_guest_state();
     env.privilege = 1;
@@ -4534,6 +4902,184 @@ static void test_pmp(void)
     env.csr[0x300] = 0;
     check(latr_translate(&env, 0x1000, LATR_ACCESS_LOAD, 8, &host, &phys),
           0, "clearing MPRV restores M-mode PMP bypass");
+
+    /* First-match priority: entry 0 covers only part of the access, so the
+     * access fails instead of falling through to the wider entry 1. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.csr[0x3a0] = 0x11 | (UINT64_C(0x1b) << 8); /* NA4 R; NAPOT RW */
+    env.csr[0x3b0] = 0x1000 >> 2;
+    env.csr[0x3b1] = (0x1000 >> 2) | 0x1ff;
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_LOAD, 8, &host, &phys),
+          LATR_EXCP_LOAD_ACCESS_FAULT,
+          "partial first match fails without fallback");
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_LOAD, 4, &host, &phys),
+          0, "first matching entry grants its own width");
+    check(latr_translate(&env, 0x1004, LATR_ACCESS_LOAD, 4, &host, &phys),
+          0, "next entry covers the following bytes");
+
+    /* An A!=OFF entry with RWX=000 is still a matching, denying entry. */
+    env.csr[0x3a0] = 0x10 | (UINT64_C(0x1b) << 8);
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_LOAD, 4, &host, &phys),
+          LATR_EXCP_LOAD_ACCESS_FAULT, "RWX=000 entry denies instead of skipping");
+
+    /* M-mode bypass applies only to unlocked (L=0) matching entries. */
+    reset_guest_state();
+    env.privilege = 3;
+    env.csr[0x3a0] = 0x11; /* NA4 R, L=0 */
+    env.csr[0x3b0] = 0x1000 >> 2;
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_STORE, 4, &host, &phys),
+          0, "M-mode ignores an unlocked rule's permissions");
+    env.csr[0x3a0] = 0x91; /* L|NA4|R */
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_STORE, 4, &host, &phys),
+          LATR_EXCP_STORE_ACCESS_FAULT, "locked rule constrains M-mode stores");
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_LOAD, 4, &host, &phys),
+          0, "locked rule still grants its own permission");
+
+    /* mseccfg.MML truth table. L=0, W-only is a shared data region. */
+    reset_guest_state();
+    env.csr[0x747] = 4; /* MML */
+    env.csr[0x3a0] = 0x1a; /* NAPOT W */
+    env.csr[0x3b0] = (0x1000 >> 2) | 0x1ff;
+    env.privilege = 3;
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_LOAD, 4, &host, &phys),
+          0, "MML M-mode reads the shared data region");
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_STORE, 4, &host, &phys),
+          0, "MML M-mode writes the shared data region");
+    env.privilege = 1;
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_LOAD, 4, &host, &phys),
+          0, "MML S-mode reads the shared data region");
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_STORE, 4, &host, &phys),
+          LATR_EXCP_STORE_ACCESS_FAULT, "MML S-mode cannot write shared data");
+
+    /* L=0, X-only is S/U execute-only and denied to M-mode. */
+    env.csr[0x3a0] = 0x1c; /* NAPOT X */
+    env.privilege = 1;
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_EXEC, 4, &host, &phys),
+          0, "MML S/U execute-only rule");
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_LOAD, 4, &host, &phys),
+          LATR_EXCP_LOAD_ACCESS_FAULT, "MML S/U execute-only denies loads");
+    env.privilege = 3;
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_EXEC, 4, &host, &phys),
+          LATR_EXCP_INST_ACCESS_FAULT, "MML M-mode execute-only rule");
+
+    /* L=1, X=1 is M-mode execute-only and denied to S/U. */
+    env.csr[0x3a0] = 0x9c; /* L|NAPOT|X */
+    env.privilege = 3;
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_EXEC, 4, &host, &phys),
+          0, "MML locked M-mode execute rule");
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_LOAD, 4, &host, &phys),
+          LATR_EXCP_LOAD_ACCESS_FAULT, "MML locked execute-only denies M loads");
+    env.privilege = 1;
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_EXEC, 4, &host, &phys),
+          LATR_EXCP_INST_ACCESS_FAULT, "MML locked M-only rule denies S/U");
+
+    /* L=1, RWX=111 is read-only for both M and S/U. */
+    env.csr[0x3a0] = 0x9f;
+    env.privilege = 3;
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_LOAD, 4, &host, &phys),
+          0, "MML locked shared data is M-readable");
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_STORE, 4, &host, &phys),
+          LATR_EXCP_STORE_ACCESS_FAULT, "MML locked shared data is not writable");
+    env.privilege = 1;
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_LOAD, 4, &host, &phys),
+          0, "MML locked shared data is S-readable");
+
+    /* MML default policy: M-mode data still succeeds, execute does not. */
+    env.csr[0x3a0] = 0;
+    env.privilege = 3;
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_LOAD, 4, &host, &phys),
+          0, "MML unmatched M-mode load succeeds");
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_EXEC, 4, &host, &phys),
+          LATR_EXCP_INST_ACCESS_FAULT, "MML unmatched M-mode fetch fails");
+    env.privilege = 1;
+    check(latr_translate(&env, 0x1000, LATR_ACCESS_LOAD, 4, &host, &phys),
+          LATR_EXCP_LOAD_ACCESS_FAULT, "MML unmatched S-mode load fails");
+
+    /* PTE read PMP faults use the original access type. */
+    clear_page_tables();
+    env.privilege = 1;
+    env.csr[0x180] = (UINT64_C(8) << 60) |
+                     ((uint64_t)(uintptr_t)pte_table[0] >> 12);
+    map_page(8, UINT64_C(0x1000), UINT64_C(0x2000),
+             LATR_PTE_V | LATR_PTE_R);
+    {
+        uint64_t root = (uint64_t)(uintptr_t)&pte_table[0][0];
+        env.csr[0x747] = 0;
+        env.csr[0x3a0] = 0x18; /* NAPOT, no permissions */
+        env.csr[0x3b0] = (root >> 2) | 1; /* 8-byte NAPOT on the root PTE */
+        check(latr_walk(&env, UINT64_C(0x1000), LATR_ACCESS_LOAD, &pa),
+              LATR_EXCP_LOAD_ACCESS_FAULT, "PTE read fault maps to a load fault");
+        check(latr_walk(&env, UINT64_C(0x1000), LATR_ACCESS_STORE, &pa),
+              LATR_EXCP_STORE_ACCESS_FAULT,
+              "PTE read fault maps to a store fault");
+        check(latr_walk(&env, UINT64_C(0x1000), LATR_ACCESS_EXEC, &pa),
+              LATR_EXCP_INST_ACCESS_FAULT,
+              "PTE read fault maps to an instruction fault");
+    }
+
+    /* Svadu A/D write-back is an S-mode PMP store; denial is an access
+     * fault of the original type and leaves the PTE unchanged. */
+    clear_page_tables();
+    map_page(8, UINT64_C(0x1000), UINT64_C(0x2000),
+             LATR_PTE_V | LATR_PTE_R | LATR_PTE_W);
+    {
+        uint64_t leaf = (uint64_t)(uintptr_t)&pte_table[2][1];
+        /* entry0: TOR below the leaf (RWX); entry1: 8-byte NAPOT leaf (R);
+         * entry2: TOR above the leaf (RWX). */
+        env.csr[0x3a0] = 0x0f | (UINT64_C(0x19) << 8) |
+                         (UINT64_C(0x0f) << 16);
+        env.csr[0x3b0] = leaf >> 2;
+        env.csr[0x3b1] = (leaf >> 2) | 1;
+        env.csr[0x3b2] = (UINT64_C(1) << 54) - 1;
+        check(latr_walk(&env, UINT64_C(0x1000), LATR_ACCESS_LOAD, &pa),
+              LATR_EXCP_LOAD_ACCESS_FAULT,
+              "PMP-denied A update is a load access fault");
+        check(pte_table[2][1] & LATR_PTE_A, 0,
+              "PMP-denied A update leaves the PTE clear");
+        check(latr_walk(&env, UINT64_C(0x1000), LATR_ACCESS_STORE, &pa),
+              LATR_EXCP_STORE_ACCESS_FAULT,
+              "PMP-denied D update is a store access fault");
+    }
+
+    /* mseccfg writes expose MML and keep MMWP/MML sticky. */
+    static const uint32_t mseccfg_ops[] = {
+        0x74709073, /* csrw mseccfg, x1 */
+        0x747022f3, /* csrr x5, mseccfg */
+    };
+    reset_guest_state();
+    env.privilege = 3;
+    /* MML only permits M-mode fetch from a locked shared-code rule. */
+    env.csr[0x3a0] = 0x9e; /* L|NAPOT|W|X */
+    env.csr[0x3b0] = (UINT64_C(1) << 54) - 1;
+    env.gpr[1] = 4; /* MML */
+    check(latr_execute_block(mseccfg_ops, 2), 1, "mseccfg write translates");
+    check(env.gpr[5], 4, "mseccfg writes MML");
+    env.gpr[1] = 0;
+    check(latr_execute_block(mseccfg_ops, 2), 1, "mseccfg clear translates");
+    check(env.gpr[5], 4, "MML is sticky across writes");
+
+    /* Under MML, adding an M-only executable rule is refused unless RLB
+     * is set. Entry 0 stays as the locked shared-code fetch rule. */
+    static const uint32_t mml_cfg_ops[] = {
+        0x3a009073, /* csrw pmpcfg0, x1 */
+        0x3a0022f3, /* csrr x5, pmpcfg0 */
+    };
+    reset_guest_state();
+    env.privilege = 3;
+    env.csr[0x747] = 4; /* MML */
+    env.csr[0x3a0] = 0x9e; /* entry0: L|NAPOT|W|X shared code */
+    env.csr[0x3b0] = (UINT64_C(1) << 54) - 1;
+    /* entry0 stays 0x9e; entry1 would become L|NAPOT|X. */
+    env.gpr[1] = UINT64_C(0x9c9e);
+    check(latr_execute_block(mml_cfg_ops, 2), 1,
+          "MML pmpcfg write translates");
+    check(env.gpr[5], 0x9e, "MML refuses an M-only executable rule");
+    env.csr[0x747] = 5; /* MML | RLB */
+    check(latr_execute_block(mml_cfg_ops, 2), 1,
+          "RLB pmpcfg write translates");
+    check(env.gpr[5], UINT64_C(0x9c9e),
+          "RLB accepts the M-only executable rule");
 }
 
 
@@ -4589,6 +5135,39 @@ static void test_cross_page(void)
     check(page1[0], 0x44, "cross-page store page1 byte 0");
     check(page1[3], 0x11, "cross-page store page1 byte 3");
 
+    /* The unified interface is the path used by RVV/PVIR lanes. */
+    {
+        uint64_t value = 0;
+        uint64_t want = 0;
+        int i;
+
+        page0[0xffc] = 0xaa;
+        page0[0xffd] = 0xbb;
+        page0[0xffe] = 0xcc;
+        page0[0xfff] = 0xdd;
+        page1[0] = 0x11;
+        page1[1] = 0x22;
+        page1[2] = 0x33;
+        page1[3] = 0x44;
+        reset_guest_state();
+        env.privilege = 1;
+        env.mem_map = &map;
+        check(latr_guest_load(&env, 0x1ffc, 8, &value), 0,
+              "guest_load splits at a page boundary");
+        for (i = 0; i < 4; i++) {
+            want |= (uint64_t)page0[0xffc + i] << (8 * i);
+            want |= (uint64_t)page1[i] << (8 * (4 + i));
+        }
+        check(value, want, "guest_load assembles both pages");
+        check(latr_guest_store(&env, 0x1ffc, 8,
+                               UINT64_C(0x1122334455667788)), 0,
+              "guest_store splits at a page boundary");
+        check(page0[0xffc], 0x88, "guest_store writes page0 head");
+        check(page0[0xfff], 0x55, "guest_store writes page0 tail");
+        check(page1[0], 0x44, "guest_store writes page1 head");
+        check(page1[3], 0x11, "guest_store writes page1 tail");
+    }
+
     loongemu_mem_map_init(&map);
     map_host_range(&map, code, 0x1000);
     check(loongemu_mem_map_add(&map, 0x1000, 0x1000,
@@ -4603,6 +5182,94 @@ static void test_cross_page(void)
     check(env.exception, LATR_EXCP_LOAD_ACCESS_FAULT,
           "cross-page fault reports an access fault");
     check(env.badaddr, 0x2000, "cross-page fault names the second page");
+
+    {
+        uint64_t value = UINT64_C(0xdeadbeef);
+        check(latr_guest_load(&env, 0x1ffc, 8, &value),
+              LATR_EXCP_LOAD_ACCESS_FAULT,
+              "guest_load reports a second-page fault");
+        check(env.mem_va, 0x2000, "guest_load names the faulting page");
+        check(latr_guest_store(&env, 0x1ffc, 8, UINT64_C(0x12345678)),
+              LATR_EXCP_STORE_ACCESS_FAULT,
+              "guest_store reports a second-page fault");
+        check(env.mem_va, 0x2000, "guest_store names the faulting page");
+    }
+
+    /* RVV unit-stride (PVIR lane path) and strided (rvv lane path) accesses
+     * whose element spans two non-contiguous physical pages. */
+    loongemu_mem_map_init(&map);
+    map_host_range(&map, code, 0x1000);
+    check(loongemu_mem_map_add(&map, 0x1000, 0x1000,
+                               (uint64_t)(uintptr_t)page0,
+                               LOONGEMU_MEM_RAM, "page0-rvv"), 1,
+          "RVV map low page registers");
+    check(loongemu_mem_map_add(&map, 0x2000, 0x1000,
+                               (uint64_t)(uintptr_t)page1,
+                               LOONGEMU_MEM_RAM, "page1-rvv"), 1,
+          "RVV map high page registers");
+
+    for (int i = 0; i < 4; i++) {
+        page0[0xffc + i] = (uint8_t)(1 + i);
+        page1[i] = (uint8_t)(5 + i);
+    }
+    reset_guest_state();
+    env.privilege = 1;
+    env.mem_map = &map;
+    env.vtype = 0x18; /* SEW=64, LMUL=1 */
+    env.vl = 1;
+    env.vstart = 0;
+    env.rvv_args[0] = 0x1ffc;
+    env.rvv_args[1] = 8; /* vd */
+    env.rvv_args[2] = 3; /* EEW=64 */
+    env.rvv_args[3] = 1; /* load */
+    env.rvv_args[4] = 1; /* unmasked */
+    env.rvv_args[5] = 0;
+    check(latr_rvv_mem(&env), 0, "unit-stride lane crosses a page");
+    {
+        uint64_t got = 0;
+        for (int i = 0; i < 8; i++) {
+            got |= (uint64_t)env.vreg[8][i] << (8 * i);
+        }
+        check(got, UINT64_C(0x0807060504030201),
+              "unit-stride lane reads both pages");
+    }
+    for (int i = 0; i < 8; i++) {
+        env.vreg[8][i] = (uint8_t)(0x80 + i);
+    }
+    env.vstart = 0;
+    env.rvv_args[3] = 0; /* store */
+    check(latr_rvv_mem(&env), 0, "unit-stride lane store crosses a page");
+    check(page0[0xffc], 0x80, "unit-stride store writes page0 head");
+    check(page0[0xfff], 0x83, "unit-stride store writes page0 tail");
+    check(page1[0], 0x84, "unit-stride store writes page1 head");
+    check(page1[3], 0x87, "unit-stride store writes page1 tail");
+
+    for (int i = 0; i < 4; i++) {
+        page0[0xffc + i] = (uint8_t)(0x10 + i);
+        page1[i] = (uint8_t)(0x14 + i);
+    }
+    reset_guest_state();
+    env.privilege = 1;
+    env.mem_map = &map;
+    env.vtype = 0x18; /* SEW=64, LMUL=1 */
+    env.vl = 1;
+    env.vstart = 0;
+    env.rvv_args[0] = 0x1ffc;
+    env.rvv_args[1] = 8; /* vd */
+    env.rvv_args[2] = 3; /* EEW=64 */
+    env.rvv_args[3] = 1; /* load */
+    env.rvv_args[4] = 1; /* unmasked */
+    env.rvv_args[5] = 0; /* stride 0 keeps the lane on the boundary */
+    env.rvv_args[6] = 1; /* strided */
+    check(latr_rvv_stride_mem(&env), 0, "strided lane crosses a page");
+    {
+        uint64_t got = 0;
+        for (int i = 0; i < 8; i++) {
+            got |= (uint64_t)env.vreg[8][i] << (8 * i);
+        }
+        check(got, UINT64_C(0x1716151413121110),
+              "strided lane reads both pages");
+    }
 }
 
 
@@ -4689,6 +5356,131 @@ static void test_delegation(void)
           "mip read refreshes Sstc STIP");
 }
 
+/* --- ELF loader contract --- */
+
+static uint8_t elf_ram[0x40000] __attribute__((aligned(4096)));
+static uint8_t elf_file[0x200] __attribute__((aligned(8)));
+static LatrSystem elf_sys;
+
+static void elf_put(uint8_t *p, unsigned off, uint64_t value, unsigned size)
+{
+    for (unsigned i = 0; i < size; i++) {
+        p[off + i] = (uint8_t)(value >> (8 * i));
+    }
+}
+
+static void elf_build_ph(uint8_t *elf, unsigned phoff, uint64_t paddr,
+                         uint64_t vaddr, uint64_t off, uint64_t filesz,
+                         uint64_t memsz)
+{
+    uint8_t *ph = elf + phoff;
+
+    memset(ph, 0, 56);
+    elf_put(ph, 0, 1, 4);        /* PT_LOAD */
+    elf_put(ph, 4, 5, 4);        /* R+X */
+    elf_put(ph, 8, off, 8);
+    elf_put(ph, 16, vaddr, 8);
+    elf_put(ph, 24, paddr, 8);
+    elf_put(ph, 32, filesz, 8);
+    elf_put(ph, 40, memsz, 8);
+    elf_put(ph, 48, 0x1000, 8);
+}
+
+static void elf_build(uint64_t entry, uint64_t paddr, uint64_t vaddr,
+                      uint16_t phnum)
+{
+    static const uint8_t ident[16] = { 0x7f, 'E', 'L', 'F', 2, 1, 1, 0 };
+    static const uint8_t payload[16] = {
+        0x93, 0x00, 0x00, 0x00, 0x13, 0x01, 0x00, 0x00,
+        0x93, 0x81, 0x01, 0x00, 0x13, 0x02, 0x00, 0x00,
+    };
+
+    memset(elf_file, 0, sizeof(elf_file));
+    memcpy(elf_file, ident, sizeof(ident));
+    elf_put(elf_file, 16, 2, 2);          /* ET_EXEC */
+    elf_put(elf_file, 18, 243, 2);        /* EM_RISCV */
+    elf_put(elf_file, 20, 1, 4);
+    elf_put(elf_file, 24, entry, 8);
+    elf_put(elf_file, 32, 64, 8);         /* e_phoff */
+    elf_put(elf_file, 52, 64, 2);         /* e_ehsize */
+    elf_put(elf_file, 54, 56, 2);         /* e_phentsize */
+    elf_put(elf_file, 56, phnum, 2);
+    elf_build_ph(elf_file, 64, paddr, vaddr, 0x100, 16, 32);
+    memcpy(elf_file + 0x100, payload, sizeof(payload));
+}
+
+static void test_elf_loader(void)
+{
+    const uint64_t base = LATR_SYSTEM_RAM_BASE;
+    const uint64_t paddr = base + 0x1000;
+    const uint64_t vaddr = UINT64_C(0xdeadbeef);
+    uint64_t entry = 0;
+    uint8_t *ph = elf_file + 64;
+
+    check(latr_system_init(&elf_sys, elf_ram, sizeof(elf_ram), 0), 1,
+          "ELF loader board initialises");
+    memset(elf_ram, 0xcc, sizeof(elf_ram));
+
+    /* p_vaddr is deliberately outside RAM: loading at offset 16 would fail. */
+    elf_build(paddr + 8, paddr, vaddr, 1);
+    check(latr_system_load_elf(&elf_sys, elf_file, sizeof(elf_file), &entry),
+          1, "ELF with distinct p_vaddr/p_paddr loads");
+    check(entry, paddr + 8, "ELF entry comes from e_entry");
+    check(elf_sys.env.pc, paddr + 8, "ELF sets the start PC");
+    check(elf_ram[0x1000], 0x93, "ELF loads at p_paddr");
+    check(elf_ram[0x100f], 0x00, "ELF copies the whole file segment");
+    check(elf_ram[0x1010], 0, "ELF zeroes memsz beyond filesz");
+    check(elf_ram[0x101f], 0, "ELF zero fill reaches p_memsz");
+
+    /* Every rejection must leave RAM untouched (validation precedes writes). */
+    elf_ram[0x1000] = 0x5a;
+
+    elf_build(paddr + 8, paddr, vaddr, 1);
+    elf_put(elf_file, 18, 183, 2); /* EM_AARCH64 */
+    check(latr_system_load_elf(&elf_sys, elf_file, sizeof(elf_file), NULL), 0,
+          "non-RISC-V e_machine is rejected");
+    check(elf_ram[0x1000], 0x5a, "rejected image leaves RAM untouched");
+
+    elf_build(paddr + 8, paddr, vaddr, 1);
+    elf_put(ph, 32, 40, 8); /* filesz > memsz */
+    check(latr_system_load_elf(&elf_sys, elf_file, sizeof(elf_file), NULL), 0,
+          "filesz > memsz is rejected");
+
+    elf_build(paddr + 8, paddr, vaddr, 1);
+    elf_put(ph, 24, base + sizeof(elf_ram) - 8, 8); /* memsz overruns RAM */
+    check(latr_system_load_elf(&elf_sys, elf_file, sizeof(elf_file), NULL), 0,
+          "segment past the end of RAM is rejected");
+
+    elf_build(paddr + 8, paddr, vaddr, 1);
+    elf_put(ph, 8, 0x1f8, 8); /* off + filesz > len */
+    check(latr_system_load_elf(&elf_sys, elf_file, sizeof(elf_file), NULL), 0,
+          "file range past the image is rejected");
+
+    elf_build(paddr + 8, paddr, vaddr, 1);
+    elf_put(ph, 40, 0, 8); /* memsz == 0 */
+    check(latr_system_load_elf(&elf_sys, elf_file, sizeof(elf_file), NULL), 0,
+          "empty segment is rejected");
+
+    elf_build(paddr + 8, paddr, vaddr, 2);
+    elf_build_ph(elf_file, 64 + 56, paddr + 16, paddr + 16, 0x100, 8, 8);
+    check(latr_system_load_elf(&elf_sys, elf_file, sizeof(elf_file), NULL), 0,
+          "overlapping segments are rejected");
+
+    elf_build(paddr + 0x100, paddr, vaddr, 1); /* entry outside */
+    check(latr_system_load_elf(&elf_sys, elf_file, sizeof(elf_file), NULL), 0,
+          "entry outside every segment is rejected");
+
+    elf_build(paddr + 8, paddr, vaddr, 1);
+    elf_put(elf_file, 32, UINT64_MAX - 8, 8); /* phoff overflow */
+    check(latr_system_load_elf(&elf_sys, elf_file, sizeof(elf_file), NULL), 0,
+          "program header offset overflow is rejected");
+
+    elf_build(paddr + 8, paddr, vaddr, 1);
+    elf_put(elf_file, 54, 40, 2); /* e_phentsize too small */
+    check(latr_system_load_elf(&elf_sys, elf_file, sizeof(elf_file), NULL), 0,
+          "short program header entries are rejected");
+}
+
 void kmain(void)
 {
     uint64_t euen;
@@ -4727,6 +5519,7 @@ void kmain(void)
     test_privileged();
     test_mmu_csr_state();
     test_mmu_walk();
+    test_tlb();
     test_mmu_data_path();
     test_phys_map();
     test_mmio_path();
@@ -4734,7 +5527,9 @@ void kmain(void)
     test_sbi_service();
     test_interrupts();
     test_tb_cache();
+    test_translator_context();
     test_sfence_shootdown();
+    test_elf_loader();
     test_rvv_state();
     test_rvv_ops();
     test_rvv_memory();

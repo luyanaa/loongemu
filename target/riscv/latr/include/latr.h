@@ -16,6 +16,17 @@
  * crossings in one block; the real TB dispatcher leaves this clear. */
 #define LATR_TB_CFLAGS_ALLOW_FLOW (UINT32_C(1) << 30)
 
+/*
+ * Host TLS for translator state. The freestanding LoongArch build has no TLS
+ * runtime, so it compiles to plain globals; a VMM host build defines
+ * LATR_ENABLE_TLS so every vCPU thread gets its own context pointers.
+ */
+#if defined(LATR_ENABLE_TLS)
+#define LATR_TLS _Thread_local
+#else
+#define LATR_TLS
+#endif
+
 
 /* TB cache key: a translation is valid for one ASID/privilege/satp mode/RVV config. */
 typedef struct LatrTbKey {
@@ -82,6 +93,41 @@ typedef struct ENV {
     TRANSLATION_DATA *tr_data;
 } ENV;
 
+struct LatrTbCache;
+typedef struct LatrPvirCache LatrPvirCache;
+
+/*
+ * All translator state belonging to one vCPU. A VMM thread binds its hart's
+ * context with latr_context_bind(); `tr_data`/`lsenv` then point into this
+ * object, so two harts never share IR2 lists, labels, register allocation,
+ * instruction maps or the PVIR descriptor cache.
+ */
+typedef struct LatrTranslatorContext {
+    TRANSLATION_DATA tr_data;
+    ENV env;
+    CPUArchState *cpu;
+    struct LatrTbCache *tb_cache;
+    LatrPvirCache *pvir_cache;
+    uint64_t pvir_generation;
+    uint8_t *code_buf;
+    uint32_t code_buf_size;
+} LatrTranslatorContext;
+
+LatrTranslatorContext *latr_context_create(CPUArchState *cpu,
+                                           struct LatrTbCache *tb_cache,
+                                           uint8_t *code_buf,
+                                           uint32_t code_buf_size);
+void latr_context_destroy(LatrTranslatorContext *ctx);
+/* Makes `ctx` the current hart on this host thread (TLS when enabled). */
+void latr_context_bind(LatrTranslatorContext *ctx);
+LatrTranslatorContext *latr_context_current(void);
+/*
+ * Per-hart safe point: reclaims the TB arena once no translation is live and
+ * drops this hart's PVIR cache when its TB generation moved. Call between TB
+ * dispatches, never while executing generated code.
+ */
+void latr_context_safepoint(LatrTranslatorContext *ctx);
+
 #include "reg-alloc.h"
 
 /*
@@ -106,6 +152,10 @@ typedef struct LatrTbCache {
     uint32_t arena_used;
     uint32_t count;
     uint64_t generation;
+    /* Serializes cross-core shootdowns against the owner's lookup/insert. */
+    volatile int lock;
+    /* Set by shootdown; the owner resets the arena at its next safe point. */
+    uint32_t reclaim_pending;
 } LatrTbCache;
 
 void latr_tb_cache_init(LatrTbCache *cache, uint8_t *arena, uint32_t size);
@@ -119,6 +169,13 @@ LatrTbEntry *latr_tb_cache_insert(LatrTbCache *cache, uint64_t pc,
 void latr_tb_shootdown_all(LatrTbCache *cache);
 void latr_tb_shootdown_asid(LatrTbCache *cache, uint32_t asid);
 void latr_tb_shootdown_privilege(LatrTbCache *cache, uint32_t privilege);
+/*
+ * Owner-only reclamation points. Shootdowns only invalidate entries so code
+ * another hart is still executing stays mapped; the arena is recycled here.
+ */
+void latr_tb_cache_safepoint(LatrTbCache *cache);
+void latr_tb_cache_reclaim_all(LatrTbCache *cache);
+uint32_t latr_tb_cache_available(const LatrTbCache *cache);
 
 /* Switches the runtime to another vCPU's environment. */
 void latr_set_cpu_env(CPUArchState *env);
@@ -134,6 +191,9 @@ void latr_tb_cache_unregister(LatrTbCache *cache);
 void latr_tb_shootdown_asid_all_cores(uint32_t asid);
 void latr_tb_fence_i_all_cores(void);
 void latr_pvir_cache_clear(void);
+void latr_pvir_cache_reset(LatrPvirCache *cache);
+LatrPvirCache *latr_pvir_cache_create(void);
+void latr_pvir_cache_destroy(LatrPvirCache *cache);
 
 void latr_tb_insn_map_begin(void *code, uint32_t code_size);
 void latr_tb_insn_map_add(uint64_t guest_pc, uint32_t native_start,
@@ -161,8 +221,8 @@ void tr_fini(void);
 int tr_ir2_assemble(const void *code_start_addr);
 void label_dispose(void);
 
-extern __thread TRANSLATION_DATA *tr_data;
-extern __thread ENV *lsenv;
+extern LATR_TLS TRANSLATION_DATA *tr_data;
+extern LATR_TLS ENV *lsenv;
 extern bool latr_dump;
 extern const int latr_la_map[32];
 extern const int latr_la_fmap[32];

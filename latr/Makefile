@@ -43,7 +43,7 @@ CORE_OBJS := $(BUILD)/ir2.o $(BUILD)/ir2-assemble.o $(BUILD)/la-append.o \
              $(BUILD)/translate-riscv-csr.o $(BUILD)/translate-riscv-fp.o \
              $(BUILD)/translate-riscv-fp-helper.o $(BUILD)/softfloat.o \
              $(BUILD)/decode-riscv.o $(BUILD)/pvir.o $(BUILD)/pvir-exec.o $(BUILD)/pvir-lower-lsx.o $(BUILD)/cpu_features.o $(BUILD)/mmu.o $(BUILD)/interrupt.o $(BUILD)/mmio.o $(BUILD)/rvv.o $(BUILD)/translate-riscv-rvv.o $(BUILD)/tb-cache.o $(BUILD)/tb-insn-map.o \
-             $(BUILD)/phys_mem.o $(BUILD)/mmio_bus.o $(BUILD)/latr_system.o $(BUILD)/uart16550.o $(BUILD)/riscv_clint.o $(BUILD)/riscv_plic.o $(BUILD)/riscv_acpi.o $(BUILD)/riscv_fw.o $(BUILD)/ovmf_board.o $(BUILD)/riscv_sbi.o \
+             $(BUILD)/phys_mem.o $(BUILD)/mmio_bus.o $(BUILD)/latr_system.o $(BUILD)/latr_fdt.o $(BUILD)/latr_machine.o $(BUILD)/uart16550.o $(BUILD)/riscv_clint.o $(BUILD)/riscv_plic.o $(BUILD)/riscv_acpi.o $(BUILD)/riscv_fw.o $(BUILD)/ovmf_board.o $(BUILD)/riscv_sbi.o \
              $(BUILD)/runtime.o \
              $(BUILD)/vclock.o $(BUILD)/compiler-rt.o
 
@@ -214,6 +214,14 @@ $(BUILD)/mmio.o: $(LATR)/translator/mmio.c $(LATR)/include/latr.h \
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/mmio_bus.o: ../src/mmio_bus.c ../include/loongemu/mmio_bus.h | $(BUILD)
+	$(CLANG) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/latr_fdt.o: $(LATR)/system/latr_fdt.c $(LATR)/include/latr-fdt.h | $(BUILD)
+	$(CLANG) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/latr_machine.o: $(LATR)/system/latr_machine.c \
+                $(LATR)/include/latr-machine.h $(LATR)/include/latr-fdt.h \
+                $(LATR)/include/latr-system.h $(LATR)/include/latr.h | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/tb-cache.o: $(LATR)/tb-cache.c $(LATR)/include/latr.h \

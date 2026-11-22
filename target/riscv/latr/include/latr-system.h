@@ -49,6 +49,9 @@ typedef struct LatrSystem {
 
 int latr_system_init(LatrSystem *sys, uint8_t *ram, uint64_t ram_size,
                      uint32_t hartid);
+/* Same board with PLIC contexts for `nharts` harts (2*hart = M, 2*hart+1 = S). */
+int latr_system_init_harts(LatrSystem *sys, uint8_t *ram, uint64_t ram_size,
+                           uint32_t nharts, uint32_t boot_hart);
 int latr_system_load_elf(LatrSystem *sys, const uint8_t *elf, uint64_t len,
                          uint64_t *entry);
 void latr_system_update(LatrSystem *sys);

@@ -35,10 +35,9 @@ enum {
 
 /*
  * Walks the active satp page table for `va`. Returns 0 and the physical
- * address, or a page-fault cause. A/D bits are updated in memory (Svadu
- * style); Svpbmt is ignored and physical memory is identity-mapped to host
- * memory (no LoongemuMemMap yet). M-mode accesses bypass translation; MPRV is
- * not modelled.
+ * address, or a fault cause. Implicit PTE reads and hardware A/D writes use
+ * S-mode PMP checks. M-mode accesses bypass translation unless MPRV selects a
+ * lower effective privilege.
  */
 int latr_walk(CPUArchState *env, uint64_t va, unsigned access,
               uint64_t *pa_out);
@@ -54,7 +53,31 @@ int latr_translate(CPUArchState *env, uint64_t va, unsigned access,
 int latr_pmp_check(const CPUArchState *env, uint64_t pa, unsigned size,
                    unsigned access, unsigned privilege);
 
-/* Cross-4KiB-page scalar accesses: translate each page chunk separately. */
+/*
+ * Unified guest-memory access used by scalar slow paths, RVV lanes and PVIR
+ * lanes. The range is split at 4 KiB virtual page boundaries so every chunk
+ * is translated, PMP-checked and (for MMIO) dispatched with its own mapping.
+ * `size` is 1..8 and the value is assembled little-endian. Returns 0 on
+ * success or an exception cause; on failure env->mem_fault_cause and
+ * env->mem_va describe the faulting chunk.
+ */
+int latr_guest_load(CPUArchState *env, uint64_t va, unsigned size,
+                    uint64_t *value);
+int latr_guest_store(CPUArchState *env, uint64_t va, unsigned size,
+                     uint64_t value);
+
+/*
+ * Shared reservation domain for LR/SC. Bit 0 is the writer lock; the upper
+ * bits count completed guest writes. Emitted scalar stores and all C-level
+ * memory paths use this same word, so a write through any path invalidates
+ * outstanding reservations. Non-CPU writers (device DMA) call
+ * latr_reservation_notify_write(). If a CPU writer already holds the lock the
+ * notification returns immediately: that writer's release advances the epoch.
+ */
+extern volatile uint64_t latr_guest_store_lock;
+void latr_reservation_notify_write(uint64_t pa, unsigned size);
+
+/* Emitted-code entry points for page-crossing scalar accesses. */
 uint64_t latr_cross_load(CPUArchState *env, uint64_t va, unsigned size);
 uint64_t latr_cross_store(CPUArchState *env, uint64_t va, unsigned size,
                           uint64_t value);
