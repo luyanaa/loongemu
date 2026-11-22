@@ -9361,6 +9361,7 @@ IR2_INST *la_vmax_h(IR2_OPND vd, IR2_OPND vj, IR2_OPND vk) {
 
 IR2_INST *la_vmax_w(IR2_OPND vd, IR2_OPND vj, IR2_OPND vk) {
     IR2_INST *pir2 = ir2_allocate();
+
     pir2->_opcode = LISA_VMAX_W;
     pir2->op_count = 3;
     pir2->_opnd[0] = vd;

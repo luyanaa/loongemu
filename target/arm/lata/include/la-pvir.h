@@ -163,6 +163,10 @@ typedef enum {
     PVIR_OP_FP_ARITH,
     /* Generate a lane-index vector (PvirIndexOperation). */
     PVIR_OP_LANE_INDEX,
+    /* Horizontal lane reductions (PvirReduceOperation). */
+    PVIR_OP_REDUCE,
+    /* Cross-lane permutations and table lookups (PvirPermuteOperation). */
+    PVIR_OP_PERMUTE,
 } PvirOpcode;
 
 typedef enum {
@@ -406,6 +410,9 @@ typedef struct {
     /* Optional state input consumed while producing the predicate value. */
     PvirArchStateEffect source_state;
     PvirValueId source_state_value;
+    /* Optional pointer-conflict comparison mode (WHILERW/WHILEWR). */
+    bool conflict_check;
+    bool conflict_write_first;
 } PvirPredicateGeneratorOperation;
 
 typedef struct {
@@ -486,13 +493,21 @@ typedef struct {
     PvirArchStateOperation sat_state;
 } PvirFixedPointOperation;
 
-/* FP arithmetic with an explicit rounding mode; SQRT takes one operand. */
+/* FP arithmetic with an explicit rounding mode; SQRT/RECPE/RSQRTE take one operand. */
 typedef enum {
     PVIR_FP_ADD,
     PVIR_FP_SUB,
     PVIR_FP_MUL,
     PVIR_FP_DIV,
     PVIR_FP_SQRT,
+    PVIR_FP_MIN,
+    PVIR_FP_MAX,
+    PVIR_FP_MINNM,
+    PVIR_FP_MAXNM,
+    PVIR_FP_RECPE,
+    PVIR_FP_RSQRTE,
+    PVIR_FP_RECPS,
+    PVIR_FP_RSQRTS,
 } PvirFPKind;
 
 typedef struct {
@@ -521,6 +536,59 @@ typedef struct {
     PvirValueId step_value;
 } PvirIndexOperation;
 
+typedef enum {
+    PVIR_REDUCE_ADD,
+    PVIR_REDUCE_ADD_ORDERED,
+    PVIR_REDUCE_MIN,
+    PVIR_REDUCE_MAX,
+    PVIR_REDUCE_MINNM,
+    PVIR_REDUCE_MAXNM,
+    PVIR_REDUCE_OR,
+    PVIR_REDUCE_XOR,
+    PVIR_REDUCE_AND,
+} PvirReduceKind;
+
+typedef struct {
+    PvirVectorType type;
+    PvirVectorType result_type;
+    PvirPredicate predicate;
+    PvirValueId destination;
+    PvirValueId source;
+    PvirValueId init_scalar;
+    PvirReduceKind kind;
+} PvirReduceOperation;
+
+typedef enum {
+    PVIR_PERMUTE_TBL,
+    PVIR_PERMUTE_TBX,
+    PVIR_PERMUTE_ZIP1,
+    PVIR_PERMUTE_ZIP2,
+    PVIR_PERMUTE_UZP1,
+    PVIR_PERMUTE_UZP2,
+    PVIR_PERMUTE_TRN1,
+    PVIR_PERMUTE_TRN2,
+    PVIR_PERMUTE_SPLICE,
+    PVIR_PERMUTE_EXT,
+    PVIR_PERMUTE_REV,
+    PVIR_PERMUTE_REVB,
+    PVIR_PERMUTE_REVH,
+    PVIR_PERMUTE_REVW,
+    PVIR_PERMUTE_COMPACT,
+} PvirPermuteKind;
+
+typedef struct {
+    PvirVectorType type;
+    PvirPredicate predicate;
+    bool has_predicate;
+    PvirInactivePolicy inactive_policy;
+    PvirValueId destination;
+    PvirValueId merge_value;
+    PvirValueId operands[3];
+    uint8_t operand_count;
+    PvirPermuteKind kind;
+    uint32_t imm;
+} PvirPermuteOperation;
+
 typedef struct {
     PvirOpcode opcode;
     PvirEffectMetadata effects;
@@ -533,6 +601,8 @@ typedef struct {
         PvirFixedPointOperation fixed;
         PvirFPOpOperation fp;
         PvirIndexOperation index;
+        PvirReduceOperation reduce;
+        PvirPermuteOperation permute;
     } operation;
 } PvirInstruction;
 

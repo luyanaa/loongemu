@@ -22,6 +22,8 @@ enum {
 };
 /* Max VL 2048 bits has 256 byte lanes: four packed 64-bit words. */
 #define A64_SVE_PVIR_MAX_MASK_KEY_WORDS 4u
+/* Match ARM_SVE_MAX_PRED_BYTES (256 / 8) without cyclic header include. */
+#define A64_SVE_PVIR_MAX_PRED_BYTES 32u
 
 /* Entry-state IDs are Z0-31, P0-15, then X0-31; X31 denotes the zero value. */
 
@@ -51,6 +53,13 @@ typedef struct A64SVEPvirBuilder {
     A64SVEPredicateMaskCacheKey expanded_mask_key;
     size_t expanded_mask_chunks_materialized;
     size_t expanded_mask_chunks_reused;
+
+    /* P2 trace optimization: compile-time known predicates across a trace. */
+    uint16_t known_preg_valid_mask;
+    bool trace_opt_const_pred_enabled;
+    uint64_t known_preg_version[A64_SVE_PVIR_NUM_PREGS];
+    uint8_t known_preg_bytes[A64_SVE_PVIR_NUM_PREGS][A64_SVE_PVIR_MAX_PRED_BYTES];
+    size_t trace_opt_const_pred_folds;
 } A64SVEPvirBuilder;
 
 typedef enum {

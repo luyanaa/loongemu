@@ -1,5 +1,6 @@
 #include <string.h>
 #include "reg-alloc.h"
+#include "lata-vcache.h"
 #include "ir2.h"
 // #include "translate.h"
 // #include "common.h"
@@ -201,17 +202,51 @@ const int reg_itemp_reverse_map[32] = {
     // REG_MAP_DEF(la_a7, ITEMP10),
 };
 
-const int reg_ftemp_map[] = {
+/*
+ * Temporary pool, initially f9..f14.  When the pool runs dry the allocator
+ * spills a cold resident guest register and appends it here, so the pool is a
+ * prefix of this array whose length is ftemp_pool_entries.
+ */
+int reg_ftemp_map[32] = {
     REG_MAP_DEF(FTEMP0, 9),
     REG_MAP_DEF(FTEMP1, 10),
     REG_MAP_DEF(FTEMP2, 11),
     REG_MAP_DEF(FTEMP3, 12),
     REG_MAP_DEF(FTEMP4, 13),
     REG_MAP_DEF(FTEMP5, 14),
-    // REG_MAP_DEF(FTEMP6, 15),
 };
 
-const int reg_ftemp_reverse_map[32] = {
+#define FTEMP_BASE_ENTRIES 6
+static int ftemp_base = FTEMP_BASE_ENTRIES;
+static int ftemp_pool_entries = FTEMP_BASE_ENTRIES;
+
+bool ra_ftemp_phys_in_pool(int phys)
+{
+    for (int slot = 0; slot < ra_ftemp_pool_size(); ++slot) {
+        if (reg_ftemp_map[slot] == phys) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void lata_ftemp_set_base_pool(int pool)
+{
+    if (pool < 1) {
+        pool = 1;
+    }
+    if (pool > FTEMP_BASE_ENTRIES) {
+        pool = FTEMP_BASE_ENTRIES;
+    }
+    /* Drop appended spill slots so their registers are not handed out twice. */
+    for (int slot = pool; slot < ftemp_pool_entries; ++slot) {
+        reg_ftemp_reverse_map[reg_ftemp_map[slot]] = INVALID_TEMP;
+    }
+    ftemp_base = pool;
+    ftemp_pool_entries = pool;
+}
+
+int reg_ftemp_reverse_map[32] = {
     REG_MAP_DEF(0 ... 31, INVALID_TEMP),
     REG_MAP_DEF(9, FTEMP0),
     REG_MAP_DEF(10, FTEMP1),
@@ -254,8 +289,82 @@ RA_ALLOC_FUNC(trace, IR2_OPND_GPR)
 RA_ALLOC_FUNC(scr, IR2_OPND_SCR);
 /* ra_alloc_itemp_num() */
 RA_ALLOC_TEMP_NUM_FUNC(itemp)
-/* ra_alloc_ftemp_num() */
-RA_ALLOC_TEMP_NUM_FUNC(ftemp)
+/* ra_alloc_ftemp_num(): spill a cold guest register when the pool is dry. */
+/*
+ * Allocation failures must be deterministic: the old code fell through with an
+ * out-of-range slot after the assert, which produced a bogus register and made
+ * the generated TB loop forever instead of reporting the problem.
+ */
+static uint32_t ftemp_alloc_failures;
+
+uint32_t ra_ftemp_alloc_failures(void)
+{
+    return ftemp_alloc_failures;
+}
+
+static int ra_alloc_ftemp_num(void)
+{
+    int cto_num, ftemp_num;
+    int spill_attempts = 0;
+
+    for (;;) {
+        __asm("cto.w %0, %1\n\t"
+              : "=r"(cto_num)
+              : "r"(lsenv->tr_data->ftemp_status));
+        if (cto_num < ra_ftemp_pool_size()) {
+            break;
+        }
+        {
+            int spilled = lata_vreg_spill_cold();
+            int phys;
+
+            if (spilled < 0 || spill_attempts >= 8) {
+                ftemp_alloc_failures++;
+                /* Best effort: reuse slot 0 so translation stays in range. */
+                BITS_SET(lsenv->tr_data->ftemp_status, 1 << 0);
+                return reg_ftemp_map[0];
+            }
+            spill_attempts++;
+            phys = arm_la_fmap[spilled];
+            /* A register already in the pool must not get a second slot:
+             * the reverse map would point at the newer slot and freeing the
+             * older one later clears an already-clear bit (assert in
+             * ra_free_ftemp).  The loop re-reads ftemp_status, so if that
+             * slot is free it is picked up on the next iteration. */
+            if (!ra_ftemp_phys_in_pool(phys)) {
+                if (ftemp_pool_entries >= 32) {
+                    ftemp_alloc_failures++;
+                    BITS_SET(lsenv->tr_data->ftemp_status, 1 << 0);
+                    return reg_ftemp_map[0];
+                }
+                reg_ftemp_map[ftemp_pool_entries] = phys;
+                reg_ftemp_reverse_map[phys] = ftemp_pool_entries;
+                ftemp_pool_entries++;
+            }
+        }
+    }
+    if (cto_num >= ra_ftemp_pool_size()) {
+        ftemp_alloc_failures++;
+        BITS_SET(lsenv->tr_data->ftemp_status, 1 << 0);
+        return reg_ftemp_map[0];
+    }
+    ftemp_num = reg_ftemp_map[cto_num];
+    BITS_SET(lsenv->tr_data->ftemp_status, 1 << cto_num);
+    return ftemp_num;
+}
+
+int ra_ftemp_pool_size(void)
+{
+    int entries = ftemp_pool_entries;
+
+    /* f14/f15 are the cache homes while the window is enabled; a deliberately
+     * shrunken pool (test knob) keeps its own size. */
+    if (lata_vcache_enabled() && ftemp_base == FTEMP_BASE_ENTRIES &&
+        entries > 1) {
+        entries -= 1;
+    }
+    return entries;
+}
 
 /*
  * Some encapsulation of base interface

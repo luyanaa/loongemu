@@ -9,6 +9,7 @@
 #include "la-append.h"
 #include "reg-alloc.h"
 #include "macro-inst.h"
+#include "lata-vcache.h"
 
 #include "tcg/tcg.h"
 //#include "env.h"
@@ -52,6 +53,16 @@ typedef struct TRANSLATION_DATA {
         };
     };
 
+    /*
+     * Guest V registers the current TB actually loaded into their resident
+     * LASX register.  A helper call writes those registers back to env; doing
+     * that for untouched registers would overwrite env with stale contents
+     * (the SVE lowering keeps vector state authoritative in env).
+     */
+    uint32_t vreg_resident_touched;
+    /* Resident registers written in this TB; discharged by the exit code. */
+    uint32_t vreg_resident_dirty;
+
     /* TODO : support static translation */
     uint8 curr_ir1_skipped_eflags; /* these eflag calculation can be skipped */
                                    /* (because of flag pattern, etc) */
@@ -84,6 +95,52 @@ void lata_fast_jmp_cache_init(CPUArchState *env, uint64_t start_code, uint64_t e
 void lata_fast_jmp_cache_add(CPUArchState *env, uint64_t guest_pc, uint64_t host_pc);
 
 int tr_ir2_assemble(const void *code_start_addr);
+/* Debug aid: first instruction of the current TB's IR2 list. */
+struct IR2_INST *lata_first_ir2(void);
+
+/*
+ * Emit any pending vector-cache write-back.  Every path that leaves the TB
+ * (native return and direct linked-TB jump) must call this first; it is a
+ * no-op while the cache is read-only or disabled.
+ */
+void lata_zcache_flush_for_exit(void);
+
+/* Emit per-TB stores for resident registers this TB wrote, then clear them. */
+void lata_emit_dirty_vreg_stores(void);
+/* TBs that reached tr_fini() without discharging their dirty registers. */
+uint32_t lata_vreg_exit_violations(void);
+/* Number of per-TB vector stores emitted (proves the per-TB exit ran). */
+uint32_t lata_vreg_tb_publishes(void);
+/* Vector loads emitted on first use instead of preloaded by the entry stub. */
+uint32_t lata_vreg_lazy_loads(void);
+uint32_t lata_vreg_temp_loads(void);
+/* Temporary-pool allocations that could not be satisfied (must stay 0). */
+uint32_t ra_ftemp_alloc_failures(void);
+
+/*
+ * Guest V-register residency.  A resident register holds the live value; a
+ * demoted one is env-backed.  Spilling picks a register the current TB has not
+ * touched, writes it back and hands its LASX register to the temporary pool.
+ */
+bool lata_vreg_resident(int index);
+void lata_vreg_init_residency(void);
+int lata_vreg_spill_cold(void);
+uint32_t lata_vreg_spills(void);
+/* Number of guest V registers currently resident in host registers. */
+uint32_t lata_vreg_resident_count(void);
+/* Test/debug knob: shrink the temporary base pool to force spilling. */
+void lata_ftemp_set_base_pool(int pool);
+/* True when the physical register is currently handed out by the temp pool. */
+bool ra_ftemp_phys_in_pool(int phys);
+
+/*
+ * Register-file partition invariant: a physical LASX register is owned by at
+ * most one of {resident guest register, temporary pool, cache window}.  The
+ * native<->BT switch code is emitted once at startup, so the resident set must
+ * be fixed for the whole session; the partition is what makes cross-TB
+ * residency sound.  Returns the number of violations (0 is required).
+ */
+int lata_vreg_partition_violations(void);
 void label_dispose(void);
 
 void lata_gen_call_helper_prologue(TCGContext *tcg_ctx);
@@ -95,6 +152,7 @@ void lata_env_vst(IR2_OPND vector, int offset);
 void lata_env_xvld(IR2_OPND vector, int offset);
 void lata_env_xvst(IR2_OPND vector, int offset);
 void lata_env_ld_wu(IR2_OPND scalar, int offset);
+void lata_env_ld_du(IR2_OPND scalar, int offset);
 void lata_env_st_b(IR2_OPND scalar, int offset);
 
 IR2_OPND alloc_gpr_src(int i);
@@ -109,5 +167,29 @@ IR2_OPND alloc_fpr_src(int i);
 IR2_OPND alloc_fpr_dst(int i);
 void store_fpr_dst(int i, IR2_OPND opnd);
 void free_alloc_fpr(IR2_OPND opnd);
+
+typedef struct LataIr2Snapshot {
+    int ir2_inst_num_current;
+    int real_ir2_inst_num;
+    int first_ir2_id;
+    int last_ir2_id;
+    int last_ir2_next;
+    int label_num;
+    uint32_t all_temp_status;
+    uint32_t vreg_resident_touched;
+    uint32_t vreg_resident_dirty;
+    uint32_t vreg_tb_resident;
+    uint32_t w_write_flag;
+    struct {
+        bool valid;
+        bool dirty;
+        int offset;
+    } zcache_slots[2];
+    unsigned zcache_victim;
+    LataVcacheSnapshot vcache_snap;
+} LataIr2Snapshot;
+
+void lata_ir2_snapshot_take(LataIr2Snapshot *snap);
+void lata_ir2_snapshot_rollback(const LataIr2Snapshot *snap);
 
 #endif

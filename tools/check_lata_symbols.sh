@@ -4,7 +4,15 @@
 # satisfied by weak defaults in lata/runtime.c.
 set -eu
 
-NM=${NM:-/opt/homebrew/Cellar/llvm/23.1.5_1/bin/llvm-nm}
+if [ -z "${NM:-}" ]; then
+    if command -v brew >/dev/null 2>&1 && [ -x "$(brew --prefix llvm 2>/dev/null)/bin/llvm-nm" ]; then
+        NM="$(brew --prefix llvm)/bin/llvm-nm"
+    elif [ -x /opt/homebrew/opt/llvm/bin/llvm-nm ]; then
+        NM=/opt/homebrew/opt/llvm/bin/llvm-nm
+    else
+        NM=llvm-nm
+    fi
+fi
 ARCHIVE=${1:-lata/build/liblata_core.a}
 ALLOW=${2:-lata/lata_externals.allowlist}
 

@@ -141,6 +141,16 @@ build/test_sve_pvir: tests/test_sve_pvir.c target/arm/lata/ir1/sve-pvir.c \
 test-sve-pvir: build/test_sve_pvir
 	./build/test_sve_pvir
 
+build/test_vcache: tests/test_vcache.c lata/vcache.c \
+                   target/arm/lata/include/lata-vcache.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Wno-gnu-empty-struct \
+	      -Itarget/arm/lata/include \
+	      lata/vcache.c tests/test_vcache.c -o $@
+
+test-vcache: build/test_vcache
+	./build/test_vcache
+
 build/test_arm_state: tests/test_arm_state.c \
                       target/arm/lata/include/env.h \
                       lata/compat/target/arm/cpu.h
@@ -162,7 +172,7 @@ test-soft-ras: build/test_soft_ras
 	./build/test_soft_ras
 
 test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging build/test_x86_64_paging \
-      build/test_pci_host build/test_hyperv build/test_tb_cache build/test_soft_ras build/test_pvir build/test_sve_decode build/test_sve_pvir build/test_arm_state \
+      build/test_pci_host build/test_hyperv build/test_tb_cache build/test_soft_ras build/test_pvir build/test_sve_decode build/test_sve_pvir build/test_vcache build/test_arm_state \
       build/test_latm_decode
 	./build/test_loongbt
 	./build/test_loongbt_cpu
@@ -180,6 +190,7 @@ test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging buil
 	./build/test_riscv_fw
 	./build/test_sve_decode
 	./build/test_sve_pvir
+	./build/test_vcache
 	./build/test_arm_state
 	./build/test_latm_decode
 

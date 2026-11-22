@@ -630,9 +630,19 @@ static bool valid_operation_operands(PvirOpcode opcode,
     if (opcode == PVIR_OP_COMPARE) {
         if (operation->type.kind != PVIR_ELEMENT_MASK ||
             !valid_compare_condition(operation->compare_condition) ||
-            operation->operand_kinds[0] != PVIR_OPERAND_VECTOR ||
-            operation->operand_kinds[1] != PVIR_OPERAND_VECTOR ||
-            !same_vector_type(operand_types[0], operand_types[1])) {
+            operation->operand_kinds[0] != PVIR_OPERAND_VECTOR) {
+            return false;
+        }
+        if (operation->operand_kinds[1] == PVIR_OPERAND_VECTOR) {
+            if (!same_vector_type(operand_types[0], operand_types[1])) {
+                return false;
+            }
+        } else if (operation->operand_kinds[1] == PVIR_OPERAND_IMMEDIATE) {
+            if (operand_types[0].kind == PVIR_ELEMENT_FLOAT &&
+                operation->operand_immediates[1] != 0) {
+                return false;
+            }
+        } else if (operation->operand_kinds[1] != PVIR_OPERAND_SCALAR) {
             return false;
         }
         return compare_condition_matches(operation->compare_condition,
@@ -849,7 +859,7 @@ static bool valid_predicate_generator(const PvirInstruction *instruction)
                !operation->source_state.present &&
                operation->form == PVIR_PREDICATE_VECTOR_MASK &&
                operation->active_lanes == 0 &&
-               operation->compare_condition == PVIR_COMPARE_LTU &&
+               valid_compare_condition(operation->compare_condition) &&
                (operation->scalar_bits == 32 ||
                 operation->scalar_bits == 64) &&
                operation->scalar_start != PVIR_NO_VALUE &&
@@ -862,7 +872,6 @@ static bool valid_predicate_generator(const PvirInstruction *instruction)
                operation->scalar_bits == 0 &&
                operation->scalar_start == PVIR_NO_VALUE &&
                operation->scalar_limit == PVIR_NO_VALUE &&
-               !operation->status_state.present &&
                operation->source_state.present &&
                valid_arch_state_effect(&operation->source_state) &&
                operation->source_state.domain ==
@@ -1095,7 +1104,7 @@ static bool valid_fp_operation(const PvirInstruction *instruction)
         instruction->effects.arch_state.present ||
         instruction->effects.fp_exceptions !=
             PVIR_FP_EXCEPTIONS_ACTIVE_LANES_ONLY ||
-        operation->kind < PVIR_FP_ADD || operation->kind > PVIR_FP_SQRT ||
+        operation->kind < PVIR_FP_ADD || operation->kind > PVIR_FP_RSQRTS ||
         operation->rounding < PVIR_ROUND_DEFAULT ||
         operation->rounding > PVIR_ROUND_ROD) {
         return false;
@@ -1104,8 +1113,10 @@ static bool valid_fp_operation(const PvirInstruction *instruction)
         operation->operands[0] == PVIR_NO_VALUE) {
         return false;
     }
-    if (operation->kind == PVIR_FP_SQRT) {
-        /* SQRT is unary: the second operand slot must be unused. */
+    if (operation->kind == PVIR_FP_SQRT ||
+        operation->kind == PVIR_FP_RECPE ||
+        operation->kind == PVIR_FP_RSQRTE) {
+        /* SQRT/RECPE/RSQRTE are unary: the second operand slot must be unused. */
         return operation->operands[1] == PVIR_NO_VALUE;
     }
     if (operation->operand_kinds[1] != PVIR_OPERAND_VECTOR &&
@@ -1132,6 +1143,63 @@ static bool valid_index_operation(const PvirInstruction *instruction)
         return false;
     }
     /* step_value == PVIR_NO_VALUE means the constant 1. */
+    return true;
+}
+
+static bool valid_reduce_operation(const PvirInstruction *instruction)
+{
+    const PvirReduceOperation *operation = &instruction->operation.reduce;
+    size_t lanes;
+    size_t result_lanes;
+
+    if (!valid_plain_vector_facts(instruction, &operation->type,
+                                  &operation->predicate, &lanes) ||
+        operation->type.kind == PVIR_ELEMENT_MASK ||
+        pvir_vector_type_lanes(operation->result_type, &result_lanes) !=
+            PVIR_STATUS_OK ||
+        result_lanes != 1 ||
+        operation->destination == PVIR_NO_VALUE ||
+        operation->source == PVIR_NO_VALUE ||
+        operation->kind < PVIR_REDUCE_ADD ||
+        operation->kind > PVIR_REDUCE_AND) {
+        return false;
+    }
+    if (operation->type.kind == PVIR_ELEMENT_FLOAT) {
+        return instruction->effects.fp_exceptions ==
+               PVIR_FP_EXCEPTIONS_ACTIVE_LANES_ONLY;
+    }
+    return instruction->effects.fp_exceptions == PVIR_FP_EXCEPTIONS_NONE;
+}
+
+static bool valid_permute_operation(const PvirInstruction *instruction)
+{
+    const PvirPermuteOperation *operation = &instruction->operation.permute;
+    size_t lanes;
+
+    if (instruction->effects.memory.access != PVIR_MEMORY_NONE ||
+        instruction->effects.fault.behavior != PVIR_FAULT_NONE ||
+        instruction->effects.side_effects != 0 ||
+        instruction->effects.fp_exceptions != PVIR_FP_EXCEPTIONS_NONE ||
+        pvir_vector_type_lanes(operation->type, &lanes) != PVIR_STATUS_OK ||
+        operation->type.kind == PVIR_ELEMENT_MASK ||
+        operation->destination == PVIR_NO_VALUE ||
+        operation->operand_count == 0 || operation->operand_count > 3 ||
+        operation->kind < PVIR_PERMUTE_TBL ||
+        operation->kind > PVIR_PERMUTE_COMPACT ||
+        !valid_inactive_policy(operation->inactive_policy,
+                               operation->merge_value, false)) {
+        return false;
+    }
+    if (operation->has_predicate &&
+        (operation->predicate.lanes != lanes ||
+         pvir_predicate_validate(&operation->predicate) != PVIR_STATUS_OK)) {
+        return false;
+    }
+    for (uint8_t i = 0; i < operation->operand_count; i++) {
+        if (operation->operands[i] == PVIR_NO_VALUE) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -1188,6 +1256,16 @@ PvirStatus pvir_instruction_validate(const PvirInstruction *instruction)
     }
     if (instruction->opcode == PVIR_OP_LANE_INDEX) {
         return valid_index_operation(instruction)
+                   ? PVIR_STATUS_OK
+                   : PVIR_STATUS_INVALID_ARGUMENT;
+    }
+    if (instruction->opcode == PVIR_OP_REDUCE) {
+        return valid_reduce_operation(instruction)
+                   ? PVIR_STATUS_OK
+                   : PVIR_STATUS_INVALID_ARGUMENT;
+    }
+    if (instruction->opcode == PVIR_OP_PERMUTE) {
+        return valid_permute_operation(instruction)
                    ? PVIR_STATUS_OK
                    : PVIR_STATUS_INVALID_ARGUMENT;
     }

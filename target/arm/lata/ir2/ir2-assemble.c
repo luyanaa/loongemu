@@ -2,6 +2,9 @@
 // #include "translate.h"
 #include "ir2-la-assemble.h"
 
+/* Weak hook: embedders may want to observe the encoded words. */
+extern void lata_ir2_debug(unsigned int opcode, unsigned int word);
+
 // void set_operand_into_instruction(GM_OPERAND_TYPE operand_type,
 //                                   IR2_OPND *p_opnd, uint32 *result);
 
@@ -42,6 +45,7 @@ uint32 ir2_assemble(IR2_INST *ir2){
         }
     }
 
+    lata_ir2_debug(ir2->_opcode, ins);
     return ins;
 }
 

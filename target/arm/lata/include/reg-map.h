@@ -195,8 +195,8 @@ extern const int reg_fpr_map[];
 extern const int reg_xmm_map[];
 extern const int reg_statics_map[];
 extern const int reg_itemp_map[];
-extern const int reg_ftemp_map[];
+extern int reg_ftemp_map[];
 extern const int reg_itemp_reverse_map[];
-extern const int reg_ftemp_reverse_map[];
+extern int reg_ftemp_reverse_map[];
 
 #endif

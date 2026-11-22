@@ -78,7 +78,84 @@ typedef struct CPUARMState {
     } sve;
     /* Transient lowerer cache storage; never architectural or context-saved. */
     _Alignas(16) uint8_t sve_expanded_mask_scratch[ARM_SVE_MAX_VL_BYTES];
+    /* Architectural SVE access control & standalone runtime trap/fault state. */
+    struct {
+        uint64_t cpacr_el1;
+        uint64_t cptr_el2;
+        uint64_t cptr_el3;
+        uint32_t svcr;
+        bool access_control_enforced;
+        bool cptr_el3_enforced;
+        uint64_t fault_mem_limit; /* 0 = default 0x10000000 bare-metal RAM limit */
+        uint32_t last_exception_index;
+        uint32_t last_exception_syndrome;
+        uint32_t last_exception_target_el;
+    } sve_ctrl;
 } CPUARMState;
+
+static inline void arm_sve_set_cpacr_el1_zen(CPUARMState *env, unsigned zen)
+{
+    if (env == NULL) {
+        return;
+    }
+    env->sve_ctrl.cpacr_el1 =
+        (env->sve_ctrl.cpacr_el1 & ~(UINT64_C(3) << 16)) |
+        ((uint64_t)(zen & 3u) << 16);
+    env->sve_ctrl.access_control_enforced = true;
+}
+
+static inline void arm_sve_set_cptr_el2_tz(CPUARMState *env, bool trap_sve)
+{
+    if (env == NULL) {
+        return;
+    }
+    if (trap_sve) {
+        env->sve_ctrl.cptr_el2 |= (UINT64_C(1) << 8);
+    } else {
+        env->sve_ctrl.cptr_el2 &= ~(UINT64_C(1) << 8);
+    }
+    env->sve_ctrl.access_control_enforced = true;
+}
+
+static inline void arm_sve_set_cptr_el3_ez(CPUARMState *env, bool enable_sve)
+{
+    if (env == NULL) {
+        return;
+    }
+    if (enable_sve) {
+        env->sve_ctrl.cptr_el3 |= (UINT64_C(1) << 8);
+    } else {
+        env->sve_ctrl.cptr_el3 &= ~(UINT64_C(1) << 8);
+    }
+    env->sve_ctrl.cptr_el3_enforced = true;
+    env->sve_ctrl.access_control_enforced = true;
+}
+
+/*
+ * Evaluate the target exception level (0 = allowed, 1..3 = EL to trap to)
+ * from CPACR_EL1.ZEN, CPTR_EL2.TZ, and CPTR_EL3.EZ.
+ */
+static inline int arm_sve_evaluate_excp_el(const CPUARMState *env,
+                                           int current_el)
+{
+    if (env == NULL || !env->sve_ctrl.access_control_enforced) {
+        return 0;
+    }
+    if (current_el <= 1) {
+        unsigned zen = (unsigned)((env->sve_ctrl.cpacr_el1 >> 16) & 3u);
+        if (zen == 0u || zen == 2u || (current_el == 0 && zen == 1u)) {
+            return 1;
+        }
+    }
+    if (current_el <= 2 && (env->sve_ctrl.cptr_el2 & (UINT64_C(1) << 8))) {
+        return 2;
+    }
+    if (env->sve_ctrl.cptr_el3_enforced &&
+        !(env->sve_ctrl.cptr_el3 & (UINT64_C(1) << 8))) {
+        return 3;
+    }
+    return 0;
+}
 
 #define ARM_VFP_FPSCR 1
 #undef env_archcpu

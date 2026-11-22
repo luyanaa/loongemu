@@ -390,15 +390,356 @@ static void test_lasx_dispatch_gate(void)
           A64_SVE_IR2_READY);
 }
 
+static void test_fp_builder(void)
+{
+    A64SVEPvirBuilder builder;
+    A64SVEIR1Instruction source;
+    PvirInstruction instruction;
+    const PvirVectorOperation *op;
+    PvirValueId z0_before;
+
+    a64_sve_pvir_builder_init(&builder);
+
+    source = decode(0x65808020u); /* FADD z0.s,p0/m,z0.s,z1.s */
+    CHECK(a64_sve_build_pvir(&builder, &source, 256, &instruction) ==
+          PVIR_STATUS_OK);
+    CHECK(instruction.opcode == PVIR_OP_ADD);
+    op = &instruction.operation.vector;
+    CHECK(op->type.kind == PVIR_ELEMENT_FLOAT);
+    CHECK(op->type.signedness == PVIR_SIGNLESS);
+    CHECK(op->type.element_bits == 32);
+    CHECK(op->type.vector_bits == 256);
+    CHECK(op->predicate.lanes == 8);
+    CHECK(op->predicate.form == PVIR_PREDICATE_VECTOR_MASK);
+    CHECK(op->inactive_policy == PVIR_INACTIVE_MERGE);
+    CHECK(op->merge_value != PVIR_NO_VALUE);
+    CHECK(op->merge_value == op->operands[0]);
+    /* Inactive lanes must not raise FP exceptions or touch FPSR. */
+    CHECK(instruction.effects.fp_exceptions ==
+          PVIR_FP_EXCEPTIONS_ACTIVE_LANES_ONLY);
+    CHECK(instruction.effects.memory.access == PVIR_MEMORY_NONE);
+    CHECK(instruction.effects.fault.behavior == PVIR_FAULT_NONE);
+
+    source = decode(0x658d88e6u); /* FDIV z6.s,p2/m,z6.s,z7.s */
+    CHECK(a64_sve_build_pvir(&builder, &source, 512, &instruction) ==
+          PVIR_STATUS_OK);
+    CHECK(instruction.opcode == PVIR_OP_DIV);
+    CHECK(instruction.operation.vector.type.element_bits == 32);
+    CHECK(instruction.operation.vector.predicate.lanes == 16);
+    CHECK(instruction.effects.fp_exceptions ==
+          PVIR_FP_EXCEPTIONS_ACTIVE_LANES_ONLY);
+
+    source = decode(0x65c18462u); /* FSUB z2.d,p1/m,z2.d,z3.d */
+    CHECK(a64_sve_build_pvir(&builder, &source, 256, &instruction) ==
+          PVIR_STATUS_OK);
+    CHECK(instruction.opcode == PVIR_OP_SUB);
+    CHECK(instruction.operation.vector.type.element_bits == 64);
+    CHECK(instruction.operation.vector.predicate.lanes == 4);
+
+    /* Element size outside {32,64} is rejected, never silently widened. */
+    source = decode(0x65808020u);
+    source.arg.f_sve_fadd.element_bits = 16;
+    CHECK(a64_sve_build_pvir(&builder, &source, 256, &instruction) ==
+          PVIR_STATUS_INVALID_ARGUMENT);
+
+    /* FABS/FNEG are sign-bit ops: BITS + immediate, never FLOAT. */
+    source = decode(0x049ca020u); /* FABS z0.s,p0/m,z1.s */
+    z0_before = builder.z_values[0];
+    CHECK(a64_sve_build_pvir(&builder, &source, 256, &instruction) ==
+          PVIR_STATUS_OK);
+    CHECK(instruction.opcode == PVIR_OP_AND);
+    op = &instruction.operation.vector;
+    CHECK(op->type.kind == PVIR_ELEMENT_BITS);
+    CHECK(op->type.element_bits == 32);
+    CHECK(op->type.vector_bits == 256);
+    CHECK(op->predicate.lanes == 8);
+    CHECK(op->inactive_policy == PVIR_INACTIVE_MERGE);
+    CHECK(op->merge_value == z0_before);
+    CHECK(op->operand_count == 2);
+    CHECK(op->operand_kinds[0] == PVIR_OPERAND_VECTOR);
+    CHECK(op->operand_kinds[1] == PVIR_OPERAND_IMMEDIATE);
+    CHECK(op->operand_immediates[1] == UINT64_C(0x7fffffff));
+    CHECK(instruction.effects.fp_exceptions == PVIR_FP_EXCEPTIONS_NONE);
+
+    source = decode(0x04dda020u); /* FNEG z0.d,p0/m,z1.d */
+    CHECK(a64_sve_build_pvir(&builder, &source, 512, &instruction) ==
+          PVIR_STATUS_OK);
+    CHECK(instruction.opcode == PVIR_OP_XOR);
+    CHECK(instruction.operation.vector.type.element_bits == 64);
+    CHECK(instruction.operation.vector.operand_immediates[1] ==
+          UINT64_C(0x8000000000000000));
+    CHECK(instruction.effects.fp_exceptions == PVIR_FP_EXCEPTIONS_NONE);
+
+    source = decode(0x049ca020u);
+    source.arg.f_sve_fabs.element_bits = 16;
+    CHECK(a64_sve_build_pvir(&builder, &source, 256, &instruction) ==
+          PVIR_STATUS_INVALID_ARGUMENT);
+}
+
+static void test_ptrue_patterns(void)
+{
+    struct {
+        uint8_t pattern;
+        uint32_t vl_bits;
+        uint8_t element_bits;
+        PvirPredicateForm form;
+        size_t active_lanes;
+    } cases[] = {
+        /* VL=256: .b 32 lanes, .s 8 lanes, .d 4 lanes. */
+        { 0x1f, 256, 8, PVIR_PREDICATE_ALL_TRUE, 32 },
+        { 0x00, 256, 8, PVIR_PREDICATE_ALL_TRUE, 32 },
+        { 0x00, 256, 32, PVIR_PREDICATE_ALL_TRUE, 8 },
+        { 0x01, 256, 8, PVIR_PREDICATE_PREFIX, 1 },
+        { 0x00, 256, 64, PVIR_PREDICATE_ALL_TRUE, 4 },
+        { 0x04, 256, 32, PVIR_PREDICATE_PREFIX, 4 },
+        { 0x04, 128, 64, PVIR_PREDICATE_ALL_FALSE, 0 }, /* 2 lanes < VL4 */
+        { 0x02, 128, 64, PVIR_PREDICATE_ALL_TRUE, 2 }, /* VL2 == 2 lanes */
+        { 0x09, 1024, 32, PVIR_PREDICATE_PREFIX, 16 }, /* VL16 < 32 lanes */
+        { 0x0a, 1024, 32, PVIR_PREDICATE_ALL_TRUE, 32 }, /* VL32 == 32 */
+        /* VL256 needs 256 elements; a 128-lane VL cannot satisfy it. */
+        { 0x0d, 1024, 8, PVIR_PREDICATE_ALL_FALSE, 0 },
+        { 0x1d, 256, 8, PVIR_PREDICATE_ALL_TRUE, 32 }, /* 32 % 4 == 0 */
+        { 0x1e, 256, 8, PVIR_PREDICATE_PREFIX, 30 },   /* 32 - 32%3 */
+        { 0x10, 256, 8, PVIR_PREDICATE_ALL_FALSE, 0 }, /* reserved uimm5 */
+    };
+    A64SVEPvirBuilder builder;
+    A64SVEIR1Instruction source;
+    PvirInstruction instruction;
+    const PvirPredicateGeneratorOperation *generator;
+    const PvirVectorOperation *op;
+    PvirValueId z0_before;
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        uint32_t word = 0x2518e000u; /* PTRUE p0.b, all */
+        word |= (uint32_t)cases[i].pattern << 5;
+        word |= (uint32_t)(cases[i].element_bits == 8    ? 0x0
+                           : cases[i].element_bits == 16 ? 0x400000u
+                           : cases[i].element_bits == 32 ? 0x800000u
+                                                         : 0xc00000u);
+
+        a64_sve_pvir_builder_init(&builder);
+        source = decode(word);
+        CHECK(a64_sve_build_pvir(&builder, &source, cases[i].vl_bits,
+                                 &instruction) == PVIR_STATUS_OK);
+        generator = &instruction.operation.predicate_generator;
+        CHECK(generator->form == cases[i].form);
+        CHECK(generator->active_lanes == cases[i].active_lanes);
+    }
+
+    /* DUP: scalar operand broadcast across an all-true predicate. */
+    a64_sve_pvir_builder_init(&builder);
+    source = decode(0x05a03820u); /* MOV z0.s, w1 */
+    CHECK(a64_sve_build_pvir(&builder, &source, 256, &instruction) ==
+          PVIR_STATUS_OK);
+    CHECK(instruction.opcode == PVIR_OP_BROADCAST);
+    op = &instruction.operation.vector;
+    CHECK(op->type.element_bits == 32);
+    CHECK(op->operand_count == 1);
+    CHECK(op->operand_kinds[0] == PVIR_OPERAND_SCALAR);
+    CHECK(op->operands[0] == A64_SVE_PVIR_GPR_VALUE_BASE + 1);
+    CHECK(op->predicate.form == PVIR_PREDICATE_ALL_TRUE);
+    CHECK(op->predicate.lanes == 8);
+
+    /* NOT: PVIR_OP_NOT with one vector operand and merge policy. */
+    a64_sve_pvir_builder_init(&builder);
+    source = decode(0x049ea020u); /* NOT z0.s,p0/m,z1.s */
+    z0_before = builder.z_values[0];
+    CHECK(a64_sve_build_pvir(&builder, &source, 256, &instruction) ==
+          PVIR_STATUS_OK);
+    CHECK(instruction.opcode == PVIR_OP_NOT);
+    op = &instruction.operation.vector;
+    CHECK(op->type.kind == PVIR_ELEMENT_BITS);
+    CHECK(op->type.element_bits == 32);
+    CHECK(op->operand_count == 1);
+    CHECK(op->operand_kinds[0] == PVIR_OPERAND_VECTOR);
+    CHECK(op->merge_value == z0_before);
+    CHECK(op->predicate.lanes == 8);
+    CHECK(instruction.effects.fp_exceptions == PVIR_FP_EXCEPTIONS_NONE);
+
+    /* PFALSE: constant generator with zero active lanes. */
+    a64_sve_pvir_builder_init(&builder);
+    source = decode(0x2518e400u);
+    CHECK(a64_sve_build_pvir(&builder, &source, 256, &instruction) ==
+          PVIR_STATUS_OK);
+    CHECK(instruction.operation.predicate_generator.form ==
+          PVIR_PREDICATE_ALL_FALSE);
+    CHECK(instruction.operation.predicate_generator.active_lanes == 0);
+
+    /* PTRUES carries a PSTATE write; PTRUE does not. */
+    a64_sve_pvir_builder_init(&builder);
+    source = decode(0x2519e3e0u); /* PTRUES p0.b, all */
+    CHECK(a64_sve_build_pvir(&builder, &source, 256, &instruction) ==
+          PVIR_STATUS_OK);
+    CHECK(instruction.operation.predicate_generator.status_state.present);
+    CHECK(instruction.operation.predicate_generator.status_state.state_id ==
+          A64_SVE_PVIR_STATUS_STATE);
+
+    a64_sve_pvir_builder_init(&builder);
+    source = decode(0x2518e3e0u); /* PTRUE p0.b, all */
+    CHECK(a64_sve_build_pvir(&builder, &source, 256, &instruction) ==
+          PVIR_STATUS_OK);
+    CHECK(!instruction.operation.predicate_generator.status_state.present);
+
+    /* VL32 at exactly 32 lanes is a prefix, not all-true. */
+    a64_sve_pvir_builder_init(&builder);
+    source = decode(0x2518e3e0u);
+    source.arg.f_sve_ptrue.pattern = 0x0a;
+    source.arg.f_sve_ptrue.element_bits = 32;
+    CHECK(a64_sve_build_pvir(&builder, &source, 1024, &instruction) ==
+          PVIR_STATUS_OK);
+    CHECK(instruction.operation.predicate_generator.active_lanes == 32);
+}
+
+
+static void test_contiguous_widths(void)
+{
+    A64SVEPvirBuilder builder;
+    A64SVEIR1Instruction source;
+    PvirInstruction instruction;
+    const PvirVectorOperation *op;
+
+    /* LD1W {z0.s},p0/z,[x0] at VL=256: 8 lanes of 32 bits from 32-bit memory. */
+    a64_sve_pvir_builder_init(&builder);
+    source = decode(0xa540a000u);
+    CHECK(a64_sve_build_pvir(&builder, &source, 256, &instruction) ==
+          PVIR_STATUS_OK);
+    CHECK(instruction.opcode == PVIR_OP_LOAD);
+    op = &instruction.operation.vector;
+    CHECK(op->type.kind == PVIR_ELEMENT_INTEGER);
+    CHECK(op->type.signedness == PVIR_UNSIGNED);
+    CHECK(op->type.element_bits == 32);
+    CHECK(op->memory_element_bits == 32);
+    CHECK(op->predicate.lanes == 8);
+    CHECK(op->inactive_policy == PVIR_INACTIVE_ZERO);
+    CHECK(instruction.effects.memory.access == PVIR_MEMORY_READ);
+
+    /* ST1D {z0.d},p0,[x0]: 4 lanes, 64-bit memory, no merge value. */
+    a64_sve_pvir_builder_init(&builder);
+    source = decode(0xe5e0e000u);
+    CHECK(a64_sve_build_pvir(&builder, &source, 256, &instruction) ==
+          PVIR_STATUS_OK);
+    CHECK(instruction.opcode == PVIR_OP_STORE);
+    op = &instruction.operation.vector;
+    CHECK(op->type.element_bits == 64);
+    CHECK(op->memory_element_bits == 64);
+    CHECK(op->predicate.lanes == 4);
+    CHECK(op->inactive_policy == PVIR_INACTIVE_NOT_APPLICABLE);
+    CHECK(instruction.effects.memory.access == PVIR_MEMORY_WRITE);
+
+    /* LD1SB {z0.d}: sign extension is recorded as SIGNED integer elements. */
+    a64_sve_pvir_builder_init(&builder);
+    source = decode(0xa580a000u);
+    CHECK(a64_sve_build_pvir(&builder, &source, 256, &instruction) ==
+          PVIR_STATUS_OK);
+    CHECK(instruction.opcode == PVIR_OP_LOAD);
+    op = &instruction.operation.vector;
+    CHECK(op->type.signedness == PVIR_SIGNED);
+    CHECK(op->type.element_bits == 64);
+    CHECK(op->memory_element_bits == 8);
+    CHECK(op->predicate.lanes == 4);
+
+    /* A store can never carry sign extension. */
+    a64_sve_pvir_builder_init(&builder);
+    source = decode(0xe5e0e000u); /* ST1D {z0.d} */
+    source.arg.f_sve_contiguous.sign_extend = true;
+    CHECK(a64_sve_build_pvir(&builder, &source, 256, &instruction) ==
+          PVIR_STATUS_INVALID_ARGUMENT);
+
+    /* A memory width wider than the vector element is rejected. */
+    a64_sve_pvir_builder_init(&builder);
+    source = decode(0xa5e0a000u); /* LD1D {z0.d} */
+    source.arg.f_sve_contiguous.element_bits = 32;
+    CHECK(a64_sve_build_pvir(&builder, &source, 256, &instruction) ==
+          PVIR_STATUS_INVALID_ARGUMENT);
+}
+
+static void test_expanded_sve_pvir_and_const_pred(void)
+{
+    A64SVEPvirBuilder builder;
+    A64SVEIR1Instruction source;
+    PvirInstruction instruction;
+
+    /* PTRUE records constant predicate bytes in known_preg_valid_mask and invalidates on WHILELO. */
+    a64_sve_pvir_builder_init(&builder);
+    source = decode(0x2518e3e0u); /* PTRUE p0.b, all */
+    CHECK(a64_sve_build_pvir(&builder, &source, 256, &instruction) == PVIR_STATUS_OK);
+    CHECK((builder.known_preg_valid_mask & 1u) != 0);
+    CHECK(builder.known_preg_bytes[0][0] == 0xffu);
+    CHECK(builder.known_preg_bytes[0][3] == 0xffu);
+
+    /* WRFFR, predicated RDFFR, and COMPACT */
+    source = decode(0x25289040u); /* wrffr p2.b */
+    CHECK(a64_sve_build_pvir(&builder, &source, 256, &instruction) == PVIR_STATUS_OK);
+    CHECK(instruction.opcode == PVIR_OP_ARCH_STATE);
+
+    source = decode(0x2558f020u); /* rdffrs p0.b, p1/z */
+    CHECK(a64_sve_build_pvir(&builder, &source, 256, &instruction) == PVIR_STATUS_OK);
+    CHECK(instruction.opcode == PVIR_OP_PREDICATE_GENERATE);
+    CHECK((builder.known_preg_valid_mask & 1u) == 0); /* invalidated by dynamic write */
+
+    /* PFALSE records all-zero constant predicate bytes */
+    source = decode(0x2518e400u); /* pfalse p0.b */
+    CHECK(a64_sve_build_pvir(&builder, &source, 256, &instruction) == PVIR_STATUS_OK);
+    CHECK((builder.known_preg_valid_mask & 1u) != 0);
+    CHECK(builder.known_preg_bytes[0][0] == 0x00u);
+
+    /* Expanded instruction builders produce valid PVIR ops. */
+    static const uint32_t words[] = {
+        0x05a18440u, /* compact z0.s, p1, z2.s */
+        0x2550c440u, /* ptest p1, p2.b */
+        0x25a21420u, /* whilelt p0.s, x1, x2 */
+        0x25a08440u, /* cntp x0, p1, p2.s */
+        0x04b2e3e0u, /* incw x0, all, mul #3 */
+        0x25104440u, /* brka p0.b, p1/z, p2.b */
+        0x2558c020u, /* pfirst p0.b, p1, p0.b */
+        0x2599c420u, /* pnext p0.s, p1, p0.s */
+        0x05a0a440u, /* lasta w0, p1, z2.s */
+        0x25034440u, /* and p0.b, p1/z, p2.b, p3.b */
+        0xa5434440u, /* ld1w scalar+scalar */
+        0xa520e440u, /* ld2w */
+        0x8541c440u, /* ld1rw */
+        0xa5012440u, /* ld1rqw */
+        0x85234440u, /* gather ld1w */
+        0xa501e440u, /* ldnt1w */
+        0x65a30440u, /* fmla */
+        0x65858440u, /* fminnm */
+        0x65836440u, /* fcmeq */
+        0x65caa440u, /* fcvt */
+        0x658e3040u, /* frecpe */
+        0x65802440u, /* faddv */
+        0x04812440u, /* uaddv */
+        0x04a21020u, /* sqadd */
+        0x04639c20u, /* lsl #3 */
+        0x0499a440u, /* clz */
+        0x05b83820u, /* rev */
+        0x05a23020u, /* tbl */
+        0x04a24020u, /* index */
+        0x45c27020u, /* smullb */
+        0x058000e0u, /* and #0xff */
+        0x2483a440u, /* cmpeq */
+        0x05a3c440u, /* sel */
+        0x04940440u, /* sdiv */
+    };
+    for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); ++i) {
+        a64_sve_pvir_builder_init(&builder);
+        source = decode(words[i]);
+        CHECK(a64_sve_build_pvir(&builder, &source, 256, &instruction) == PVIR_STATUS_OK);
+    }
+}
+
 int main(void)
 {
     test_ptrue_add_chain();
     test_sub_builder();
     test_mul_builder();
+    test_fp_builder();
+    test_ptrue_patterns();
+    test_contiguous_widths();
     test_prefix_and_lane_compare_producers();
     test_ffr_builder_and_fault_loads();
     test_dynamic_predicate_cache_versions();
     test_lasx_dispatch_gate();
+    test_expanded_sve_pvir_and_const_pred();
 
     if (failures != 0) {
         fprintf(stderr, "SVE PVIR: %u/%u checks failed\n", failures,

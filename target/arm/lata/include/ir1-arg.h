@@ -395,10 +395,111 @@ typedef struct {
     bool ffr_clears_from_fault_boundary;
 } arg_sve_effect_intent;
 
+typedef enum {
+    SVE_PRED_OP_AND = 0,
+    SVE_PRED_OP_ORR,
+    SVE_PRED_OP_EOR,
+    SVE_PRED_OP_BIC,
+    SVE_PRED_OP_ORN,
+    SVE_PRED_OP_NOR,
+    SVE_PRED_OP_NAND,
+    SVE_PRED_OP_SEL,
+    SVE_PRED_OP_PTEST,
+    SVE_PRED_OP_BRKA,
+    SVE_PRED_OP_BRKB,
+    SVE_PRED_OP_BRKN,
+    SVE_PRED_OP_PFIRST,
+    SVE_PRED_OP_PNEXT,
+} SvePredSubop;
+
+typedef enum {
+    SVE_CNT_SUBOP_CNTP = 0,
+    SVE_CNT_SUBOP_CNT,
+    SVE_CNT_SUBOP_INC,
+    SVE_CNT_SUBOP_DEC,
+    SVE_CNT_SUBOP_SQINC,
+    SVE_CNT_SUBOP_UQINC,
+    SVE_CNT_SUBOP_SQDEC,
+    SVE_CNT_SUBOP_UQDEC,
+} SveCntSubop;
+
+typedef enum {
+    SVE_FP_EXT_FMLA = 0,
+    SVE_FP_EXT_FMLS,
+    SVE_FP_EXT_FNMLA,
+    SVE_FP_EXT_FNMLS,
+    SVE_FP_EXT_FMINNM,
+    SVE_FP_EXT_FMAXNM,
+    SVE_FP_EXT_FMIN,
+    SVE_FP_EXT_FMAX,
+    SVE_FP_EXT_FSQRT,
+    SVE_FP_EXT_FRECPE,
+    SVE_FP_EXT_FRSQRTE,
+    SVE_FP_EXT_FRECPS,
+    SVE_FP_EXT_FRSQRTS,
+} SveFpExtSubop;
+
+typedef enum {
+    SVE_FCVT_F_TO_F = 0,
+    SVE_FCVT_F_TO_S,
+    SVE_FCVT_F_TO_U,
+    SVE_FCVT_S_TO_F,
+    SVE_FCVT_U_TO_F,
+} SveFcvtMode;
+
+typedef enum {
+    SVE_SHIFT_IMM_LSL = 0,
+    SVE_SHIFT_IMM_LSR,
+    SVE_SHIFT_IMM_ASR,
+    SVE_SHIFT_IMM_ASRD,
+} SveShiftImmSubop;
+
+typedef enum {
+    SVE_UNARY_CLZ = 0,
+    SVE_UNARY_CLS,
+    SVE_UNARY_CNT,
+    SVE_UNARY_RBIT,
+    SVE_UNARY_ABS,
+    SVE_UNARY_NEG,
+    SVE_UNARY_CNOT,
+    SVE_UNARY_SXTB,
+    SVE_UNARY_SXTH,
+    SVE_UNARY_SXTW,
+    SVE_UNARY_UXTB,
+    SVE_UNARY_UXTH,
+    SVE_UNARY_UXTW,
+} SveUnarySubop;
+
+typedef enum {
+    SVE_IMM_BIN_AND = 0,
+    SVE_IMM_BIN_ORR,
+    SVE_IMM_BIN_EOR,
+    SVE_IMM_BIN_ADD,
+    SVE_IMM_BIN_SUB,
+    SVE_IMM_BIN_SUBR,
+    SVE_IMM_BIN_MUL,
+    SVE_IMM_BIN_DUP,
+} SveImmBinSubop;
+
+typedef enum {
+    SVE_WMUL_MULL = 0,
+    SVE_WMUL_MLA,
+    SVE_WMUL_MLS,
+} SveWmulSubop;
+
+typedef enum {
+    SVE_IDIV_SDIV = 0,
+    SVE_IDIV_UDIV,
+    SVE_IDIV_SDIVR,
+    SVE_IDIV_UDIVR,
+} SveIdivSubop;
+
 typedef struct {
     uint8_t pd;
     uint8_t element_bits;
     uint8_t pattern;
+    /* PTRUES additionally writes PSTATE.NZCV from the PredTest result. */
+    bool setflags;
     arg_sve_effect_intent effects;
 } arg_sve_ptrue;
 
@@ -408,6 +509,9 @@ typedef struct {
     uint8_t rm;
     uint8_t element_bits;
     uint8_t scalar_bits;
+    PvirCompareCondition cond;
+    bool is_conflict;
+    bool conflict_wr;
     arg_sve_effect_intent effects;
 } arg_sve_whilelo;
 
@@ -416,11 +520,41 @@ typedef struct {
     uint8_t pg;
     uint8_t zm;
     uint8_t element_bits;
+    bool is_signed;
     arg_sve_effect_intent effects;
 } arg_sve_integer_binary;
 typedef arg_sve_integer_binary arg_sve_add;
+typedef arg_sve_integer_binary arg_sve_orr;
+typedef arg_sve_integer_binary arg_sve_and;
+typedef arg_sve_integer_binary arg_sve_eor;
+typedef arg_sve_integer_binary arg_sve_lsl;
+typedef arg_sve_integer_binary arg_sve_lsr;
+typedef arg_sve_integer_binary arg_sve_asr;
 typedef arg_sve_integer_binary arg_sve_sub;
+typedef arg_sve_integer_binary arg_sve_smax;
+typedef arg_sve_integer_binary arg_sve_umax;
+typedef arg_sve_integer_binary arg_sve_smin;
+typedef arg_sve_integer_binary arg_sve_umin;
 typedef arg_sve_integer_binary arg_sve_mul;
+/* Zdn is both the addend source and the merge value; /M is the only policy. */
+typedef arg_sve_integer_binary arg_sve_fp_binary;
+typedef arg_sve_fp_binary arg_sve_fadd;
+typedef arg_sve_fp_binary arg_sve_fsub;
+typedef arg_sve_fp_binary arg_sve_fmul;
+typedef arg_sve_fp_binary arg_sve_fdiv;
+/* Unary predicated sign-bit ops: Zd = op(Zn), inactive lanes hold old Zd. */
+typedef arg_sve_integer_binary arg_sve_fp_unary;
+typedef arg_sve_fp_unary arg_sve_fabs;
+typedef arg_sve_fp_unary arg_sve_fneg;
+typedef arg_sve_fp_unary arg_sve_int_unary;
+typedef arg_sve_int_unary arg_sve_not;
+
+typedef struct {
+    uint8_t zd;
+    uint8_t rn;          /* guest GPR holding the scalar to broadcast */
+    uint8_t element_bits; /* 8/16/32/64 */
+    arg_sve_effect_intent effects;
+} arg_sve_dup;
 
 typedef struct {
     uint8_t zt;
@@ -429,13 +563,20 @@ typedef struct {
     uint8_t element_bits;
     uint8_t memory_bits;
     int8_t immediate_vl;
+    /* LD1SB/LD1SH/LD1SW sign-extend the memory element into the lane. */
+    bool sign_extend;
     bool base_is_sp;
     arg_sve_effect_intent effects;
 } arg_sve_contiguous;
 
 typedef struct {
     uint8_t pd;
+    uint8_t pg;
+    uint8_t pn;
     bool has_pd;
+    bool predicated;
+    bool setflags;
+    bool is_write;
     arg_sve_effect_intent effects;
 } arg_sve_ffr;
 
@@ -446,6 +587,7 @@ typedef struct {
     uint8_t rm;
     uint8_t element_bits;
     uint8_t memory_bits;
+    bool sign_extend;
     bool base_is_sp;
     bool has_index;
     arg_sve_effect_intent effects;
@@ -458,9 +600,125 @@ typedef struct {
     uint8_t element_bits;
     uint8_t memory_bits;
     int8_t immediate_vl;
+    bool sign_extend;
     bool base_is_sp;
     arg_sve_effect_intent effects;
 } arg_sve_nonfault_load;
+
+typedef struct {
+    uint8_t pd;
+    uint8_t pg;
+    uint8_t pn;
+    uint8_t pm;
+    uint8_t element_bits;
+    uint8_t subop; /* AND/ORR/EOR/BIC/ORN/NOR/NAND/SEL / BRKA/BRKB/BRKN / PTEST/PFIRST/PNEXT */
+    bool merge;
+    bool setflags;
+    arg_sve_effect_intent effects;
+} arg_sve_pred_op;
+
+typedef struct {
+    uint8_t rd;
+    uint8_t pg;
+    uint8_t pn;
+    uint8_t element_bits;
+    uint8_t pattern;
+    uint8_t imm_mul;
+    uint8_t subop; /* 0=CNTP, 1=CNTx, 2=INCx, 3=DECx, 4=SQINCx, 5=UQINCx, 6=SQDECx, 7=UQDECx */
+    bool is_64;
+    bool is_signed;
+    arg_sve_effect_intent effects;
+} arg_sve_cnt;
+
+typedef struct {
+    uint8_t rd_zd;
+    uint8_t pg;
+    uint8_t zm;
+    uint8_t element_bits;
+    bool is_after;      /* LASTA / CLASTA vs LASTB / CLASTB */
+    bool is_cond;       /* CLAST* vs LAST* */
+    bool dst_is_vector; /* true -> Zreg / FP Vreg, false -> X/W GPR */
+    arg_sve_effect_intent effects;
+} arg_sve_last;
+
+typedef enum {
+    SVE_MEM_SCALAR_REG = 0,
+    SVE_MEM_STRUCT_IMM,
+    SVE_MEM_STRUCT_REG,
+    SVE_MEM_REP_IMM,
+    SVE_MEM_REP_QUAD,
+    SVE_MEM_GATHER_VEC_BASE,
+    SVE_MEM_GATHER_VEC_OFFSET,
+    SVE_MEM_NT_IMM,
+    SVE_MEM_NT_REG,
+} SveMemAddrKind;
+
+typedef struct {
+    uint8_t zt;
+    uint8_t pg;
+    uint8_t rn;
+    uint8_t rm;
+    uint8_t nregs; /* 1..4 for LD1..LD4 */
+    uint8_t element_bits;
+    uint8_t memory_bits;
+    int32_t imm;
+    bool sign_extend;
+    bool base_is_sp;
+    bool is_load;
+    bool scaled;
+    bool offset_is_signed; /* sxtw vs uxtw/lsl */
+    bool offset_is_64;     /* Zm.D vs Zm.S */
+    SveMemAddrKind kind;
+    arg_sve_effect_intent effects;
+} arg_sve_mem_ext;
+
+typedef struct {
+    uint8_t zd;
+    uint8_t pg;
+    uint8_t zn;
+    uint8_t zm;
+    uint8_t za;
+    uint8_t element_bits;
+    uint8_t subop; /* FMLA/FMLS/FNMLA/FNMLS/FMAD/FMSB/FNMAD/FNMSB / FMIN/FMAX/FMINNM/FMAXNM / FSQRT/FRECPE/FRSQRTE/FRECPS/FRSQRTS */
+    bool destructive_madd; /* FMAD/FMSB: Zd is first multiplicand */
+    arg_sve_effect_intent effects;
+} arg_sve_fp_ext;
+
+typedef struct {
+    uint8_t zd_pd;
+    uint8_t pg;
+    uint8_t zn;
+    uint8_t zm;
+    uint8_t src_bits;
+    uint8_t dst_bits;
+    uint8_t subop; /* condition / FCVT mode / integer op kind */
+    int64_t imm;
+    bool cmp_with_imm;
+    bool is_float;
+    bool is_signed;
+    bool predicated;
+    arg_sve_effect_intent effects;
+} arg_sve_ext_op;
+
+typedef struct {
+    uint8_t zd;
+    uint8_t pg;
+    uint8_t zn;
+    uint8_t zm;
+    uint8_t za;
+    uint8_t element_bits;
+    uint8_t subop; /* REDUCE kind, PERMUTE kind, FIXED kind, UNARY kind, WMUL kind, INDEX kind, IMM_BIN kind */
+    int64_t imm1;
+    int64_t imm2;
+    uint64_t mask_imm;
+    bool predicated;
+    bool is_signed;
+    bool src1_is_imm;
+    bool src2_is_imm;
+    bool top_half;
+    bool destructive;
+    arg_sve_effect_intent effects;
+} arg_sve_general;
 
 typedef struct {
     uint32_t raw_insn;
@@ -514,12 +772,37 @@ union a64_u{
     arg_sve_ptrue f_sve_ptrue;
     arg_sve_whilelo f_sve_whilelo;
     arg_sve_add f_sve_add;
+    arg_sve_orr f_sve_orr;
+    arg_sve_and f_sve_and;
+    arg_sve_eor f_sve_eor;
+    arg_sve_lsl f_sve_lsl;
+    arg_sve_lsr f_sve_lsr;
+    arg_sve_asr f_sve_asr;
     arg_sve_sub f_sve_sub;
     arg_sve_mul f_sve_mul;
+    arg_sve_smax f_sve_smax;
+    arg_sve_umax f_sve_umax;
+    arg_sve_smin f_sve_smin;
+    arg_sve_umin f_sve_umin;
+    arg_sve_fadd f_sve_fadd;
+    arg_sve_fsub f_sve_fsub;
+    arg_sve_fmul f_sve_fmul;
+    arg_sve_fdiv f_sve_fdiv;
+    arg_sve_fp_unary f_sve_fabs;
+    arg_sve_fp_unary f_sve_fneg;
+    arg_sve_int_unary f_sve_not;
+    arg_sve_dup f_sve_dup;
     arg_sve_contiguous f_sve_contiguous;
     arg_sve_ffr f_sve_ffr;
     arg_sve_fault_load f_sve_fault_load;
     arg_sve_nonfault_load f_sve_nonfault_load;
+    arg_sve_pred_op f_sve_pred_op;
+    arg_sve_cnt f_sve_cnt;
+    arg_sve_last f_sve_last;
+    arg_sve_mem_ext f_sve_mem_ext;
+    arg_sve_fp_ext f_sve_fp_ext;
+    arg_sve_ext_op f_sve_ext_op;
+    arg_sve_general f_sve_general;
     arg_sve_access_failure f_sve_access_failure;
     arg_sve_unsupported_encoding f_sve_unsupported_encoding;
     arg_sve_lasx_failure f_sve_lasx_failure;

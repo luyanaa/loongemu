@@ -228,6 +228,53 @@ static void test_expanded_mask_scratch(void)
 }
 
 
+static void test_sve_access_control(void)
+{
+    CPUARMState ctrl_env;
+
+    memset(&ctrl_env, 0, sizeof(ctrl_env));
+    /* Default zero-initialized state does not trap unless access control is enforced. */
+    for (int el = 0; el <= 3; el++) {
+        CHECK(arm_sve_evaluate_excp_el(&ctrl_env, el) == 0);
+    }
+
+    /* CPACR_EL1.ZEN controls EL0 and EL1 trapping. */
+    arm_sve_set_cpacr_el1_zen(&ctrl_env, 0);
+    CHECK(ctrl_env.sve_ctrl.access_control_enforced);
+    CHECK(arm_sve_evaluate_excp_el(&ctrl_env, 0) == 1);
+    CHECK(arm_sve_evaluate_excp_el(&ctrl_env, 1) == 1);
+    CHECK(arm_sve_evaluate_excp_el(&ctrl_env, 2) == 0);
+    CHECK(arm_sve_evaluate_excp_el(&ctrl_env, 3) == 0);
+
+    arm_sve_set_cpacr_el1_zen(&ctrl_env, 1);
+    CHECK(arm_sve_evaluate_excp_el(&ctrl_env, 0) == 1);
+    CHECK(arm_sve_evaluate_excp_el(&ctrl_env, 1) == 0);
+
+    arm_sve_set_cpacr_el1_zen(&ctrl_env, 3);
+    CHECK(arm_sve_evaluate_excp_el(&ctrl_env, 0) == 0);
+    CHECK(arm_sve_evaluate_excp_el(&ctrl_env, 1) == 0);
+
+    /* CPTR_EL2.TZ traps EL0..EL2 to EL2. */
+    arm_sve_set_cptr_el2_tz(&ctrl_env, true);
+    CHECK(arm_sve_evaluate_excp_el(&ctrl_env, 0) == 2);
+    CHECK(arm_sve_evaluate_excp_el(&ctrl_env, 1) == 2);
+    CHECK(arm_sve_evaluate_excp_el(&ctrl_env, 2) == 2);
+    CHECK(arm_sve_evaluate_excp_el(&ctrl_env, 3) == 0);
+    arm_sve_set_cptr_el2_tz(&ctrl_env, false);
+    CHECK(arm_sve_evaluate_excp_el(&ctrl_env, 0) == 0);
+
+    /* CPTR_EL3.EZ == 0 (when enforced) traps all EL0..EL3 to EL3. */
+    arm_sve_set_cptr_el3_ez(&ctrl_env, false);
+    CHECK(ctrl_env.sve_ctrl.cptr_el3_enforced);
+    for (int el = 0; el <= 3; el++) {
+        CHECK(arm_sve_evaluate_excp_el(&ctrl_env, el) == 3);
+    }
+    arm_sve_set_cptr_el3_ez(&ctrl_env, true);
+    for (int el = 0; el <= 3; el++) {
+        CHECK(arm_sve_evaluate_excp_el(&ctrl_env, el) == 0);
+    }
+}
+
 int main(void)
 {
     test_v_register_offsets();
@@ -238,6 +285,7 @@ int main(void)
     test_active_vl();
     test_active_vl_storage_window();
     test_expanded_mask_scratch();
+    test_sve_access_control();
     if (failures != 0) {
         printf("ARM state: %u/%u checks failed\n", failures, checks);
         return 1;

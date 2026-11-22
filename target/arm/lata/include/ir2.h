@@ -10,8 +10,14 @@
 
 #define itemp_status_num \
     (sizeof(reg_itemp_map) / sizeof(int))
-#define ftemp_status_num \
-    (sizeof(reg_ftemp_map) / sizeof(int))
+
+/*
+ * The vector cache keeps f14/f15 as chunk homes when it is enabled, so the
+ * temporary pool shrinks from 6 to 5 for those translations.  Evaluated per
+ * allocation, which is safe because the flag is fixed for a whole TB.
+ */
+int ra_ftemp_pool_size(void);
+#define ftemp_status_num (ra_ftemp_pool_size())
 
 
 void ir2_opnd_build(IR2_OPND *, IR2_OPND_TYPE, int value);

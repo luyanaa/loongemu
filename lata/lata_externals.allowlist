@@ -4,6 +4,7 @@ calloc
 fprintf
 free
 malloc
+memcpy
 memset
 printf
 realloc

@@ -1,6 +1,7 @@
 # Bare build for the LATA (ARM64 -> LoongArch) translation core.
-CLANG   ?= /opt/homebrew/Cellar/llvm/23.1.5_1/bin/clang
-AR      := /opt/homebrew/Cellar/llvm/23.1.5_1/bin/llvm-ar
+LLVM_PREFIX ?= $(shell brew --prefix llvm 2>/dev/null)
+CLANG   ?= $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/clang,clang)
+AR      := $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/llvm-ar,llvm-ar)
 TARGET  ?= loongarch64-unknown-linux-gnu
 RESINC  := $(shell $(CLANG) -print-resource-dir)/include
 LATA    := ../target/arm/lata
@@ -20,7 +21,7 @@ SRCS := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \
         $(LATA)/optimization/clear-high.c $(LATA)/optimization/insts-pattern.c \
         $(LATA)/optimization/tu.c glib_tree.c \
         $(LATA)/ir1/ir1.c $(LATA)/ir1/sve-decode.c $(LATA)/ir1/sve-pvir.c \
-        $(LATX)/runtime/cpu_features.c \
+        $(LATX)/runtime/cpu_features.c vcache.c \
         $(LATA)/translator/reg-alloc.c $(LATA)/translator/macro-helper.c \
         $(LATA)/translator/sve-lasx-lower.c \
         $(LATA)/translator/translate-a64.c

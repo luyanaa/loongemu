@@ -9,6 +9,7 @@
 #define LATA_WEAK __attribute__((weak))
 
 LATA_WEAK int option_fam_jmp_cache;
+LATA_WEAK int qemu_loglevel;
 LATA_WEAK CPUState *current_cpu;
 
 LATA_WEAK uint32_t lata_guest_ldl(uint64_t addr) { (void)addr; return 0; }
@@ -99,13 +100,30 @@ LATA_WEAK void helper_set_cp_reg64(CPUARMState *env,
     *(uint64_t *)((uint8_t *)env + ri->fieldoffset) = value;
 }
 
+LATA_WEAK void lata_ir2_debug(unsigned int opcode, unsigned int word)
+{
+    (void)opcode;
+    (void)word;
+}
+
+/* Opt-in switch for optional AArch64 ISA extensions (see translate.h). */
+LATA_WEAK bool lata_isa_optional_features;
+
 #define LATA_HELPER_STUB(name) LATA_WEAK void name(void) { }
 LATA_HELPER_STUB(helper_access_check_cp_reg)
-LATA_HELPER_STUB(helper_exception_with_syndrome)
+LATA_WEAK void helper_exception_with_syndrome(CPUARMState *env,
+                                              uint32_t excp,
+                                              uint32_t syndrome)
+{
+    if (env != NULL) {
+        env->sve_ctrl.last_exception_index = excp;
+        env->sve_ctrl.last_exception_syndrome = syndrome;
+    }
+}
 LATA_HELPER_STUB(helper_lookup_cp_reg)
+LATA_HELPER_STUB(helper_simd_tblx)
 LATA_HELPER_STUB(helper_neon_addl_saturate_s32)
 LATA_HELPER_STUB(helper_neon_addl_saturate_s64)
-LATA_HELPER_STUB(helper_simd_tblx)
 LATA_HELPER_STUB(helper_vfp_tosld)
 LATA_HELPER_STUB(helper_vfp_tosls)
 LATA_HELPER_STUB(helper_vfp_tosqd)

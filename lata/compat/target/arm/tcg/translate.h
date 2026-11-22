@@ -85,6 +85,8 @@ extern int option_fam_jmp_cache;
 extern CPUState *current_cpu;
 static inline CPUARMState *arm_env(CPUState *cpu) { return (CPUARMState *)cpu->env_ptr; }
 static inline uint32_t syn_uncategorized(void) { return 0; }
+static inline uint32_t syn_sve_access_trap(void) { return (0x19u << 26) | (1u << 25); }
+static inline uint32_t syn_sme_access_trap(void) { return (0x1du << 26) | (1u << 25); }
 static inline uint32_t syn_aa64_sysregtrap(int op0, int op1, int op2, int crn,
                                            int crm, int rt, bool isread) { return 0; }
 static inline uint32_t syn_aa64_svc(int imm16) { return 0; }
@@ -107,7 +109,13 @@ static inline uint64_t dup_const(unsigned size, uint64_t imm)
 #define plus_2(ctx, x) ((int64_t)(x) + 2)
 #define EX_TBFLAG_ANY(tb, f) 0
 #define EX_TBFLAG_A64(tb, f) 0
-#define dc_isar_feature(name, s) 0
+/*
+ * Optional ISA extensions (FEAT_DotProd, FEAT_RDM, FEAT_FCMA, ...) are off by
+ * default.  A guest model or a test can opt in as a group; encodings that are
+ * not implemented still fail closed with an unallocated-encoding exception.
+ */
+extern bool lata_isa_optional_features;
+#define dc_isar_feature(name, s) (lata_isa_optional_features)
 
 static inline int core_to_aa64_mmu_idx(int idx) { return idx; }
 int arm_mmu_idx_to_el(int idx);
