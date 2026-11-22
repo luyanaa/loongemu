@@ -2566,9 +2566,20 @@ A64SVEIR2Dispatch a64_sve_ir2_dispatch(
     case A64_SVE_ACCESS_TRAP_REQUIRED:
         return A64_SVE_IR2_ACCESS_UNSUPPORTED;
     case A64_SVE_ACCESS_ALLOWED:
-        return latx_cpu_has_lasx() ? A64_SVE_IR2_READY
-                                   : A64_SVE_IR2_LASX_UNAVAILABLE;
+        /* Guest SVE legality must not depend on host LASX/LSX capability. */
+        return A64_SVE_IR2_READY;
     default:
         return A64_SVE_IR2_ACCESS_UNSUPPORTED;
     }
+}
+
+A64SVEBackendMode a64_sve_select_backend(void)
+{
+    if (latx_cpu_has_lasx()) {
+        return A64_SVE_BACKEND_LASX;
+    }
+    if (latx_cpu_has_lsx()) {
+        return A64_SVE_BACKEND_LSX;
+    }
+    return A64_SVE_BACKEND_SCALAR_HELPER;
 }

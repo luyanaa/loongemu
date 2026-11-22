@@ -74,6 +74,10 @@ void latr_rvv_mv_x_s(CPUArchState *env);
 void latr_rvv_mv_s_x(CPUArchState *env);
 uint64_t latr_rvv_mem(CPUArchState *env);
 uint64_t latr_rvv_stride_mem(CPUArchState *env);
+/* Fault-only-first load: returns 1 when it narrowed vl and the TB must exit. */
+uint64_t latr_rvv_ldff(CPUArchState *env);
+uint64_t latr_rvv_whole_mem(CPUArchState *env);
+void latr_rvv_whole_move(CPUArchState *env);
 enum {
     LATR_RVV_MASK_AND = 0, LATR_RVV_MASK_NAND, LATR_RVV_MASK_ANDN,
     LATR_RVV_MASK_XOR, LATR_RVV_MASK_OR, LATR_RVV_MASK_NOR,

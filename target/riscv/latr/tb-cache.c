@@ -4,12 +4,13 @@
  * satp mode" and applies shootdowns. Entries are never reused for a different
  * key, which is what makes privilege switches and satp rewrites safe.
  */
-#include "latr.h"
-#include "mmu.h"
+#include <string.h>
+#include "latr-tb-cache.h"
 
 #define SATP_ASID_SHIFT 44
 #define SATP_MODE_SHIFT 60
 #define SATP_ASID_MASK  UINT64_C(0xffff)
+#define PTE_PPN_MASK ((UINT64_C(1) << 44) - 1)
 
 static void cache_lock(LatrTbCache *cache)
 {
@@ -37,25 +38,21 @@ void latr_tb_cache_init(LatrTbCache *cache, uint8_t *arena, uint32_t size)
     cache->arena_used = 0;
     cache->count = 0;
     cache->generation = 1;
+    cache->victim = 0;
     cache->lock = 0;
     cache->reclaim_pending = 0;
 }
 
-LatrTbKey latr_tb_cache_key(const CPUArchState *env)
+LatrTbKey latr_tb_cache_key_parts(uint64_t satp, uint32_t privilege,
+                                  uint32_t vtype, uint32_t vill, uint32_t vl)
 {
-    LatrTbKey key = { 0, 0, 0, 0, 0 };
-    uint64_t satp;
+    LatrTbKey key;
 
-    if (env == 0) {
-        return key;
-    }
-    satp = env->csr[0x180];
     key.satp_mode = (uint32_t)(satp >> SATP_MODE_SHIFT);
     key.asid = (uint32_t)((satp >> SATP_ASID_SHIFT) & SATP_ASID_MASK);
-    key.privilege = (uint32_t)env->privilege;
-    key.vspec = (uint32_t)((env->vtype & 0x3ffu) | ((env->vill & 1u) << 10) |
-                           (((uint32_t)env->vl & 0xffu) << 16));
-    key.root_ppn = satp & LATR_PTE_PPN_MASK;
+    key.privilege = privilege;
+    key.vspec = (vtype & 0x3ffu) | ((vill & 1u) << 10) | ((vl & 0xffu) << 16);
+    key.root_ppn = satp & PTE_PPN_MASK;
     return key;
 }
 
@@ -66,19 +63,39 @@ static int key_equal(const LatrTbKey *a, const LatrTbKey *b)
            a->root_ppn == b->root_ppn;
 }
 
+/*
+ * Set index for the 4-way index. This has to be cheap: it runs on every
+ * dispatch, and in a bare-metal VMM that cost is pure overhead on top of the
+ * translated block. Mixing the key in as well as the PC keeps every ASID /
+ * privilege variant from landing in the same set.
+ */
+static uint32_t tb_set_index(uint64_t pc, LatrTbKey key)
+{
+    uint32_t h = (uint32_t)(pc >> 2);
+
+    h ^= h >> 7;
+    h *= 0x9e3779b1u;
+    h ^= key.asid * 0x85ebca6bu;
+    h ^= key.vspec * 0xc2b2ae35u;
+    h ^= (uint32_t)key.privilege + (uint32_t)key.satp_mode * 31u;
+    return h & (uint32_t)(LATR_TB_CACHE_SETS - 1);
+}
+
 LatrTbEntry *latr_tb_cache_lookup(LatrTbCache *cache, uint64_t pc,
                                   LatrTbKey key)
 {
     LatrTbEntry *found = 0;
+    uint32_t set;
 
     if (cache == 0) {
         return 0;
     }
+    set = tb_set_index(pc, key) * LATR_TB_CACHE_WAYS;
     /* The entry pointer stays valid after unlocking: entries live in the
      * cache object and only the owner recycles the arena at a safe point. */
     cache_lock(cache);
-    for (int i = 0; i < LATR_TB_CACHE_ENTRIES; i++) {
-        LatrTbEntry *entry = &cache->entries[i];
+    for (int way = 0; way < LATR_TB_CACHE_WAYS; way++) {
+        LatrTbEntry *entry = &cache->entries[set + (uint32_t)way];
         if (entry->valid && entry->guest_pc == pc &&
             key_equal(&entry->key, &key)) {
             found = entry;
@@ -111,16 +128,23 @@ LatrTbEntry *latr_tb_cache_insert(LatrTbCache *cache, uint64_t pc,
         return 0;
     }
     int slot = -1;
-    for (int i = 0; i < LATR_TB_CACHE_ENTRIES; i++) {
-        if (!cache->entries[i].valid) {
-            slot = i;
+    uint32_t set = tb_set_index(pc, key) * LATR_TB_CACHE_WAYS;
+    for (int way = 0; way < LATR_TB_CACHE_WAYS; way++) {
+        if (!cache->entries[set + (uint32_t)way].valid) {
+            slot = (int)(set + (uint32_t)way);
             break;
         }
     }
     if (slot < 0) {
-        cache->reclaim_pending = 1;
-        cache_unlock(cache);
-        return 0; /* full: the owner must flush at its next safe point */
+        /* Replace one way of *this* set round-robin instead of flushing the
+         * whole index. The old code bytes remain in the arena, so a hart still
+         * executing them is not disturbed; the arena is recycled at a safe
+         * point. A global cursor advancing modulo the way count keeps every
+         * set rotating through all of its ways without a per-set counter. */
+        slot = (int)(set + (cache->victim % LATR_TB_CACHE_WAYS));
+        cache->victim = (uint32_t)(slot + 1);
+        cache->entries[slot].valid = 0;
+        cache->count--;
     }
     uint8_t *dest = cache->arena + cache->arena_used;
     for (uint32_t i = 0; i < code_size; i++) {
@@ -199,17 +223,27 @@ void latr_tb_shootdown_privilege(LatrTbCache *cache, uint32_t privilege)
     cache_unlock(cache);
 }
 
-void latr_tb_cache_safepoint(LatrTbCache *cache)
+bool latr_tb_cache_safepoint(LatrTbCache *cache)
 {
+    bool reclaimed = false;
+
     if (cache == 0) {
-        return;
+        return false;
     }
     cache_lock(cache);
-    if (cache->count == 0) {
+    /*
+     * Recycling is only legal for the owning hart between dispatches: at that
+     * instant no generated code from this arena is executing. `count == 0`
+     * means every entry has been invalidated (shootdown or eviction), so the
+     * whole arena is garbage and reuse can restart at offset 0.
+     */
+    if (cache->count == 0 && (cache->arena_used != 0 || cache->reclaim_pending)) {
         cache->arena_used = 0;
         cache->reclaim_pending = 0;
+        reclaimed = true;
     }
     cache_unlock(cache);
+    return reclaimed;
 }
 
 void latr_tb_cache_reclaim_all(LatrTbCache *cache)
@@ -227,18 +261,6 @@ uint32_t latr_tb_cache_available(const LatrTbCache *cache)
         return 0;
     }
     return cache->arena_size - cache->arena_used;
-}
-
-void latr_set_cpu_env(CPUArchState *env)
-{
-    LatrTranslatorContext *ctx = latr_context_current();
-
-    if (ctx != 0) {
-        ctx->cpu = env;
-    }
-    if (lsenv != 0) {
-        lsenv->cpu_state = env;
-    }
 }
 
 /* --- cross-core shootdown registry --- */

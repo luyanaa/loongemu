@@ -21,9 +21,9 @@
 #define assert_memory_lock() tcg_debug_assert(have_mmap_lock())
 #endif
 
-static __thread TUControl tu_data_rel;
-__thread TUControl *tu_data;
-static __thread uint32_t search_buff_offset[MAX_TB_IN_TU];
+static LATA_TLS TUControl tu_data_rel;
+LATA_TLS TUControl *tu_data;
+static LATA_TLS uint32_t search_buff_offset[MAX_TB_IN_TU];
 
 static inline void tu_trees_reset(void)
 {

@@ -355,6 +355,7 @@ RISC-V 有 31 个可写 GPR（x0 恒零）。LATA 的 A64 映射只直映 21 个
 - spilled guest 寄存器通过 `la_ld_d/la_st_d` 访问 env，复用 LATA 的 `alloc_gpr_src/dst` 模式。
 - `$t0-$t5` 作为 itemp 时，不能同时作为 guest 映射；helper 调用前后要保存/恢复 guest 映射。
 - **重写 `reg_statics_map`**：LATA 把 `S_UD0/S_UD1` 放在 `$fp/$r21`（`target/arm/lata/translator/reg-alloc.c`），而本表把这两个寄存器分给 guest x3/x4。LATR 不能沿用这两个 statics；要么删掉未使用的 `S_UD*`，要么把它们指到不用的槽。`S_ENV=$s8`、`S_EFLAGS` 对 RISC-V 无意义（RISC-V 无 flags），只保留 `S_ENV`。
+- **helper 返回值一律用 `uint64_t`**：LoongArch 的 C ABI 对 `int` 只保证 `$a0` 的低 32 位，高半仍是调用方留下的残值（这里就是 env 指针）。生成代码若用 `beqz $a0` 判成功/失败，高半非零时会把成功误判成失败——`latr_riscv_fp_rmm` 曾因此在 `fadd.s ..., rmm` 之后直接 `raise_illegal` 并退出 TB，表现为"helper 算出了正确结果，落到 env 里却全是旧值"。返回值类型统一成 64 位之外，生成侧仍加一条 `bstrpick.d $a0, $a0, 31, 0` 作双保险。
 
 ### 4.2 32-bit 符号扩展
 
@@ -543,7 +544,8 @@ typedef struct CPUArchState {
 >   ⚠️ 这与"尚缺 94 条 RVV 1.0 编码"矛盾（guest 会误判 V 可用），应按 profile 拆分
 >   `rv64gc` / `rv64gcv-experimental`，见 [`RVV_P1_LEGALITY.md`](RVV_P1_LEGALITY.md) §6。
 > - **状态与 CSR**：`vtype/vill/vl/vstart/vxrm/vxsat/vreg[32][16]`、掩码词、`rvv_args/rvv_scalar/rvv_imm`、PVIR 观测字段；`vsetvli/vsetvl/vsetivli`（AVL、vill、`mstatus.VS`、退出 TB）；`vstart/vxsat/vxrm/vcsr/vl/vtype/vlenb` CSR。
-> - **访存**：unit-stride `vle/vse`、strided `vlse/vsse`、indexed `vluxei/vloxei` 与 `vsuxei/vsoxei`（8/16/32/64；indexed 的 EEW 是索引宽度、索引零扩展，strided 用符号扩展 GPR 步长）；`nf=1`，segment `nf>1` 显式报非法；masked/vma/vta、`vstart` 重启、逐元素精确故障（`vstart=故障 lane`，`mtval=元素地址`，MMIO 复用 `latr_mmio_*`）。
+> - **访存**：unit-stride `vle/vse`、strided `vlse/vsse`、indexed `vluxei/vloxei` 与 `vsuxei/vsoxei`（8/16/32/64；indexed 的 EEW 是索引宽度、索引零扩展，strided 用符号扩展 GPR 步长）；segment `nf>1`（unit-stride/strided/indexed 三种模式，`vlseg/vsseg/vlsseg/vsseg`，field k 落在寄存器 `vd+k` 的 lane i，故障逐元素写回且 `vstart`=故障 lane）；fault-only-first `vle<eew>ff`（故障时只把 `vl` 收窄到故障 lane，`vstart=0`，不抛异常，`vma/vta` 均不生效）；masked/vma/vta、`vstart` 重启、逐元素精确故障（`vstart=故障 lane`，`mtval=元素地址`，MMIO 复用 `latr_mmio_*`）。
+> - **整寄存器访问**：`vmv<n>r`（`vstart != 0` 时空操作并清 `vstart`）、`vl<n>re<eew>` / `vs<n>r`（搬 `nf×VLENB` 字节，忽略 `vl` 与 `vtype`，`vstart` 按 `EEW` 的元素索引恢复）。见 [`RVV_P1_LEGALITY.md`](RVV_P1_LEGALITY.md) §10.1。
 > - **掩码**：`vmand/vmnand/vmandn/vmxor/vmor/vmnor/vmorn/vmxnor`；`vcpop/vfirst/vmsbf/vmsif/vmsof/viota/vid`；mask 尾部与 QEMU 默认（`rvv_ta_all_1s=false`）一致。
 > - **归约**：`vredsum/and/or/xor/minu/min/maxu/max`、`vwredsum(u)`、`vfredusum/osum/min/max`、`vfwredusum/osum`（FP 用 softfloat；有序/无序在当前串行实现下同序）。
 > - **排列**：`vslideup/vslidedown`（vx/vi）、`vslide1up/vslide1down`、`vrgather`（vv/vx/vi）、`vrgatherei16.vv`、`vcompress.vm`。
@@ -552,9 +554,12 @@ typedef struct CPUArchState {
 > - **整数标量移动**：`vmv.x.s`（符号扩展 element 0）、`vmv.s.x`。
 > - **PVIR 发射、缓存与混合 LSX/LASX lowering**：`translator/pvir-exec.c` 实现完整 RVV PVIR 解释执行（整数含 `MUL/DIV/REM/MIN/MAX` 与 signed `INT_MIN/-1` 保护、`COMPARE`、`SELECT`、`BROADCAST`、`MOVE`、`EXTEND/TRUNCATE`、`FP_ARITH`、带 mask 的 `CONVERT` 及 `vfncvt.rod`、`FIXED`、`EXTRACT`/`INSERT`、`LANE_INDEX`、`LOAD`/`STORE` 含 `vlm.v/vsm.v` 8-bit 掩码访存），并配备 64 槽 per-TB PVIR 描述符缓存（`latr_pvir_cache_*`）与 `LatrTbKey.vspec` 向量特化；`translator/pvir-lower-lsx.c` 实现 3 级自适应直接 lowering（Tier 2 LASX `la_xv*` 32B + Tier 1 LSX `la_v*` 16B 同指令混合与 Tier 0 PVIR helper 回退），涵盖整数 ALU、move/merge、mask logic 与带不活动 lane 隔离的 FP 算术。
 > - **关键修复**：`latx/compat/qemu/host-utils.h` 的 `mulu64/muls64` 出参顺序已修正；`vsll/vsrl/vsra.vi` 修复无符号 5-bit 移位；`vmv.x.s` 增加 `x0` 保护；`vmv.s.x`/`vfmv.s.f` 修复 `vl==0` 与 `vta=1` 尾填充。
-> - **测试**：裸机 `latr-isa` **1181 checks**；`-march=rv64gcv` QEMU RVV 差分 `latr-diff: PASS`；decode 26 checks；PVIR 222/54/347 checks 全部通过；混用 LASX+LSX（`LMUL=4, vl=12, SEW=32`）与 `latx_cpu_set_vector_features` 门控实测通过。
+> - **操作数合法性（翻译期）**：新增 [`translator/rvv-legality.c`](translator/rvv-legality.c) + [`include/latr-rvv-legality.h`](include/latr-rvv-legality.h)，把 QEMU 的 `vext_check_*` 规则整套搬到翻译期——`require_align`/`require_noover`/`require_nf`/`require_vm`、EMUL ∈ 1/8..8、widening/narrowing 的 2·SEW ≤ ELEN、`vrgather`/`vcompress`/`viota` 的重叠约束。`LatrTbKey.vspec` 已含 vtype，SEW/LMUL 因此是 TB 常量，非法编码直接 illegal；`latr_rvv_read_elem/write_elem` 同时去掉 `(reg + idx) & 31`（原来会把 v31 组回绕写进 `v0` 等寄存器），只保留越界兜底。
+> - **运行时门控**：`frm ∈ {5,6,7}` 对所有使用舍入模式的向量 FP 指令一律 illegal（对齐 QEMU `helper_set_rounding_mode[_chkfrm]`，此前向量路径丢弃了 `latr_fp_set_rounding` 的返回值并按未初始化的 `float_status` 执行）；归约族（`vred*`/`vwred*`/`vfred*`）与 `vcpop/vfirst/vms*/viota/vcompress` 统一 `vstart == 0` 门控（QEMU `vext_check_reduction`）。
+> - **测试**：裸机 `latr-isa` **1402 checks**（含 26 项合法性/门控负例）；`make -C latr test-legality` 51 checks（纯函数负例矩阵，无需交叉工具链）；`-march=rv64gcv` QEMU RVV 差分 `latr-diff: PASS`；decode 26 checks；PVIR 222/54/347 checks 全部通过；混用 LASX+LSX（`LMUL=4, vl=12, SEW=32`）与 `latx_cpu_set_vector_features` 门控实测通过。
 >
-> **仍未做**：segment（`nf>1`）、whole-register load/store、`vleff`、FP FMA/`vadc/vmadc/vmacc`、组对齐/重叠检查、归约/排列族的 PVIR 化；`misa` 写入仍忽略。
+> **仍未做**：FP FMA/`vadc/vmadc/vmacc`、归约/排列族的 PVIR 化；`misa` 写入仍忽略、CPU profile 未拆分。
+> 已完成：segment（`nf>1`）、whole-register load/store、`vleff`，以及 `vlm.v` 的 tail 策略（已改为与 QEMU 默认一致：保持原值，见 [`RVV_P1_LEGALITY.md`](RVV_P1_LEGALITY.md) §10）。
 
 > **本轮新增**：[`RVV_PVIR.md`](RVV_PVIR.md) 是 RVV 1.0 → PVIR 的映射研究（PVIR 能力/硬约束逐条核对到 `la-pvir.h`/`pvir.c` 行号、逐族 D/S/H/X 映射表、P0 必须钉死的 lowering 契约、分阶段计划与风险）。三个已定结论：
 > 1. `vta/vma` 的四种组合都可用 **PVIR `MERGE`（undisturbed）** 覆盖——RVV 允许 agnostic 保持原值，因此 P0 不需要两个 inactive 策略位；
@@ -991,3 +996,17 @@ QEMU 自带的 `tests/tcg/riscv64` 只有少量用例（`test-div.c`、`test-fcv
 - **测试基线**：`latr-isa` 1337 checks、`latr-boot` PASS、`latr-diff` PASS；decode 26；PVIR 222/54/347；SBI 60；CLINT 13。
 
 仍未完成（见 `GAPS.md` 的 `[ ]`）：RVV 1.0 剩余指令/合规检查、PVIR 全族覆盖、SMP 宿主线程调度与并发压力、真实 OpenSBI/EDK2 装载、`la-pvir.h` 目录迁移（明确本轮不做）。软件 TLB、RVV 差分与系统 QEMU 差分已完成。
+
+## 7. 2026-11-22 SMP 与虚拟机器轮
+
+- **翻译器上下文与 TLS**：`lsenv`/`tr_data` 改为 `LATR_TLS`；新增 `LatrTranslatorContext`（`TRANSLATION_DATA`、`ENV`、`CPUArchState*`、`LatrTbCache*`、`LatrPvirCache*`、代码缓冲）。`latr_context_create/bind/destroy/safepoint` 提供每 vCPU 隔离；无 context 时保留 bootstrap 兼容路径，freestanding 构建仍以 `-D__thread=` 单线程绑定。
+- **TB 缓存并发**：缓存与 core 列表由自旋锁保护；shootdown 只失效条目并递增 generation，不回收 arena；arena 耗尽置 `reclaim_pending`，由 owner 在两次 TB 之间的 `latr_tb_cache_safepoint()` 回收。插入失败时 `latr_tb_cache_reclaim_all()` 后重试。
+- **PVIR 缓存**：64 槽描述符缓存改为 per-context（无 context 时退回静态 cache）；shootdown 不再清别的 hart 的 PVIR；context safepoint 观察到 TB generation 变化时 reset。
+- **虚拟机器**：`system/latr_machine.c` 定义 QEMU virt 风格机器：RAM `0x80000000`、固件入口 `RAM_BASE`、内核 `+2 MiB`、DTB 在 RAM 顶部 1 MiB 保留区、CLINT `0x2000000`、PLIC `0xc000000`、UART `0x10000000`（IRQ 10）、virtio-mmio `0x10001000`（IRQ 1）。启动契约：`a0=hartid`、`a1=DTB`；有固件时 M 模式从固件入口开始，否则直接进 S 模式内核。多 hart 采用单宿主线程合作式轮转（最多 4 hart），每 hart 独立 context/arena/代码缓冲。
+- **DTB**：`system/latr_fdt.c` 生成 FDT v17，含 `chosen`（bootargs/stdout-path/initrd）、`memory`、`cpus`（cpu/intc、`riscv,isa` 与扩展列表、SV39）、`soc`（CLINT/PLIC/UART/virtio-mmio）。
+- **virtio-mmio block**：modern v2 传输，单 split virtqueue；寄存器语义、描述符链（header/data/status）、IN/OUT/FLUSH、used ring、level IRQ 经回调送入 PLIC；后端为宿主 RAM 磁盘。`latr_machine_attach_disk()` 同时登记 MMIO window 与 DTB 节点；`image == NULL` 时降级为无盘机器。
+- **ELF 装载器**：`pend = p_paddr`（偏移 24），校验 `ET_EXEC`/`EM_RISCV`、`filesz <= memsz`、文件与内存区间、整数溢出、段重叠、entry 落在已装载段；两遍校验通过后才写 RAM。
+- **宿主 fault 闭环**：`latr_machine_host_fault()` 用 hart 的 arena PC 调 `latr_tb_insn_map_resolve()`，恢复 `env.pc` 到出错 guest 指令、锁存 `exception/badaddr`，并 shootdown 该 hart 的 TB；下轮调度从恢复点重新翻译。
+- **验证**：`latr-isa` 1402 checks；`latr-boot` 四段全过（裸镜像/pflash、M→S+DTB、virtio+initrd、2-hart SMP）；`latr-sys-diff` 逐字节一致；PVIR 222、RVV shapes 54。
+
+仍未完成：真实 OpenSBI/Linux 镜像（仓库无二进制）、宿主线程并行 vCPU 与并发压力、PCI ECAM/MSI、AIA/IMSIC/APLIC。

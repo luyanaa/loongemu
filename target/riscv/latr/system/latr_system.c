@@ -5,11 +5,7 @@
 #include "loongemu/riscv_fw.h"
 #include "loongemu/ovmf_board.h"
 
-#define ELF_PT_LOAD 1
-#define ELF_ET_EXEC 2
-#define ELF_EM_RISCV 243
-#define ELF_PHDR_SIZE 56
-#define ELF_MAX_LOADS 16
+#include "latr-elf.h"
 
 static void sys_uart_tx(void *opaque, uint8_t byte)
 {
@@ -128,7 +124,8 @@ static int system_init(LatrSystem *sys, uint8_t *ram, uint64_t ram_size,
         !loongemu_mem_map_add(&sys->map, LATR_SYSTEM_UART_BASE,
                               0x100, 0, LOONGEMU_MEM_MMIO, "uart") ||
         !loongemu_mem_map_add(&sys->map, LATR_SYSTEM_EXIT_BASE,
-                              4, 0, LOONGEMU_MEM_MMIO, "exit") ||
+                              LATR_SYSTEM_EXIT_SIZE, 0, LOONGEMU_MEM_MMIO,
+                              "exit") ||
         !loongemu_mem_map_add(&sys->map, LATR_SYSTEM_FWCFG_BASE,
                               0x100, 0, LOONGEMU_MEM_MMIO, "fwcfg")) {
         return 0;
@@ -150,7 +147,8 @@ static int system_init(LatrSystem *sys, uint8_t *ram, uint64_t ram_size,
                                    LATR_SYSTEM_UART_BASE, 0x100)) {
         return 0;
     }
-    if (!loongemu_mmio_bus_add(&sys->bus, LATR_SYSTEM_EXIT_BASE, 4,
+    if (!loongemu_mmio_bus_add(&sys->bus, LATR_SYSTEM_EXIT_BASE,
+                               LATR_SYSTEM_EXIT_SIZE,
                                sys_exit_read, sys_exit_write_cb, sys,
                                "exit")) {
         return 0;
@@ -210,146 +208,47 @@ int latr_system_init_harts(LatrSystem *sys, uint8_t *ram, uint64_t ram_size,
     return system_init(sys, ram, ram_size, nharts, boot_hart);
 }
 
-static uint64_t elf64(const uint8_t *p, unsigned off, unsigned size)
-{
-    uint64_t v = 0;
-
-    for (unsigned i = 0; i < size; i++) {
-        v |= (uint64_t)p[off + i] << (8 * i);
-    }
-    return v;
-}
-
-/*
- * Loads an ELF64 RISC-V ET_EXEC image at each segment's p_paddr (offset 24;
- * offset 16 is p_vaddr). The whole image is validated before anything is
- * written, so a corrupt firmware cannot leave a partially loaded RAM image.
- */
 int latr_system_load_elf(LatrSystem *sys, const uint8_t *elf, uint64_t len,
                          uint64_t *entry)
 {
-    struct {
-        uint64_t start;
-        uint64_t end;
-    } loads[ELF_MAX_LOADS];
-    unsigned nloads = 0;
-    uint64_t phoff;
-    uint64_t phentsize;
-    uint64_t phnum;
-    uint64_t entry_addr;
-    uint64_t type;
-    uint64_t machine;
+    LatrElfImage image;
 
-    if (sys == NULL || elf == NULL || len < 64) {
+    if (sys == NULL || sys->ram == NULL) {
         return 0;
     }
-    if (elf[0] != 0x7f || elf[1] != 'E' || elf[2] != 'L' || elf[3] != 'F' ||
-        elf[4] != 2 || elf[5] != 1) {
+    if (!latr_elf_load(elf, len, sys->ram, sys->ram_base, sys->ram_size,
+                       &image)) {
         return 0;
     }
-    type = elf64(elf, 16, 2);
-    machine = elf64(elf, 18, 2);
-    entry_addr = elf64(elf, 24, 8);
-    phoff = elf64(elf, 32, 8);
-    phentsize = elf64(elf, 54, 2);
-    phnum = elf64(elf, 56, 2);
-
-    if (type != ELF_ET_EXEC || machine != ELF_EM_RISCV) {
-        return 0;
-    }
-    if (phentsize < ELF_PHDR_SIZE || phnum == 0 || phnum > ELF_MAX_LOADS) {
-        return 0;
-    }
-    if (phoff > len || phnum > (len - phoff) / phentsize) {
-        return 0;
-    }
-
-    /* Pass 1: validate every PT_LOAD segment and record its RAM range. */
-    for (uint64_t i = 0; i < phnum; i++) {
-        const uint8_t *ph = elf + phoff + i * phentsize;
-        uint64_t off;
-        uint64_t paddr;
-        uint64_t filesz;
-        uint64_t memsz;
-        uint64_t delta;
-        uint64_t end;
-
-        if ((uint32_t)elf64(ph, 0, 4) != ELF_PT_LOAD) {
-            continue;
-        }
-        off = elf64(ph, 8, 8);
-        paddr = elf64(ph, 24, 8); /* p_paddr; p_vaddr lives at offset 16 */
-        filesz = elf64(ph, 32, 8);
-        memsz = elf64(ph, 40, 8);
-        if (filesz > memsz || memsz == 0) {
-            return 0;
-        }
-        if (off > len || filesz > len - off) {
-            return 0;
-        }
-        if (paddr < sys->ram_base) {
-            return 0;
-        }
-        delta = paddr - sys->ram_base;
-        if (delta > sys->ram_size || memsz > sys->ram_size - delta) {
-            return 0; /* also rejects paddr + memsz overflow */
-        }
-        end = paddr + memsz;
-        for (unsigned j = 0; j < nloads; j++) {
-            if (paddr < loads[j].end && loads[j].start < end) {
-                return 0; /* overlapping load segments */
-            }
-        }
-        if (nloads == ELF_MAX_LOADS) {
-            return 0;
-        }
-        loads[nloads].start = paddr;
-        loads[nloads].end = end;
-        nloads++;
-    }
-    if (nloads == 0) {
-        return 0;
-    }
-    {
-        bool entry_ok = false;
-
-        for (unsigned j = 0; j < nloads; j++) {
-            if (entry_addr >= loads[j].start && entry_addr < loads[j].end) {
-                entry_ok = true;
-            }
-        }
-        if (!entry_ok) {
-            return 0;
-        }
-    }
-
-    /* Pass 2: write. */
-    for (uint64_t i = 0; i < phnum; i++) {
-        const uint8_t *ph = elf + phoff + i * phentsize;
-        uint64_t off;
-        uint64_t paddr;
-        uint64_t filesz;
-        uint64_t memsz;
-        uint8_t *dst;
-
-        if ((uint32_t)elf64(ph, 0, 4) != ELF_PT_LOAD) {
-            continue;
-        }
-        off = elf64(ph, 8, 8);
-        paddr = elf64(ph, 24, 8);
-        filesz = elf64(ph, 32, 8);
-        memsz = elf64(ph, 40, 8);
-        dst = sys->ram + (paddr - sys->ram_base);
-        memcpy(dst, elf + off, filesz);
-        if (memsz > filesz) {
-            memset(dst + filesz, 0, memsz - filesz);
-        }
-    }
-    sys->env.pc = entry_addr;
+    sys->image_end = image.end;
+    sys->env.pc = image.entry;
     if (entry != NULL) {
-        *entry = entry_addr;
+        *entry = image.entry;
     }
     return 1;
+}
+
+void latr_system_tick(LatrSystem *sys, uint64_t ns)
+{
+    if (sys == NULL) {
+        return;
+    }
+    loongemu_vclock_advance_ns(&sys->vclock, ns);
+}
+
+/*
+ * Reflects this hart's CLINT state (MSIP/MTIP) and device state into its MIP.
+ * Split from the clock advance because the clock is global: advancing it once
+ * per hart would run N times faster on an N-hart machine.
+ */
+void latr_system_update_hart(LatrSystem *sys, CPUArchState *env, uint32_t hartid)
+{
+    if (sys == NULL || env == NULL) {
+        return;
+    }
+    loongemu_clint_tick(&sys->clint, loongemu_vclock_now_ns(&sys->vclock),
+                        &env->csr[0x344], hartid);
+    latr_update_interrupts(env);
 }
 
 void latr_system_update(LatrSystem *sys)
@@ -357,11 +256,8 @@ void latr_system_update(LatrSystem *sys)
     if (sys == NULL) {
         return;
     }
-    loongemu_vclock_advance_ns(&sys->vclock, UINT64_C(1000));
-    loongemu_clint_tick(&sys->clint,
-                        loongemu_vclock_now_ns(&sys->vclock),
-                        &sys->env.csr[0x344], (uint32_t)sys->env.hartid);
-    latr_update_interrupts(&sys->env);
+    latr_system_tick(sys, UINT64_C(1000));
+    latr_system_update_hart(sys, &sys->env, (uint32_t)sys->env.hartid);
 }
 
 void latr_system_mmio_write(LatrSystem *sys, uint64_t pa, unsigned size,

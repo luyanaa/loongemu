@@ -9,8 +9,10 @@ LATX    := ../latx
 
 INCS := -Icompat -I.. -I$(LATA)/include -I$(LATA) -I$(LATX)/compat -I$(LATX)/upstream/include \
          -isystem $(RESINC)
+LATA_ENABLE_TLS ?= 0
+TLS_DEFS := $(if $(filter 1,$(LATA_ENABLE_TLS)),-DLATA_ENABLE_TLS,-D__thread=)
 DEFS := -DTARGET_AARCH64 -DCONFIG_LATA -DCONFIG_LATA_TU -DCONFIG_LATA_STANDALONE -D__WORDSIZE=64 \
-        -DCONFIG_LATX -D__thread=
+        -DCONFIG_LATX $(TLS_DEFS)
 BASE := --target=$(TARGET) -ffreestanding -nostdinc -fno-builtin \
         -fno-stack-protector -O2 -g -mno-lsx -mno-lasx -fno-vectorize \
         -fno-slp-vectorize -Wno-unused-parameter -Wno-unused-variable -ferror-limit=0
@@ -23,7 +25,7 @@ SRCS := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \
         $(LATA)/ir1/ir1.c $(LATA)/ir1/sve-decode.c $(LATA)/ir1/sve-pvir.c \
         $(LATX)/runtime/cpu_features.c vcache.c \
         $(LATA)/translator/reg-alloc.c $(LATA)/translator/macro-helper.c \
-        $(LATA)/translator/sve-lasx-lower.c \
+        $(LATA)/translator/sve-helper.c $(LATA)/translator/sve-lasx-lower.c \
         $(LATA)/translator/translate-a64.c
 
 .PHONY: all probe clean

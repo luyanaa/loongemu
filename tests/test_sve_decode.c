@@ -668,6 +668,22 @@ int main(void)
     }
     status = decode(0x14000000u, &insn); /* Ordinary B-immediate prefix. */
     CHECK(status == A64_SVE_DECODE_NO_MATCH);
+    {
+        static const uint32_t legacy_non_sve[] = {
+            0x4f07e7e2u, /* movi v2.16b, #0xff */
+            0x4f000460u, /* movi v0.4s, #3 */
+            0x1e222820u, /* fadd s0, s1, s2 */
+            0x4e22d420u, /* fadd v0.4s, v1.4s, v2.4s */
+            0x8b020020u, /* add x0, x1, x2 */
+            0x9ac20820u, /* udiv x0, x1, x2 */
+            0x9a020020u, /* adc x0, x1, x2 */
+        };
+        for (i = 0; i < sizeof(legacy_non_sve) / sizeof(legacy_non_sve[0]); i++) {
+            status = decode(legacy_non_sve[i], &insn);
+            CHECK(status == A64_SVE_DECODE_NO_MATCH);
+            CHECK(insn.insn_type == AARCH64_A64_NULL);
+        }
+    }
     CHECK(a64_sve_decode(0x2518e3e0u, NULL) ==
           A64_SVE_DECODE_INVALID_ARGUMENT);
 

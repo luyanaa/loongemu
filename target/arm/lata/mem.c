@@ -1,4 +1,12 @@
 #include "mem.h"
+#include "lata.h"
+#include "lata-mem.h"
+#include "target/arm/tcg/translate.h"
+
+void helper_exception_with_syndrome(CPUARMState *env, uint32_t excp,
+                                    uint32_t syndrome);
+
+#include <string.h>
 
 void *mm_malloc(int size)
 {
@@ -29,4 +37,245 @@ void *mmi_palloc(int size, char *file_name, int line_num)
     void *retval = malloc(size);
     lsassertm(retval != NULL, "dbt: cannot allocate memory (%d bytes)\n", size);
     return retval;
+}
+
+static bool ranges_overlap(uint64_t a_start, uint64_t a_size,
+                           uint64_t b_start, uint64_t b_size)
+{
+    uint64_t a_end = a_start + a_size;
+    uint64_t b_end = b_start + b_size;
+    if (a_size == 0 || b_size == 0) {
+        return false;
+    }
+    if (a_end < a_start) {
+        a_end = UINT64_MAX;
+    }
+    if (b_end < b_start) {
+        b_end = UINT64_MAX;
+    }
+    return a_start < b_end && b_start < a_end;
+}
+
+static LataGuestMemStatus default_probe(CPUARMState *env, uint64_t vaddr,
+                                        size_t size, bool is_write,
+                                        bool clean_tbi)
+{
+    if (clean_tbi) {
+        vaddr &= UINT64_C(0x00ffffffffffffff);
+    }
+    if (size == 0) {
+        return LATA_MEM_OK;
+    }
+    if (size != 1 && size != 2 && size != 4 && size != 8 && size != 16) {
+        /* Multi-byte span probes are allowed as contiguous byte checks. */
+    }
+    if (vaddr < UINT64_C(0x1000) || vaddr > UINT64_MAX - size) {
+        return LATA_MEM_FAULT_TRANSLATION;
+    }
+    if (env != NULL && env->sve_ctrl.fault_region_count > 0) {
+        uint32_t need = is_write ? LATA_MEM_PERM_WRITE : LATA_MEM_PERM_READ;
+        uint32_t count = env->sve_ctrl.fault_region_count;
+        if (count > 8) {
+            count = 8;
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            if (!env->sve_ctrl.fault_regions[i].valid) {
+                continue;
+            }
+            if (ranges_overlap(vaddr, size,
+                               env->sve_ctrl.fault_regions[i].base,
+                               env->sve_ctrl.fault_regions[i].size)) {
+                if ((env->sve_ctrl.fault_regions[i].perm & need) != need) {
+                    return env->sve_ctrl.fault_regions[i].perm == 0
+                               ? LATA_MEM_FAULT_UNMAPPED
+                               : LATA_MEM_FAULT_PERMISSION;
+                }
+                return LATA_MEM_OK;
+            }
+        }
+    }
+    if (env != NULL && env->sve_ctrl.fault_mem_limit != 0) {
+        if (vaddr + size > env->sve_ctrl.fault_mem_limit) {
+            return LATA_MEM_FAULT_TRANSLATION;
+        }
+        return LATA_MEM_OK;
+    }
+    if (ranges_overlap(vaddr, size, UINT64_C(0x10000000),
+                       UINT64_C(0x10000000))) {
+        return LATA_MEM_FAULT_UNMAPPED;
+    }
+    return LATA_MEM_OK;
+}
+
+static uint64_t sign_extend_u64(uint64_t val, size_t size)
+{
+    switch (size) {
+    case 1:
+        return (uint64_t)(int64_t)(int8_t)(val & 0xffu);
+    case 2:
+        return (uint64_t)(int64_t)(int16_t)(val & 0xffffu);
+    case 4:
+        return (uint64_t)(int64_t)(int32_t)(val & 0xffffffffu);
+    default:
+        return val;
+    }
+}
+
+static LataGuestMemStatus default_load(CPUARMState *env, uint64_t vaddr,
+                                       size_t size, bool is_signed,
+                                       uint64_t *out_value)
+{
+    LataGuestMemStatus st = default_probe(env, vaddr, size, false, false);
+    const volatile uint8_t *p;
+    uint64_t val = 0;
+
+    if (st != LATA_MEM_OK) {
+        return st;
+    }
+    if (out_value == NULL) {
+        return LATA_MEM_FAULT_TRANSLATION;
+    }
+    p = (const volatile uint8_t *)(uintptr_t)vaddr;
+    for (size_t i = 0; i < size && i < 8; ++i) {
+        val |= (uint64_t)p[i] << (i * 8u);
+    }
+    *out_value = is_signed ? sign_extend_u64(val, size) : val;
+    return LATA_MEM_OK;
+}
+
+static LataGuestMemStatus default_store(CPUARMState *env, uint64_t vaddr,
+                                        size_t size, uint64_t value)
+{
+    LataGuestMemStatus st = default_probe(env, vaddr, size, true, false);
+    volatile uint8_t *p;
+
+    if (st != LATA_MEM_OK) {
+        return st;
+    }
+    p = (volatile uint8_t *)(uintptr_t)vaddr;
+    for (size_t i = 0; i < size && i < 8; ++i) {
+        p[i] = (uint8_t)(value >> (i * 8u));
+    }
+    return LATA_MEM_OK;
+}
+
+static bool default_direct_range_stable(CPUARMState *env, uint64_t vaddr,
+                                        size_t size, bool is_write)
+{
+    if (env != NULL && (env->sve_ctrl.fault_region_count > 0 ||
+                        env->sve_ctrl.fault_mem_limit != 0)) {
+        return false;
+    }
+    return default_probe(env, vaddr, size, is_write, false) == LATA_MEM_OK;
+}
+
+const LataGuestMemOps lata_default_guest_mem_ops = {
+    .probe = default_probe,
+    .load = default_load,
+    .store = default_store,
+    .direct_range_stable = default_direct_range_stable,
+};
+
+void lata_set_guest_mem_ops(const LataGuestMemOps *ops)
+{
+    LataContext *ctx = lata_context_current();
+    if (ctx != NULL) {
+        ctx->mem_ops = ops != NULL ? ops : &lata_default_guest_mem_ops;
+    }
+}
+
+const LataGuestMemOps *lata_get_guest_mem_ops(void)
+{
+    LataContext *ctx = lata_context_current();
+    if (ctx != NULL && ctx->mem_ops != NULL) {
+        return ctx->mem_ops;
+    }
+    return &lata_default_guest_mem_ops;
+}
+
+LataGuestMemStatus lata_guest_mem_probe(CPUARMState *env, uint64_t vaddr,
+                                        size_t size, bool is_write,
+                                        bool clean_tbi)
+{
+    const LataGuestMemOps *ops = lata_get_guest_mem_ops();
+    return ops->probe(env, vaddr, size, is_write, clean_tbi);
+}
+
+LataGuestMemStatus lata_guest_mem_load(CPUARMState *env, uint64_t vaddr,
+                                       size_t size, bool is_signed,
+                                       uint64_t *out_value)
+{
+    const LataGuestMemOps *ops = lata_get_guest_mem_ops();
+    return ops->load(env, vaddr, size, is_signed, out_value);
+}
+
+LataGuestMemStatus lata_guest_mem_store(CPUARMState *env, uint64_t vaddr,
+                                        size_t size, uint64_t value)
+{
+    const LataGuestMemOps *ops = lata_get_guest_mem_ops();
+    return ops->store(env, vaddr, size, value);
+}
+
+bool lata_guest_mem_direct_range_stable(CPUARMState *env, uint64_t vaddr,
+                                        size_t size, bool is_write)
+{
+    const LataGuestMemOps *ops = lata_get_guest_mem_ops();
+    if (ops != &lata_default_guest_mem_ops) {
+        return ops->direct_range_stable
+                   ? ops->direct_range_stable(env, vaddr, size, is_write)
+                   : false;
+    }
+    return ops->direct_range_stable(env, vaddr, size, is_write);
+}
+
+void lata_guest_mem_clear_fault_regions(CPUARMState *env)
+{
+    if (env == NULL) {
+        return;
+    }
+    memset(env->sve_ctrl.fault_regions, 0,
+           sizeof(env->sve_ctrl.fault_regions));
+    env->sve_ctrl.fault_region_count = 0;
+}
+
+bool lata_guest_mem_add_fault_region(CPUARMState *env, uint64_t base,
+                                     uint64_t size, uint32_t perm)
+{
+    if (env == NULL || env->sve_ctrl.fault_region_count >= 8) {
+        return false;
+    }
+    uint32_t idx = env->sve_ctrl.fault_region_count++;
+    env->sve_ctrl.fault_regions[idx].base = base;
+    env->sve_ctrl.fault_regions[idx].size = size;
+    env->sve_ctrl.fault_regions[idx].perm = perm;
+    env->sve_ctrl.fault_regions[idx].valid = true;
+    return true;
+}
+
+uint64_t lata_guest_mem_load_checked(CPUARMState *env, uint64_t vaddr,
+                                     uint32_t size_and_flags, uint64_t *out_val)
+{
+    size_t size = (size_t)(size_and_flags & 0xffu);
+    bool is_signed = (size_and_flags & (1u << 8)) != 0;
+    return (uint64_t)lata_guest_mem_load(env, vaddr, size, is_signed, out_val);
+}
+
+uint64_t lata_guest_mem_store_checked(CPUARMState *env, uint64_t vaddr,
+                                      uint32_t size_and_flags, uint64_t val)
+{
+    size_t size = (size_t)(size_and_flags & 0xffu);
+    return (uint64_t)lata_guest_mem_store(env, vaddr, size, val);
+}
+
+void lata_guest_mem_raise_fault(CPUARMState *env, uint64_t fault_pc,
+                                  uint64_t vaddr, uint32_t is_write,
+                                  uint32_t status)
+{
+    uint32_t syn = syn_data_abort_curr_el(is_write != 0) | (status & 0x3fu);
+    if (env != NULL) {
+        env->pc = fault_pc;
+        env->sve_ctrl.last_fault_va = vaddr;
+        env->sve_ctrl.last_fault_is_write = (is_write != 0);
+    }
+    helper_exception_with_syndrome(env, EXCP_DATA_ABORT, syn);
 }

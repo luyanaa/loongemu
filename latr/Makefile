@@ -42,18 +42,27 @@ CORE_OBJS := $(BUILD)/ir2.o $(BUILD)/ir2-assemble.o $(BUILD)/la-append.o \
              $(BUILD)/reg-alloc.o $(BUILD)/translate-riscv.o \
              $(BUILD)/translate-riscv-csr.o $(BUILD)/translate-riscv-fp.o \
              $(BUILD)/translate-riscv-fp-helper.o $(BUILD)/softfloat.o \
-             $(BUILD)/decode-riscv.o $(BUILD)/pvir.o $(BUILD)/pvir-exec.o $(BUILD)/pvir-lower-lsx.o $(BUILD)/cpu_features.o $(BUILD)/mmu.o $(BUILD)/interrupt.o $(BUILD)/mmio.o $(BUILD)/rvv.o $(BUILD)/translate-riscv-rvv.o $(BUILD)/tb-cache.o $(BUILD)/tb-insn-map.o \
-             $(BUILD)/phys_mem.o $(BUILD)/mmio_bus.o $(BUILD)/latr_system.o $(BUILD)/latr_fdt.o $(BUILD)/latr_machine.o $(BUILD)/uart16550.o $(BUILD)/riscv_clint.o $(BUILD)/riscv_plic.o $(BUILD)/riscv_acpi.o $(BUILD)/riscv_fw.o $(BUILD)/ovmf_board.o $(BUILD)/riscv_sbi.o \
+             $(BUILD)/decode-riscv.o $(BUILD)/pvir.o $(BUILD)/pvir-exec.o $(BUILD)/pvir-lower-lsx.o $(BUILD)/cpu_features.o $(BUILD)/mmu.o $(BUILD)/interrupt.o $(BUILD)/mmio.o $(BUILD)/rvv.o $(BUILD)/rvv-legality.o $(BUILD)/translate-riscv-rvv.o $(BUILD)/tb-cache.o $(BUILD)/tb-insn-map.o \
+             $(BUILD)/phys_mem.o $(BUILD)/mmio_bus.o $(BUILD)/riscv_virtio_blk.o $(BUILD)/latr_system.o $(BUILD)/latr_elf.o $(BUILD)/latr_fdt.o $(BUILD)/latr_machine.o $(BUILD)/uart16550.o $(BUILD)/riscv_clint.o $(BUILD)/riscv_plic.o $(BUILD)/riscv_acpi.o $(BUILD)/riscv_fw.o $(BUILD)/ovmf_board.o $(BUILD)/riscv_sbi.o \
              $(BUILD)/runtime.o \
              $(BUILD)/vclock.o $(BUILD)/compiler-rt.o
 
-.PHONY: all test-decode check probe clean
+.PHONY: all test-decode test-legality test-elf test-tb-smp check probe clean
 all: $(BUILD)/liblatr_core.a
 
 test-decode: $(BUILD)/test-latr-decode
 	./$(BUILD)/test-latr-decode
 
-check: all
+test-legality: $(BUILD)/test-latr-rvv-legality
+	./$(BUILD)/test-latr-rvv-legality
+
+test-elf: $(BUILD)/test-latr-elf
+	./$(BUILD)/test-latr-elf
+
+test-tb-smp: $(BUILD)/test-latr-tb-smp
+	./$(BUILD)/test-latr-tb-smp
+
+check: all test-legality test-elf test-tb-smp
 	NM="$(NM)" sh ../tools/check_lata_symbols.sh $(BUILD)/liblatr_core.a $(CURDIR)/latr_externals.allowlist
 
 probe: $(CORE_OBJS)
@@ -84,7 +93,7 @@ $(BUILD)/ir2-assemble.o: $(LATA)/ir2/ir2-assemble.c | $(BUILD)
 $(BUILD)/la-append.o: $(LATA)/ir2/la-append.c | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/mem.o: $(LATA)/mem.c | $(BUILD)
+$(BUILD)/mem.o: mem-latr.c | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/macro-helper.o: $(LATA)/translator/macro-helper.c | $(BUILD)
@@ -152,6 +161,11 @@ $(BUILD)/uart16550.o: ../src/uart16550.c ../include/loongemu/uart16550.h | $(BUI
 $(BUILD)/riscv_plic.o: ../src/riscv_plic.c ../include/loongemu/riscv_plic.h | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
+$(BUILD)/riscv_virtio_blk.o: ../src/riscv_virtio_blk.c \
+                ../include/loongemu/riscv_virtio_blk.h \
+                ../include/loongemu/mmio_bus.h ../include/loongemu/phys_mem.h | $(BUILD)
+	$(CLANG) $(CFLAGS) -c $< -o $@
+
 $(BUILD)/riscv_sbi.o: ../src/riscv_sbi.c ../include/loongemu/riscv_sbi.h | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
@@ -172,7 +186,11 @@ $(BUILD)/riscv_fw.o: ../src/riscv_fw.c ../include/loongemu/riscv_fw.h \
 $(BUILD)/ovmf_board.o: ../src/ovmf_board.c ../include/loongemu/ovmf_board.h | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
+$(BUILD)/latr_elf.o: $(LATR)/system/latr_elf.c $(LATR)/include/latr-elf.h | $(BUILD)
+	$(CLANG) $(CFLAGS) -c $< -o $@
+
 $(BUILD)/latr_system.o: $(LATR)/system/latr_system.c \
+                $(LATR)/include/latr-elf.h \
                 $(LATR)/include/latr-system.h $(LATR)/include/latr.h \
                 $(LATR)/include/riscv-env.h ../include/loongemu/mmio_bus.h \
                 ../include/loongemu/phys_mem.h ../include/loongemu/riscv_clint.h \
@@ -206,7 +224,13 @@ $(BUILD)/cpu_features.o: $(LATX)/runtime/cpu_features.c \
 
 $(BUILD)/translate-riscv-rvv.o: $(LATR)/translator/translate-riscv-rvv.c \
                 $(LATR)/include/latr.h $(LATR)/include/translate.h \
-                $(LATR)/include/riscv-env.h $(LATR)/include/ir1.h | $(BUILD)
+                $(LATR)/include/riscv-env.h $(LATR)/include/ir1.h \
+                $(LATR)/include/latr-rvv-legality.h | $(BUILD)
+	$(CLANG) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/rvv-legality.o: $(LATR)/translator/rvv-legality.c \
+                $(LATR)/include/latr-rvv-legality.h $(LATR)/include/ir1.h \
+                $(LATR)/ir1/rv64gc-opcodes.def | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/mmio.o: $(LATR)/translator/mmio.c $(LATR)/include/latr.h \
@@ -224,8 +248,7 @@ $(BUILD)/latr_machine.o: $(LATR)/system/latr_machine.c \
                 $(LATR)/include/latr-system.h $(LATR)/include/latr.h | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/tb-cache.o: $(LATR)/tb-cache.c $(LATR)/include/latr.h \
-                     $(LATR)/include/riscv-env.h | $(BUILD)
+$(BUILD)/tb-cache.o: $(LATR)/tb-cache.c $(LATR)/include/latr-tb-cache.h | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/tb-insn-map.o: $(LATR)/translator/tb-insn-map.c $(LATR)/include/latr.h | $(BUILD)
@@ -255,6 +278,24 @@ $(BUILD)/test-latr-decode: ../tests/test_latr_decode.c $(LATR)/ir1/decode-riscv.
                            $(DECODE32) $(DECODE16) $(TRANS_STUBS) | $(BUILD)
 	$(HOST_CC) $(HOST_CFLAGS) $(LATR)/ir1/decode-riscv.c \
 		../tests/test_latr_decode.c -o $@
+
+$(BUILD)/test-latr-rvv-legality: ../tests/test_latr_rvv_legality.c \
+                           $(LATR)/translator/rvv-legality.c \
+                           $(LATR)/ir1/decode-riscv.c \
+                           $(LATR)/include/latr-rvv-legality.h \
+                           $(LATR)/include/ir1.h $(LATR)/ir1/rv64gc-opcodes.def \
+                           $(DECODE32) $(DECODE16) $(TRANS_STUBS) | $(BUILD)
+	$(HOST_CC) $(HOST_CFLAGS) $(LATR)/translator/rvv-legality.c \
+		$(LATR)/ir1/decode-riscv.c ../tests/test_latr_rvv_legality.c -o $@
+
+$(BUILD)/test-latr-tb-smp: ../tests/test_latr_tb_smp.c \
+                           $(LATR)/tb-cache.c $(LATR)/include/latr-tb-cache.h | $(BUILD)
+	$(HOST_CC) $(HOST_CFLAGS) $(LATR)/tb-cache.c ../tests/test_latr_tb_smp.c -o $@
+
+$(BUILD)/test-latr-elf: ../tests/test_latr_elf.c $(LATR)/system/latr_elf.c \
+                        $(LATR)/include/latr-elf.h | $(BUILD)
+	$(HOST_CC) $(HOST_CFLAGS) $(LATR)/system/latr_elf.c \
+		../tests/test_latr_elf.c -o $@
 
 clean:
 	rm -rf $(BUILD)

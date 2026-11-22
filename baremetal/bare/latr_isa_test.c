@@ -187,6 +187,49 @@ static bool latr_execute_block(const void *guest, int insns)
     return ok;
 }
 
+/* Translates `insns` at `guest` and keeps the generated LoongArch code in
+ * code_buf, so the caller can enter the very same TB more than once with a
+ * different env.  vstart is deliberately *not* part of the TB key, so this is
+ * the only way to reproduce what happens when a restart lands on an
+ * already-translated block. */
+static bool latr_translate_block(const void *guest, int insns)
+{
+    int max_insns = insns;
+    bool ok;
+
+    for (size_t i = 0; i < sizeof(tb); i++) {
+        ((uint8_t *)&tb)[i] = 0;
+    }
+    cpu.env_ptr = &env;
+    env.pc = (uint64_t)(uintptr_t)guest;
+    tb.pc = env.pc;
+    tb.tc.ptr = code_buf;
+    tb.cflags = LATR_TB_CFLAGS_ALLOW_FLOW;
+
+    target_disasm(&tb, &max_insns, &cpu);
+    if (tb.icount != insns) {
+        return false;
+    }
+    tr_init(&tb);
+    ok = tr_ir2_generate(&tb);
+    if (ok) {
+        int words = tr_ir2_assemble(code_buf);
+        if ((size_t)words * 4 > sizeof(code_buf)) {
+            tr_fini();
+            return false;
+        }
+        __asm__ volatile("ibar 0" ::: "memory");
+    }
+    tr_fini();
+    return ok;
+}
+
+/* Re-enters the TB most recently built by latr_translate_block(). */
+static void latr_reenter_tb(void)
+{
+    latr_enter_tb(&env, code_buf);
+}
+
 static bool run_block_with_regs_and_fpr(const void *guest, int insns,
                                         int reg0, uint64_t value0,
                                         int reg1, uint64_t value1,
@@ -3417,6 +3460,567 @@ static void test_rvv_memory(void)
 }
 
 
+/*
+ * Whole-register moves (vmv<n>r / vl<n>re / vs<n>r), segment accesses (nf>1),
+ * fault-only-first loads and the byte-granular mask transfer (vlm.v/vsm.v).
+ *
+ * Every expected value here was measured on QEMU first (`-cpu max`, i.e.
+ * rvv_ta_all_1s=false, probes build/probe8.S and build/probe9.S) rather than
+ * read off the spec, because the corner cases are the point:
+ *   - vl<n>re / vs<n>r ignore vl *and* vtype, moving vlmax*nf whole elements
+ *     and treating vstart as an element index;
+ *   - vmv<n>r does nothing at all when vstart != 0, but still clears vstart;
+ *   - segment faults write back the lanes that already completed and name the
+ *     faulting *lane* in vstart;
+ *   - vle<eew>ff narrows vl to the faulting lane without raising, and neither
+ *     vta nor vma touches the tail;
+ *   - vlm.v transfers ceil(vl/8) bytes and leaves the rest of the mask
+ *     register alone even with vta=1.
+ */
+static void test_rvv_whole_segment_ldff(void)
+{
+    static const uint32_t code[] = {
+        0x2283e207, /* 0  vl2re32.v   v4, (x7)  */
+        0x22840227, /* 1  vs2r.v      v4, (x8)  */
+        0x9e80b257, /* 2  vmv2r.v     v4, v8    */
+        0x9e83bc57, /* 3  vmv8r.v     v24, v8   */
+        0x2203e207, /* 4  vlseg2e32.v v4, (x7)  */
+        0x22046227, /* 5  vsseg2e32.v v4, (x8)  */
+        0x0303e207, /* 6  vle32ff.v   v4, (x7)  */
+        0x02b38407, /* 7  vlm.v       v8, (x7)  */
+        0x02b40427, /* 8  vsm.v       v8, (x8)  */
+        0x0283e207, /* 9  vl1re32.v   v4, (x7)  */
+        0x9e803257, /* 10 vmv1r.v     v4, v8    */
+        0x4203e207, /* 11 vlseg3e32.v v4, (x7)  */
+        0xe283ec07, /* 12 vl8re32.v   v24, (x7) */
+    };
+    static uint8_t page[4096] __attribute__((aligned(4096)));
+    static uint8_t copy[4096] __attribute__((aligned(4096)));
+    static uint8_t edge[4096] __attribute__((aligned(4096)));
+    static LoongemuMemMap map;
+
+    for (int i = 0; i < 4096; i++) {
+        page[i] = (uint8_t)(i + 1);
+        edge[i] = (uint8_t)(0xa0 + i);
+        copy[i] = 0xaa;
+    }
+    loongemu_mem_map_init(&map);
+    map_host_range(&map, code, 0x1000);
+    check(loongemu_mem_map_add(&map, 0x10000, 0x1000,
+                               (uint64_t)(uintptr_t)page,
+                               LOONGEMU_MEM_RAM, "whole-data"), 1,
+          "whole-register data page registers");
+    check(loongemu_mem_map_add(&map, 0x11000, 0x1000,
+                               (uint64_t)(uintptr_t)copy,
+                               LOONGEMU_MEM_RAM, "whole-copy"), 1,
+          "whole-register copy page registers");
+    /* Only the first page is mapped: 0x21000 faults, which is what the
+     * fault-only-first and segment-fault cases below rely on. */
+    check(loongemu_mem_map_add(&map, 0x20000, 0x1000,
+                               (uint64_t)(uintptr_t)edge,
+                               LOONGEMU_MEM_RAM, "edge-page"), 1,
+          "edge page registers");
+
+    /* vl2re32 ignores vl=1 and SEW=8: it moves two whole registers. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.mem_map = &map;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x00; /* SEW=8, LMUL=1, tu, mu */
+    env.vl = 1;
+    env.gpr[7] = 0x10000;
+    rvv_fill_sentinel(4);
+    rvv_fill_sentinel(5);
+    check(latr_execute_block(code, 1), 1, "vl2re32 translates");
+    check(vec_read32(4, 0), 0x04030201u, "vl2re32 ignores vl: byte 0");
+    check(vec_read32(4, 3), 0x100f0e0du, "vl2re32 fills the whole first register");
+    check(vec_read32(5, 0), 0x14131211u, "vl2re32 crosses into the second register");
+    check(vec_read32(5, 3), 0x201f1e1du, "vl2re32 fills the whole second register");
+    check(env.vl, 1, "vl2re32 leaves vl alone");
+    check(env.vstart, 0, "vl2re32 leaves vstart clear");
+
+    /* vstart is an element index: 3 elements of e32 = 12 bytes. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.mem_map = &map;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x00;
+    env.vl = 4;
+    env.vstart = 3;
+    env.gpr[7] = 0x10000;
+    rvv_fill_sentinel(4);
+    rvv_fill_sentinel(5);
+    check(latr_execute_block(code, 1), 1, "vl2re32 restart translates");
+    check(vec_read32(4, 0), 0xdeadbeefu, "vl2re32 restart skips byte 0");
+    check(vec_read32(4, 2), 0xdeadbeefu, "vl2re32 restart skips byte 8");
+    check(vec_read32(4, 3), 0x100f0e0du, "vl2re32 restart resumes at byte 12");
+    check(vec_read32(5, 0), 0x14131211u, "vl2re32 restart runs into the second register");
+    check(env.vstart, 0, "vl2re32 restart clears vstart");
+
+    /* vmv<n>r is a no-op once vstart != 0, but still clears vstart. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.mem_map = &map;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x10;
+    env.vl = 4;
+    env.vstart = 2;
+    for (int lane = 0; lane < 4; lane++) {
+        vec_store32(8, lane, 0x11223344u);
+        vec_store32(9, lane, 0x55667788u);
+    }
+    rvv_fill_sentinel(4);
+    rvv_fill_sentinel(5);
+    check(latr_execute_block(code + 2, 1), 1, "vmv2r translates");
+    check(vec_read32(4, 0), 0xdeadbeefu, "vmv2r with vstart set moves nothing");
+    check(vec_read32(5, 0), 0xdeadbeefu, "vmv2r with vstart set leaves the second register");
+    check(vec_read32(8, 0), 0x11223344u, "vmv2r leaves the source alone");
+    check(env.vstart, 0, "vmv2r clears vstart even when it does nothing");
+
+    /* With vstart clear it copies vlmax*nf elements, ignoring vl. */
+    env.vl = 1;
+    check(latr_execute_block(code + 2, 1), 1, "vmv2r with vstart clear translates");
+    check(vec_read32(4, 0), 0x11223344u, "vmv2r copies lane 0");
+    check(vec_read32(4, 3), 0x11223344u, "vmv2r ignores vl and copies lane 3");
+    check(vec_read32(5, 0), 0x55667788u, "vmv2r copies the second register");
+
+    /* vmv1r moves exactly one register; vmv8r moves eight. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.mem_map = &map;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x10;
+    env.vl = 1;
+    for (int r = 8; r < 16; r++) {
+        for (int lane = 0; lane < 4; lane++) {
+            vec_store32(r, lane, 0x0a000000u + (uint32_t)r);
+        }
+    }
+    rvv_fill_sentinel(4);
+    rvv_fill_sentinel(5);
+    check(latr_execute_block(code + 10, 1), 1, "vmv1r translates");
+    check(vec_read32(4, 0), 0x0a000008u, "vmv1r copies its source");
+    check(vec_read32(5, 0), 0xdeadbeefu, "vmv1r leaves the next register");
+
+    for (int r = 24; r < 32; r++) {
+        for (int lane = 0; lane < 4; lane++) {
+            vec_store32(r, lane, 0xdeadbeefu);
+        }
+    }
+    check(latr_execute_block(code + 3, 1), 1, "vmv8r translates");
+    check(vec_read32(24, 0), 0x0a000008u, "vmv8r copies the first register");
+    check(vec_read32(28, 3), 0x0a00000cu, "vmv8r copies the fifth register");
+    check(vec_read32(31, 3), 0x0a00000fu, "vmv8r copies the eighth register");
+
+    /* vl8re32 moves eight whole registers = 128 bytes at SEW=8. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.mem_map = &map;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x00;
+    env.vl = 1;
+    env.gpr[7] = 0x10000;
+    check(latr_execute_block(code + 12, 1), 1, "vl8re32 translates");
+    check(env.vreg[24][0], 1, "vl8re32 fills byte 0");
+    check(env.vreg[24][15], 16, "vl8re32 fills the first register");
+    check(env.vreg[27][0], 49, "vl8re32 crosses into the fourth register");
+    check(env.vreg[31][15], 128, "vl8re32 fills the last of eight registers");
+
+    /* vl1re32 at vstart=3 restarts at element 3 instead of reloading. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.mem_map = &map;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x00;
+    env.vl = 4;
+    env.vstart = 3;
+    env.gpr[7] = 0x10000;
+    rvv_fill_sentinel(4);
+    check(latr_execute_block(code + 9, 1), 1, "vl1re32 restart translates");
+    check(env.vreg[4][11], 0xde, "vl1re32 restart skips the first elements");
+    check(env.vreg[4][12], 13, "vl1re32 restart resumes at element 3");
+    check(env.vreg[4][15], 16, "vl1re32 restart still fills the whole register");
+    check(env.vstart, 0, "vl1re32 restart clears vstart");
+
+    /* vlseg2e32 interleaves: field k of lane i lands in register vd+k. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.mem_map = &map;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x10;
+    env.vl = 4;
+    env.gpr[7] = 0x10000;
+    check(latr_execute_block(code + 4, 1), 1, "vlseg2e32 translates");
+    check(vec_read32(4, 0), 0x04030201u, "vlseg2e32 lane 0 field 0");
+    check(vec_read32(4, 1), 0x0c0b0a09u, "vlseg2e32 lane 1 field 0 skips a field");
+    check(vec_read32(5, 0), 0x08070605u, "vlseg2e32 lane 0 field 1");
+    check(vec_read32(5, 3), 0x201f1e1du, "vlseg2e32 lane 3 field 1");
+
+    /* nf=3 is legal and not a power of two. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.mem_map = &map;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x10;
+    env.vl = 4;
+    env.gpr[7] = 0x10000;
+    check(latr_execute_block(code + 11, 1), 1, "vlseg3e32 translates");
+    check(vec_read32(4, 0), 0x04030201u, "vlseg3e32 lane 0 field 0");
+    check(vec_read32(5, 0), 0x08070605u, "vlseg3e32 lane 0 field 1");
+    check(vec_read32(6, 0), 0x0c0b0a09u, "vlseg3e32 lane 0 field 2");
+    check(vec_read32(4, 1), 0x100f0e0du, "vlseg3e32 lane 1 strides three fields");
+
+    /* vsseg2e32 writes the same interleaving back out. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.mem_map = &map;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x10;
+    env.vl = 4;
+    env.gpr[8] = 0x11000;
+    vec_store32(4, 0, 0x11111111u);
+    vec_store32(4, 1, 0x22222222u);
+    vec_store32(4, 2, 0x55555555u);
+    vec_store32(5, 0, 0x33333333u);
+    vec_store32(5, 1, 0x44444444u);
+    for (int i = 0; i < 64; i++) {
+        copy[i] = 0xaa;
+    }
+    check(latr_execute_block(code + 5, 1), 1, "vsseg2e32 translates");
+    check(copy[0], 0x11, "vsseg2e32 lane 0 field 0 byte 0");
+    check(copy[4], 0x33, "vsseg2e32 lane 0 field 1");
+    check(copy[8], 0x22, "vsseg2e32 lane 1 field 0");
+    check(copy[12], 0x44, "vsseg2e32 lane 1 field 1");
+    check(copy[16], 0x55, "vsseg2e32 lane 2 field 0 comes from v4");
+    check(copy[32], 0xaa, "vsseg2e32 leaves memory beyond vl untouched");
+
+    /* Segment fault: completed lanes stay written, vstart names the lane. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.mem_map = &map;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x10;
+    env.vl = 4;
+    env.gpr[7] = 0x20ff0;
+    rvv_fill_sentinel(4);
+    rvv_fill_sentinel(5);
+    check(latr_execute_block(code + 4, 1), 1, "faulting vlseg2e32 translates");
+    check(env.exception, 5, "segment fault raises an access fault");
+    check(env.vstart, 2, "segment fault names the faulting lane");
+    check(env.badaddr, 0x21000, "segment fault reports the element address");
+    check(vec_read32(4, 0), 0x93929190u, "segment fault keeps lane 0 field 0");
+    check(vec_read32(5, 0), 0x97969594u, "segment fault keeps lane 0 field 1");
+    check(vec_read32(4, 1), 0x9b9a9998u, "segment fault keeps lane 1 field 0");
+    check(vec_read32(4, 2), 0xdeadbeefu, "segment fault leaves the faulting lane");
+
+    /* vle32ff narrows vl instead of raising, and ignores vta/vma. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.mem_map = &map;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x10 | (1u << 6) | (1u << 7); /* ta, ma */
+    env.vl = 4;
+    env.gpr[7] = 0x20ff8;
+    rvv_fill_sentinel(4);
+    check(latr_execute_block(code + 6, 1), 1, "vle32ff translates");
+    check(env.exception, 0, "vle32ff does not raise");
+    check(env.vl, 2, "vle32ff narrows vl to the faulting lane");
+    check(env.vstart, 0, "vle32ff clears vstart");
+    check(vec_read32(4, 0), 0x9b9a9998u, "vle32ff keeps the loaded lanes");
+    check(vec_read32(4, 1), 0x9f9e9d9cu, "vle32ff loads up to the faulting lane");
+    check(vec_read32(4, 2), 0xdeadbeefu, "vle32ff leaves the tail despite vta/vma");
+
+    /* vlm.v moves ceil(vl/8) bytes and never touches the tail. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.mem_map = &map;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x00; /* tu, mu */
+    env.vl = 4;
+    env.gpr[7] = 0x20000;
+    for (int i = 0; i < LATR_RVV_VLENB; i++) {
+        env.vreg[8][i] = 0x5a;
+    }
+    check(latr_execute_block(code + 7, 1), 1, "vlm translates");
+    check(env.vreg[8][0], 0xa0, "vlm moves one byte for vl=4");
+    check(env.vreg[8][1], 0x5a, "vlm leaves the tail with vta=0");
+    check(env.vreg[8][15], 0x5a, "vlm leaves the rest of the mask register");
+
+    env.vtype = 0x00 | (1u << 6); /* vta=1 must behave the same way */
+    for (int i = 0; i < LATR_RVV_VLENB; i++) {
+        env.vreg[8][i] = 0x5a;
+    }
+    check(latr_execute_block(code + 7, 1), 1, "vlm with vta=1 translates");
+    check(env.vreg[8][0], 0xa0, "vlm vta=1 still moves one byte");
+    check(env.vreg[8][1], 0x5a, "vlm vta=1 leaves the tail alone");
+
+    /* vsm.v mirrors it: one byte out, the rest of the page untouched. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.mem_map = &map;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x10;
+    env.vl = 4;
+    env.gpr[8] = 0x11000;
+    env.vreg[8][0] = 0x5a;
+    for (int i = 0; i < 64; i++) {
+        copy[i] = 0xaa;
+    }
+    check(latr_execute_block(code + 8, 1), 1, "vsm translates");
+    check(copy[0], 0x5a, "vsm stores one byte for vl=4");
+    check(copy[1], 0xaa, "vsm leaves the next byte untouched");
+
+    /* vs2r stores two whole registers whatever vl says. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.mem_map = &map;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x00;
+    env.vl = 1;
+    env.gpr[8] = 0x11000;
+    for (int i = 0; i < LATR_RVV_VLENB; i++) {
+        env.vreg[4][i] = 0x11;
+        env.vreg[5][i] = 0x22;
+    }
+    for (int i = 0; i < 32; i++) {
+        copy[i] = 0xaa;
+    }
+    check(latr_execute_block(code + 1, 1), 1, "vs2r translates");
+    check(copy[0], 0x11, "vs2r stores the first register");
+    check(copy[15], 0x11, "vs2r stores all of the first register");
+    check(copy[16], 0x22, "vs2r stores the second register");
+    check(copy[31], 0x22, "vs2r stores all of the second register");
+}
+
+/*
+ * vstart restart across the non-memory families.
+ *
+ * vstart is not part of the TB key, so a block translated while vstart == 0
+ * can be entered again with vstart != 0.  Each case below therefore translates
+ * once and then enters that same TB twice: first with vstart == 0 (fast path
+ * taken), then with a non-zero vstart, where the lanes below vstart must stay
+ * exactly as they were instead of being recomputed.
+ */
+static void test_rvv_vstart_restart(void)
+{
+    static const uint32_t code[] = {
+        0x021101d7, /* 0  vadd.vv        v3, v1, v2       */
+        0x001101d7, /* 1  vadd.vv        v3, v1, v2, v0.t */
+        0x021111d7, /* 2  vfadd.vv       v3, v1, v2       */
+        0x661121d7, /* 3  vmand.mm       v3, v1, v2       */
+        0x5c1101d7, /* 4  vmerge.vvm     v3, v1, v2, v0   */
+        0x3e12e1d7, /* 5  vslide1down.vx v3, v1, x5       */
+        0xc6112257, /* 6  vwadd.vv       v4, v1, v2       */
+    };
+
+    /* --- integer ALU: the PVIR path and the LSX fast path agree on vstart. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x10; /* e32, m1, tu, mu */
+    env.vl = 4;
+    for (int lane = 0; lane < 4; lane++) {
+        vec_store32(1, lane, (uint32_t)(1 + lane));
+        vec_store32(2, lane, (uint32_t)(10 + 10 * lane));
+    }
+    check(latr_translate_block(code, 1), 1, "vadd TB translates once");
+    env.vstart = 0;
+    latr_reenter_tb();
+    check(vec_read32(3, 0), 11, "vadd lane 0");
+    check(vec_read32(3, 3), 44, "vadd lane 3");
+    check(env.vstart, 0, "vadd clears vstart");
+
+    for (int lane = 0; lane < 4; lane++) {
+        vec_store32(1, lane, (uint32_t)(100 * (lane + 1)));
+        vec_store32(2, lane, 1);
+    }
+    rvv_fill_sentinel(3);
+    env.vstart = 2;
+    latr_reenter_tb();
+    check(vec_read32(3, 0), 0xdeadbeefu, "vadd restart leaves lane 0 undisturbed");
+    check(vec_read32(3, 1), 0xdeadbeefu, "vadd restart leaves lane 1 undisturbed");
+    check(vec_read32(3, 2), 301, "vadd restart resumes at lane 2");
+    check(vec_read32(3, 3), 401, "vadd restart resumes at lane 3");
+    check(env.vstart, 0, "vadd restart clears vstart");
+
+    /* --- masked ALU: vstart wins over an active mask bit below it. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x10;
+    env.vl = 4;
+    env.vreg[0][0] = 0x0f;
+    for (int lane = 0; lane < 4; lane++) {
+        vec_store32(1, lane, (uint32_t)(1 + lane));
+        vec_store32(2, lane, 10);
+    }
+    check(latr_translate_block(code + 1, 1), 1, "masked vadd TB translates once");
+    rvv_fill_sentinel(3);
+    env.vstart = 0;
+    latr_reenter_tb();
+    check(vec_read32(3, 0), 11, "masked vadd lane 0");
+    check(vec_read32(3, 3), 14, "masked vadd lane 3");
+
+    rvv_fill_sentinel(3);
+    env.vstart = 1;
+    latr_reenter_tb();
+    check(vec_read32(3, 0), 0xdeadbeefu, "masked vadd restart leaves lane 0");
+    check(vec_read32(3, 1), 12, "masked vadd restart resumes at lane 1");
+    check(vec_read32(3, 3), 14, "masked vadd restart resumes at lane 3");
+
+    /* vma=1 must not treat the already-done lanes as inactive: below vstart
+     * they stay as they were instead of being filled with ones. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x10 | (1u << 7); /* e32, m1, tu, ma */
+    env.vl = 4;
+    env.vreg[0][0] = 0x05; /* lanes 0 and 2 active */
+    for (int lane = 0; lane < 4; lane++) {
+        vec_store32(1, lane, (uint32_t)(1 + lane));
+        vec_store32(2, lane, 10);
+    }
+    check(latr_translate_block(code + 1, 1), 1, "masked vadd vma TB translates once");
+    rvv_fill_sentinel(3);
+    env.vstart = 0;
+    latr_reenter_tb();
+    check(vec_read32(3, 0), 11, "masked vadd vma lane 0");
+    check(vec_read32(3, 1), 0xffffffffu, "masked vadd vma fills the inactive lane");
+    check(vec_read32(3, 2), 13, "masked vadd vma lane 2");
+
+    rvv_fill_sentinel(3);
+    env.vstart = 2;
+    latr_reenter_tb();
+    check(vec_read32(3, 0), 0xdeadbeefu, "masked vadd vma restart keeps lane 0");
+    check(vec_read32(3, 1), 0xdeadbeefu, "masked vadd vma restart keeps lane 1");
+    check(vec_read32(3, 2), 13, "masked vadd vma restart resumes at lane 2");
+
+    /* --- FP arithmetic. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x10;
+    env.vl = 4;
+    vec_store32(1, 0, 0x3f800000u); /* 1.0 */
+    vec_store32(1, 1, 0x40000000u); /* 2.0 */
+    vec_store32(1, 2, 0x40400000u); /* 3.0 */
+    vec_store32(1, 3, 0x40800000u); /* 4.0 */
+    for (int lane = 0; lane < 4; lane++) {
+        vec_store32(2, lane, 0x3f000000u); /* 0.5 */
+    }
+    check(latr_translate_block(code + 2, 1), 1, "vfadd TB translates once");
+    rvv_fill_sentinel(3);
+    env.vstart = 0;
+    latr_reenter_tb();
+    check(vec_read32(3, 0), 0x3fc00000u, "vfadd 1.0 + 0.5");
+    check(vec_read32(3, 3), 0x40900000u, "vfadd 4.0 + 0.5");
+
+    rvv_fill_sentinel(3);
+    env.vstart = 2;
+    latr_reenter_tb();
+    check(vec_read32(3, 0), 0xdeadbeefu, "vfadd restart leaves lane 0 undisturbed");
+    check(vec_read32(3, 1), 0xdeadbeefu, "vfadd restart leaves lane 1 undisturbed");
+    check(vec_read32(3, 2), 0x40600000u, "vfadd restart resumes at lane 2");
+    check(vec_read32(3, 3), 0x40900000u, "vfadd restart resumes at lane 3");
+
+    /* --- mask logic: elements are bits, so vstart counts bits. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x00; /* e8, m1 */
+    env.vl = 8;
+    env.vreg[1][0] = 0xf0;
+    env.vreg[2][0] = 0xf0;
+    check(latr_translate_block(code + 3, 1), 1, "vmand TB translates once");
+    env.vreg[3][0] = 0x00;
+    env.vstart = 0;
+    latr_reenter_tb();
+    check(env.vreg[3][0], 0xf0, "vmand computes all active bits");
+
+    env.vreg[3][0] = 0x0f;
+    env.vstart = 4;
+    latr_reenter_tb();
+    check(env.vreg[3][0], 0xff, "vmand restart keeps the low bits and sets the high ones");
+
+    /* --- vmerge. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x10;
+    env.vl = 4;
+    env.vreg[0][0] = 0x05;
+    for (int lane = 0; lane < 4; lane++) {
+        vec_store32(1, lane, (uint32_t)(1 + lane));
+        vec_store32(2, lane, (uint32_t)(10 + 10 * lane));
+    }
+    check(latr_translate_block(code + 4, 1), 1, "vmerge TB translates once");
+    rvv_fill_sentinel(3);
+    env.vstart = 0;
+    latr_reenter_tb();
+    check(vec_read32(3, 0), 1, "vmerge takes v1 where the mask is set");
+    check(vec_read32(3, 1), 20, "vmerge takes v2 where the mask is clear");
+
+    rvv_fill_sentinel(3);
+    env.vstart = 2;
+    latr_reenter_tb();
+    check(vec_read32(3, 0), 0xdeadbeefu, "vmerge restart leaves lane 0 undisturbed");
+    check(vec_read32(3, 1), 0xdeadbeefu, "vmerge restart leaves lane 1 undisturbed");
+    check(vec_read32(3, 2), 3, "vmerge restart resumes at lane 2");
+    check(vec_read32(3, 3), 40, "vmerge restart resumes at lane 3");
+
+    /* --- permute: vslide1down. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x10;
+    env.vl = 4;
+    env.gpr[5] = 0x7777;
+    for (int lane = 0; lane < 4; lane++) {
+        vec_store32(1, lane, (uint32_t)(1 + lane));
+    }
+    check(latr_translate_block(code + 5, 1), 1, "vslide1down TB translates once");
+    rvv_fill_sentinel(3);
+    env.vstart = 0;
+    latr_reenter_tb();
+    check(vec_read32(3, 0), 2, "vslide1down shifts lane 0");
+    check(vec_read32(3, 3), 0x7777, "vslide1down feeds the scalar into the last lane");
+
+    rvv_fill_sentinel(3);
+    env.vstart = 2;
+    latr_reenter_tb();
+    check(vec_read32(3, 0), 0xdeadbeefu, "vslide1down restart leaves lane 0 undisturbed");
+    check(vec_read32(3, 1), 0xdeadbeefu, "vslide1down restart leaves lane 1 undisturbed");
+    check(vec_read32(3, 2), 4, "vslide1down restart resumes at lane 2");
+    check(vec_read32(3, 3), 0x7777, "vslide1down restart still feeds the last lane");
+
+    /* --- widening: the destination spans two registers. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x10;
+    env.vl = 2;
+    vec_store32(1, 0, 0x80000000u);
+    vec_store32(1, 1, 5);
+    vec_store32(2, 0, 0x80000000u);
+    vec_store32(2, 1, 7);
+    check(latr_translate_block(code + 6, 1), 1, "vwadd TB translates once");
+    vec_store64(4, 0, 0);
+    vec_store64(4, 1, 0);
+    env.vstart = 0;
+    latr_reenter_tb();
+    check(vec_read64(4, 0), UINT64_C(0xffffffff00000000),
+          "vwadd sign-extends the operands before widening");
+    check(vec_read64(4, 1), 12, "vwadd lane 1");
+
+    vec_store64(4, 0, UINT64_C(0xdeadbeefdeadbeef));
+    vec_store64(4, 1, UINT64_C(0xdeadbeefdeadbeef));
+    env.vstart = 1;
+    latr_reenter_tb();
+    check(vec_read64(4, 0), UINT64_C(0xdeadbeefdeadbeef),
+          "vwadd restart leaves lane 0 undisturbed");
+    check(vec_read64(4, 1), 12, "vwadd restart resumes at lane 1");
+}
+
 static void test_rvv_strided_indexed(void)
 {
     static const uint32_t code[] = {
@@ -3829,6 +4433,10 @@ static void test_rvv_reductions(void)
     check(vec_read32(3, 1), 0xffffffffu, "vta reduction tail lane 1");
     check(vec_read32(3, 3), 0xffffffffu, "vta reduction tail lane 3");
 
+    /* Reductions accumulate lanes below vstart into state the instruction
+     * does not keep, so RVV 1.0 (and QEMU's vext_check_reduction) require
+     * vstart == 0 here: a non-zero vstart is an illegal instruction, not a
+     * resume point. */
     reset_guest_state();
     env.csr[0x300] = 0x600;
     env.vtype = 0x10;
@@ -3839,13 +4447,125 @@ static void test_rvv_reductions(void)
     vec_store32(1, 2, 3);
     vec_store32(1, 3, 4);
     vec_store32(2, 0, 10);
-    check(latr_execute_block(int_red, 1), 1, "reduction restart translates");
-    check(vec_read32(3, 0), 17, "vredsum honors vstart");
+    check(latr_execute_block(int_red, 1), 1, "reduction with vstart translates");
+    check(env.exception, 2, "vredsum with vstart != 0 is illegal");
+    check(vec_read32(3, 0), 0, "illegal vredsum leaves the destination alone");
 }
 
 
-static void test_rvv_permute(void)
+/*
+ * Operand legality: QEMU raises an illegal instruction when a register group
+ * would wrap past v31, when a masked destination would clobber v0, and when
+ * the destination overlaps a source it may not. Before this check existed the
+ * wraparound in latr_rvv_read_elem()/write_elem() silently redirected those
+ * accesses to another architectural register.
+ */
+static void test_rvv_legality(void)
 {
+    static const uint32_t add_v31[] = {0x02008fd7};   /* vadd.vv v31, v0, v1 */
+    static const uint32_t add_v8[] = {0x02040457};    /* vadd.vv v8, v0, v8 */
+    static const uint32_t masked_v0[] = {0x00110057}; /* vadd.vv v0,v1,v2,v0.t */
+    static const uint32_t masked_v1[] = {0x001100d7}; /* vadd.vv v1,v1,v2,v0.t */
+    static const uint32_t load_v3[] = {0x0200e187};   /* vle32.v v3, (x1) */
+    static const uint32_t store_v3[] = {0x0200e1a7};  /* vse32.v v3, (x1) */
+    static const uint32_t gather_v4[] = {0x32208257}; /* vrgather.vv v4,v2,v1 */
+    static const uint32_t gather_bad[] = {0x32408257};/* vrgather.vv v4,v4,v1 */
+    static const uint32_t mask_logic[] = {0x6621a0d7};/* vmand.mm v1,v2,v3 */
+    static const uint32_t vfadd[] = {0x022190d7};     /* vfadd.vv v1,v2,v3 */
+
+    /* SEW=64, LMUL=8: the v31 group would span v31..v38. */
+    reset_guest_state();
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x1b;
+    env.vl = 2;
+    env.vreg[0][0] = 0xff; /* clobbered by the old wraparound */
+    env.vreg[7][0] = 0x5a;
+    check(latr_execute_block(add_v31, 1), 1, "vadd.v31 translates");
+    check(env.exception, 2, "vadd.vv v31 with LMUL=8 is illegal");
+    check(env.vreg[0][0], 0xff, "illegal group leaves the mask register alone");
+    check(env.vreg[7][0], 0x5a, "illegal group leaves v7 alone");
+
+    /* The aligned form of the same instruction must still execute. */
+    reset_guest_state();
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x1b;
+    env.vl = 2;
+    vec_store64(0, 0, 3);
+    vec_store64(8, 0, 4);
+    check(latr_execute_block(add_v8, 1), 1, "aligned LMUL=8 vadd translates");
+    check(env.exception, 0, "vadd.vv v8 with LMUL=8 is legal");
+    check(vec_read64(8, 0), 7, "vadd.vv v8 result");
+
+    /* A masked destination may not overlap v0. */
+    reset_guest_state();
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x10;
+    env.vl = 4;
+    check(latr_execute_block(masked_v1, 1), 1, "masked vadd into v1 translates");
+    check(env.exception, 0, "masked vadd.vv into v1 is legal");
+    reset_guest_state();
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x10;
+    env.vl = 4;
+    env.vreg[0][0] = 0x05;
+    check(latr_execute_block(masked_v0, 1), 1, "masked vadd into v0 translates");
+    check(env.exception, 2, "masked vadd.vv into v0 is illegal");
+    check(env.vreg[0][0], 0x05, "illegal masked vadd keeps the mask intact");
+
+    /* EMUL for a unit-stride access is EEW - SEW + LMUL. */
+    reset_guest_state();
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x12; /* SEW=32, LMUL=2 */
+    env.vl = 2;
+    check(latr_execute_block(load_v3, 1), 1, "misaligned vle32 translates");
+    check(env.exception, 2, "vle32.v v3 with LMUL=2 is illegal");
+    reset_guest_state();
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x12;
+    env.vl = 2;
+    check(latr_execute_block(store_v3, 1), 1, "misaligned vse32 translates");
+    check(env.exception, 2, "vse32.v v3 with LMUL=2 is illegal");
+
+    /* Gather rejects a destination that aliases a source. */
+    reset_guest_state();
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x10;
+    env.vl = 2;
+    check(latr_execute_block(gather_v4, 1), 1, "vrgather.vv translates");
+    check(env.exception, 0, "vrgather.vv v4,v2,v1 is legal");
+    reset_guest_state();
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x10;
+    env.vl = 2;
+    check(latr_execute_block(gather_bad, 1), 1, "aliasing vrgather translates");
+    check(env.exception, 2, "vrgather.vv v4,v4,v1 is illegal");
+
+    /* Mask logic works on single registers, so LMUL does not constrain it. */
+    reset_guest_state();
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x1b;
+    env.vl = 2;
+    check(latr_execute_block(mask_logic, 1), 1, "vmand.mm translates");
+    check(env.exception, 0, "vmand.mm ignores LMUL alignment");
+
+    /* A reserved frm is illegal for every vector FP instruction that rounds. */
+    reset_guest_state();
+    env.csr[0x300] = 0x600;
+    env.fcsr = 5u << 5; /* frm = 5 is reserved */
+    env.vtype = 0x10;
+    env.vl = 2;
+    check(latr_execute_block(vfadd, 1), 1, "vfadd with frm=5 translates");
+    check(env.exception, 2, "vfadd.vv with a reserved frm is illegal");
+    reset_guest_state();
+    env.csr[0x300] = 0x600;
+    env.fcsr = 4u << 5; /* RMM stays valid */
+    env.vtype = 0x10;
+    env.vl = 2;
+    check(latr_execute_block(vfadd, 1), 1, "vfadd with frm=4 translates");
+    check(env.exception, 0, "vfadd.vv with RMM is legal");
+}
+
+static void test_rvv_permute(void){
     static const uint32_t code[] = {
         0x3a12c1d7, /* vslideup.vx    v3, v1, x5 */
         0x3e12c257, /* vslidedown.vx  v4, v1, x5 */
@@ -3931,23 +4651,27 @@ static void test_rvv_permute(void)
 
 static void test_rvv_width_sat(void)
 {
+    /* Widening destinations have EMUL = 2*LMUL, so with LMUL=1 the register
+     * number must be even (RVV 1.0 section 3.4.2). */
     static const uint32_t wide[] = {
-        0xc61121d7, /* vwadd.vv   v3, v1, v2 */
-        0xc212e257, /* vwaddu.vx  v4, v1, x5 */
-        0xce1122d7, /* vwsub.vv   v5, v1, v2 */
-        0xca12e357, /* vwsubu.vx  v6, v1, x5 */
-        0xee1123d7, /* vwmul.vv   v7, v1, v2 */
-        0xe212e457, /* vwmulu.vx  v8, v1, x5 */
-        0xea1124d7, /* vwmulsu.vv v9, v1, v2 */
+        0xc6112257, /* vwadd.vv   v4, v1, v2 */
+        0xc212e357, /* vwaddu.vx  v6, v1, x5 */
+        0xce112457, /* vwsub.vv   v8, v1, v2 */
+        0xca12e557, /* vwsubu.vx  v10, v1, x5 */
+        0xee112657, /* vwmul.vv   v12, v1, v2 */
+        0xe212e757, /* vwmulu.vx  v14, v1, x5 */
+        0xea112857, /* vwmulsu.vv v16, v1, v2 */
     };
     static const uint32_t macc[] = {
         0xc61121d7, /* placeholder replaced below */
     };
+    /* Narrowing sources have EMUL = 2*LMUL and the destination must stay clear
+     * of the whole source group. */
     static const uint32_t narrow[] = {
-        0xb210b1d7, /* vnsrl.wi  v3, v1, 1 */
-        0xb610b257, /* vnsra.wi  v4, v1, 1 */
-        0xbe10b2d7, /* vnclip.wi v5, v1, 1 */
-        0xba10b357, /* vnclipu.wi v6, v1, 1 */
+        0xb220b257, /* vnsrl.wi  v4, v2, 1 */
+        0xb620b357, /* vnsra.wi  v6, v2, 1 */
+        0xbe20b457, /* vnclip.wi v8, v2, 1 */
+        0xba20b557, /* vnclipu.wi v10, v2, 1 */
     };
     static const uint32_t sat[] = {
         0x821103d7, /* vsaddu.vv v7, v1, v2 */
@@ -3973,48 +4697,48 @@ static void test_rvv_width_sat(void)
     vec_store32(2, 1, 4);
     env.gpr[5] = 10;
     check(latr_execute_block(wide, 7), 1, "widening block translates");
-    check(vec_read64(3, 0), 4, "vwadd lane 0");
-    check(vec_read64(3, 1), 6, "vwadd lane 1");
-    check(vec_read64(4, 0), 11, "vwaddu.vx lane 0");
-    check(vec_read64(4, 1), 12, "vwaddu.vx lane 1");
-    check(vec_read64(5, 0), (uint64_t)-2, "vwsub lane 0");
-    check(vec_read64(6, 0), (uint64_t)-9, "vwsubu.vx wraps");
-    check(vec_read64(7, 0), 3, "vwmul lane 0");
-    check(vec_read64(7, 1), 8, "vwmul lane 1");
-    check(vec_read64(8, 1), 20, "vwmulu.vx lane 1");
-    check(vec_read64(9, 1), 8, "vwmulsu.vv lane 1");
+    check(vec_read64(4, 0), 4, "vwadd lane 0");
+    check(vec_read64(4, 1), 6, "vwadd lane 1");
+    check(vec_read64(6, 0), 11, "vwaddu.vx lane 0");
+    check(vec_read64(6, 1), 12, "vwaddu.vx lane 1");
+    check(vec_read64(8, 0), (uint64_t)-2, "vwsub lane 0");
+    check(vec_read64(10, 0), (uint64_t)-9, "vwsubu.vx wraps");
+    check(vec_read64(12, 0), 3, "vwmul lane 0");
+    check(vec_read64(12, 1), 8, "vwmul lane 1");
+    check(vec_read64(14, 1), 20, "vwmulu.vx lane 1");
+    check(vec_read64(16, 1), 8, "vwmulsu.vv lane 1");
 
     reset_guest_state();
     env.csr[0x300] = 0x600;
     env.vtype = 0x10;
     env.vl = 2;
-    vec_store64(1, 0, 6);
-    vec_store64(1, 1, 8);
+    vec_store64(2, 0, 6);
+    vec_store64(2, 1, 8);
     check(latr_execute_block(narrow, 1), 1, "vnsrl translates");
-    check(vec_read32(3, 0), 3, "vnsrl lane 0");
-    check(vec_read32(3, 1), 4, "vnsrl lane 1");
+    check(vec_read32(4, 0), 3, "vnsrl lane 0");
+    check(vec_read32(4, 1), 4, "vnsrl lane 1");
 
     reset_guest_state();
     env.csr[0x300] = 0x600;
     env.vtype = 0x10;
     env.vl = 2;
-    vec_store64(1, 0, (uint64_t)-8);
-    vec_store64(1, 1, 8);
+    vec_store64(2, 0, (uint64_t)-8);
+    vec_store64(2, 1, 8);
     check(latr_execute_block(narrow + 1, 1), 1, "vnsra translates");
-    check(vec_read32(4, 0), 0xfffffffcu, "vnsra lane 0");
-    check(vec_read32(4, 1), 4, "vnsra lane 1");
+    check(vec_read32(6, 0), 0xfffffffcu, "vnsra lane 0");
+    check(vec_read32(6, 1), 4, "vnsra lane 1");
 
     reset_guest_state();
     env.csr[0x300] = 0x600;
     env.vtype = 0x10;
     env.vl = 2;
-    vec_store64(1, 0, UINT64_C(0x100000000));
-    vec_store64(1, 1, UINT64_MAX);
+    vec_store64(2, 0, UINT64_C(0x100000000));
+    vec_store64(2, 1, UINT64_MAX);
     check(latr_execute_block(narrow + 2, 2), 1, "clip translates");
-    check(vec_read32(5, 0), 0x7fffffffu, "vnclip saturates lane 0");
-    check(vec_read32(5, 1), 0xffffffffu, "vnclip keeps -1 lane 1");
-    check(vec_read32(6, 0), 0x80000000u, "vnclipu keeps 2^31 lane 0");
-    check(vec_read32(6, 1), 0xffffffffu, "vnclipu saturates lane 1");
+    check(vec_read32(8, 0), 0x7fffffffu, "vnclip saturates lane 0");
+    check(vec_read32(8, 1), 0xffffffffu, "vnclip keeps -1 lane 1");
+    check(vec_read32(10, 0), 0x80000000u, "vnclipu keeps 2^31 lane 0");
+    check(vec_read32(10, 1), 0xffffffffu, "vnclipu saturates lane 1");
     check(env.vxsat, 1, "clip sets vxsat");
 
     reset_guest_state();
@@ -4121,8 +4845,8 @@ static void test_rvv_fp(void)
         0x4a111d57, /* vfcvt.f.xu.v v26, v1 */
         0x4a119dd7, /* vfcvt.f.x.v  v27, v1 */
         0x4a161e57, /* vfwcvt.f.f.v v28, v1 */
-        0x4a1a1ed7, /* vfncvt.f.f.w v29, v1 */
-        0x4a1a9f57, /* vfncvt.rod.f.f.w v30, v1 */
+        0x4a2a1ed7, /* vfncvt.f.f.w v29, v2 */
+        0x4a2a9f57, /* vfncvt.rod.f.f.w v30, v2 */
     };
     const uint32_t f15 = 0x3fc00000u;
     const uint32_t fn2 = 0xc0000000u;
@@ -4273,10 +4997,10 @@ static void test_rvv_fp(void)
     env.csr[0x300] = 0x600;
     env.vtype = 0x10;
     env.vl = 4;
-    vec_store64(1, 0, UINT64_C(0x3ff0000008000000)); /* 1 + 2^-25 */
-    vec_store64(1, 1, UINT64_C(0xc000000000000000)); /* -2.0 */
-    vec_store64(1, 2, 0);
-    vec_store64(1, 3, UINT64_C(0x7ff0000000000000)); /* inf */
+    vec_store64(2, 0, UINT64_C(0x3ff0000008000000)); /* 1 + 2^-25 */
+    vec_store64(2, 1, UINT64_C(0xc000000000000000)); /* -2.0 */
+    vec_store64(2, 2, 0);
+    vec_store64(2, 3, UINT64_C(0x7ff0000000000000)); /* inf */
     check(latr_execute_block(code + 28, 1), 1, "vfncvt.rod translates");
     check(vec_read32(30, 0), 0x3f800001u, "vfncvt.rod rounds to odd");
     check(vec_read32(30, 1), fn2, "vfncvt.rod -2.0");
@@ -4285,8 +5009,8 @@ static void test_rvv_fp(void)
     env.csr[0x300] = 0x600;
     env.vtype = 0x10;
     env.vl = 4;
-    vec_store64(1, 0, UINT64_C(0x3ff8000000000000));
-    vec_store64(1, 1, UINT64_C(0xc000000000000000));
+    vec_store64(2, 0, UINT64_C(0x3ff8000000000000));
+    vec_store64(2, 1, UINT64_C(0xc000000000000000));
     check(latr_execute_block(code + 27, 1), 1, "vfncvt.f.f translates");
     check(vec_read32(29, 0), f15, "vfncvt.f.f 1.5");
     check(vec_read32(29, 1), fn2, "vfncvt.f.f -2.0");
@@ -4300,15 +5024,15 @@ static void test_rvv_moves_wide_fp(void)
         0x420361d7, /* vmv.s.x v3, x6 */
     };
     static const uint32_t wide_fp[] = {
-        0xc21111d7, /* vfwadd.vv v3, v1, v2 */
-        0xca111257, /* vfwsub.vv v4, v1, v2 */
-        0xe21112d7, /* vfwmul.vv v5, v1, v2 */
+        0xc2111257, /* vfwadd.vv v4, v1, v2 */
+        0xca111357, /* vfwsub.vv v6, v1, v2 */
+        0xe2111457, /* vfwmul.vv v8, v1, v2 */
     };
     static const uint32_t wide_src_fp[] = {
-        0xd21111d7, /* vfwadd.wv v3, v1, v2 */
-        0xda111257, /* vfwsub.wv v4, v1, v2 */
-        0xd21052d7, /* vfwadd.wf v5, v1, f0 */
-        0xda105357, /* vfwsub.wf v6, v1, f0 */
+        0xd2111257, /* vfwadd.wv v4, v1, v2 */
+        0xda111357, /* vfwsub.wv v6, v1, v2 */
+        0xd2105457, /* vfwadd.wf v8, v1, f0 */
+        0xda105557, /* vfwsub.wf v10, v1, f0 */
     };
 
     reset_guest_state();
@@ -4330,12 +5054,12 @@ static void test_rvv_moves_wide_fp(void)
     vec_store32(2, 0, 0x3f000000u);
     vec_store32(2, 1, 0x3e800000u);
     check(latr_execute_block(wide_fp, 3), 1, "FP widening block translates");
-    check(vec_read64(3, 0), UINT64_C(0x4000000000000000), "vfwadd 2.0");
-    check(vec_read64(3, 1), UINT64_C(0x4006000000000000), "vfwadd 2.75");
-    check(vec_read64(4, 0), UINT64_C(0x3ff0000000000000), "vfwsub 1.0");
-    check(vec_read64(4, 1), UINT64_C(0x4002000000000000), "vfwsub 2.25");
-    check(vec_read64(5, 0), UINT64_C(0x3fe8000000000000), "vfwmul 0.75");
-    check(vec_read64(5, 1), UINT64_C(0x3fe4000000000000), "vfwmul 0.625");
+    check(vec_read64(4, 0), UINT64_C(0x4000000000000000), "vfwadd 2.0");
+    check(vec_read64(4, 1), UINT64_C(0x4006000000000000), "vfwadd 2.75");
+    check(vec_read64(6, 0), UINT64_C(0x3ff0000000000000), "vfwsub 1.0");
+    check(vec_read64(6, 1), UINT64_C(0x4002000000000000), "vfwsub 2.25");
+    check(vec_read64(8, 0), UINT64_C(0x3fe8000000000000), "vfwmul 0.75");
+    check(vec_read64(8, 1), UINT64_C(0x3fe4000000000000), "vfwmul 0.625");
 
     reset_guest_state();
     env.csr[0x300] = 0x600;
@@ -4347,12 +5071,12 @@ static void test_rvv_moves_wide_fp(void)
     vec_store64(2, 1, UINT64_C(0x3fd0000000000000));
     env.fpr[0] = UINT64_C(0xffffffff3f000000);
     check(latr_execute_block(wide_src_fp, 4), 1, "FP wide-source block translates");
-    check(vec_read64(3, 0), UINT64_C(0x4000000000000000), "vfwadd.wv 2.0");
-    check(vec_read64(3, 1), UINT64_C(0x4006000000000000), "vfwadd.wv 2.75");
-    check(vec_read64(4, 0), UINT64_C(0x3ff0000000000000), "vfwsub.wv 1.0");
-    check(vec_read64(5, 0), UINT64_C(0x4000000000000000), "vfwadd.wf 2.0");
-    check(vec_read64(6, 0), UINT64_C(0x3ff0000000000000), "vfwsub.wf 1.0");
-    check(vec_read64(6, 1), UINT64_C(0x4000000000000000), "vfwsub.wf 2.0");
+    check(vec_read64(4, 0), UINT64_C(0x4000000000000000), "vfwadd.wv 2.0");
+    check(vec_read64(4, 1), UINT64_C(0x4006000000000000), "vfwadd.wv 2.75");
+    check(vec_read64(6, 0), UINT64_C(0x3ff0000000000000), "vfwsub.wv 1.0");
+    check(vec_read64(8, 0), UINT64_C(0x4000000000000000), "vfwadd.wf 2.0");
+    check(vec_read64(10, 0), UINT64_C(0x3ff0000000000000), "vfwsub.wf 1.0");
+    check(vec_read64(10, 1), UINT64_C(0x4000000000000000), "vfwsub.wf 2.0");
 }
 
 static void test_rvv_pvir_lsx_lasx(void)
@@ -5533,9 +6257,12 @@ void kmain(void)
     test_rvv_state();
     test_rvv_ops();
     test_rvv_memory();
+    test_rvv_whole_segment_ldff();
+    test_rvv_vstart_restart();
     test_rvv_strided_indexed();
     test_rvv_masks();
     test_rvv_reductions();
+    test_rvv_legality();
     test_rvv_permute();
     test_rvv_width_sat();
     test_rvv_fp();

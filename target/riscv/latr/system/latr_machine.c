@@ -5,6 +5,7 @@
 #include "translate.h"
 
 #define PLIC_PHANDLE (1u + LATR_MACHINE_MAX_HARTS)
+#define TEST_PHANDLE (2u + LATR_MACHINE_MAX_HARTS)
 #define CPU_INTC_PHANDLE(hart) (1u + (hart))
 
 static uint64_t align_down(uint64_t value, uint64_t align)
@@ -17,22 +18,25 @@ static uint64_t align_up(uint64_t value, uint64_t align)
     return (value + align - 1u) & ~(align - 1u);
 }
 
+/* Device-tree unit addresses are hexadecimal and must match the literal paths
+ * used by /chosen/stdout-path and /aliases. */
 static void format_node(char *out, const char *prefix, uint32_t value)
 {
-    char digits[12];
+    static const char digits[] = "0123456789abcdef";
+    char tmp[12];
     unsigned d = 0;
     size_t n = strlen(prefix);
 
     memcpy(out, prefix, n);
     if (value == 0) {
-        digits[d++] = '0';
+        tmp[d++] = '0';
     }
     while (value != 0) {
-        digits[d++] = (char)('0' + value % 10u);
-        value /= 10u;
+        tmp[d++] = digits[value & 15u];
+        value >>= 4;
     }
     while (d != 0) {
-        out[n++] = digits[--d];
+        out[n++] = tmp[--d];
     }
     out[n] = '\0';
 }
@@ -61,6 +65,24 @@ int latr_machine_init(LatrMachine *m, uint8_t *ram, uint64_t ram_size,
                                 m->boot_hart)) {
         return 0;
     }
+    /* QEMU virt exposes readable low memory; fw_dynamic probes address 0
+     * before deciding whether a2 carries a fw_dynamic_info structure. */
+    {
+        uint64_t *info = (uint64_t *)(void *)(m->boot_rom +
+                                              LATR_MACHINE_FW_DYNAMIC_INFO);
+
+        info[0] = UINT64_C(0x4942534f); /* FW_DYNAMIC_INFO_MAGIC */
+        info[1] = 2;                    /* version */
+        info[2] = LATR_MACHINE_KERNEL_BASE;
+        info[3] = 1;                    /* next stage: S-mode */
+        info[4] = 0;                    /* options */
+        info[5] = m->boot_hart;
+    }
+    if (!loongemu_mem_map_add(&m->sys.map, 0, sizeof(m->boot_rom),
+                              (uint64_t)(uintptr_t)m->boot_rom,
+                              LOONGEMU_MEM_ROM, "boot-rom")) {
+        return 0;
+    }
     per = work_size / (nharts * 2u);
     per &= ~15u;
     if (per < 4096) {
@@ -77,6 +99,7 @@ int latr_machine_init(LatrMachine *m, uint8_t *ram, uint64_t ram_size,
         h->env.exception = 0;
         h->env.mem_fault_cause = 0;
         h->env.fetch_faulted = 0;
+        h->cpu.env_ptr = &h->env;
         h->hartid = i;
         h->online = true;
         h->arena = work + (size_t)i * per;
@@ -151,6 +174,15 @@ int latr_machine_load_firmware_elf(LatrMachine *m, const uint8_t *elf,
         entry >= LATR_MACHINE_KERNEL_BASE) {
         return 0;
     }
+    /*
+     * Checking only the entry point is not enough: a segment may start below
+     * the kernel window and still extend into it, which would let the firmware
+     * overwrite the image we load at +2 MiB. latr_elf_load() already rejected
+     * anything outside RAM, so `image_end` is a valid exclusive bound.
+     */
+    if (m->sys.image_end > LATR_MACHINE_KERNEL_BASE) {
+        return 0;
+    }
     m->firmware_entry = entry;
     m->firmware_loaded = true;
     return 1;
@@ -190,6 +222,58 @@ int latr_machine_load_initrd(LatrMachine *m, const uint8_t *image,
     return 1;
 }
 
+static void machine_virtio_irq(void *opaque, uint32_t irq, int level)
+{
+    LatrMachine *m = opaque;
+
+    loongemu_plic_set_irq(&m->sys.plic, irq, level);
+}
+
+int latr_machine_attach_disk(LatrMachine *m, uint8_t *image, uint64_t len)
+{
+    if (m == NULL) {
+        return 0;
+    }
+    /*
+     * No image means the board was started without -drive. That is a supported
+     * configuration: the guest simply sees no block device. Everything the
+     * device would have contributed (MMIO window, PLIC line, DTB node) is keyed
+     * off `disk_attached`, which stays false here, so bailing out early *is* the
+     * degradation -- reporting it as a failure would make "-drive is optional"
+     * impossible for callers to express.
+     */
+    if (len == 0) {
+        return 1;
+    }
+    if (image == NULL) {
+        /* A size without a buffer is not "no disk", it is a caller bug. */
+        return 0;
+    }
+    if (len < LOONGEMU_VIRTIO_BLK_SECTOR || m->disk_attached) {
+        return 0;
+    }
+    if (!loongemu_mem_map_add(&m->sys.map, LATR_MACHINE_VIRTIO_BASE,
+                              LATR_MACHINE_VIRTIO_STRIDE *
+                                  LATR_MACHINE_VIRTIO_COUNT,
+                              0, LOONGEMU_MEM_MMIO, "virtio")) {
+        return 0;
+    }
+    if (!loongemu_virtio_blk_init(&m->virtio_blk, &m->sys.map, image, len,
+                                  LATR_MACHINE_VIRTIO_IRQ_BASE,
+                                  machine_virtio_irq, m)) {
+        return 0;
+    }
+    if (!loongemu_virtio_blk_attach(&m->sys.bus, &m->virtio_blk,
+                                    LATR_MACHINE_VIRTIO_BASE)) {
+        return 0;
+    }
+    m->disk = image;
+    m->disk_size = len;
+    m->disk_attached = true;
+    m->dtb_ready = false;
+    return 1;
+}
+
 int latr_machine_set_bootargs(LatrMachine *m, const char *args)
 {
     size_t len;
@@ -211,6 +295,20 @@ void latr_machine_set_enter_tb(LatrMachine *m, LatrMachineEnterTb fn)
 {
     if (m != NULL) {
         m->enter_tb = fn;
+    }
+}
+
+void latr_machine_set_translate_tb(LatrMachine *m, LatrMachineTranslateTb fn)
+{
+    if (m != NULL) {
+        m->translate_tb = fn;
+    }
+}
+
+void latr_machine_set_translated_tb(LatrMachine *m, LatrMachineTranslatedTb fn)
+{
+    if (m != NULL) {
+        m->translated_tb = fn;
     }
 }
 
@@ -289,6 +387,25 @@ int latr_machine_build_dtb(LatrMachine *m)
     }
     latr_fdt_end_node(&fdt);
 
+    /* Poweroff / reboot through the SiFive test device, exactly like QEMU virt.
+     * Without these two nodes OpenSBI's SRST extension reports
+     * SBI_ERR_NOT_SUPPORTED, so an S-mode `system_reset` ecall cannot stop the
+     * machine and every clean shutdown has to poke the test device behind the
+     * firmware's back. Linux's poweroff path looks for the same nodes. */
+    latr_fdt_begin_node(&fdt, "poweroff");
+    latr_fdt_prop_string(&fdt, "compatible", "syscon-poweroff");
+    latr_fdt_prop_u32(&fdt, "regmap", TEST_PHANDLE);
+    latr_fdt_prop_u32(&fdt, "offset", 0);
+    latr_fdt_prop_u32(&fdt, "value", 0x5555);
+    latr_fdt_end_node(&fdt);
+
+    latr_fdt_begin_node(&fdt, "reboot");
+    latr_fdt_prop_string(&fdt, "compatible", "syscon-reboot");
+    latr_fdt_prop_u32(&fdt, "regmap", TEST_PHANDLE);
+    latr_fdt_prop_u32(&fdt, "offset", 0);
+    latr_fdt_prop_u32(&fdt, "value", 0x7777);
+    latr_fdt_end_node(&fdt);
+
     reg[0] = (uint32_t)(LATR_SYSTEM_RAM_BASE >> 32);
     reg[1] = (uint32_t)LATR_SYSTEM_RAM_BASE;
     reg[2] = (uint32_t)(m->sys.ram_size >> 32);
@@ -351,6 +468,19 @@ int latr_machine_build_dtb(LatrMachine *m)
     latr_fdt_prop_cells(&fdt, "interrupts-extended", cells, n);
     latr_fdt_end_node(&fdt);
 
+    if (m->disk_attached) {
+        latr_fdt_begin_node(&fdt, "virtio_mmio@10001000");
+        latr_fdt_prop_string(&fdt, "compatible", "virtio,mmio");
+        reg[0] = 0;
+        reg[1] = (uint32_t)LATR_MACHINE_VIRTIO_BASE;
+        reg[2] = 0;
+        reg[3] = LOONGEMU_VIRTIO_MMIO_SIZE;
+        latr_fdt_prop_cells(&fdt, "reg", reg, 4);
+        latr_fdt_prop_u32(&fdt, "interrupt-parent", PLIC_PHANDLE);
+        latr_fdt_prop_u32(&fdt, "interrupts", LATR_MACHINE_VIRTIO_IRQ_BASE);
+        latr_fdt_end_node(&fdt);
+    }
+
     format_node(node, "uart@", 0x10000000u);
     latr_fdt_begin_node(&fdt, node);
     latr_fdt_prop_string(&fdt, "compatible", "ns16550a");
@@ -364,6 +494,27 @@ int latr_machine_build_dtb(LatrMachine *m)
     latr_fdt_prop_u32(&fdt, "interrupt-parent", PLIC_PHANDLE);
     latr_fdt_prop_u32(&fdt, "interrupts", LATR_MACHINE_UART_IRQ);
     latr_fdt_end_node(&fdt);
+
+    /* SiFive test device. OpenSBI's fdt_reset_sifive_test binds to
+     * "sifive,test0"/"sifive,test1" and implements SRST by writing 0x5555
+     * (poweroff) or 0x7777 (reboot) to offset 0, which is exactly what the
+     * exit device already decodes. */
+    latr_fdt_begin_node(&fdt, "test@100000");
+    {
+        static const char *const test_compat[] = {
+            "sifive,test1", "sifive,test0", "syscon",
+        };
+
+        latr_fdt_prop_strings(&fdt, "compatible", test_compat, 3);
+    }
+    reg[0] = 0;
+    reg[1] = (uint32_t)LATR_SYSTEM_EXIT_BASE;
+    reg[2] = 0;
+    reg[3] = 0x1000;
+    latr_fdt_prop_cells(&fdt, "reg", reg, 4);
+    latr_fdt_prop_u32(&fdt, "phandle", TEST_PHANDLE);
+    latr_fdt_end_node(&fdt);
+
     latr_fdt_end_node(&fdt); /* soc */
     latr_fdt_end_node(&fdt); /* root */
 
@@ -373,6 +524,59 @@ int latr_machine_build_dtb(LatrMachine *m)
     }
     m->dtb_size = size;
     m->dtb_ready = true;
+    return 1;
+}
+
+int latr_machine_host_fault(LatrMachine *m, uint32_t hartid,
+                            uintptr_t host_pc, uint32_t cause,
+                            uint64_t badaddr, LatrMachineFaultInfo *info)
+{
+    LatrMachineHart *h;
+    LatrTranslatorContext *saved;
+    uint64_t guest_pc = 0;
+    bool resolved;
+
+    if (info != NULL) {
+        memset(info, 0, sizeof(*info));
+        info->host_pc = host_pc;
+        info->cause = cause;
+        info->badaddr = badaddr;
+        info->hartid = hartid;
+    }
+    if (m == NULL || hartid >= m->nharts) {
+        return 0;
+    }
+    h = &m->harts[hartid];
+    if (h->ctx == NULL) {
+        return 0;
+    }
+    /*
+     * Borrow the hart's translator context to resolve the native PC, then put
+     * the caller's context back. Without the restore, a host fault raised while
+     * dispatching hart 1 would leave hart 0's state pointing at hart 1 -- which
+     * only shows up once each hart has its own TLS context.
+     */
+    saved = latr_context_bind(h->ctx);
+    latr_set_cpu_env(&h->env);
+    resolved = latr_tb_insn_map_resolve(host_pc, &guest_pc, NULL);
+    if (!resolved) {
+        latr_context_restore(saved);
+        return 0;
+    }
+    if (info != NULL) {
+        info->guest_pc = guest_pc;
+        info->resolved = true;
+    }
+    /* Instructions before the faulting one already committed their effects;
+     * resume the guest at the faulting instruction itself with the guest
+     * exception latched. */
+    h->env.pc = guest_pc;
+    h->env.exception = cause;
+    h->env.badaddr = badaddr;
+    h->env.mem_fault_cause = 0;
+    h->env.fetch_faulted = 0;
+    latr_tb_shootdown_all(&h->tb_cache);
+    latr_context_restore(saved);
     return 1;
 }
 
@@ -392,10 +596,25 @@ int latr_machine_boot(LatrMachine *m)
         h->env.fetch_faulted = 0;
         h->env.gpr[10] = i;           /* a0 = hartid */
         h->env.gpr[11] = m->dtb_addr; /* a1 = DTB */
+        h->env.gpr[12] = m->firmware_loaded
+                             ? LATR_MACHINE_FW_DYNAMIC_INFO
+                             : 0; /* a2 = fw_dynamic_info (OpenSBI) */
         if (m->firmware_loaded) {
             h->env.pc = m->firmware_entry;
             h->env.privilege = LATR_RISCV_PRIV_M;
         } else if (m->kernel_loaded) {
+            /*
+             * No firmware: start Linux directly in S-mode with the state
+             * OpenSBI would have installed. Without these the very first
+             * rdtime/csr access traps and the kernel dies before earlycon.
+             */
+            uint64_t status = h->env.csr[0x300] & ~(UINT64_C(3) << 11);
+
+            status |= UINT64_C(1) << 11; /* MPP = S */
+            h->env.csr[0x300] = status;
+            h->env.csr[0x303] = UINT64_C(0x222); /* delegate SSI/STI/SEI */
+            h->env.csr[0x304] = UINT64_C(0x222);
+            h->env.csr[0x306] = 7;               /* mcounteren: cycle/time/instret */
             h->env.pc = m->kernel_entry;
             h->env.privilege = LATR_RISCV_PRIV_S;
         } else {
@@ -404,6 +623,16 @@ int latr_machine_boot(LatrMachine *m)
     }
     m->booted = true;
     return 1;
+}
+
+/* Publish freshly generated code to the instruction stream. */
+static inline void latr_icache_sync(void)
+{
+#if defined(__loongarch__)
+    __asm__ volatile("dbar 0\n\tibar 0" ::: "memory");
+#else
+    __asm__ volatile("" ::: "memory");
+#endif
 }
 
 static int run_hart(LatrMachine *m, LatrMachineHart *h)
@@ -418,6 +647,12 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
 
     latr_context_bind(h->ctx);
     latr_set_cpu_env(&h->env);
+    /*
+     * Per-hart timer and IPI state: CLINT MSIP/MTIP are per hart and must be
+     * latched into *this* hart's MIP. The clock itself is advanced once per
+     * machine step by the caller.
+     */
+    latr_system_update_hart(&m->sys, &h->env, h->hartid);
     if (h->env.sfence_pending) {
         latr_tb_shootdown_asid(&h->tb_cache, (uint32_t)h->env.sfence_asid);
         h->env.sfence_pending = 0;
@@ -433,19 +668,11 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
 
     key = latr_tb_cache_key(&h->env);
     pc_before = h->env.pc;
-    if (!m->kernel_probed && pc_before == LATR_MACHINE_KERNEL_BASE) {
-        uint64_t host = 0;
-        uint64_t phys = 0;
-
-        m->kernel_probed = true;
-        m->kernel_fetch_cause = (uint64_t)latr_translate(
-            &h->env, pc_before, LATR_ACCESS_EXEC, 2, &host, &phys);
-        m->kernel_cpu_state = (uint64_t)(uintptr_t)lsenv->cpu_state;
-        m->kernel_env = (uint64_t)(uintptr_t)&h->env;
-        m->kernel_priv = h->env.privilege;
-    }
     entry = latr_tb_cache_lookup(&h->tb_cache, h->env.pc, key);
     if (entry == NULL) {
+        if (m->translate_tb != NULL) {
+            m->translate_tb(&h->env, h->env.pc);
+        }
         memset(&tb, 0, sizeof(tb));
         tb.pc = h->env.pc;
         tb.tc.ptr = h->code_buf;
@@ -461,6 +688,9 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
         }
         words = tr_ir2_assemble(h->code_buf);
         tr_fini();
+        if (m->translated_tb != NULL) {
+            m->translated_tb(&h->env, tb.pc);
+        }
         entry = latr_tb_cache_insert(&h->tb_cache, tb.pc, key, h->code_buf,
                                      (uint32_t)words * 4u, tb.icount);
         if (entry == NULL) {
@@ -473,9 +703,21 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
         if (entry != NULL) {
             latr_tb_insn_map_rebase(h->code_buf, entry->code);
         }
+        /*
+         * The block has just written machine code into the arena (or into
+         * code_buf on the uncached fallback). LoongArch keeps instructions in a
+         * separate cache, and a VMM that is itself running on LoongArch also
+         * has the host's translated-block cache to invalidate. Without this the
+         * hart keeps executing whatever bytes used to live at that address: an
+         * arena slot recycled for a different guest PC then runs an unrelated
+         * block, which shows up as an impossible PC (0) or as a jump into the
+         * translator's own C code.
+         */
+        latr_icache_sync();
     }
     code = entry != NULL ? (uint64_t)(uintptr_t)entry->code
                          : (uint64_t)(uintptr_t)h->code_buf;
+    h->last_code = code;
     if (m->enter_tb == NULL) {
         return 0;
     }
@@ -500,6 +742,9 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
     h->env.exception = 0;
     h->env.mem_fault_cause = 0;
     h->env.fetch_faulted = 0;
+    m->last_pc = pc_before;
+    m->dispatch_count++;
+    h->tbs++;
     return 1;
 }
 
@@ -513,7 +758,9 @@ int latr_machine_run(LatrMachine *m, uint32_t max_tbs)
     while (executed < max_tbs) {
         bool online = false;
 
-        latr_system_update(&m->sys);
+        /* The virtual clock is global: advance it once, then let every hart
+         * latch its own CLINT comparators against it. */
+        latr_system_tick(&m->sys, UINT64_C(1000));
         for (uint32_t i = 0; i < m->nharts; i++) {
             LatrMachineHart *h = &m->harts[i];
 

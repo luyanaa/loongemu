@@ -81,12 +81,17 @@ typedef struct DisasContext {
 
 #define LOG2_TAG_GRANULE 4
 #define EXCP_UDEF 1
+#define EXCP_DATA_ABORT 4
 extern int option_fam_jmp_cache;
 extern CPUState *current_cpu;
 static inline CPUARMState *arm_env(CPUState *cpu) { return (CPUARMState *)cpu->env_ptr; }
 static inline uint32_t syn_uncategorized(void) { return 0; }
 static inline uint32_t syn_sve_access_trap(void) { return (0x19u << 26) | (1u << 25); }
 static inline uint32_t syn_sme_access_trap(void) { return (0x1du << 26) | (1u << 25); }
+static inline uint32_t syn_data_abort_curr_el(bool is_write)
+{
+    return (0x25u << 26) | (1u << 25) | (is_write ? (1u << 6) : 0u);
+}
 static inline uint32_t syn_aa64_sysregtrap(int op0, int op1, int op2, int crn,
                                            int crm, int rt, bool isread) { return 0; }
 static inline uint32_t syn_aa64_svc(int imm16) { return 0; }

@@ -3,6 +3,7 @@
 
 #include "latr-system.h"
 #include "latr.h"
+#include "loongemu/riscv_virtio_blk.h"
 
 /*
  * QEMU-virt-style RISC-V machine: OpenSBI-compatible M-mode firmware entry at
@@ -15,6 +16,8 @@
 #define LATR_MACHINE_FIRMWARE_BASE LATR_SYSTEM_RAM_BASE
 #define LATR_MACHINE_KERNEL_BASE (LATR_SYSTEM_RAM_BASE + UINT64_C(0x00200000))
 #define LATR_MACHINE_FIRMWARE_MAX UINT64_C(0x00200000)
+/* fw_dynamic_info lives in the low boot ROM, mirroring QEMU's MROM. */
+#define LATR_MACHINE_FW_DYNAMIC_INFO UINT64_C(0x100)
 #define LATR_MACHINE_DTB_SIZE (64u << 10)
 #define LATR_MACHINE_DTB_RESERVE UINT64_C(0x00100000)
 #define LATR_MACHINE_VIRTIO_BASE UINT64_C(0x10001000)
@@ -28,6 +31,28 @@
  * CPU-state register. The VMM (or bare-metal harness) supplies it. */
 typedef void (*LatrMachineEnterTb)(void *env, void *code);
 
+/* Optional probe invoked with the guest PC immediately *before* a block is
+ * translated. A translator bug that loops forever never reaches enter_tb, so
+ * without this hook the dispatch loop looks like it vanished: this names the
+ * block that is being translated when the machine stops making progress. */
+typedef void (*LatrMachineTranslateTb)(void *env, uint64_t pc);
+
+/* Invoked with the guest PC right after the block has been assembled, i.e.
+ * the translation is complete and the harness is about to enter the generated
+ * code. Together with translate_tb this splits a stall into "stuck in the
+ * translator" (only translate_tb fires) versus "stuck executing generated
+ * code" (both fire, enter_tb fires, and nothing comes back). */
+typedef void (*LatrMachineTranslatedTb)(void *env, uint64_t pc);
+
+typedef struct LatrMachineFaultInfo {
+    uint64_t host_pc;
+    uint64_t guest_pc;
+    uint64_t badaddr;
+    uint32_t cause;
+    uint32_t hartid;
+    bool resolved;
+} LatrMachineFaultInfo;
+
 typedef struct LatrMachineHart {
     CPUArchState env;
     CPUState cpu;
@@ -38,11 +63,18 @@ typedef struct LatrMachineHart {
     uint8_t *code_buf;
     uint32_t code_buf_size;
     uint32_t hartid;
+    uint64_t tbs;
+    uint64_t last_code;
     bool online;
 } LatrMachineHart;
 
 typedef struct LatrMachine {
     LatrSystem sys;
+    LoongemuVirtioBlk virtio_blk;
+    uint8_t boot_rom[0x1000];
+    uint8_t *disk;
+    uint64_t disk_size;
+    bool disk_attached;
     uint32_t nharts;
     uint32_t boot_hart;
     uint64_t firmware_entry;
@@ -64,12 +96,11 @@ typedef struct LatrMachine {
     uint64_t first_trap_bad;
     uint64_t first_trap_fetch;
     uint64_t first_trap_mem;
-    uint64_t kernel_fetch_cause;
-    uint64_t kernel_cpu_state;
-    uint64_t kernel_env;
-    uint64_t kernel_priv;
-    bool kernel_probed;
+    uint64_t last_pc;
+    uint64_t dispatch_count;
     LatrMachineEnterTb enter_tb;
+    LatrMachineTranslateTb translate_tb;
+    LatrMachineTranslatedTb translated_tb;
     char bootargs[256];
     LatrMachineHart harts[LATR_MACHINE_MAX_HARTS];
 } LatrMachine;
@@ -89,8 +120,28 @@ int latr_machine_load_kernel(LatrMachine *m, const uint8_t *image,
                              uint64_t len);
 int latr_machine_load_initrd(LatrMachine *m, const uint8_t *image,
                              uint64_t len);
+/* Attaches a RAM-backed virtio-mmio block device at 0x10001000 (PLIC 1).
+ *
+ * A zero length is the "no -drive" case and is not an error: the machine model
+ * degrades to a board with no block device at all -- no MMIO window is mapped,
+ * no IRQ is wired, build_dtb() emits no virtio node, and the call returns 1 with
+ * `disk_attached` still false. A NULL image with a non-zero length, a disk
+ * smaller than one sector, or a second attach all return 0. */
+int latr_machine_attach_disk(LatrMachine *m, uint8_t *image, uint64_t len);
 int latr_machine_set_bootargs(LatrMachine *m, const char *args);
+/*
+ * Host-fault dispatcher closure: attributes a native fault PC to the guest
+ * instruction that produced it, restores the guest PC to that instruction,
+ * latches the guest exception/bad address, and drops the native blocks so the
+ * next dispatch re-translates from the restored PC. Returns 0 when the host PC
+ * is not inside any translated block of the hart.
+ */
+int latr_machine_host_fault(LatrMachine *m, uint32_t hartid,
+                            uintptr_t host_pc, uint32_t cause,
+                            uint64_t badaddr, LatrMachineFaultInfo *info);
 void latr_machine_set_enter_tb(LatrMachine *m, LatrMachineEnterTb fn);
+void latr_machine_set_translate_tb(LatrMachine *m, LatrMachineTranslateTb fn);
+void latr_machine_set_translated_tb(LatrMachine *m, LatrMachineTranslatedTb fn);
 int latr_machine_build_dtb(LatrMachine *m);
 /* Program a0/a1 (hartid/DTB), PC=firmware entry and M-mode privilege. */
 int latr_machine_boot(LatrMachine *m);

@@ -59,6 +59,31 @@ static void append_cell(LatrFdt *fdt, uint32_t value)
     append_bytes(fdt, cell, sizeof(cell));
 }
 
+/* Raw copy without per-item alignment; used for string lists whose items are
+ * packed and padded only once at the end of the property. */
+static void append_raw(LatrFdt *fdt, const void *data, uint32_t len)
+{
+    if (!reserve(fdt, len)) {
+        return;
+    }
+    memcpy(fdt->buf + fdt->struct_off + fdt->struct_len, data, len);
+    fdt->struct_len += len;
+}
+
+static void pad_struct(LatrFdt *fdt)
+{
+    uint32_t pad = (4u - (fdt->struct_len & 3u)) & 3u;
+
+    if (pad == 0) {
+        return;
+    }
+    if (!reserve(fdt, pad)) {
+        return;
+    }
+    memset(fdt->buf + fdt->struct_off + fdt->struct_len, 0, pad);
+    fdt->struct_len += pad;
+}
+
 static uint32_t string_offset(LatrFdt *fdt, const char *name)
 {
     uint32_t len = (uint32_t)strlen(name) + 1u;
@@ -194,8 +219,9 @@ void latr_fdt_prop_strings(LatrFdt *fdt, const char *name,
     append_cell(fdt, len);
     append_cell(fdt, name_off);
     for (uint32_t i = 0; i < count; i++) {
-        append_bytes(fdt, values[i], (uint32_t)strlen(values[i]) + 1u);
+        append_raw(fdt, values[i], (uint32_t)strlen(values[i]) + 1u);
     }
+    pad_struct(fdt);
 }
 
 uint32_t latr_fdt_finish(LatrFdt *fdt)

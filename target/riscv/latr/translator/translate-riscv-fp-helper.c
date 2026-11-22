@@ -120,9 +120,9 @@ void latr_fp_status_end(CPUArchState *env, float_status *status)
     env->fcsr |= latr_fp_riscv_flags(status);
 }
 
-int latr_riscv_fp_rmm(CPUArchState *env, uint64_t opcode, uint64_t rd,
-                      uint64_t rs1, uint64_t rs2, uint64_t rs3,
-                      uint64_t rm, uint64_t pc)
+uint64_t latr_riscv_fp_rmm(CPUArchState *env, uint64_t opcode, uint64_t rd,
+                           uint64_t rs1, uint64_t rs2, uint64_t rs3,
+                           uint64_t rm, uint64_t pc)
 {
     float_status status = { 0 };
     uint64_t result = 0;

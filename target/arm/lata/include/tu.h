@@ -1,6 +1,8 @@
 #ifndef _TU_H_
 #define _TU_H_
 
+#include "lata.h"
+
 #ifdef CONFIG_LATA_TU
 
 #define MAX_TB_IN_TU 50
@@ -32,7 +34,7 @@ typedef enum TU_TB_START_TYPE {
     TU_TB_START_ENTRY
 } TU_TB_START_TYPE;
 
-extern __thread TUControl *tu_data;
+extern LATA_TLS TUControl *tu_data;
 
 void tu_control_init(void);
 

@@ -1,8 +1,12 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <string.h>
 #include "lata.h"
+#include "lata-mem.h"
 #include "lata-vcache.h"
+#include "target/arm/tcg/translate.h"
+#include "target/arm/lata/translator/sve-lasx-lower.h"
 
 #include "exec/exec-all.h"
 #include "qemu/log.h"
@@ -164,13 +168,13 @@ void lata(void){
     // printf("lata enabled\n");
 }
 
-__thread ENV *lsenv;
-static __thread ENV lsenv_real;
+LATA_TLS ENV *lsenv;
+static LataContext default_ctx;
+static LATA_TLS LataContext *bound_ctx;
 uint64_t *ibtc_cache;
 uint64_t *fam_cache;
 
-static __thread TRANSLATION_DATA tr_data_real;
-__thread TRANSLATION_DATA *tr_data;
+LATA_TLS TRANSLATION_DATA *tr_data;
 
 bool lata_dump = 0;
 uint64_t context_switch_bt_to_native;
@@ -181,12 +185,6 @@ uint64_t context_switch_bt_to_native;
  * and still publishes for hand-built / untranslated paths.
  */
 uint32_t lata_vreg_published;
-static uint32_t vreg_publish_count;
-static uint32_t vreg_exit_violations;
-/* Resident registers already loaded into their home during this TB. */
-static uint32_t vreg_tb_resident;
-static uint32_t vreg_lazy_loads;
-static uint32_t vreg_temp_loads;
 uint64_t context_switch_native_to_bt_ret_0;
 uint64_t context_switch_native_to_bt;
 
@@ -247,15 +245,109 @@ static void global_register_init(void)
     scr3_ir2_opnd = INIT_RA(IR2_OPND_SCR, 3);
 }
 
-void lata_tr_data_init(CPUArchState *env)
+LataContext *lata_context_current(void)
 {
-    lsenv = &lsenv_real;
-    lsenv->cpu_state = env;
-    lsenv->tr_data = &tr_data_real;
+    if (bound_ctx != NULL) {
+        return bound_ctx;
+    }
+    return &default_ctx;
+}
+
+void lata_context_init(LataContext *ctx, CPUArchState *env)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->cpu_state = env;
+    ctx->env.cpu_state = env;
+    ctx->env.tr_data = &ctx->tr_data;
+    lata_vcache_state_init(&ctx->vcache, true);
+    lata_ftemp_init_context(ctx);
+    ctx->sve_const_pred_opt_enabled = true;
+    ctx->mem_ops = &lata_default_guest_mem_ops;
+    ctx->initialized = true;
+
+    LataContext *prev = bound_ctx;
+    bound_ctx = ctx;
+    lata_vreg_init_residency();
+    bound_ctx = prev;
+}
+
+void lata_context_destroy(LataContext *ctx)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    if (ctx->tr_data.ir2_inst_array != NULL) {
+        mm_free(ctx->tr_data.ir2_inst_array);
+        ctx->tr_data.ir2_inst_array = NULL;
+    }
+    ctx->tr_data.ir2_inst_num_max = 0;
+    if (ctx->ir1_list != NULL) {
+        mm_free(ctx->ir1_list);
+        ctx->ir1_list = NULL;
+    }
+    if (ctx->db_rel != NULL) {
+        mm_free(ctx->db_rel);
+        ctx->db_rel = NULL;
+    }
+    if (ctx->sve_helper_list != NULL) {
+        lata_sve_helper_list_free(ctx->sve_helper_list);
+        ctx->sve_helper_list = NULL;
+    }
+    if (bound_ctx == ctx) {
+        bound_ctx = NULL;
+        lata_vcache_bind_state(NULL);
+    }
+    ctx->initialized = false;
+}
+
+LataContext *lata_context_new(CPUArchState *env)
+{
+    LataContext *ctx = (LataContext *)mm_calloc(1, sizeof(LataContext));
+    lata_context_init(ctx, env);
+    return ctx;
+}
+
+void lata_context_delete(LataContext *ctx)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    lata_context_destroy(ctx);
+    mm_free(ctx);
+}
+
+void lata_context_bind(LataContext *ctx)
+{
+    LataContext *target = ctx != NULL ? ctx : &default_ctx;
+    if (!target->initialized) {
+        lata_context_init(target, target->cpu_state);
+    }
+    bound_ctx = target;
+    lsenv = &target->env;
+    tr_data = &target->tr_data;
+    lsenv->tr_data = tr_data;
+    lsenv->cpu_state = target->cpu_state;
+    lata_vcache_bind_state(&target->vcache);
 #ifdef CONFIG_LATA_TU
     tu_control_init();
 #endif
     global_register_init();
+}
+
+void lata_tr_data_init(CPUArchState *env)
+{
+    LataContext *ctx = lata_context_current();
+    if (!ctx->initialized) {
+        bool preserve_vcache = lata_vcache_enabled();
+        lata_context_init(ctx, env);
+        ctx->vcache.enabled = preserve_vcache;
+    }
+    ctx->cpu_state = env;
+    ctx->env.cpu_state = env;
+    lata_context_bind(ctx);
 }
 
 /*
@@ -272,13 +364,6 @@ static void emit_env_xvector_memory(IR2_OPND vector, int offset, bool store);
  * the temporary pool while the window is enabled (ra_ftemp_pool_size()). */
 #define LATA_VCACHE_HOME_BASE 14
 
-static struct {
-    bool valid;
-    bool dirty;
-    int offset;
-} zcache[LATA_VCACHE_ENTRIES];
-static unsigned zcache_victim;
-
 static IR2_OPND vcache_home(unsigned slot)
 {
     return ir2_opnd_new(IR2_OPND_FPR, LATA_VCACHE_HOME_BASE + (int)slot);
@@ -286,34 +371,75 @@ static IR2_OPND vcache_home(unsigned slot)
 
 static void vcache_flush_slot(unsigned slot)
 {
-    if (!zcache[slot].valid || !zcache[slot].dirty) {
-        zcache[slot].dirty = false;
+    LataContext *ctx = lata_context_current();
+    if (!ctx->zcache[slot].valid || !ctx->zcache[slot].dirty) {
+        ctx->zcache[slot].dirty = false;
         return;
     }
     lata_vcache_note_env_vector_write();
     lata_vcache_note_z_write();
-    emit_env_xvector_memory(vcache_home(slot), zcache[slot].offset, true);
-    zcache[slot].dirty = false;
+    emit_env_xvector_memory(vcache_home(slot), ctx->zcache[slot].offset, true);
+    ctx->zcache[slot].dirty = false;
     lata_vcache_clear_dirty(slot);
 }
 
 void lata_zcache_flush(void)
 {
+    LataContext *ctx = lata_context_current();
     for (unsigned slot = 0; slot < LATA_VCACHE_ENTRIES; ++slot) {
         vcache_flush_slot(slot);
-        zcache[slot].valid = false;
+        ctx->zcache[slot].valid = false;
+    }
+}
+
+void lata_zcache_flush_reg(int reg)
+{
+    LataContext *ctx = lata_context_current();
+    int low = env_offset_zreg(reg);
+    int high;
+
+    if (low < 0) {
+        return;
+    }
+    high = low + (int)ARM_SVE_MAX_VL_BYTES;
+    for (unsigned slot = 0; slot < LATA_VCACHE_ENTRIES; ++slot) {
+        if (ctx->zcache[slot].valid && ctx->zcache[slot].offset >= low &&
+            ctx->zcache[slot].offset < high) {
+            vcache_flush_slot(slot);
+        }
+    }
+}
+
+void lata_zcache_invalidate_reg(int reg)
+{
+    LataContext *ctx = lata_context_current();
+    int low = env_offset_zreg(reg);
+    int high;
+
+    if (low < 0) {
+        return;
+    }
+    high = low + (int)ARM_SVE_MAX_VL_BYTES;
+    for (unsigned slot = 0; slot < LATA_VCACHE_ENTRIES; ++slot) {
+        if (ctx->zcache[slot].valid && ctx->zcache[slot].offset >= low &&
+            ctx->zcache[slot].offset < high) {
+            ctx->zcache[slot].valid = false;
+            ctx->zcache[slot].dirty = false;
+            lata_vcache_clear_dirty(slot);
+        }
     }
 }
 
 static void vcache_invalidate(void)
 {
+    LataContext *ctx = lata_context_current();
     for (unsigned slot = 0; slot < LATA_VCACHE_ENTRIES; ++slot) {
-        zcache[slot].valid = false;
-        zcache[slot].dirty = false;
+        ctx->zcache[slot].valid = false;
+        ctx->zcache[slot].dirty = false;
     }
     /* Deterministic victim order per TB: otherwise a stale round-robin index
      * from a previous TB evicts a dirty chunk and defeats dead-store removal. */
-    zcache_victim = 0;
+    ctx->zcache_victim = 0;
 }
 
 /* Write back every dirty chunk but keep the clean ones in place. */
@@ -339,8 +465,9 @@ static bool vcache_offset_is_z(int offset)
 
 static int vcache_lookup(int offset)
 {
+    LataContext *ctx = lata_context_current();
     for (unsigned slot = 0; slot < LATA_VCACHE_ENTRIES; ++slot) {
-        if (zcache[slot].valid && zcache[slot].offset == offset) {
+        if (ctx->zcache[slot].valid && ctx->zcache[slot].offset == offset) {
             return (int)slot;
         }
     }
@@ -349,19 +476,20 @@ static int vcache_lookup(int offset)
 
 static unsigned vcache_choose_slot(void)
 {
+    LataContext *ctx = lata_context_current();
     for (unsigned slot = 0; slot < LATA_VCACHE_ENTRIES; ++slot) {
-        if (!zcache[slot].valid) {
+        if (!ctx->zcache[slot].valid) {
             return slot;
         }
     }
     /* Prefer evicting a clean read-only slot over a dirty destination slot. */
     for (unsigned slot = 0; slot < LATA_VCACHE_ENTRIES; ++slot) {
-        if (!zcache[slot].dirty) {
+        if (!ctx->zcache[slot].dirty) {
             return slot;
         }
     }
-    zcache_victim = (zcache_victim + 1u) % LATA_VCACHE_ENTRIES;
-    return zcache_victim;
+    ctx->zcache_victim = (ctx->zcache_victim + 1u) % LATA_VCACHE_ENTRIES;
+    return ctx->zcache_victim;
 }
 
 void lata_zcache_flush_for_exit(void)
@@ -406,9 +534,11 @@ void tr_init(void* tb)
 
     t->vreg_resident_touched = 0;
     t->vreg_resident_dirty = 0;
+    t->vreg_v_written_mask = 0;
+    t->ftemp_alloc_failed = false;
     lata_vreg_init_residency();
     /* Nothing is in a host register yet: the entry stub no longer preloads. */
-    vreg_tb_resident = 0;
+    lata_context_current()->vreg_tb_resident = 0;
 }
 
 struct IR2_INST *lata_first_ir2(void)
@@ -419,6 +549,7 @@ struct IR2_INST *lata_first_ir2(void)
 void tr_fini(void)
 {
     TRANSLATION_DATA *t = lsenv->tr_data;
+    LataContext *ctx = lata_context_current();
 
     /* I0: no borrowed vector register may survive the TB. */
     lata_vcache_end_tb();
@@ -434,10 +565,12 @@ void tr_fini(void)
 
     /* label number */
     t->label_num = 0;
+    t->vreg_v_written_mask = 0;
+    t->ftemp_alloc_failed = false;
 
     /* I0 for registers: every dirty resident register must be published. */
     if (t->vreg_resident_dirty != 0) {
-        vreg_exit_violations++;
+        ctx->vreg_exit_violations++;
         t->vreg_resident_dirty = 0;
     }
 }
@@ -523,7 +656,9 @@ static void emit_env_xvector_memory(IR2_OPND vector, int offset, bool store)
 
 void lata_env_xvld(IR2_OPND vector, int offset)
 {
-    if (lata_vcache_enabled() && vcache_offset_is_z(offset)) {
+    LataContext *ctx = lata_context_current();
+    if (lata_vcache_enabled() && latx_cpu_has_lasx() &&
+        vcache_offset_is_z(offset)) {
         int slot = vcache_lookup(offset);
 
         if (slot >= 0) {
@@ -537,9 +672,9 @@ void lata_env_xvld(IR2_OPND vector, int offset)
         vcache_flush_slot((unsigned)slot);
         lata_vcache_note_env_vector_read();
         emit_env_xvector_memory(vector, offset, false);
-        zcache[slot].valid = true;
-        zcache[slot].dirty = false;
-        zcache[slot].offset = offset;
+        ctx->zcache[slot].valid = true;
+        ctx->zcache[slot].dirty = false;
+        ctx->zcache[slot].offset = offset;
         la_xvor_v(vcache_home((unsigned)slot), vector, vector);
         return;
     }
@@ -549,7 +684,9 @@ void lata_env_xvld(IR2_OPND vector, int offset)
 
 void lata_env_xvst(IR2_OPND vector, int offset)
 {
-    if (lata_vcache_enabled() && vcache_offset_is_z(offset)) {
+    LataContext *ctx = lata_context_current();
+    if (lata_vcache_enabled() && latx_cpu_has_lasx() &&
+        vcache_offset_is_z(offset)) {
         int slot = vcache_lookup(offset);
 
         if (slot < 0) {
@@ -557,13 +694,13 @@ void lata_env_xvst(IR2_OPND vector, int offset)
             slot = (int)vcache_choose_slot();
             /* Evicting a dirty victim must write it back first. */
             vcache_flush_slot((unsigned)slot);
-            zcache[slot].valid = true;
-            zcache[slot].offset = offset;
-            zcache[slot].dirty = false;
+            ctx->zcache[slot].valid = true;
+            ctx->zcache[slot].offset = offset;
+            ctx->zcache[slot].dirty = false;
         }
         /* Deferred: env is updated when the chunk is flushed. */
         la_xvor_v(vcache_home((unsigned)slot), vector, vector);
-        zcache[slot].dirty = true;
+        ctx->zcache[slot].dirty = true;
         lata_vcache_mark_dirty((unsigned)slot);
         return;
     }
@@ -680,9 +817,11 @@ static void generate_context_switch_bt_to_native(void)
         }
     }
 
-    /* Initialize scalar mask register */
-    la_vldi(fsmask_ir2_opnd, 0x190f);
-    la_vextl_qu_du(fsmask_ir2_opnd, fsmask_ir2_opnd);
+    /* Initialize scalar mask register when LSX is available */
+    if (latx_cpu_has_lsx()) {
+        la_vldi(fsmask_ir2_opnd, 0x190f);
+        la_vextl_qu_du(fsmask_ir2_opnd, fsmask_ir2_opnd);
+    }
 
     /* jmp to tb */
     la_jirl(zero_ir2_opnd, a0_ir2_opnd, 0);
@@ -708,10 +847,12 @@ static void generate_context_switch_native_to_bt(void)
         li_d(t0_ir2_opnd, (int64_t)(uintptr_t)&lata_vreg_published);
         la_ld_wu(t1_ir2_opnd, t0_ir2_opnd, 0);
         la_bnez(t1_ir2_opnd, skip);
-        for(int i = 0; i <= 31; ++i) {
-            if (arm_la_fmap[i] >= 0) {
-                lata_env_vst(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]),
-                             env_offset_vreg(i));
+        if (latx_cpu_has_lsx()) {
+            for(int i = 0; i <= 31; ++i) {
+                if (arm_la_fmap[i] >= 0) {
+                    lata_env_vst(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]),
+                                 env_offset_vreg(i));
+                }
             }
         }
         la_label(skip);
@@ -940,6 +1081,8 @@ int tr_ir2_assemble(const void *code_start_addr)
     return code_nr;
 }
 
+static void emit_zero_z_upper(int rd);
+
 void lata_gen_call_helper_prologue(TCGContext *tcg_ctx)
 {
     for(int i = 0; i <= 31; ++i) {
@@ -951,9 +1094,15 @@ void lata_gen_call_helper_prologue(TCGContext *tcg_ctx)
     for(int i = 0; i <= 31; ++i) {
         if (arm_la_fmap[i] >= 0 &&
             (lsenv->tr_data->vreg_resident_dirty & (1u << i)) != 0) {
+            lata_zcache_invalidate_reg(i);
             lata_env_vst(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]), env_offset_vreg(i));
+            if (lsenv->tr_data->vreg_v_written_mask & (1u << i)) {
+                emit_zero_z_upper(i);
+            }
         }
     }
+    lsenv->tr_data->vreg_resident_dirty = 0;
+    lsenv->tr_data->vreg_v_written_mask = 0;
 
     /* Helper boundaries keep NZCV in env->pstate, not the LBT flag register. */
     /* store fcsr(rouding mode) to vfp.xregs[ARM_VFP_FPSCR] */
@@ -987,7 +1136,7 @@ void lata_gen_call_helper_epilogue(TCGContext *tcg_ctx)
     la_movgr2fcsr(fcsr_ir2_opnd, a7_ir2_opnd);
 
     for(int i = 0; i <= 31; ++i) {
-        if (arm_la_fmap[i] >= 0 && (vreg_tb_resident & (1u << i)) != 0) {
+        if (arm_la_fmap[i] >= 0 && (lata_context_current()->vreg_tb_resident & (1u << i)) != 0) {
             lata_env_vld(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]), env_offset_vreg(i));
         }
     }
@@ -1113,27 +1262,95 @@ void free_alloc_gpr(IR2_OPND opnd) {
 
 // fpr
 /* --- guest V-register residency ------------------------------------------ */
-static uint32_t vreg_resident_mask;
-static uint32_t vreg_spill_count;
+
+static void emit_zero_z_upper(int rd)
+{
+    CPUARMState *cpu_env = (CPUARMState *)lsenv->cpu_state;
+    int zoff = env_offset_zreg(rd);
+    if (zoff < 0) {
+        return;
+    }
+    if (cpu_env != NULL && !arm_isar_has_aa64_sve(&cpu_env->arm_cpu.isar)) {
+        return;
+    }
+    /* AArch64 V/Q/D/S/H/B writes zero Z[rd][VL-1 : 128] when VL > 128. */
+    IR2_OPND end = ra_alloc_itemp();
+    lata_env_ld_wu(end, env_offset_sve_active_vl_bits());
+    IR2_OPND ptr = ra_alloc_itemp();
+    IR2_OPND skip = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND loop = ir2_opnd_new_type(IR2_OPND_LABEL);
+
+    la_srli_d(end, end, 3);
+    li_d(ptr, 16);
+    la_bgeu(ptr, end, skip);
+    li_d(ptr, zoff);
+    la_add_d(ptr, env_ir2_opnd, ptr);
+    la_add_d(end, ptr, end);
+    la_addi_d(ptr, ptr, 16);
+    la_label(loop);
+    la_st_d(zero_ir2_opnd, ptr, 0);
+    la_addi_d(ptr, ptr, 8);
+    la_bltu(ptr, end, loop);
+    la_label(skip);
+    ra_free_temp(ptr);
+    ra_free_temp(end);
+}
 
 uint32_t lata_vreg_exit_violations(void)
 {
-    return vreg_exit_violations;
+    return lata_context_current()->vreg_exit_violations;
 }
 
 uint32_t lata_vreg_tb_publishes(void)
 {
-    return vreg_publish_count;
+    return lata_context_current()->vreg_publish_count;
 }
 
 uint32_t lata_vreg_lazy_loads(void)
 {
-    return vreg_lazy_loads;
+    return lata_context_current()->vreg_lazy_loads;
 }
 
 uint32_t lata_vreg_temp_loads(void)
 {
-    return vreg_temp_loads;
+    return lata_context_current()->vreg_temp_loads;
+}
+
+void lata_note_vreg_v_write(int rd)
+{
+    if (rd < 0 || rd > 31) {
+        return;
+    }
+    lata_zcache_invalidate_reg(rd);
+    emit_zero_z_upper(rd);
+    lata_context_current()->vreg_tb_resident &= ~(1u << rd);
+    lsenv->tr_data->vreg_resident_dirty &= ~(1u << rd);
+    lsenv->tr_data->vreg_v_written_mask &= ~(1u << rd);
+}
+
+void lata_flush_vregs_for_sve(void)
+{
+    LataContext *ctx = lata_context_current();
+    uint32_t dirty = lsenv->tr_data->vreg_resident_dirty;
+    uint32_t vmask = lsenv->tr_data->vreg_v_written_mask;
+
+    if (dirty != 0 || vmask != 0) {
+        for (int i = 0; i <= 31; ++i) {
+            if (dirty & (1u << i)) {
+                lata_env_vst(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]),
+                             env_offset_vreg(i));
+                ctx->vreg_publish_count++;
+            }
+            if ((dirty & (1u << i)) || (vmask & (1u << i))) {
+                lata_zcache_invalidate_reg(i);
+                emit_zero_z_upper(i);
+            }
+        }
+        lsenv->tr_data->vreg_resident_dirty = 0;
+        lsenv->tr_data->vreg_v_written_mask = 0;
+    }
+    /* SVE may modify low 128 bits of any Zreg; reload on subsequent NEON use. */
+    ctx->vreg_tb_resident = 0;
 }
 
 /*
@@ -1143,17 +1360,24 @@ uint32_t lata_vreg_temp_loads(void)
  */
 void lata_emit_dirty_vreg_stores(void)
 {
+    LataContext *ctx = lata_context_current();
     uint32_t dirty = lsenv->tr_data->vreg_resident_dirty;
+    uint32_t vmask = lsenv->tr_data->vreg_v_written_mask;
 
     for (int i = 0; i <= 31; ++i) {
         if (!(dirty & (1u << i))) {
             continue;
         }
+        lata_zcache_invalidate_reg(i);
         lata_env_vst(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]),
                      env_offset_vreg(i));
-        vreg_publish_count++;
+        if (vmask & (1u << i)) {
+            emit_zero_z_upper(i);
+        }
+        ctx->vreg_publish_count++;
     }
     lsenv->tr_data->vreg_resident_dirty = 0;
+    lsenv->tr_data->vreg_v_written_mask = 0;
     {
         IR2_OPND addr = ra_alloc_itemp();
         IR2_OPND one = ra_alloc_itemp();
@@ -1171,12 +1395,13 @@ bool lata_vreg_resident(int index)
     if (index < 0 || index > 31) {
         return false;
     }
-    return (vreg_resident_mask & (1u << index)) != 0;
+    return (lata_context_current()->vreg_resident_mask & (1u << index)) != 0;
 }
 
 void lata_vreg_init_residency(void)
 {
-    vreg_resident_mask = 0;
+    LataContext *ctx = lata_context_current();
+    ctx->vreg_resident_mask = 0;
     for (int i = 0; i <= 31; ++i) {
         if (arm_la_fmap[i] < 0) {
             continue;
@@ -1186,16 +1411,15 @@ void lata_vreg_init_residency(void)
         if (ra_ftemp_phys_in_pool(arm_la_fmap[i])) {
             continue;
         }
-        vreg_resident_mask |= 1u << i;
+        ctx->vreg_resident_mask |= 1u << i;
     }
 }
 
-/*
- * Verify the register-file partition.  Cross-TB residency is only sound while
- * every LASX register has exactly one owner, because the native<->BT switch
- * code loads/stores a fixed set of registers and a TB's translate-time
- * residency decisions must still hold when that TB runs later.
- */
+void lata_vreg_clear_residency_for_test(void)
+{
+    lata_context_current()->vreg_resident_mask = 0;
+}
+
 int lata_vreg_partition_violations(void)
 {
     int violations = 0;
@@ -1219,7 +1443,7 @@ int lata_vreg_partition_violations(void)
 
 uint32_t lata_vreg_spills(void)
 {
-    return vreg_spill_count;
+    return lata_context_current()->vreg_spill_count;
 }
 
 uint32_t lata_vreg_resident_count(void)
@@ -1241,6 +1465,7 @@ uint32_t lata_vreg_resident_count(void)
  */
 int lata_vreg_spill_cold(void)
 {
+    LataContext *ctx = lata_context_current();
     for (int i = 0; i <= 31; ++i) {
         if (arm_la_fmap[i] < 0) {
             continue;
@@ -1255,30 +1480,33 @@ int lata_vreg_spill_cold(void)
             arm_la_fmap[i] == LATA_VCACHE_HOME_BASE + 1) {
             continue; /* window homes */
         }
-        lata_env_vst(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]),
-                     env_offset_vreg(i));
-        vreg_resident_mask &= ~(1u << i);
-        vreg_spill_count++;
+        if ((ctx->vreg_tb_resident & (1u << i)) != 0) {
+            lata_env_vst(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]),
+                         env_offset_vreg(i));
+        }
+        ctx->vreg_resident_mask &= ~(1u << i);
+        ctx->vreg_spill_count++;
         return i;
     }
     return -1;
 }
 
 IR2_OPND alloc_fpr_src(int i) {
+    LataContext *ctx = lata_context_current();
     if (lata_vreg_resident(i)) {
         lsenv->tr_data->vreg_resident_touched |= 1u << i;
-        if (!(vreg_tb_resident & (1u << i))) {
+        if (!(ctx->vreg_tb_resident & (1u << i))) {
             /* P2: load on first use instead of preloading every register. */
             lata_env_vld(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]),
                          env_offset_vreg(i));
-            vreg_tb_resident |= 1u << i;
-            vreg_lazy_loads++;
+            ctx->vreg_tb_resident |= 1u << i;
+            ctx->vreg_lazy_loads++;
         }
         return ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]);
     } else {
         IR2_OPND t = ra_alloc_ftemp();
 
-        vreg_temp_loads++;
+        ctx->vreg_temp_loads++;
         lata_env_vld(t, env_offset_vreg(i));
 
         return t;
@@ -1286,10 +1514,12 @@ IR2_OPND alloc_fpr_src(int i) {
 }
 
 IR2_OPND alloc_fpr_dst(int i) {
+    LataContext *ctx = lata_context_current();
     if (lata_vreg_resident(i)) {
         lsenv->tr_data->vreg_resident_touched |= 1u << i;
         lsenv->tr_data->vreg_resident_dirty |= 1u << i;
-        vreg_tb_resident |= 1u << i;
+        lsenv->tr_data->vreg_v_written_mask |= 1u << i;
+        ctx->vreg_tb_resident |= 1u << i;
         return ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]);
     } else {
         return ra_alloc_ftemp();
@@ -1297,11 +1527,14 @@ IR2_OPND alloc_fpr_dst(int i) {
 }
 
 void store_fpr_dst(int i, IR2_OPND opnd) {
+    lata_zcache_invalidate_reg(i);
     if (!lata_vreg_resident(i)) {
         lata_env_vst(opnd, env_offset_vreg(i));
+        emit_zero_z_upper(i);
     } else {
         lsenv->tr_data->vreg_resident_touched |= 1u << i;
         lsenv->tr_data->vreg_resident_dirty |= 1u << i;
+        lsenv->tr_data->vreg_v_written_mask |= 1u << i;
     }
 }
 
@@ -1315,6 +1548,7 @@ void free_alloc_fpr(IR2_OPND opnd) {
 void lata_ir2_snapshot_take(LataIr2Snapshot *snap)
 {
     TRANSLATION_DATA *t;
+    LataContext *ctx = lata_context_current();
 
     if (snap == NULL || lsenv == NULL || lsenv->tr_data == NULL) {
         return;
@@ -1329,20 +1563,23 @@ void lata_ir2_snapshot_take(LataIr2Snapshot *snap)
     snap->all_temp_status = t->all_temp_status;
     snap->vreg_resident_touched = t->vreg_resident_touched;
     snap->vreg_resident_dirty = t->vreg_resident_dirty;
-    snap->vreg_tb_resident = vreg_tb_resident;
+    snap->vreg_v_written_mask = t->vreg_v_written_mask;
+    snap->vreg_tb_resident = ctx->vreg_tb_resident;
     snap->w_write_flag = t->w_write_flag;
+    snap->ftemp_alloc_failed = t->ftemp_alloc_failed;
     for (unsigned slot = 0; slot < LATA_VCACHE_ENTRIES; ++slot) {
-        snap->zcache_slots[slot].valid = zcache[slot].valid;
-        snap->zcache_slots[slot].dirty = zcache[slot].dirty;
-        snap->zcache_slots[slot].offset = zcache[slot].offset;
+        snap->zcache_slots[slot].valid = ctx->zcache[slot].valid;
+        snap->zcache_slots[slot].dirty = ctx->zcache[slot].dirty;
+        snap->zcache_slots[slot].offset = ctx->zcache[slot].offset;
     }
-    snap->zcache_victim = zcache_victim;
+    snap->zcache_victim = ctx->zcache_victim;
     lata_vcache_snapshot_take(&snap->vcache_snap);
 }
 
 void lata_ir2_snapshot_rollback(const LataIr2Snapshot *snap)
 {
     TRANSLATION_DATA *t;
+    LataContext *ctx = lata_context_current();
 
     if (snap == NULL || lsenv == NULL || lsenv->tr_data == NULL) {
         return;
@@ -1363,13 +1600,15 @@ void lata_ir2_snapshot_rollback(const LataIr2Snapshot *snap)
     t->all_temp_status = snap->all_temp_status;
     t->vreg_resident_touched = snap->vreg_resident_touched;
     t->vreg_resident_dirty = snap->vreg_resident_dirty;
-    vreg_tb_resident = snap->vreg_tb_resident;
+    t->vreg_v_written_mask = snap->vreg_v_written_mask;
+    ctx->vreg_tb_resident = snap->vreg_tb_resident;
     t->w_write_flag = snap->w_write_flag;
+    t->ftemp_alloc_failed = snap->ftemp_alloc_failed;
     for (unsigned slot = 0; slot < LATA_VCACHE_ENTRIES; ++slot) {
-        zcache[slot].valid = snap->zcache_slots[slot].valid;
-        zcache[slot].dirty = snap->zcache_slots[slot].dirty;
-        zcache[slot].offset = snap->zcache_slots[slot].offset;
+        ctx->zcache[slot].valid = snap->zcache_slots[slot].valid;
+        ctx->zcache[slot].dirty = snap->zcache_slots[slot].dirty;
+        ctx->zcache[slot].offset = snap->zcache_slots[slot].offset;
     }
-    zcache_victim = snap->zcache_victim;
+    ctx->zcache_victim = snap->zcache_victim;
     lata_vcache_snapshot_restore(&snap->vcache_snap);
 }

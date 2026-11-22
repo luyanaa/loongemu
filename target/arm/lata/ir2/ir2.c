@@ -157,7 +157,7 @@ int ir2_opnd_is_itemp(const IR2_OPND *opnd)
 int ir2_opnd_is_ftemp(const IR2_OPND *opnd)
 {
     return (ir2_opnd_is_freg(opnd) &&
-           (reg_ftemp_reverse_map[ir2_opnd_base_reg_num(opnd)] >= 0));
+           (lata_ftemp_slot_for_phys(ir2_opnd_base_reg_num(opnd)) >= 0));
 }
 
 int ir2_opnd_is_mem(const IR2_OPND *opnd) { return opnd->_type == IR2_OPND_MEM; }
@@ -210,7 +210,7 @@ int ir2_opnd_to_string(IR2_OPND *opnd, char *str, bool hex)
     case IR2_OPND_FPR: {
         if (ir2_opnd_is_ftemp(opnd)) {
             return sprintf(str, "\033[3%dmftmp%d\033[m", base_reg_num % 6 + 1,
-                           reg_ftemp_reverse_map[base_reg_num]);
+                           lata_ftemp_slot_for_phys(base_reg_num));
         } else {
             strcpy(str, ir2_name(40 + base_reg_num));
             return strlen(str);
@@ -366,12 +366,11 @@ int ir2_to_string(IR2_INST *ir2, char *str)
     return length;
 }
 
-static int ir1_id;
-
 int ir2_dump(IR2_INST *ir2)
 {
-   char str[64];
+    char str[64];
     int size = 0;
+    LataContext *ctx = lata_context_current();
 
     if (ir2_opcode(ir2) ==
         0) { /* an empty IR2_INST was inserted into the ir2 */
@@ -381,15 +380,14 @@ int ir2_dump(IR2_INST *ir2)
 
     size = ir2_to_string(ir2, str);
     if (ir2->_id == 0) {
-        ir1_id = 0;
-        qemu_log("[%d, %d] %s\n", ir2->_id, ir1_id, str);
+        ctx->ir2_dump_ir1_id = 0;
+        qemu_log("[%d, %d] %s\n", ir2->_id, ctx->ir2_dump_ir1_id, str);
     } else if (str[0] == '-') {
-        ir1_id ++;
-        qemu_log("[%d, %d] %s\n", ir2->_id, ir1_id, str);
+        ctx->ir2_dump_ir1_id++;
+        qemu_log("[%d, %d] %s\n", ir2->_id, ctx->ir2_dump_ir1_id, str);
     } else {
         qemu_log("%s\n", str);
     }
-
 
     return size;
 }
@@ -408,6 +406,17 @@ void ir2_append(IR2_INST *ir2)
 {
     TRANSLATION_DATA *t = lsenv->tr_data;
     IR2_INST *former_last = t->last_ir2;
+
+    /*
+     * Appending a node that is already the tail would link it to itself
+     * (_next becomes its own id) and turn the IR2 list into a cycle.
+     * label_dispose() and assemble then walk that cycle forever: the whole
+     * translator hangs with no guest progress and no diagnostic, which reads
+     * exactly like a wedged guest TB. Cheap to check, expensive to debug.
+     */
+    if (former_last == ir2) {
+        return;
+    }
 
     if (former_last != NULL) {
         lsassert(t->first_ir2 != NULL);
@@ -509,12 +518,25 @@ IR2_INST *ir2_allocate(void)
         IR2_INST *back_ir2_inst_array = t->ir2_inst_array;
         t->ir2_inst_array =
             (IR2_INST *)mm_realloc(t->ir2_inst_array, bytes << 1);
-        t->first_ir2 =
-            (IR2_INST *)((ADDR)t->first_ir2 - (ADDR)back_ir2_inst_array +
-                         (ADDR)t->ir2_inst_array);
-        t->last_ir2 =
-            (IR2_INST *)((ADDR)t->last_ir2 - (ADDR)back_ir2_inst_array +
-                         (ADDR)t->ir2_inst_array);
+        /*
+         * realloc() may move the block. first_ir2/last_ir2 are rebased, but
+         * any IR2_INST * that the translator itself stashed across this call
+         * now dangles. That is why the capacity is normally grown at TB
+         * boundaries (see tr_init()) and this path is only a last resort.
+         * The rebase must not be applied to a NULL head/tail: NULL is encoded
+         * as -1 in the links, so a rebased NULL would turn into a bogus
+         * non-NULL pointer and ir2_append() would then walk into it.
+         */
+        if (t->first_ir2 != NULL) {
+            t->first_ir2 =
+                (IR2_INST *)((ADDR)t->first_ir2 - (ADDR)back_ir2_inst_array +
+                             (ADDR)t->ir2_inst_array);
+        }
+        if (t->last_ir2 != NULL) {
+            t->last_ir2 =
+                (IR2_INST *)((ADDR)t->last_ir2 - (ADDR)back_ir2_inst_array +
+                             (ADDR)t->ir2_inst_array);
+        }
     }
 
     /* 2. allocate one */

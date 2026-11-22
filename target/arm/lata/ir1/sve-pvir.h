@@ -69,6 +69,12 @@ typedef enum {
     A64_SVE_IR2_READY,
 } A64SVEIR2Dispatch;
 
+typedef enum {
+    A64_SVE_BACKEND_LASX = 0,
+    A64_SVE_BACKEND_LSX = 1,
+    A64_SVE_BACKEND_SCALAR_HELPER = 2,
+} A64SVEBackendMode;
+
 /* Initialize caller-owned SSA/version state; no storage is allocated. */
 void a64_sve_pvir_builder_init(A64SVEPvirBuilder *builder);
 
@@ -78,8 +84,11 @@ PvirStatus a64_sve_build_pvir(A64SVEPvirBuilder *builder,
                               uint32_t vl_bits,
                               PvirInstruction *out);
 
-/* Access controls are checked before this helper consults the shared LASX API. */
+/* SVE execution legality depends on guest access control, never host LASX. */
 A64SVEIR2Dispatch a64_sve_ir2_dispatch(
     A64SVEAccessDisposition access_disposition);
+
+/* Select host lowering tier from runtime vector capability (LASX/LSX/scalar). */
+A64SVEBackendMode a64_sve_select_backend(void);
 
 #endif

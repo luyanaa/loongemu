@@ -217,34 +217,6 @@ int reg_ftemp_map[32] = {
 };
 
 #define FTEMP_BASE_ENTRIES 6
-static int ftemp_base = FTEMP_BASE_ENTRIES;
-static int ftemp_pool_entries = FTEMP_BASE_ENTRIES;
-
-bool ra_ftemp_phys_in_pool(int phys)
-{
-    for (int slot = 0; slot < ra_ftemp_pool_size(); ++slot) {
-        if (reg_ftemp_map[slot] == phys) {
-            return true;
-        }
-    }
-    return false;
-}
-
-void lata_ftemp_set_base_pool(int pool)
-{
-    if (pool < 1) {
-        pool = 1;
-    }
-    if (pool > FTEMP_BASE_ENTRIES) {
-        pool = FTEMP_BASE_ENTRIES;
-    }
-    /* Drop appended spill slots so their registers are not handed out twice. */
-    for (int slot = pool; slot < ftemp_pool_entries; ++slot) {
-        reg_ftemp_reverse_map[reg_ftemp_map[slot]] = INVALID_TEMP;
-    }
-    ftemp_base = pool;
-    ftemp_pool_entries = pool;
-}
 
 int reg_ftemp_reverse_map[32] = {
     REG_MAP_DEF(0 ... 31, INVALID_TEMP),
@@ -254,9 +226,70 @@ int reg_ftemp_reverse_map[32] = {
     REG_MAP_DEF(12, FTEMP3),
     REG_MAP_DEF(13, FTEMP4),
     REG_MAP_DEF(14, FTEMP5),
-    // REG_MAP_DEF(15, FTEMP6),
-    // REG_MAP_DEF(16 ... 31, INVALID_TEMP),
 };
+
+void lata_ftemp_init_context(LataContext *ctx)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    ctx->ftemp_base = FTEMP_BASE_ENTRIES;
+    ctx->ftemp_pool_entries = FTEMP_BASE_ENTRIES;
+    memcpy(ctx->reg_ftemp_map, reg_ftemp_map, sizeof(ctx->reg_ftemp_map));
+    memcpy(ctx->reg_ftemp_reverse_map, reg_ftemp_reverse_map,
+           sizeof(ctx->reg_ftemp_reverse_map));
+    ctx->ftemp_alloc_failures = 0;
+    ctx->ftemp_fallbacks = 0;
+}
+
+int lata_ftemp_slot_for_phys(int phys)
+{
+    LataContext *ctx;
+    if (phys < 0 || phys >= 32) {
+        return INVALID_TEMP;
+    }
+    ctx = lata_context_current();
+    if (ctx != NULL && ctx->initialized) {
+        return ctx->reg_ftemp_reverse_map[phys];
+    }
+    return reg_ftemp_reverse_map[phys];
+}
+
+bool ra_ftemp_phys_in_pool(int phys)
+{
+    LataContext *ctx = lata_context_current();
+    const int *map = (ctx != NULL && ctx->initialized) ? ctx->reg_ftemp_map
+                                                       : reg_ftemp_map;
+    for (int slot = 0; slot < ra_ftemp_pool_size(); ++slot) {
+        if (map[slot] == phys) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void lata_ftemp_set_base_pool(int pool)
+{
+    LataContext *ctx = lata_context_current();
+    if (pool < 1) {
+        pool = 1;
+    }
+    if (pool > FTEMP_BASE_ENTRIES) {
+        pool = FTEMP_BASE_ENTRIES;
+    }
+    if (ctx == NULL || !ctx->initialized) {
+        return;
+    }
+    /* Drop appended spill slots so their registers are not handed out twice. */
+    for (int slot = pool; slot < ctx->ftemp_pool_entries; ++slot) {
+        int phys = ctx->reg_ftemp_map[slot];
+        if (phys >= 0 && phys < 32) {
+            ctx->reg_ftemp_reverse_map[phys] = INVALID_TEMP;
+        }
+    }
+    ctx->ftemp_base = pool;
+    ctx->ftemp_pool_entries = pool;
+}
 
 const int reg_scr_map[] = {
     REG_MAP_DEF(0, 0),
@@ -295,15 +328,42 @@ RA_ALLOC_TEMP_NUM_FUNC(itemp)
  * out-of-range slot after the assert, which produced a bogus register and made
  * the generated TB loop forever instead of reporting the problem.
  */
-static uint32_t ftemp_alloc_failures;
-
 uint32_t ra_ftemp_alloc_failures(void)
 {
-    return ftemp_alloc_failures;
+    LataContext *ctx = lata_context_current();
+    return (ctx != NULL) ? ctx->ftemp_alloc_failures : 0;
+}
+
+bool ra_ftemp_alloc_failed(void)
+{
+    return lsenv != NULL && lsenv->tr_data != NULL &&
+           lsenv->tr_data->ftemp_alloc_failed;
+}
+
+void ra_ftemp_clear_failed(void)
+{
+    if (lsenv != NULL && lsenv->tr_data != NULL) {
+        lsenv->tr_data->ftemp_alloc_failed = false;
+    }
+}
+
+void ra_ftemp_note_fallback(void)
+{
+    LataContext *ctx = lata_context_current();
+    if (ctx != NULL) {
+        ctx->ftemp_fallbacks++;
+    }
+}
+
+uint32_t ra_ftemp_fallbacks(void)
+{
+    LataContext *ctx = lata_context_current();
+    return (ctx != NULL) ? ctx->ftemp_fallbacks : 0;
 }
 
 static int ra_alloc_ftemp_num(void)
 {
+    LataContext *ctx = lata_context_current();
     int cto_num, ftemp_num;
     int spill_attempts = 0;
 
@@ -319,47 +379,46 @@ static int ra_alloc_ftemp_num(void)
             int phys;
 
             if (spilled < 0 || spill_attempts >= 8) {
-                ftemp_alloc_failures++;
-                /* Best effort: reuse slot 0 so translation stays in range. */
-                BITS_SET(lsenv->tr_data->ftemp_status, 1 << 0);
-                return reg_ftemp_map[0];
+                ctx->ftemp_alloc_failures++;
+                /* Explicit failure: callers roll back snapshot and fall back. */
+                lsenv->tr_data->ftemp_alloc_failed = true;
+                return ctx->reg_ftemp_map[0];
             }
             spill_attempts++;
             phys = arm_la_fmap[spilled];
-            /* A register already in the pool must not get a second slot:
-             * the reverse map would point at the newer slot and freeing the
-             * older one later clears an already-clear bit (assert in
-             * ra_free_ftemp).  The loop re-reads ftemp_status, so if that
-             * slot is free it is picked up on the next iteration. */
             if (!ra_ftemp_phys_in_pool(phys)) {
-                if (ftemp_pool_entries >= 32) {
-                    ftemp_alloc_failures++;
-                    BITS_SET(lsenv->tr_data->ftemp_status, 1 << 0);
-                    return reg_ftemp_map[0];
+                if (ctx->ftemp_pool_entries >= 32) {
+                    ctx->ftemp_alloc_failures++;
+                    lsenv->tr_data->ftemp_alloc_failed = true;
+                    return ctx->reg_ftemp_map[0];
                 }
-                reg_ftemp_map[ftemp_pool_entries] = phys;
-                reg_ftemp_reverse_map[phys] = ftemp_pool_entries;
-                ftemp_pool_entries++;
+                ctx->reg_ftemp_map[ctx->ftemp_pool_entries] = phys;
+                ctx->reg_ftemp_reverse_map[phys] = ctx->ftemp_pool_entries;
+                ctx->ftemp_pool_entries++;
             }
         }
     }
     if (cto_num >= ra_ftemp_pool_size()) {
-        ftemp_alloc_failures++;
-        BITS_SET(lsenv->tr_data->ftemp_status, 1 << 0);
-        return reg_ftemp_map[0];
+        ctx->ftemp_alloc_failures++;
+        lsenv->tr_data->ftemp_alloc_failed = true;
+        return ctx->reg_ftemp_map[0];
     }
-    ftemp_num = reg_ftemp_map[cto_num];
+    ftemp_num = ctx->reg_ftemp_map[cto_num];
     BITS_SET(lsenv->tr_data->ftemp_status, 1 << cto_num);
     return ftemp_num;
 }
 
 int ra_ftemp_pool_size(void)
 {
-    int entries = ftemp_pool_entries;
+    LataContext *ctx = lata_context_current();
+    int entries = (ctx != NULL && ctx->initialized) ? ctx->ftemp_pool_entries
+                                                    : FTEMP_BASE_ENTRIES;
+    int base = (ctx != NULL && ctx->initialized) ? ctx->ftemp_base
+                                                 : FTEMP_BASE_ENTRIES;
 
     /* f14/f15 are the cache homes while the window is enabled; a deliberately
      * shrunken pool (test knob) keeps its own size. */
-    if (lata_vcache_enabled() && ftemp_base == FTEMP_BASE_ENTRIES &&
+    if (lata_vcache_enabled() && base == FTEMP_BASE_ENTRIES &&
         entries > 1) {
         entries -= 1;
     }

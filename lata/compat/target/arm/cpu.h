@@ -90,6 +90,15 @@ typedef struct CPUARMState {
         uint32_t last_exception_index;
         uint32_t last_exception_syndrome;
         uint32_t last_exception_target_el;
+        struct {
+            uint64_t base;
+            uint64_t size;
+            uint32_t perm; /* bit0 = R, bit1 = W */
+            bool valid;
+        } fault_regions[8];
+        uint32_t fault_region_count;
+        uint64_t last_fault_va;
+        bool last_fault_is_write;
     } sve_ctrl;
 } CPUARMState;
 

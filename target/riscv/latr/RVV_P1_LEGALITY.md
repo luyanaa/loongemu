@@ -544,3 +544,247 @@ typedef enum {
    需要补的一条。
 5. **`vsmul` 的文档/实现对不上**（§2.2 第 2 条）：`RVV_PVIR.md` §6 G6 说 PVIR 侧已支持 `SAT_MUL`，
    编码侧却没登记。建议在 S6 一并补齐，并顺手校订该文档。
+
+## 9. 执行记录（S1 + S2 已落地）
+
+本节记录 §7 中 S1/S2 的实际实现，与前面各节的设计对照阅读。**§2 的指令缺口没有变化，本轮不补指令。**
+
+### 9.1 新增/修改的文件
+
+| 文件 | 作用 |
+| --- | --- |
+| `include/latr-rvv-legality.h` | `LatrVectorState`、`LatrRvvLegality`、`latr_rvv_check_operands()`、`latr_rvv_uses_frm()` |
+| `translator/rvv-legality.c` | 规则实现（QEMU `vext_check_*` 的逐条转录）+ opcode → 操作数形状的映射表 |
+| `translator/translate-riscv-rvv.c` | `emit_operand_legality()`、`emit_frm_gate()`、`rvv_requires_vstart_zero()` |
+| `translator/rvv.c` | `read_elem`/`write_elem` 去掉 `(reg + idx) & 31`，改为越界兜底 |
+| `tests/test_latr_rvv_legality.c` | 宿主侧负例矩阵（51 checks），不需要交叉工具链 |
+| `baremetal/bare/latr_isa_test.c` | `test_rvv_legality()` 26 项真实陷阱用例 |
+
+### 9.2 检查在哪个阶段执行（对 §8.1 的答复）
+
+`latr_rvv_check_operands()` 是纯函数，输入 `(RiscvIR1, LatrVectorState{vtype, vill, elen, xlen})`。
+翻译器用 `lsenv->cpu_state` 取 vtype 调它，**不在 helper 里重复检查**。依据是 `LatrTbKey.vspec`
+已经包含 `vtype[9:0] | vill | vl`（`tb-cache.c:56`），所以一个 TB 内 SEW/LMUL 不会变；
+`vl`/`vstart` 仍是运行时量，**故意不放进这个函数**，由发出的比较门控处理。这与 §8.1 的结论一致，
+并且 `pvir-lower-lsx.c:674` 早已采用同样的"翻译期读 env"模式，不是新引入的假设。
+
+### 9.3 已覆盖的规则（对应 §3 的表）
+
+| 形状 | 规则 | 覆盖的指令族 |
+| --- | --- | --- |
+| `SS` / `SSS` | `require_vm` + `require_align(vd,vs2[,vs1], LMUL)` | 单宽整数 ALU、单宽 FP 算术/转换、`vmerge`、`vmv.v.v` |
+| `MS` / `MSS` | `require_align(vs2)` + `require_noover(vd,0,vs)` | 整数比较、FP 比较 |
+| `DS` / `DSS` | `LMUL≤2`、`SEW<64`、`2·SEW≤ELEN`、`align(vd, LMUL+1)`、`require_noover` | `vwadd/vwsub/vwmul/vwmacc`、`vfwadd/vfwsub/vfwmul`、`vfwcvt` |
+| `SD` / `SDS` | 同上但源是 2·SEW | `vnsrl/vnsra/vnclip`、`vfncvt` |
+| `REDUCTION` / `_W` | `align(vs2, LMUL)`（+ 宽归约的 ELEN 约束） | `vred*`、`vwred*`、`vfred*`、`vfwred*` |
+| `SLIDE` | `align(vd,vs2)` + `require_vm`；`vslideup` 额外 `vd != vs2` | `vslideup/vslide1up/vslidedown/vslide1down` |
+| `GATHER` | `align` 全组 + `vd` 与两个源都不重叠 | `vrgather.vv/vx/vi`、`vrgatherei16.vv` |
+| `COMPRESS` | `align(vd,vs2)`、`vd != vs2`、`vd` 组不与掩码重叠 | `vcompress.vm` |
+| `EXT` | `from = SEW_log - div ≥ 3`、`align(vd, LMUL)`、`align(vs2, LMUL-div)`、`noover` | `vzext/vsext.vf2/4/8` |
+| `LOAD` / `STORE` | `EMUL = EEW_log - SEW_log + LMUL ∈ [-3,3]`、`align(vd, EMUL)`、`require_nf`、load 的 `require_vm` | `vle/vse/vlse/vsse` |
+| `LOAD_INDEX` / `STORE_INDEX` | `align(vs2, EMUL)`、`align(vd, LMUL)`、逐 segment 的 `noover` | `vlxei/vsxei` |
+| `NONE` | 只有 `vill` | `vmand*`、`vlm.v/vsm.v`、`vmv.x.s/vmv.s.x`、`vfmv.f.s/vfmv.s.f` |
+
+### 9.4 运行时门控（对应 §4 C1/C2）
+
+- **`frm`**：`latr_rvv_uses_frm(opcode)` 是*唯一*的真值表，覆盖所有走
+  `gen_set_rm`/`gen_set_rm_chkfrm` 的指令。注意 `helper_set_rounding_mode_chkfrm` 的实现是
+  "always validate frm, even if rm != DYN"（`fpu_helper.c:88-91`），所以 `vfcvt.rtz.*` 与
+  `vfncvt.rod.f.f.w` **也要** trap —— 唯一不受影响的是 FP 比较（`vmfeq/vmfne/vmflt/vmfle/vmfgt/vmfge`）。
+- **`vstart`**：`rvv_requires_vstart_zero()` 直接复用 `rvv_reduce_op()` 的判定，再补
+  `vcpop/vfirst/vmsbf/vmsif/vmsof/viota/vcompress`，与 QEMU `vext_check_reduction` 和
+  `s->vstart_eq_zero` 的集合逐条对应。
+
+### 9.5 反例矩阵实测结果
+
+| # | 用例 | vtype | 期望 | 实际 |
+| --- | --- | --- | --- | --- |
+| M1 | `vadd.vv v31,v0,v1` | SEW=64,LMUL=8 | illegal | `ALIGN` ✔ |
+| M2 | `vadd.vv v8,v0,v1`（vs1=1 未对齐） | SEW=64,LMUL=8 | illegal | `ALIGN` ✔ |
+| M3 | `vadd.vv v8,v0,v8` | SEW=64,LMUL=8 | legal | 执行，结果 7 ✔ |
+| M4 | `vadd.vv v0,v1,v2,v0.t` | SEW=32,LMUL=1 | illegal | `MASK` ✔ |
+| M5 | `vle32.v v3,(x1)` | SEW=32,LMUL=2 | illegal | `ALIGN`（EMUL=1）✔ |
+| M6 | `vse32.v v3,(x1)` | SEW=32,LMUL=2 | illegal | `ALIGN` ✔ |
+| M7 | `vrgather.vv v4,v4,v1` | SEW=32,LMUL=1 | illegal | `OVERLAP` ✔ |
+| M8 | `vmand.mm v1,v2,v3` | SEW=64,LMUL=8 | legal | 执行 ✔ |
+| M9 | `vfadd.vv` + `frm=5` | SEW=32,LMUL=1 | illegal | trap ✔ |
+| M10 | `vredsum.vs` + `vstart=2` | SEW=32,LMUL=1 | illegal | trap ✔ |
+
+M1 另外断言了 `v0`/`v7` 未被改写——这正是旧实现"静默写错寄存器"的现场。
+
+### 9.6 顺带发现的既有测试缺陷
+
+加上检查后有 6 处既有用例立刻变红，全部是**测试自己用了架构上非法的编码**，而不是检查过严：
+
+1. `vwadd.vv v3,v1,v2`（SEW=32,LMUL=1）：目标组 EMUL=2，必须以偶号寄存器起始 → 改为 `v4/v6/v8/v10/v12/v14/v16`。
+2. `vnsrl/vnsra/vnclip/vnclipu.wi v3..v6, v1`：源组 EMUL=2 且 `vs2=1` 未对齐 → 改为 `vs2=v2, vd=v4/v6/v8/v10`。
+3. `vfwadd/vfwsub/vfwmul.vv v3..v5`、`vfw*.wv/wf v3..v6`：同样目标组必须是偶号 → 顺移为 `v4/v6/v8/v10`。
+4. `vfncvt.f.f.w v29,v1`、`vfncvt.rod.f.f.w v30,v1`：窄化源组 `{v1,v2}` 要求 `vs2` 偶号 → 改 `vs2=v2`。
+5. `vredsum` 的 "honors vstart" 用例原本断言"从 vstart=2 继续累加得到 17"。按 RVV 1.0 与 QEMU
+   `vext_check_reduction`，归约**不可**用 vstart 重启，应当 illegal → 改为断言 trap 且目标寄存器不变。
+6. 其余（memory/strided/permute/mask 用例）本来就合法，未改动。
+
+第 5 条值得单独强调：这不是"测试写错"，而是**实现与测试一起把非法行为当成了正确行为**——
+归约族缺失的 `vstart==0` 门控被一条断言"确认"了下来，属于最容易长期潜伏的那类错误。
+
+### 9.7 回归结果
+
+```
+make -C latr test-legality                  → LATR rvv legality: 51 checks passed
+make latr-isa-run                           → latr-isa: PASS checks=1402（原 1375）
+make latr-riscv-ref / 签名比对              → latr-diff: PASS（与 qemu-system-riscv64 -cpu max 逐位相同）
+make -C latr check                          → external symbols: 12, all allowlisted
+make test-latr                              → 四道门全绿（含此前一直红的 latr-boot-run）
+```
+
+`make test-latr` 之前会停在 `latr-boot-run`（`latr-boot: FAIL machine ... fetch=1`，属未提交的
+machine/FDT bring-up）。该路径已在同一天修好，现在 `latr-boot: PASS`，整条 `test-latr` 绿。
+
+收尾时删掉了 `LatrRvvLegality` 里未被任何规则返回的 `LATR_RVV_ILLEGAL_GROUP`
+（枚举值与其 `latr_rvv_legality_name()` 分支一起删，`grep -rn ILLEGAL_GROUP` 已无残留）。
+保留它会让 `switch` 出现"永远不可能到达"的取值，日后有人误以为存在一条独立的"组越界"规则，
+而实际语义已由 `EMUL`/`ALIGN`/`OVERLAP` 三条覆盖。
+
+**构建耦合提示（与 RVV 无关，但会挡住上面四条命令）**：LATR core 直接编译
+`target/arm/lata/` 下的共享文件（`ir2/ir2.c`、`mem.c`、`translator/macro-helper.c` 等）。
+这些文件正在被 ARM/SVE 侧改动，`make -C latr all` 会被它们的中间态打断。已处理的两例：
+
+| 共享文件 | 断点 | LATR 侧处理 |
+| --- | --- | --- |
+| `target/arm/lata/mem.c` | 加入 guest-memory 探测后引入 `target/arm/cpu.h`（LATR include 集里没有） | 新增 `latr/mem-latr.c`，只保留 `mm_malloc`/`mmi_palloc` 等分配器 |
+| `target/arm/lata/ir2/ir2.c` | 新增 `lata_ftemp_slot_for_phys()` 与 `lata_context_current()->ir2_dump_ir1_id`，而 LATR 的 `include/{reg-alloc,lata}.h` 兼容头按名字遮蔽了 ARM 的同名头 → 9 个 error | 在 LATR 两个兼容头里补等价契约：`reg-alloc.h` 加 `static inline lata_ftemp_slot_for_phys()`（回退到静态 `reg_ftemp_reverse_map`，与 ARM 实现在 `ctx==NULL` 时的分支一致）；`lata.h` 加最小 `LataContext`（只有 `ir2_dump_ir1_id` 一个字段）并在 `latr.c` 里实现 `lata_context_current()` |
+
+第二条的处理原则：**不动 ARM 文件**，只在 LATR 自己的兼容头里补齐契约——LATR 已经有
+`translator/reg-alloc.c`、`include/reg-alloc.h` 这一整套 fork 的先例，继续沿用比给共享文件加
+`#ifdef CONFIG_LATA` 更不容易和 ARM 侧的编辑撞车。
+
+**机器模型：未指定 `-drive` 时退化为无 virtio（同日补的）**。之前 `latr_machine_attach_disk()`
+把"没有镜像"和"设备初始化失败"都返回 0，调用方无法表达"这台机器本来就没有盘"。
+现在契约拆开了：
+
+- `image == NULL || len == 0` → **返回 1**，`disk_attached` 保持 false。因为没有 `disk_attached`，
+  MMIO 窗口不会映射、PLIC 线不会接、`latr_machine_build_dtb()` 也不会生成 `virtio_mmio@10001000`
+  节点——**"什么都不做"本身就是退化**；
+- 真正的失败（盘小于一个扇区、重复 attach、设备初始化失败）仍返回 0。
+
+裸机冒烟里补了一条负例：先 `attach_disk(&machine, NULL, 0)` 断言成功且 `!disk_attached`、
+用该状态 `build_dtb()` 后 DTB 里**没有** `virtio,mmio` / `virtio_mmio@`（注意根节点 compatible 是
+`riscv-virtio`，所以不能用裸的 `virtio` 子串判定），随后再挂真盘继续原有流程。
+
+审计里那 2 个 virtio 符号（`loongemu_virtio_blk_init/attach`）后来由 machine 侧把
+`src/riscv_virtio_blk.c` 编进 `CORE_OBJS` 解决，**没有**动 `latr_externals.allowlist`——
+白名单只描述"freestanding 核心允许依赖谁"，不该拿来给设备实现开后门。
+
+### 9.8 仍未做（下一轮的候选）
+
+1. ~~`vlm.v` 的 tail 策略~~ → §10.4 已按 QEMU 默认（保持原值）修掉。
+2. ~~`vmv<n>r` / `vl<n>re` / `vs<n>r`~~ → §10.2 已落地。
+3. ~~`vstart != 0` 的恢复语义缺端到端测试~~ → §10.5 已补，并顺带证伪了"陈旧判断"假设。
+4. §6 的 CPU profile 拆分（`misa.V` + `mstatus.VS`）。
+
+## 10. 执行记录（S3：whole-register / segment / vleff / vstart 重启）
+
+本轮按"先钉语义、再写实现、最后用 QEMU 实测值当断言"的顺序做完四族。**所有期望值都来自
+`qemu-system-riscv64 -cpu max`（`rvv_ta_all_1s=false`）的探针实测**，不是照文档推的——下面
+每条结论后面都注明了探针编号（`build/probe{8,9,10}.S`，均在 `.gitignore` 覆盖范围内）。
+
+### 10.1 语义结论（QEMU 实测）
+
+| # | 指令 / 场景 | QEMU 行为 | 对实现的影响 |
+| --- | --- | --- | --- |
+| 1 | `vl2re32.v` + `vl=1` + `SEW=8` | 整搬 2 个寄存器（32 B），**忽略 `vl` 与 `vtype`** | 元素数不能用 `vlmax(SEW)` 算 |
+| 2 | `vl2re32.v` + `vstart=3` | 字节偏移 = `3 * EEW/8`，`vstart` 归 0 | `vstart` 是**元素**索引 |
+| 3 | `vmv2r.v` + `vstart=2` | **完全不搬**，但 `vstart` 归 0 | 需要显式空操作分支 |
+| 4 | `vlseg2e32.v` | field k → 寄存器 `vd+k` 的 lane i（寄存器维优先） | 常见错误是按元素维交错 |
+| 5 | `vlseg2e32.v` 故障 | 已完成的 lane **逐元素写回**，`vstart` = 故障 lane | 不能在故障时回滚整个寄存器 |
+| 6 | `vlseg2e32.v` + `vstart=1` | 跳过 lane 0 的**全部 nf 个 field** | 跳过粒度是 lane，不是 field |
+| 7 | `vle32ff.v` 故障 | `vl` = 故障 lane，`vstart=0`，**不抛异常** | `vl` 在 TB key 里 → 必须退出 TB |
+| 8 | `vle32ff.v` + `vta/vma=1` | tail **保持原值** | 收窄时不套用 vma/vta |
+| 9 | `vlm.v` + `vl=4`（`vta` 两种取值） | 只搬 `ceil(vl/8)` 字节，tail **都保持原值** | `cfg_vta_all_1s=false` 连掩码类也适用 |
+| 10 | `vs2r.v` + `vl=1` | 整存 2 个寄存器 | 同 load |
+| 11 | `vl2re32.v` + `SEW=8` 后再看 v6..v11 | 未被写（`vl8re32` 也不越过 8 个寄存器） | 搬多少只看 `nf` |
+
+第 11 条是本轮最关键的修正：原实现用 `evl = rvv_vlmax(env) * nf` 配指令 EEW 算元素数，
+`SEW=8` 时会算出 128 字节而实际只有 32 字节。正确式子是
+
+```c
+unsigned per_reg = LATR_RVV_VLENB >> eew;   /* 一个寄存器里装几个元素 */
+unsigned evl     = nf * per_reg;            /* 与 SEW / LMUL 无关 */
+```
+
+`SEW`/`LMUL` 只决定 `vstart` 按多少个字节一步（`esz`），不决定块有多大。
+
+### 10.2 已落地
+
+- `include/latr-rvv-legality.h` / `translator/rvv-legality.c`：`LatrRvvWholeKind` 与
+  `latr_rvv_whole_kind/nf/eew()`、`latr_rvv_is_ldff()`；新增 `FORM_WHOLE_MOVE`（`vd` 与 `vs2`
+  都按 nf 对齐）与 `FORM_WHOLE_MEM`（只查 `vd`）。
+- `translator/rvv.c`：
+  - `rvv_copy_whole()` + `latr_rvv_whole_move()`——`vmv<n>r`，`vstart != 0` 时空操作并清 `vstart`；
+  - `latr_rvv_whole_mem()`——`vl<n>re` / `vs<n>r`，按 `nf*VLENB` 的字节块走元素循环；
+  - `rvv_ldst_segment()`——unit-stride / strided / indexed 三种模式的 `nf>1`，故障逐元素写回；
+  - `latr_rvv_ldff()`——`vle<eew>ff`，故障时只收窄 `vl`；
+  - `vlm.v/vsm.v` 走 `rvv_ldst_segment` 的字节分支，**不再** `PVIR_INACTIVE_ZERO`，也不填 0xff。
+- `translator/translate-riscv-rvv.c`：mem 分支新增 `mem_mode == 4`（ff）、`arg.nf` 传递、
+  whole-move / whole-mem 分派；`vleff` 收窄后走手写的 `ff_exit` 序列（`vl` 在 TB key 里，
+  必须退出 TB 重新特化），`nf != 1 → illegal` 的旧拒绝逻辑删除。
+
+### 10.3 `vlm.v` 的 tail：为什么"保持原值"才是对的
+
+`DESIGN.md` §5.4 与 §9.7 的"掩码"条目本来就写着：mask 目的寄存器的尾部与 QEMU 默认一致
+（保持原值）；既有用例 `vmand.mm preserves tail byte 1`（`0x77`）也是这个断言。但向量族
+（ALU/FP/归约）的 `rvv_tail_ones()` 走的是另一套：`vta=1` 时尾部写全 1，且被 6 处用例断言着。
+所以本轮**按目的寄存器类别分**：掩码类保持原值，向量类维持全 1。两类都是规范允许的
+tail-agnostic 实现，只是彼此不同、各自内部一致。
+
+### 10.4 写测试时挖出来的两个真 bug
+
+1. **`vmv<n>r` 忽略 `vstart`**：`latr_rvv_whole_move()` 原实现无条件 `memcpy`。探针 #8 用例 C
+   显示 QEMU 在 `vstart != 0` 时一个字节都不搬、但会把 `vstart` 清掉。已加早退分支。
+2. **`vl<n>re` / `vs<n>r` 块大小算错**：见 §10.1 第 11 条。`SEW != EEW` 时会写坏
+   `vd+nf .. vd+8`。已改成 `nf * (VLENB >> EEW)`。
+
+另外 `memmove` 出现在 `latr_externals.allowlist` 之外（`make -C latr check` 报 `NEW external
+symbols: memmove`）。`vmv` 的源/目的组允许重叠，所以用一个 128 B 的栈上暂存显式拷两遍，
+**没有**往白名单里加 `memmove`——白名单描述的是"freestanding 核心允许依赖谁"。
+
+### 10.5 `vstart != 0` 的端到端恢复：假设被证伪，但补上了测试
+
+§9.8 第 3 条担心 `pvir-lower-lsx.c` 的快速路径用了**翻译期**的 `env->vstart` 判断，而 `vstart`
+不在 TB key 里。审计结论是**不会陈旧**：该文件两处 `env->vstart != 0`（`:141`、`:697`）中，
+`:697` 只是"翻译期干脆不生成快速路径"的提前拒绝，`:141` 位于 `latr_rvv_direct_prepare()`，
+是生成代码在**执行期**调用的；`vstart` 非零时它返回 0，生成代码随即 `la_beq(a0, zero,
+fallback)` 跳到通用 helper。归约/`viota`/`vmsbf` 等族则由 `emit_vstart_zero_gate()` 在
+**执行期**查 `vstart` 并抛非法指令，与 QEMU 的 `s->vstart_eq_zero`（在 QEMU 里是 TB 标志）
+行为等价。
+
+但"没有 bug"必须有测试守着，所以新增 `latr_translate_block()` / `latr_reenter_tb()`：
+**只翻译一次，然后用不同的 env 重入同一个 TB**——这正是 `latr_execute_block()` 做不到的
+（它每次都重新翻译）。用例覆盖 ALU（vv）、掩码 ALU、`vma=1` + 重启、FP、`vmand.mm`（按位）、
+`vmerge`、`vslide1down`、`vwadd`（目的跨两个寄存器）。
+
+顺带确认了一件容易写错的事：`rvv_build_mask()` **必须**覆盖整个 `[0, vl)`。曾经试着把它改成
+从 `vstart` 起，结果是 `vma=1` 时把"已完成"的 lane 当成"inactive"去填 1。实际的 `vstart`
+恢复点在 `pvir-exec.c` 的元素循环（`for (i = env->vstart; ...)`）。`masked vadd vma restart
+keeps lane 0` 这条断言就是用来钉住这个区别的。
+
+### 10.6 回归结果
+
+```
+make -C latr all                            → 通过
+make -C latr test-legality                  → 104 checks passed（原 51）
+make -C latr test-decode                    → 26 checks passed
+make -C latr check                          → external symbols: 12, all allowlisted
+make latr-isa-run                           → checks=1542（原 1402），RVV 侧全绿
+make latr-riscv-ref                         → latr-riscv-ref: PASS
+```
+
+宿主侧新增 53 条（whole-register 对齐/`nf_ok`/`vleff` 的 EMUL 矩阵 + 分派表真值），
+裸机侧新增 140 条（四族 89 + vstart 重启 51）。
+
+**仍是红的一条（与本轮无关）**：`test_fp_rmm()` 的 16 条标量 FP RMM 断言。证据是
+`make latr-riscv-ref` 的签名里对应槽位是 `3f800001`（QEMU 的 RMM 结果），LATR 给出 `0`
+与 `0x7ff8000000000000`；`translate-riscv-fp{,-helper}.c` 本轮**一行未改**（`git status` 可查），
+且该用例在日志第 22 行执行，远早于任何 RVV 用例。它会挡住 `make test-latr` 的签名比对，
+建议作为下一轮的独立任务。
+

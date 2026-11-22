@@ -28,15 +28,6 @@
 #endif
 
 
-/* TB cache key: a translation is valid for one ASID/privilege/satp mode/RVV config. */
-typedef struct LatrTbKey {
-    uint32_t satp_mode;
-    uint32_t privilege;
-    uint32_t asid;
-    uint32_t vspec;
-    uint64_t root_ppn;
-} LatrTbKey;
-
 /* Native-offset -> guest-PC spans for precise exception attribution. */
 #define LATR_TB_MAP_SLOTS 4
 #define LATR_TB_MAP_SPANS 512
@@ -118,8 +109,16 @@ LatrTranslatorContext *latr_context_create(CPUArchState *cpu,
                                            uint8_t *code_buf,
                                            uint32_t code_buf_size);
 void latr_context_destroy(LatrTranslatorContext *ctx);
-/* Makes `ctx` the current hart on this host thread (TLS when enabled). */
-void latr_context_bind(LatrTranslatorContext *ctx);
+/*
+ * Makes `ctx` the current hart on this host thread and returns the context
+ * that was current before, so a fault dispatcher can borrow another hart and
+ * put the caller's context back afterwards. With LATR_ENABLE_TLS this is a
+ * per-thread switch; without it (freestanding build, one hart at a time) it is
+ * still correct because every dispatch rebinds first.
+ */
+LatrTranslatorContext *latr_context_bind(LatrTranslatorContext *ctx);
+/* Restores what latr_context_bind() returned; NULL simply unbinds. */
+void latr_context_restore(LatrTranslatorContext *ctx);
 LatrTranslatorContext *latr_context_current(void);
 /*
  * Per-hart safe point: reclaims the TB arena once no translation is live and
@@ -130,66 +129,25 @@ void latr_context_safepoint(LatrTranslatorContext *ctx);
 
 #include "reg-alloc.h"
 
-/*
- * Per-vCPU TB cache. The VMM owns the code arena; entries are keyed by
- * guest PC plus {satp mode, ASID, privilege} and dropped by shootdowns.
- */
-#define LATR_TB_CACHE_ENTRIES 64
+#include "latr-tb-cache.h"
 
-typedef struct LatrTbEntry {
-    uint64_t guest_pc;
-    uint8_t *code;
-    uint32_t code_size;
-    uint32_t icount;
-    LatrTbKey key;
-    int valid;
-} LatrTbEntry;
+/* Key over the pieces of CPUArchState that make a translation ambiguous. */
+static inline LatrTbKey latr_tb_cache_key(const CPUArchState *env)
+{
+    if (env == 0) {
+        LatrTbKey zero = { 0, 0, 0, 0, 0 };
 
-typedef struct LatrTbCache {
-    LatrTbEntry entries[LATR_TB_CACHE_ENTRIES];
-    uint8_t *arena;
-    uint32_t arena_size;
-    uint32_t arena_used;
-    uint32_t count;
-    uint64_t generation;
-    /* Serializes cross-core shootdowns against the owner's lookup/insert. */
-    volatile int lock;
-    /* Set by shootdown; the owner resets the arena at its next safe point. */
-    uint32_t reclaim_pending;
-} LatrTbCache;
-
-void latr_tb_cache_init(LatrTbCache *cache, uint8_t *arena, uint32_t size);
-LatrTbKey latr_tb_cache_key(const CPUArchState *env);
-LatrTbEntry *latr_tb_cache_lookup(LatrTbCache *cache, uint64_t pc,
-                                  LatrTbKey key);
-LatrTbEntry *latr_tb_cache_insert(LatrTbCache *cache, uint64_t pc,
-                                  LatrTbKey key, const void *code,
-                                  uint32_t code_size, uint32_t icount);
-/* Bumps the generation and drops matching entries (ASID 0 drops all). */
-void latr_tb_shootdown_all(LatrTbCache *cache);
-void latr_tb_shootdown_asid(LatrTbCache *cache, uint32_t asid);
-void latr_tb_shootdown_privilege(LatrTbCache *cache, uint32_t privilege);
-/*
- * Owner-only reclamation points. Shootdowns only invalidate entries so code
- * another hart is still executing stays mapped; the arena is recycled here.
- */
-void latr_tb_cache_safepoint(LatrTbCache *cache);
-void latr_tb_cache_reclaim_all(LatrTbCache *cache);
-uint32_t latr_tb_cache_available(const LatrTbCache *cache);
+        return zero;
+    }
+    return latr_tb_cache_key_parts(env->csr[0x180], (uint32_t)env->privilege,
+                                   (uint32_t)env->vtype, (uint32_t)env->vill,
+                                   (uint32_t)env->vl);
+}
 
 /* Switches the runtime to another vCPU's environment. */
 void latr_set_cpu_env(CPUArchState *env);
 
-/*
- * Cross-core shootdowns: every registered vCPU cache is invalidated. The VMM
- * registers one cache per vCPU and calls these after an SFENCE.VMA/FENCE.I
- * retires on any core (guest flags: env->sfence_pending/sfence_asid and
- * env->fence_i_pending).
- */
-int latr_tb_cache_register(LatrTbCache *cache);
-void latr_tb_cache_unregister(LatrTbCache *cache);
-void latr_tb_shootdown_asid_all_cores(uint32_t asid);
-void latr_tb_fence_i_all_cores(void);
+/* Per-vCPU PVIR descriptor cache (see translator/pvir-exec.c). */
 void latr_pvir_cache_clear(void);
 void latr_pvir_cache_reset(LatrPvirCache *cache);
 LatrPvirCache *latr_pvir_cache_create(void);
@@ -202,6 +160,13 @@ bool latr_tb_insn_map_resolve(uintptr_t host_pc, uint64_t *guest_pc,
                               uint32_t *raw_len);
 void latr_tb_insn_map_rebase(void *old_code, void *new_code);
 void latr_tb_insn_map_forget(void *code);
+/*
+ * Drops every map whose code range intersects [base, base + size). Called when
+ * the TB arena is recycled: the offsets those maps describe no longer stand
+ * for the same instructions, and a host fault inside a reused arena must not be
+ * blamed on the guest PC that used to live there.
+ */
+void latr_tb_insn_map_forget_range(void *base, uint32_t size);
 
 void latr_tr_data_init(CPUArchState *env);
 

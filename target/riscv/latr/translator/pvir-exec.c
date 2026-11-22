@@ -24,11 +24,33 @@ typedef struct {
     PvirInstruction insn;
 } LatrPvirCacheEntry;
 
-/* One descriptor cache per vCPU: latr_context_create() allocates it so two
- * harts never share descriptors or clear each other's entries. */
+/*
+ * One descriptor cache per vCPU: latr_context_create() allocates it so two
+ * harts never share descriptors or clear each other's entries.
+ *
+ * The lock exists for the cases the per-hart split does not cover: a VMM that
+ * migrates a vCPU between host threads (bind on the new thread, in-flight
+ * lookup on the old one), and the shared fallback cache used before any
+ * context is bound. It is a spinlock because critical sections are a handful
+ * of 64-bit copies.
+ */
 struct LatrPvirCache {
     LatrPvirCacheEntry entries[LATR_PVIR_CACHE_SLOTS];
+    volatile int lock;
 };
+
+static void pvir_cache_lock(LatrPvirCache *cache)
+{
+    while (__atomic_exchange_n(&cache->lock, 1, __ATOMIC_ACQUIRE)) {
+        while (__atomic_load_n(&cache->lock, __ATOMIC_RELAXED) != 0) {
+        }
+    }
+}
+
+static void pvir_cache_unlock(LatrPvirCache *cache)
+{
+    __atomic_store_n(&cache->lock, 0, __ATOMIC_RELEASE);
+}
 
 /* Unit tests and the pre-context bootstrap fall back to this cache. */
 static LatrPvirCache latr_pvir_fallback;
@@ -65,9 +87,14 @@ static uint32_t pvir_cache_slot(uint64_t key_hash, uint64_t vtype,
 
 void latr_pvir_cache_reset(LatrPvirCache *cache)
 {
-    if (cache != NULL) {
-        memset(cache, 0, sizeof(*cache));
+    if (cache == NULL) {
+        return;
     }
+    /* Clear the entries but keep the lock word: resetting it while another
+     * hart is spinning on it would resurrect a held lock. */
+    pvir_cache_lock(cache);
+    memset(cache->entries, 0, sizeof(cache->entries));
+    pvir_cache_unlock(cache);
 }
 
 void latr_pvir_cache_clear(void)
@@ -79,17 +106,27 @@ bool latr_pvir_cache_lookup(uint64_t key_hash, uint64_t vtype, uint64_t vl,
                             PvirInstruction *out)
 {
     LatrPvirCache *cache = pvir_cache_current();
-    const LatrPvirCacheEntry *entry =
-        &cache->entries[pvir_cache_slot(key_hash, vtype, vl)];
+    LatrPvirCacheEntry scratch;
+    uint32_t slot = pvir_cache_slot(key_hash, vtype, vl);
+    bool hit = false;
 
-    if (!entry->valid || entry->key_hash != key_hash ||
-        entry->vtype != vtype || entry->vl != vl) {
-        return false;
+    pvir_cache_lock(cache);
+    {
+        const LatrPvirCacheEntry *entry = &cache->entries[slot];
+
+        if (entry->valid && entry->key_hash == key_hash &&
+            entry->vtype == vtype && entry->vl == vl) {
+            /* Copy under the lock: a concurrent store to the same slot would
+             * otherwise tear the descriptor across the unlock. */
+            scratch = *entry;
+            hit = true;
+        }
     }
-    if (out != NULL) {
-        *out = entry->insn;
+    pvir_cache_unlock(cache);
+    if (hit && out != NULL) {
+        *out = scratch.insn;
     }
-    return true;
+    return hit;
 }
 
 void latr_pvir_cache_store(uint64_t key_hash, uint64_t vtype, uint64_t vl,
@@ -102,12 +139,14 @@ void latr_pvir_cache_store(uint64_t key_hash, uint64_t vtype, uint64_t vl,
         return;
     }
     cache = pvir_cache_current();
+    pvir_cache_lock(cache);
     entry = &cache->entries[pvir_cache_slot(key_hash, vtype, vl)];
     entry->key_hash = key_hash;
     entry->vtype = vtype;
     entry->vl = vl;
     entry->insn = *insn;
     entry->valid = true;
+    pvir_cache_unlock(cache);
 }
 
 static uint64_t pvir_cache_tag_hash(const CPUArchState *env, uint64_t tag)

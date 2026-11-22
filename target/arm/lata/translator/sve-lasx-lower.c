@@ -4,31 +4,31 @@
 #include "target/arm/lata/ir1/sve-pvir.h"
 #include "target/arm/lata/include/env.h"
 #include "target/arm/lata/include/lata.h"
+#include "target/arm/lata/include/lata-mem.h"
 
 #include <limits.h>
 #include <string.h>
 
-static bool g_sve_trace_opt_const_pred_enabled = true;
-static size_t g_sve_trace_opt_const_pred_folds = 0;
+extern uint32_t lata_vreg_published;
 
 void a64_sve_trace_opt_reset_stats(void)
 {
-    g_sve_trace_opt_const_pred_folds = 0;
+    lata_context_current()->sve_const_pred_folds = 0;
 }
 
 size_t a64_sve_trace_opt_const_pred_folds(void)
 {
-    return g_sve_trace_opt_const_pred_folds;
+    return lata_context_current()->sve_const_pred_folds;
 }
 
 void a64_sve_trace_opt_set_const_pred_enabled(bool enabled)
 {
-    g_sve_trace_opt_const_pred_enabled = enabled;
+    lata_context_current()->sve_const_pred_opt_enabled = enabled;
 }
 
 bool a64_sve_trace_opt_const_pred_enabled(void)
 {
-    return g_sve_trace_opt_const_pred_enabled;
+    return lata_context_current()->sve_const_pred_opt_enabled;
 }
 
 static bool sve_context_valid(const DisasContext *s)
@@ -861,7 +861,7 @@ static bool is_const_fold_predicate(const DisasContext *s,
         pred->form == PVIR_PREDICATE_PREFIX) {
         return true;
     }
-    if (!g_sve_trace_opt_const_pred_enabled || s == NULL ||
+    if (!lata_context_current()->sve_const_pred_opt_enabled || s == NULL ||
         s->sve_pvir_builder == NULL || pg >= A64_SVE_PVIR_NUM_PREGS) {
         return false;
     }
@@ -925,7 +925,7 @@ static bool emit_materialize_const_chunk_mask(
     if (byte == 0 && pred->form == PVIR_PREDICATE_VECTOR_MASK &&
         s != NULL && s->sve_pvir_builder != NULL) {
         s->sve_pvir_builder->trace_opt_const_pred_folds++;
-        g_sve_trace_opt_const_pred_folds++;
+        lata_context_current()->sve_const_pred_folds++;
     }
     return true;
 }
@@ -1758,6 +1758,138 @@ static bool lower_broadcast(DisasContext *s,
     return true;
 }
 
+static bool instruction_writes_nzcv_static(const PvirInstruction *ins,
+                                           const A64SVEIR1Instruction *src)
+{
+    if (src != NULL) {
+        switch (src->insn_type) {
+        case AARCH64_A64_SVE_PTRUE:
+            return src->arg.f_sve_ptrue.setflags;
+        case AARCH64_A64_SVE_RDFFR:
+            return src->arg.f_sve_ffr.setflags;
+        case AARCH64_A64_SVE_PTEST:
+            return true;
+        case AARCH64_A64_SVE_BRK:
+        case AARCH64_A64_SVE_PFIRST:
+        case AARCH64_A64_SVE_PNEXT:
+        case AARCH64_A64_SVE_PRED_LOGICAL:
+            return src->arg.f_sve_pred_op.setflags;
+        case AARCH64_A64_SVE_WHILELO:
+        case AARCH64_A64_SVE_WHILE:
+        case AARCH64_A64_SVE_FCMP:
+        case AARCH64_A64_SVE_ICMP:
+            return true;
+        default:
+            break;
+        }
+    }
+    if (ins != NULL && ins->opcode == PVIR_OP_PREDICATE_GENERATE) {
+        return ins->operation.predicate_generator.status_state.present;
+    }
+    return false;
+}
+
+static bool sve_mem_needs_checked_path(void)
+{
+    const LataGuestMemOps *ops = lata_get_guest_mem_ops();
+    CPUARMState *env = (lsenv != NULL) ? (CPUARMState *)lsenv->cpu_state : NULL;
+    if (ops != &lata_default_guest_mem_ops) {
+        return true;
+    }
+    if (env != NULL && (env->sve_ctrl.fault_region_count > 0 ||
+                        env->sve_ctrl.fault_mem_limit != 0)) {
+        return true;
+    }
+    return false;
+}
+
+static void emit_save_guest_gprs_to_env(void)
+{
+    for (int i = 0; i <= 31; ++i) {
+        if (arm_la_map[i] > 0) {
+            la_st_d(ir2_opnd_new(IR2_OPND_GPR, arm_la_map[i]),
+                    env_ir2_opnd, env_offset_gpr(i));
+        }
+    }
+}
+
+static void emit_restore_guest_gprs_from_env(void)
+{
+    for (int i = 0; i <= 31; ++i) {
+        if (arm_la_map[i] > 0) {
+            la_ld_d(ir2_opnd_new(IR2_OPND_GPR, arm_la_map[i]),
+                    env_ir2_opnd, env_offset_gpr(i));
+        }
+    }
+}
+
+static void emit_inline_mem_fault_abort(const DisasContext *s,
+                                        IR2_OPND fault_addr_itemp,
+                                        bool is_write, bool pop_stack)
+{
+    if (pop_stack) {
+        la_addi_d(sp_ir2_opnd, sp_ir2_opnd, ARM_SVE_MAX_VL_BYTES);
+    }
+    emit_save_guest_gprs_to_env();
+    la_mov64(a2_ir2_opnd, fault_addr_itemp);
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    li_d(a1_ir2_opnd, (int64_t)s->pc_curr);
+    li_d(a3_ir2_opnd, is_write ? 1 : 0);
+    li_d(a4_ir2_opnd, (int64_t)LATA_MEM_FAULT_TRANSLATION);
+    li_d(t0_ir2_opnd, (int64_t)(uintptr_t)lata_guest_mem_raise_fault);
+    la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
+    emit_restore_guest_gprs_from_env();
+    li_d(t0_ir2_opnd, (int64_t)(uintptr_t)&lata_vreg_published);
+    li_d(t1_ir2_opnd, 1);
+    la_st_w(t1_ir2_opnd, t0_ir2_opnd, 0);
+    if (context_switch_native_to_bt_ret_0 != 0) {
+        li_d(t0_ir2_opnd, (int64_t)context_switch_native_to_bt_ret_0);
+        la_jirl(zero_ir2_opnd, t0_ir2_opnd, 0);
+    }
+}
+
+static bool emit_sve_helper_call(DisasContext *s,
+                                 const PvirInstruction *instruction,
+                                 const A64SVEIR1Instruction *source)
+{
+    const LataSVEHelperDesc *desc;
+    IR2_OPND no_fault = ir2_opnd_new_type(IR2_OPND_LABEL);
+    uint64_t next_pc = (s->base != NULL) ? s->base->pc_next : (s->pc_curr + 4u);
+
+    desc = lata_sve_alloc_helper_desc(s, instruction, source);
+    if (desc == NULL) {
+        return false;
+    }
+
+    emit_save_guest_gprs_to_env();
+    li_d(t0_ir2_opnd, (int64_t)next_pc);
+    la_st_d(t0_ir2_opnd, env_ir2_opnd, env_offset_pc());
+
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    li_d(a1_ir2_opnd, (int64_t)(uintptr_t)desc);
+    li_d(t0_ir2_opnd, (int64_t)(uintptr_t)lata_sve_exec_helper);
+    la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
+
+    la_mov64(s8_ir2_opnd, env_ir2_opnd); /* ensure env reg intact */
+    la_mov64(t2_ir2_opnd, a0_ir2_opnd);
+    emit_restore_guest_gprs_from_env();
+    if (instruction_writes_nzcv_static(instruction, source)) {
+        li_d(t0_ir2_opnd, env_offset_PSTATE());
+        la_ldx_wu(t1_ir2_opnd, env_ir2_opnd, t0_ir2_opnd);
+        la_armmtflag(t1_ir2_opnd, 0x39);
+    }
+    la_beqz(t2_ir2_opnd, no_fault);
+    li_d(t0_ir2_opnd, (int64_t)(uintptr_t)&lata_vreg_published);
+    li_d(t1_ir2_opnd, 1);
+    la_st_w(t1_ir2_opnd, t0_ir2_opnd, 0);
+    if (context_switch_native_to_bt_ret_0 != 0) {
+        li_d(t0_ir2_opnd, (int64_t)context_switch_native_to_bt_ret_0);
+        la_jirl(zero_ir2_opnd, t0_ir2_opnd, 0);
+    }
+    la_label(no_fault);
+    return true;
+}
+
 static bool lower_contiguous_memory(
     DisasContext *s, const A64SVEIR1Instruction *source,
     const PvirInstruction *instruction)
@@ -1853,6 +1985,10 @@ static bool lower_contiguous_memory(
         return false;
     }
 
+    if (sve_mem_needs_checked_path()) {
+        return emit_sve_helper_call(s, instruction, source);
+    }
+
     guest_base = alloc_gpr_src_sp(memory->rn);
     /* Mirror lata_clean_data_tbi() in translate-a64.c. */
     if (s->tbid != 0) {
@@ -1885,6 +2021,9 @@ static bool lower_contiguous_memory(
         ra_free_temp(zero);
     }
 
+    IR2_OPND abort_fault = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND done_loop = ir2_opnd_new_type(IR2_OPND_LABEL);
+
     /* C8.2.298/C8.2.704 visit lanes in order; inactive lanes branch around
      * the guest access entirely. Stores therefore retain prior lane effects
      * if a later active lane faults.
@@ -1907,6 +2046,8 @@ static bool lower_contiguous_memory(
         } else {
             la_addi_d(address, adjusted_base, (int)memory_byte);
         }
+        li_d(active, 0x1000);
+        la_bltu(address, active, abort_fault);
         if (is_load) {
             /*
              * The staged slot is pre-zeroed, so a wider store would leave zeros
@@ -1981,6 +2122,11 @@ static bool lower_contiguous_memory(
         }
         la_label(skip_lane);
     }
+
+    la_b(done_loop);
+    la_label(abort_fault);
+    emit_inline_mem_fault_abort(s, address, !is_load, is_load);
+    la_label(done_loop);
 
     ra_free_temp(value);
     ra_free_temp(active);
@@ -2184,6 +2330,10 @@ static bool lower_fault_load(DisasContext *s,
         return false;
     }
 
+    if (sve_mem_needs_checked_path()) {
+        return emit_sve_helper_call(s, instruction, source);
+    }
+
     base = base_is_sp ? alloc_gpr_src_sp(31) : alloc_gpr_src(rn);
     addr = ra_alloc_itemp();
     if (has_index && rm < 31) {
@@ -2219,6 +2369,8 @@ static bool lower_fault_load(DisasContext *s,
     tmp = ra_alloc_itemp();
 
     li_d(state, 0);
+    IR2_OPND first_fault_abort = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND fault_loop_done = ir2_opnd_new_type(IR2_OPND_LABEL);
 
     for (size_t lane = 0; lane < lanes; ++lane) {
         size_t vec_byte = lane * elem_bytes;
@@ -2230,6 +2382,7 @@ static bool lower_fault_load(DisasContext *s,
         unsigned shift_w = (unsigned)((pbyte - word_off) * 8u) + bit_in_byte;
         IR2_OPND skip_lane = ir2_opnd_new_type(IR2_OPND_LABEL);
         IR2_OPND fail_lane = ir2_opnd_new_type(IR2_OPND_LABEL);
+        IR2_OPND fault_check = ir2_opnd_new_type(IR2_OPND_LABEL);
         IR2_OPND do_real_load = ir2_opnd_new_type(IR2_OPND_LABEL);
         IR2_OPND check_done = ir2_opnd_new_type(IR2_OPND_LABEL);
 
@@ -2250,16 +2403,12 @@ static bool lower_fault_load(DisasContext *s,
             la_addi_d(lane_addr, addr, (int)mem_off);
         }
 
-        if (is_first) {
-            la_andi(tmp, state, 2);
-            la_beqz(tmp, do_real_load);
-        }
         li_d(tmp, 0x1000);
-        la_bltu(lane_addr, tmp, fail_lane);
+        la_bltu(lane_addr, tmp, fault_check);
         lata_env_ld_du(tmp, (int)env_offset(sve_ctrl.fault_mem_limit));
         la_beqz(tmp, check_done);
         la_addi_d(lane_addr, lane_addr, mem_bytes);
-        la_bltu(tmp, lane_addr, fail_lane);
+        la_bltu(tmp, lane_addr, fault_check);
         la_addi_d(lane_addr, lane_addr, -mem_bytes);
         la_b(do_real_load);
 
@@ -2268,6 +2417,13 @@ static bool lower_fault_load(DisasContext *s,
         la_bgeu(lane_addr, tmp, do_real_load);
         li_d(tmp, UINT64_C(0x10000000) - mem_bytes);
         la_bgeu(tmp, lane_addr, do_real_load);
+
+        la_label(fault_check);
+        if (is_first) {
+            /* First active element (state bit 1 == 0) raises synchronous Data Abort. */
+            la_andi(tmp, state, 2);
+            la_beqz(tmp, first_fault_abort);
+        }
         la_b(fail_lane);
 
         la_label(do_real_load);
@@ -2294,6 +2450,11 @@ static bool lower_fault_load(DisasContext *s,
             la_label(keep_ffr);
         }
     }
+
+    la_b(fault_loop_done);
+    la_label(first_fault_abort);
+    emit_inline_mem_fault_abort(s, lane_addr, false, true);
+    la_label(fault_loop_done);
 
     ra_free_temp(tmp);
     ra_free_temp(lane_addr);
@@ -2889,6 +3050,10 @@ static bool lower_mem_ext(DisasContext *s, const A64SVEIR1Instruction *source,
                          : (mem_bytes == 2 ? 1u : (mem_bytes == 4 ? 2u : 3u));
 
     if (pg_off < 0) return false;
+
+    if (sve_mem_needs_checked_path()) {
+        return emit_sve_helper_call(s, instruction, source);
+    }
 
     if (m->kind == SVE_MEM_REP_IMM || m->kind == SVE_MEM_REP_QUAD) {
         /* LD1R / LD1RQ: single or 16-byte block replicated across vector */
@@ -5277,7 +5442,250 @@ static bool lower_generic_binary_pvir(DisasContext *s,
     return true;
 }
 
-bool a64_sve_lower_pvir_instruction(DisasContext *s,
+static bool emit_lsx_chunk_mask(int pred_off, size_t byte_off, uint16_t ebits,
+                                IR2_OPND mask)
+{
+    IR2_OPND packed = ra_alloc_itemp();
+    unsigned elem_bytes = (unsigned)(ebits / 8u);
+
+    la_vxor_v(mask, mask, mask);
+    lata_env_ld_wu(packed, pred_off + (int)(byte_off / 8u));
+    if (ebits == 64) {
+        for (int lane = 0; lane < 2; ++lane) {
+            IR2_OPND bit = ra_alloc_itemp();
+            IR2_OPND lm = ra_alloc_itemp();
+            la_bstrpick_d(bit, packed, lane * 8, lane * 8);
+            la_sub_d(lm, zero_ir2_opnd, bit);
+            la_vinsgr2vr_d(mask, lm, lane);
+            ra_free_temp(lm);
+            ra_free_temp(bit);
+        }
+    } else {
+        for (int word_lane = 0; word_lane < 4; ++word_lane) {
+            IR2_OPND word = ra_alloc_itemp();
+            li_d(word, 0);
+            for (unsigned bl = 0; bl < 4; bl += elem_bytes) {
+                int bit_index = word_lane * 4 + (int)bl;
+                IR2_OPND bit = ra_alloc_itemp();
+                IR2_OPND lm = ra_alloc_itemp();
+                la_bstrpick_d(bit, packed, bit_index, bit_index);
+                la_sub_d(lm, zero_ir2_opnd, bit);
+                la_bstrpick_d(lm, lm, (int)ebits - 1, 0);
+                if (bl != 0) {
+                    la_slli_d(lm, lm, (int)(bl * 8u));
+                }
+                la_or(word, word, lm);
+                ra_free_temp(lm);
+                ra_free_temp(bit);
+            }
+            la_vinsgr2vr_w(mask, word, word_lane);
+            ra_free_temp(word);
+        }
+    }
+    ra_free_temp(packed);
+    return true;
+}
+
+static bool lower_sve_lsx_core(DisasContext *s,
+                               const PvirInstruction *instruction,
+                               const A64SVEIR1Instruction *source)
+{
+    size_t vl_bytes = (size_t)s->vl;
+
+    if (instruction->opcode == PVIR_OP_PREDICATE_GENERATE) {
+        const PvirPredicateGeneratorOperation *g =
+            &instruction->operation.predicate_generator;
+        if (g->kind == PVIR_PREDICATE_GENERATOR_CONSTANT) {
+            if (instruction->effects.arch_state.domain ==
+                PVIR_ARCH_STATE_DOMAIN_FIRST_FAULT) {
+                return lower_ffr_set(s, instruction);
+            }
+            return lower_predicate_constant(s, instruction);
+        }
+        return false;
+    }
+
+    if (instruction->opcode == PVIR_OP_BROADCAST) {
+        const PvirVectorOperation *op = &instruction->operation.vector;
+        uint16_t ebits = op->type.element_bits;
+        int zd = source != NULL ? (int)source->arg.f_sve_dup.zd
+                                : find_zreg_for_value(s->sve_pvir_builder, op->destination);
+        int rn = source != NULL ? (int)source->arg.f_sve_dup.rn
+                                : find_gpr_for_value(op->operands[0]);
+        int zd_off = env_offset_zreg(zd);
+        if (zd_off < 0) return false;
+        IR2_OPND gpr = (rn >= 0 && rn < 31) ? alloc_gpr_src(rn) : zero_ir2_opnd;
+        if (op->operand_kinds[0] == PVIR_OPERAND_IMMEDIATE) {
+            gpr = ra_alloc_itemp();
+            li_d(gpr, (int64_t)op->operand_immediates[0]);
+        }
+        for (size_t b = 0; b < vl_bytes; b += 16u) {
+            IR2_OPND v = ra_alloc_ftemp();
+            if (ebits == 8) la_vreplgr2vr_b(v, gpr);
+            else if (ebits == 16) la_vreplgr2vr_h(v, gpr);
+            else if (ebits == 32) la_vreplgr2vr_w(v, gpr);
+            else la_vreplgr2vr_d(v, gpr);
+            lata_env_vst(v, zd_off + (int)b);
+            ra_free_temp(v);
+        }
+        if (op->operand_kinds[0] == PVIR_OPERAND_IMMEDIATE) {
+            ra_free_temp(gpr);
+        } else if (rn >= 0 && rn < 31) {
+            free_alloc_gpr(gpr);
+        }
+        return true;
+    }
+
+    /* Binary vector ops lowered in 128-bit LSX chunks (ZERO xv* emitted). */
+    switch (instruction->opcode) {
+    case PVIR_OP_ADD:
+    case PVIR_OP_SUB:
+    case PVIR_OP_MUL:
+    case PVIR_OP_AND:
+    case PVIR_OP_OR:
+    case PVIR_OP_XOR:
+    case PVIR_OP_SHL:
+    case PVIR_OP_SHR:
+    case PVIR_OP_SAR:
+    case PVIR_OP_MIN:
+    case PVIR_OP_MAX:
+        break;
+    default:
+        return false;
+    }
+
+    const PvirVectorOperation *op = &instruction->operation.vector;
+    uint16_t ebits = op->type.element_bits;
+    bool is_flt = (op->type.kind == PVIR_ELEMENT_FLOAT);
+    bool is_signed = (op->type.signedness == PVIR_SIGNED);
+    if (op->operand_kinds[1] != PVIR_OPERAND_VECTOR) {
+        return false;
+    }
+    if (is_flt && ebits != 32 && ebits != 64) {
+        return false;
+    }
+    int zd = find_zreg_for_value(s->sve_pvir_builder, op->destination);
+    int zn = find_zreg_for_value(s->sve_pvir_builder, op->operands[0]);
+    int zm = find_zreg_for_value(s->sve_pvir_builder, op->operands[1]);
+    int pg = (op->predicate.source.kind == PVIR_PREDICATE_SOURCE_PREDICATE)
+                 ? find_preg_for_value(s->sve_pvir_builder, op->predicate.source.id)
+                 : -1;
+    if (source != NULL && source->insn_type >= AARCH64_A64_SVE_ADD &&
+        source->insn_type <= AARCH64_A64_SVE_FDIV) {
+        zd = source->arg.f_sve_add.zd;
+        zn = zd;
+        zm = source->arg.f_sve_add.zm;
+        pg = source->arg.f_sve_add.pg;
+    }
+    if (zd < 0 || zn < 0 || zm < 0) return false;
+    int zd_off = env_offset_zreg(zd), zn_off = env_offset_zreg(zn);
+    int zm_off = env_offset_zreg(zm);
+    int pg_off = (pg >= 0) ? env_offset_sve_preg(pg) : -1;
+    if (zd_off < 0 || zn_off < 0 || zm_off < 0) return false;
+    if (op->predicate.form == PVIR_PREDICATE_VECTOR_MASK && pg_off < 0) return false;
+    if (op->predicate.form != PVIR_PREDICATE_VECTOR_MASK &&
+        op->predicate.form != PVIR_PREDICATE_ALL_TRUE) {
+        return false;
+    }
+
+    for (size_t b = 0; b < vl_bytes; b += 16u) {
+        IR2_OPND oldv = ra_alloc_ftemp();
+        IR2_OPND lhs = ra_alloc_ftemp();
+        IR2_OPND rhs = ra_alloc_ftemp();
+        IR2_OPND res = ra_alloc_ftemp();
+        IR2_OPND mask = ra_alloc_ftemp();
+
+        lata_env_vld(oldv, zd_off + (int)b);
+        lata_env_vld(lhs, zn_off + (int)b);
+        lata_env_vld(rhs, zm_off + (int)b);
+        if (op->predicate.form == PVIR_PREDICATE_ALL_TRUE) {
+            la_vseq_b(mask, mask, mask);
+        } else {
+            emit_lsx_chunk_mask(pg_off, b, ebits, mask);
+        }
+        if (is_flt) {
+            if (instruction->opcode == PVIR_OP_ADD) {
+                ebits == 32 ? la_vfadd_s(res, lhs, rhs) : la_vfadd_d(res, lhs, rhs);
+            } else if (instruction->opcode == PVIR_OP_SUB) {
+                ebits == 32 ? la_vfsub_s(res, lhs, rhs) : la_vfsub_d(res, lhs, rhs);
+            } else {
+                ebits == 32 ? la_vfmul_s(res, lhs, rhs) : la_vfmul_d(res, lhs, rhs);
+            }
+        } else {
+            switch (instruction->opcode) {
+            case PVIR_OP_AND: la_vand_v(res, lhs, rhs); break;
+            case PVIR_OP_OR: la_vor_v(res, lhs, rhs); break;
+            case PVIR_OP_XOR: la_vxor_v(res, lhs, rhs); break;
+            case PVIR_OP_ADD:
+                ebits == 8 ? la_vadd_b(res, lhs, rhs)
+                           : (ebits == 16 ? la_vadd_h(res, lhs, rhs)
+                                          : (ebits == 32 ? la_vadd_w(res, lhs, rhs) : la_vadd_d(res, lhs, rhs)));
+                break;
+            case PVIR_OP_SUB:
+                ebits == 8 ? la_vsub_b(res, lhs, rhs)
+                           : (ebits == 16 ? la_vsub_h(res, lhs, rhs)
+                                          : (ebits == 32 ? la_vsub_w(res, lhs, rhs) : la_vsub_d(res, lhs, rhs)));
+                break;
+            case PVIR_OP_MUL:
+                ebits == 8 ? la_vmul_b(res, lhs, rhs)
+                           : (ebits == 16 ? la_vmul_h(res, lhs, rhs)
+                                          : (ebits == 32 ? la_vmul_w(res, lhs, rhs) : la_vmul_d(res, lhs, rhs)));
+                break;
+            case PVIR_OP_SHL:
+                ebits == 8 ? la_vsll_b(res, lhs, rhs)
+                           : (ebits == 16 ? la_vsll_h(res, lhs, rhs)
+                                          : (ebits == 32 ? la_vsll_w(res, lhs, rhs) : la_vsll_d(res, lhs, rhs)));
+                break;
+            case PVIR_OP_SHR:
+                ebits == 8 ? la_vsrl_b(res, lhs, rhs)
+                           : (ebits == 16 ? la_vsrl_h(res, lhs, rhs)
+                                          : (ebits == 32 ? la_vsrl_w(res, lhs, rhs) : la_vsrl_d(res, lhs, rhs)));
+                break;
+            case PVIR_OP_SAR:
+                ebits == 8 ? la_vsra_b(res, lhs, rhs)
+                           : (ebits == 16 ? la_vsra_h(res, lhs, rhs)
+                                          : (ebits == 32 ? la_vsra_w(res, lhs, rhs) : la_vsra_d(res, lhs, rhs)));
+                break;
+            case PVIR_OP_MAX:
+                if (is_signed) {
+                    ebits == 8 ? la_vmax_b(res, lhs, rhs)
+                               : (ebits == 16 ? la_vmax_h(res, lhs, rhs)
+                                              : (ebits == 32 ? la_vmax_w(res, lhs, rhs) : la_vmax_d(res, lhs, rhs)));
+                } else {
+                    ebits == 8 ? la_vmax_bu(res, lhs, rhs)
+                               : (ebits == 16 ? la_vmax_hu(res, lhs, rhs)
+                                              : (ebits == 32 ? la_vmax_wu(res, lhs, rhs) : la_vmax_du(res, lhs, rhs)));
+                }
+                break;
+            default:
+                if (is_signed) {
+                    ebits == 8 ? la_vmin_b(res, lhs, rhs)
+                               : (ebits == 16 ? la_vmin_h(res, lhs, rhs)
+                                              : (ebits == 32 ? la_vmin_w(res, lhs, rhs) : la_vmin_d(res, lhs, rhs)));
+                } else {
+                    ebits == 8 ? la_vmin_bu(res, lhs, rhs)
+                               : (ebits == 16 ? la_vmin_hu(res, lhs, rhs)
+                                              : (ebits == 32 ? la_vmin_wu(res, lhs, rhs) : la_vmin_du(res, lhs, rhs)));
+                }
+                break;
+            }
+        }
+        if (op->inactive_policy == PVIR_INACTIVE_MERGE) {
+            la_vbitsel_v(res, oldv, res, mask);
+        } else if (op->inactive_policy == PVIR_INACTIVE_ZERO) {
+            la_vand_v(res, res, mask);
+        }
+        lata_env_vst(res, zd_off + (int)b);
+        ra_free_temp(mask);
+        ra_free_temp(res);
+        ra_free_temp(rhs);
+        ra_free_temp(lhs);
+        ra_free_temp(oldv);
+    }
+    return true;
+}
+
+static bool lower_sve_lasx_dispatch(DisasContext *s,
                                     const PvirInstruction *instruction,
                                     const A64SVEIR1Instruction *source)
 {
@@ -5485,6 +5893,70 @@ bool a64_sve_lower_pvir_instruction(DisasContext *s,
     default:
         return false;
     }
+}
+
+bool a64_sve_lower_pvir_instruction(DisasContext *s,
+                                    const PvirInstruction *instruction,
+                                    const A64SVEIR1Instruction *source)
+{
+    A64SVEPvirBuilder bsnap;
+    LataIr2Snapshot ir2_snap;
+    A64SVEBackendMode backend;
+
+    if (!sve_context_valid(s) || instruction == NULL) {
+        return false;
+    }
+
+    lata_flush_vregs_for_sve();
+    backend = a64_sve_select_backend();
+
+    if (backend == A64_SVE_BACKEND_SCALAR_HELPER) {
+        if (pvir_instruction_validate(instruction) != PVIR_STATUS_OK) {
+            return false;
+        }
+        return emit_sve_helper_call(s, instruction, source);
+    }
+
+    bsnap = *s->sve_pvir_builder;
+    lata_ir2_snapshot_take(&ir2_snap);
+    ra_ftemp_clear_failed();
+
+    if (backend == A64_SVE_BACKEND_LSX) {
+        bool lsx_ok = lower_sve_lsx_core(s, instruction, source);
+        bool ftemp_exhausted = ra_ftemp_alloc_failed();
+        if (lsx_ok && !ftemp_exhausted) {
+            return true;
+        }
+        *s->sve_pvir_builder = bsnap;
+        lata_ir2_snapshot_rollback(&ir2_snap);
+        ra_ftemp_clear_failed();
+        if (ftemp_exhausted) {
+            ra_ftemp_note_fallback();
+        }
+        if (pvir_instruction_validate(instruction) != PVIR_STATUS_OK) {
+            return false;
+        }
+        return emit_sve_helper_call(s, instruction, source);
+    }
+
+    {
+        bool lasx_ok = lower_sve_lasx_dispatch(s, instruction, source);
+        bool ftemp_exhausted = ra_ftemp_alloc_failed();
+        if (lasx_ok && !ftemp_exhausted) {
+            return true;
+        }
+        *s->sve_pvir_builder = bsnap;
+        lata_ir2_snapshot_rollback(&ir2_snap);
+        ra_ftemp_clear_failed();
+        if (ftemp_exhausted) {
+            ra_ftemp_note_fallback();
+            if (pvir_instruction_validate(instruction) != PVIR_STATUS_OK) {
+                return false;
+            }
+            return emit_sve_helper_call(s, instruction, source);
+        }
+    }
+    return false;
 }
 
 static bool translate_sve_pvir(DisasContext *s)

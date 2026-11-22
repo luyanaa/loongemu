@@ -9,9 +9,15 @@ typedef IR2_INST *(*LatrFPFmaOp)(IR2_OPND, IR2_OPND, IR2_OPND, IR2_OPND);
 typedef IR2_INST *(*LatrFPIntToFloatOp)(IR2_OPND, IR2_OPND);
 typedef IR2_INST *(*LatrFPFloatToIntOp)(IR2_OPND, IR2_OPND);
 
-extern int latr_riscv_fp_rmm(CPUArchState *env, uint64_t opcode,
-                             uint64_t rd, uint64_t rs1, uint64_t rs2,
-                             uint64_t rs3, uint64_t rm, uint64_t pc);
+/*
+ * Returns non-zero when the rounding mode is not one the helper implements.
+ * Deliberately 64-bit: every other LATR cross-boundary helper uses uint64_t,
+ * and a 32-bit return would leave a0's upper half holding whatever the caller
+ * put there (the env pointer), which the generated code cannot test against.
+ */
+extern uint64_t latr_riscv_fp_rmm(CPUArchState *env, uint64_t opcode,
+                                  uint64_t rd, uint64_t rs1, uint64_t rs2,
+                                  uint64_t rs3, uint64_t rm, uint64_t pc);
 
 static void emit_fp_rmm_call(const RiscvIR1 *ir1);
 
@@ -56,6 +62,11 @@ static void emit_fp_rmm_call(const RiscvIR1 *ir1)
     la_ld_d(ra_ir2_opnd, sp, 0);
     la_addi_d(sp, sp, 16);
 
+    /*
+     * Belt and braces: even with the 64-bit return type above, the generated
+     * test must not depend on the upper half of a0, so mask it off explicitly.
+     */
+    la_bstrpick_d(a0, a0, 31, 0);
     la_beqz(a0, done);
     emit_fp_raise_illegal(ir1);
     la_label(done);

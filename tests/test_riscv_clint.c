@@ -12,6 +12,14 @@ int main(void)
     uint64_t mip = 0;
 
     loongemu_clint_init(&clint, 2);
+    /* Power-on comparators must be far in the future: a zero comparator makes
+     * MTIP assert on the very first tick, before firmware programs the timer. */
+    CHECK(clint.mtimecmp[0] == UINT64_MAX, "MTIMECMP hart 0 resets to max");
+    CHECK(clint.mtimecmp[1] == UINT64_MAX, "MTIMECMP hart 1 resets to max");
+    mip = 0;
+    loongemu_clint_tick(&clint, 1, &mip, 0);
+    CHECK((mip & (1ULL << 7)) == 0, "no boot-time MTIP before MTIMECMP is set");
+    CHECK((mip & (1ULL << 3)) == 0, "no boot-time MSIP");
     loongemu_clint_write(&clint, 0x0000, 1, 4);
     CHECK(loongemu_clint_read(&clint, 0x0000, 4) == 1, "MSIP hart 0");
     loongemu_clint_write(&clint, 0x0004, 1, 4);

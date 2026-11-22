@@ -16,7 +16,7 @@ LLD_PREFIX ?= $(shell brew --prefix lld 2>/dev/null)
 LD_LLD   ?= $(if $(LLD_PREFIX),$(LLD_PREFIX)/bin/ld.lld,ld.lld)
 QEMU_PREFIX ?= $(shell brew --prefix qemu 2>/dev/null)
 
-.PHONY: all test test-pvir test-riscv-sbi test-riscv-acpi test-riscv-plic test-riscv-uart test-riscv-clint test-riscv-fw test-sve-decode test-sve-pvir test-vcache test-arm-state test-cpu test-lapaging test-pci-host test-hyperv test-tbc test-soft-ras test-p0 test-plv3-isolation tb-sys-run tb-sys-smp-run vmm-efi vmm-boot vmm-integrated vmm-integrated-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot test-latr latr-core latr-isa-image latr-isa-run latr-riscv-ref latr-check latr-boot-image latr-boot-run latr-sys-ref latr-sys-run latr-sys-diff test-latm test-latm-decode latm-core latm-isa-image latm-isa-run latm-riscv-ref clean
+.PHONY: all test test-pvir test-riscv-sbi test-riscv-acpi test-riscv-plic test-riscv-uart test-riscv-clint test-riscv-fw test-sve-decode test-sve-pvir test-vcache test-arm-state test-cpu test-lapaging test-pci-host test-hyperv test-tbc test-soft-ras test-p0 test-plv3-isolation tb-sys-run tb-sys-smp-run vmm-efi vmm-boot vmm-integrated vmm-integrated-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot test-latr latr-core latr-isa-image latr-isa-run latr-riscv-ref latr-check latr-boot-image latr-boot-run latr-sys-ref latr-sys-run latr-sys-diff latr-opensbi-image latr-opensbi-run latr-opensbi-trace latr-opensbi-trace-run latr-opensbi-test test-latm test-latm-decode latm-core latm-isa-image latm-isa-run latm-riscv-ref clean
 
 all: test
 
@@ -161,6 +161,23 @@ build/test_arm_state: tests/test_arm_state.c \
 test-arm-state: build/test_arm_state
 	./build/test_arm_state
 
+build/test_lata_context: tests/test_lata_context.c lata/vcache.c \
+                         target/arm/lata/mem.c \
+                         target/arm/lata/include/lata.h \
+                         target/arm/lata/include/lata-mem.h \
+                         target/arm/lata/include/lata-vcache.h \
+                         lata/compat/target/arm/cpu.h
+	@mkdir -p build
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -DLATA_ENABLE_TLS -pthread \
+	      -DTARGET_AARCH64 -DCONFIG_LATA -DCONFIG_LATA_STANDALONE \
+	      -Wno-gnu-empty-struct -Wno-macro-redefined -Wno-unused-parameter \
+	      -Ilata/compat -Ilatx/compat -I. -Itarget/arm/lata/include \
+	      -Itarget/arm/lata -Ilatx/upstream/include \
+	      lata/vcache.c target/arm/lata/mem.c tests/test_lata_context.c -o $@
+
+test-lata-context: build/test_lata_context
+	./build/test_lata_context
+
 test-tbc: build/test_tb_cache
 	./build/test_tb_cache
 
@@ -172,7 +189,7 @@ test-soft-ras: build/test_soft_ras
 	./build/test_soft_ras
 
 test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging build/test_x86_64_paging \
-      build/test_pci_host build/test_hyperv build/test_tb_cache build/test_soft_ras build/test_pvir build/test_sve_decode build/test_sve_pvir build/test_vcache build/test_arm_state \
+      build/test_pci_host build/test_hyperv build/test_tb_cache build/test_soft_ras build/test_pvir build/test_sve_decode build/test_sve_pvir build/test_vcache build/test_arm_state build/test_lata_context \
       build/test_latm_decode
 	./build/test_loongbt
 	./build/test_loongbt_cpu
@@ -192,6 +209,7 @@ test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging buil
 	./build/test_sve_pvir
 	./build/test_vcache
 	./build/test_arm_state
+	./build/test_lata_context
 	./build/test_latm_decode
 
 # Back-end selection and the EFLAGS pack/unpack bridge.  Kept separate from
@@ -636,6 +654,128 @@ latr-boot-run: latr-boot-image
 	     bash scripts/run_qemu_lata.sh
 	@grep -a "latr-boot" build/latr_boot.log | head -10
 	@grep -qa "latr-boot: PASS" build/latr_boot.log
+
+# Optional: boot a real prebuilt OpenSBI fw_dynamic through the LATR machine.
+OPEN_SBI_BIN ?= /opt/homebrew/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
+
+build/opensbi64.bin: $(OPEN_SBI_BIN)
+	@mkdir -p build
+	cp $< $@
+
+build/latr_opensbi_blob.o: baremetal/bare/latr_opensbi_blob.S build/opensbi64.bin
+	@mkdir -p build
+	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
+	         -fno-builtin -O2 -c $< -o $@
+
+# A real S-mode next stage, so the handoff OpenSBI performs is observable
+# instead of jumping into blank RAM. Linked at LATR_MACHINE_KERNEL_BASE
+# (0x80200000) because the payload is position-dependent and uses `la`
+# (auipc+addi) throughout; latr_machine_load_kernel() places it there.
+build/latr_smode_payload.elf: baremetal/bare/latr_smode_payload.S
+	@mkdir -p build
+	$(CLANG) --target=riscv64-unknown-elf -march=rv64i -mabi=lp64 \
+	         -mno-relax -ffreestanding -nostdlib -fuse-ld=lld \
+	         -Wl,--no-relax -Wl,-Ttext=0x80200000 $< -o $@
+
+build/latr_smode_payload.bin: build/latr_smode_payload.elf
+	$(OBJCOPY) -O binary $< $@
+
+build/latr_smode_blob.o: baremetal/bare/latr_smode_blob.S build/latr_smode_payload.bin
+	@mkdir -p build
+	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
+	         -fno-builtin -O2 -c $< -o $@
+
+# Budget knobs for the real-firmware run. The defaults fail fast; a long
+# investigation passes e.g. OPEN_SBI_TBS=400000 OPEN_SBI_STALL=0, because
+# OpenSBI legitimately stays silent for tens of thousands of TBs while it
+# walks the device tree.
+OPEN_SBI_TBS ?= 4000
+OPEN_SBI_STALL ?= 4
+OPEN_SBI_PCLOG ?= 0
+OPEN_SBI_CODEWORDS ?= 200
+OPEN_SBI_PROBES ?= 0
+OPEN_SBI_STOP ?= 1
+OPEN_SBI_EXTRA_CFLAGS ?=
+
+.PHONY: opensbi-cfg-force
+opensbi-cfg-force:
+
+build/opensbi_cfg.stamp: opensbi-cfg-force
+	@mkdir -p build
+	@echo '$(OPEN_SBI_TBS) $(OPEN_SBI_STALL)' > $@.tmp
+	@cmp -s $@.tmp $@ || mv $@.tmp $@
+
+build/bare_latr_opensbi.elf: baremetal/bare/latr_opensbi_smoke.c latr-core \
+                             build/latr_opensbi_blob.o \
+                             build/latr_smode_blob.o \
+                             build/latr_miniglib.o build/latr_libc_min.o \
+                             baremetal/bare/bare.lds build/opensbi_cfg.stamp
+	@mkdir -p build
+	$(CLANG) $(LATR_BARE_CFLAGS) -I build \
+	         -DLATR_OPEN_SBI_TBS=$(OPEN_SBI_TBS) \
+	         -DLATR_OPEN_SBI_STALL_ROUNDS=$(OPEN_SBI_STALL) \
+	         -DLATR_OPEN_SBI_PCLOG_FROM=$(OPEN_SBI_PCLOG) \
+	         -DLATR_OPEN_SBI_CODEWORDS=$(OPEN_SBI_CODEWORDS) \
+	         -DLATR_OPEN_SBI_PROBES=$(OPEN_SBI_PROBES) \
+	         -DLATR_OPEN_SBI_STOP=$(OPEN_SBI_STOP) \
+	         $(OPEN_SBI_EXTRA_CFLAGS) \
+	         -c baremetal/bare/latr_opensbi_smoke.c -o build/latr_opensbi_smoke.o
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	   build/latr_opensbi_smoke.o build/latr_opensbi_blob.o \
+	   build/latr_smode_blob.o \
+	   build/latr_miniglib.o build/latr_libc_min.o \
+	   latr/build/liblatr_core.a -o $@
+
+latr-opensbi-image: build/bare_latr_opensbi.elf
+
+# Differential-debug build: same firmware, but every dispatched TB is recorded
+# so the guest PC stream can be diffed against `qemu-system-riscv64 -d exec`.
+OPEN_SBI_TRACE_TBS ?= 32000
+
+build/latr_opensbi_smoke_trace.o: baremetal/bare/latr_opensbi_smoke.c
+	@mkdir -p build
+	$(CLANG) $(LATR_BARE_CFLAGS) -I build -DLATR_OPEN_SBI_TRACE=1 \
+	         -DLATR_OPEN_SBI_TBS=$(OPEN_SBI_TRACE_TBS) -c $< -o $@
+
+build/bare_latr_opensbi_trace.elf: build/latr_opensbi_smoke_trace.o \
+                                   build/latr_opensbi_blob.o \
+                                   build/latr_smode_blob.o \
+                                   build/latr_miniglib.o build/latr_libc_min.o \
+                                   baremetal/bare/bare.lds
+	@mkdir -p build
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	   build/latr_opensbi_smoke_trace.o build/latr_opensbi_blob.o \
+	   build/latr_smode_blob.o \
+	   build/latr_miniglib.o build/latr_libc_min.o \
+	   latr/build/liblatr_core.a -o $@
+
+latr-opensbi-trace: build/bare_latr_opensbi_trace.elf
+
+latr-opensbi-trace-run: build/bare_latr_opensbi_trace.elf
+	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_latr_opensbi_trace.elf" \
+	     QEMU_LOG="build/latr_opensbi_trace.log" QEMU_DONE="latr-opensbi: done" \
+	     QEMU_TIMEOUT=1800 CPU=la464 \
+	     bash scripts/run_qemu_lata.sh
+	@grep -a "latr-opensbi: rc=\|trace_n=" build/latr_opensbi_trace.log | cut -c1-120
+
+latr-opensbi-run: latr-opensbi-image
+	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_latr_opensbi.elf" \
+	     QEMU_LOG="build/latr_opensbi.log" QEMU_DONE="latr-opensbi: done" \
+	     QEMU_TIMEOUT=1800 CPU=la464 \
+	     bash scripts/run_qemu_lata.sh
+	@grep -a "latr-opensbi" build/latr_opensbi.log | head -6
+	@grep -qa "latr-opensbi: PASS" build/latr_opensbi.log
+
+# Acceptance test for rung 1 of the boot ladder: a real fw_dynamic OpenSBI must
+# run from the M-mode entry, reach S-mode, and shut the machine down. Kept out
+# of test-latr because it needs the QEMU-shipped firmware binary, but it stays a
+# single command so it can be wired into CI wherever that file exists.
+LATR_OPEN_SBI_TEST_TBS ?= 1500000
+
+latr-opensbi-test:
+	@$(MAKE) --no-print-directory latr-opensbi-run \
+	    OPEN_SBI_TBS=$(LATR_OPEN_SBI_TEST_TBS) OPEN_SBI_STALL=0 \
+	    OPEN_SBI_CODEWORDS=0
 
 latr-isa-image: build/bare_latr_isa.elf
 

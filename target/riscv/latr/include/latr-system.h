@@ -17,6 +17,9 @@
 #define LATR_SYSTEM_PLIC_BASE   UINT64_C(0x0c000000)
 #define LATR_SYSTEM_UART_BASE   UINT64_C(0x10000000)
 #define LATR_SYSTEM_EXIT_BASE   UINT64_C(0x00100000)
+/* QEMU virt sizes the SiFive test device at 4 KiB and the DTB says so, so back
+ * the whole window instead of only the one word the device actually decodes. */
+#define LATR_SYSTEM_EXIT_SIZE   UINT64_C(0x1000)
 #define LATR_SYSTEM_FWCFG_BASE  UINT64_C(0x10100000)
 #define LATR_SYSTEM_PFLASH_CODE UINT64_C(0x20000000)
 #define LATR_SYSTEM_PFLASH_VARS UINT64_C(0x22000000)
@@ -35,7 +38,17 @@ typedef struct LatrSystem {
     uint64_t ram_base;
     uint64_t ram_size;
     uint64_t exit_request;
-    char uart_log[256];
+    /* Highest guest address touched by latr_system_load_elf(). */
+    uint64_t image_end;
+    /* Console tail captured for the harness. It must be big enough to hold a
+     * full firmware banner: OpenSBI prints its version plus a seven-line logo
+     * and then its platform/domain feature lists, which together run well past
+     * 1 KiB. A 256-byte window ended mid-logo and a 1 KiB window cut off at the
+     * logo, and both look exactly like a guest that stopped printing -- which
+     * sent an earlier investigation chasing a phantom wedge. Once the S-mode
+     * payload started printing through SBI ecall the need for a larger window
+     * became obvious, so size it for a full boot log, not just a banner. */
+    char uart_log[8192];
     uint32_t uart_log_len;
     uint64_t rsdp_gpa;
     uint64_t acpi_tables_gpa;
@@ -54,6 +67,11 @@ int latr_system_init_harts(LatrSystem *sys, uint8_t *ram, uint64_t ram_size,
                            uint32_t nharts, uint32_t boot_hart);
 int latr_system_load_elf(LatrSystem *sys, const uint8_t *elf, uint64_t len,
                          uint64_t *entry);
+/* Advances the shared virtual clock once per machine step. */
+void latr_system_tick(LatrSystem *sys, uint64_t ns);
+/* Reflects CLINT/device state for one hart into that hart's MIP. */
+void latr_system_update_hart(LatrSystem *sys, CPUArchState *env, uint32_t hartid);
+/* Hart 0 convenience wrapper: tick 1 us then update hart 0. */
 void latr_system_update(LatrSystem *sys);
 void latr_system_mmio_write(LatrSystem *sys, uint64_t pa, unsigned size,
                             uint64_t value);

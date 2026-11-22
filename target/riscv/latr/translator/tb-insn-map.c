@@ -132,3 +132,31 @@ void latr_tb_insn_map_forget(void *code)
         }
     }
 }
+
+void latr_tb_insn_map_forget_range(void *base, uint32_t size)
+{
+    TRANSLATION_DATA *t = lsenv ? lsenv->tr_data : NULL;
+    uintptr_t start = (uintptr_t)base;
+    uintptr_t end = start + size;
+
+    if (t == NULL || size == 0) {
+        return;
+    }
+    for (int i = 0; i < LATR_TB_MAP_SLOTS; i++) {
+        LatrTbInsnMap *map = &t->insn_maps[i];
+
+        if (!map->valid) {
+            continue;
+        }
+        /* Empty ranges are not produced by the assembler, but tolerate one so
+         * a zero-length TB cannot pin a map forever. */
+        if (map->code_base == start ||
+            (map->code_base < end &&
+             start < map->code_base + map->code_size)) {
+            map->valid = false;
+            if (t->active_insn_map == map) {
+                t->active_insn_map = NULL;
+            }
+        }
+    }
+}

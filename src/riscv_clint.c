@@ -13,6 +13,14 @@ void loongemu_clint_init(LoongemuClint *clint, uint32_t hart_count)
     clint->hart_count = hart_count > LOONGEMU_CLINT_MAX_HARTS
                             ? LOONGEMU_CLINT_MAX_HARTS
                             : hart_count;
+    /*
+     * QEMU (and real firmware) power up with mtimecmp far in the future, not 0.
+     * A zero comparator makes `mtime >= mtimecmp` true from the first tick, so
+     * every hart would latch MTIP before it ever programmed the timer.
+     */
+    for (uint32_t i = 0; i < clint->hart_count; i++) {
+        clint->mtimecmp[i] = UINT64_MAX;
+    }
 }
 
 uint64_t loongemu_clint_read(LoongemuClint *clint, uint64_t offset,

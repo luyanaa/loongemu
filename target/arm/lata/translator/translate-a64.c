@@ -24,6 +24,7 @@
 #include "target/arm/lata/include/insts-pattern.h"
 #include "ir1.h"
 #include "ir1-arg.h"
+#include "lata-mem.h"
 #include "translate-a64.h"
 #include "../ir1/sve-decode.h"
 #include "../ir1/sve-pvir.h"
@@ -318,6 +319,84 @@ static bool trans_sve_unimplemented(DisasContext *s)
     return true;
 }
 
+static bool lata_guest_mem_needs_probe(void)
+{
+    CPUARMState *cpu_env = (lsenv != NULL) ? (CPUARMState *)lsenv->cpu_state : NULL;
+    return (lata_get_guest_mem_ops() != &lata_default_guest_mem_ops) ||
+           (cpu_env != NULL && (cpu_env->sve_ctrl.fault_region_count > 0 ||
+                                cpu_env->sve_ctrl.fault_mem_limit != 0));
+}
+
+extern uint32_t lata_vreg_published;
+
+static void lata_emit_guest_mem_probe(DisasContext *s, IR2_OPND addr_reg,
+                                      int64_t offset, size_t size,
+                                      bool is_write,
+                                      const IR2_OPND *preserve_vreg)
+{
+    if (!lata_guest_mem_needs_probe()) {
+        return;
+    }
+    lata_zcache_flush_for_exit();
+
+    IR2_OPND ok_lbl = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND vaddr = ra_alloc_itemp();
+    li_d(vaddr, offset);
+    la_add_d(vaddr, addr_reg, vaddr);
+
+    la_addi_d(sp_ir2_opnd, sp_ir2_opnd, -96);
+    la_st_d(t0_ir2_opnd, sp_ir2_opnd, 0);
+    la_st_d(t1_ir2_opnd, sp_ir2_opnd, 8);
+    la_st_d(t2_ir2_opnd, sp_ir2_opnd, 16);
+    la_st_d(t3_ir2_opnd, sp_ir2_opnd, 24);
+    la_st_d(t4_ir2_opnd, sp_ir2_opnd, 32);
+    la_st_d(t5_ir2_opnd, sp_ir2_opnd, 40);
+    la_st_d(vaddr, sp_ir2_opnd, 48);
+    if (preserve_vreg != NULL) {
+        la_vst(*preserve_vreg, sp_ir2_opnd, 64);
+    }
+    ra_free_temp(vaddr);
+
+    lata_gen_call_helper_prologue(tcg_ctx);
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    la_ld_d(a1_ir2_opnd, sp_ir2_opnd, 48);
+    li_d(a2_ir2_opnd, (int64_t)size);
+    li_d(a3_ir2_opnd, is_write ? 1 : 0);
+    li_d(a4_ir2_opnd, 0);
+    li_d(t0_ir2_opnd, (uint64_t)lata_guest_mem_probe);
+    la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
+    la_beqz(a0_ir2_opnd, ok_lbl);
+
+    /* Fault path: publish synchronous Data Abort at s->pc_curr and exit TB. */
+    la_mov64(a4_ir2_opnd, a0_ir2_opnd);
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    li_d(a1_ir2_opnd, (int64_t)s->pc_curr);
+    la_ld_d(a2_ir2_opnd, sp_ir2_opnd, 48);
+    li_d(a3_ir2_opnd, is_write ? 1 : 0);
+    li_d(t0_ir2_opnd, (uint64_t)lata_guest_mem_raise_fault);
+    la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
+    la_addi_d(sp_ir2_opnd, sp_ir2_opnd, 96);
+    lata_gen_call_helper_epilogue(tcg_ctx);
+    li_d(t0_ir2_opnd, (int64_t)(uintptr_t)&lata_vreg_published);
+    li_d(t1_ir2_opnd, 1);
+    la_st_w(t1_ir2_opnd, t0_ir2_opnd, 0);
+    li_d(t0_ir2_opnd, (int64_t)context_switch_native_to_bt_ret_0);
+    la_jirl(zero_ir2_opnd, t0_ir2_opnd, 0);
+
+    la_label(ok_lbl);
+    lata_gen_call_helper_epilogue(tcg_ctx);
+    if (preserve_vreg != NULL) {
+        la_vld(*preserve_vreg, sp_ir2_opnd, 64);
+    }
+    la_ld_d(t0_ir2_opnd, sp_ir2_opnd, 0);
+    la_ld_d(t1_ir2_opnd, sp_ir2_opnd, 8);
+    la_ld_d(t2_ir2_opnd, sp_ir2_opnd, 16);
+    la_ld_d(t3_ir2_opnd, sp_ir2_opnd, 24);
+    la_ld_d(t4_ir2_opnd, sp_ir2_opnd, 32);
+    la_ld_d(t5_ir2_opnd, sp_ir2_opnd, 40);
+    la_addi_d(sp_ir2_opnd, sp_ir2_opnd, 96);
+}
+
 static void lata_clean_data_tbi(DisasContext *s, IR2_OPND *dst, IR2_OPND *src, int tbi)
 {
     if (tbi == 0)
@@ -444,8 +523,10 @@ static void lata_helper_addl_saturate_s64(DisasContext *ctx, IR2_OPND vreg_d, IR
     la_jirl(ra_ir2_opnd, temp, 0);
     la_vinsgr2vr_d(vreg_d, a0_ir2_opnd, 1);
 
-    if (rd != -1)
+    if (rd != -1) {
         lata_env_vst(vreg_d, env_offset_vreg(rd));
+        lata_note_vreg_v_write(rd);
+    }
 
     lata_gen_call_helper_epilogue(tcg_ctx);
 
@@ -489,8 +570,10 @@ static void lata_helper_addl_saturate_s32(DisasContext *ctx, IR2_OPND vreg_d, IR
     la_vpickve2gr_w(a2_ir2_opnd, vreg2, 3);
     la_jirl(ra_ir2_opnd, temp, 0);
     la_vinsgr2vr_w(vreg_d, a0_ir2_opnd, 3);
-    if (rd != -1)
+    if (rd != -1) {
         lata_env_vst(vreg_d, env_offset_vreg(rd));
+        lata_note_vreg_v_write(rd);
+    }
 
     lata_gen_call_helper_epilogue(tcg_ctx);
     free_alloc_gpr(temp);
@@ -2496,6 +2579,8 @@ static bool trans_STP(DisasContext *s)
     }
 
     lata_clean_data_tbi(s, &reg_n, &reg_n, s->tbid);
+    lata_emit_guest_mem_probe(s, reg_n, (!a->w || !a->p) ? (int64_t)offset : 0,
+                              (size_t)dbytes * 2u, true, NULL);
 
     if (!a->w && offset)
     { // wback = false && offset!=0
@@ -2574,11 +2659,13 @@ static bool trans_LDP(DisasContext *s)
     IR2_OPND reg_t2 = alloc_gpr_dst(a->rt2);
     IR2_OPND temp = ra_alloc_itemp();
 
-    lata_clean_data_tbi(s, &reg_n, &reg_n, s->tbid);
-
     if (clearGprHigh && arm_la_map[a->rn] >= 0) { /* all reg_n is 64-bit size*/
         clear_gpr_high(a->rn);
     }
+
+    lata_clean_data_tbi(s, &reg_n, &reg_n, s->tbid);
+    lata_emit_guest_mem_probe(s, reg_n, (!a->w || !a->p) ? (int64_t)offset : 0,
+                              (size_t)dbytes * 2u, false, NULL);
 
     if (!a->w && offset)
     { // wback = false && offset!=0
@@ -2704,9 +2791,6 @@ static bool trans_STP_v(DisasContext *s)
     /* TODO: CheckFPAdvSIMDEnabled64(s) */
 
     IR2_OPND reg_n = alloc_gpr_src_sp(a->rn);
-    IR2_OPND vreg_t = alloc_fpr_src(a->rt);
-    IR2_OPND vreg_t2 = alloc_fpr_src(a->rt2);
-    IR2_OPND temp = ra_alloc_itemp();
 
     if (clearGprHigh && arm_la_map[a->rn] >= 0)
     { /* all reg_n is 64-bit size*/
@@ -2714,6 +2798,12 @@ static bool trans_STP_v(DisasContext *s)
     }
 
     lata_clean_data_tbi(s, &reg_n, &reg_n, s->tbid);
+    lata_emit_guest_mem_probe(s, reg_n, (!a->w || !a->p) ? (int64_t)offset : 0,
+                              (size_t)dbytes * 2u, true, NULL);
+
+    IR2_OPND vreg_t = alloc_fpr_src(a->rt);
+    IR2_OPND vreg_t2 = alloc_fpr_src(a->rt2);
+    IR2_OPND temp = ra_alloc_itemp();
 
     if (!a->w && offset)
     { // wback = false && offset!=0
@@ -2799,6 +2889,10 @@ static bool trans_LDP_v(DisasContext *s)
     { /* all reg_n is 64-bit size*/
         clear_gpr_high(a->rn);
     }
+
+    lata_clean_data_tbi(s, &reg_n, &reg_n, s->tbid);
+    lata_emit_guest_mem_probe(s, reg_n, (!a->w || !a->p) ? (int64_t)offset : 0,
+                              (size_t)dbytes * 2u, false, NULL);
 
     if (!a->w && offset)
     { // wback = false && offset!=0
@@ -2903,8 +2997,9 @@ static bool trans_STGP(DisasContext *s)
     assert(0);
 }
 
-static void assist_trans_STR_i(IR2_OPND *reg_t, IR2_OPND *reg_n, uint64_t offset, uint64_t sz)
+static void assist_trans_STR_i(DisasContext *s, IR2_OPND *reg_t, IR2_OPND *reg_n, uint64_t offset, uint64_t sz)
 {
+    lata_emit_guest_mem_probe(s, *reg_n, (int64_t)offset, (size_t)1u << sz, true, NULL);
     switch (sz)
     {
     case 0:
@@ -2970,8 +3065,6 @@ static bool trans_STR_i(DisasContext *s)
         clear_gpr_high(a->rt);
     }
 
-    lata_clean_data_tbi(s, &reg_n, &reg_n, s->tbid);
-
     if (!a->w && offset) { // postindex = false
         /* Unsigned offset立即数是uimm12位，
         la_addi_d立即数是imm12，需要将立即数加载到寄存器
@@ -2982,19 +3075,19 @@ static bool trans_STR_i(DisasContext *s)
             IR2_OPND temp = ra_alloc_itemp();
             li_d(temp, a->imm);
             la_add_d(temp, reg_n, temp);
-            assist_trans_STR_i(&reg_t, &temp, 0, a->sz);
+            assist_trans_STR_i(s, &reg_t, &temp, 0, a->sz);
             free_alloc_gpr(temp);
         }
         else
         {
-            assist_trans_STR_i(&reg_t, &reg_n, offset, a->sz);
+            assist_trans_STR_i(s, &reg_t, &reg_n, offset, a->sz);
         }
     }
     else
     {
         if (!a->p && offset)
             la_addi_d(reg_n, reg_n, offset);
-        assist_trans_STR_i(&reg_t, &reg_n, 0, a->sz);
+        assist_trans_STR_i(s, &reg_t, &reg_n, 0, a->sz);
         if (a->p && offset)
             la_addi_d(reg_n, reg_n, offset);
         if (a->w)
@@ -3006,8 +3099,9 @@ static bool trans_STR_i(DisasContext *s)
     return true;
 }
 
-static void assist_trans_LDR_i(IR2_OPND *reg_t, IR2_OPND *reg_n, uint64_t offset, uint64_t sz, uint64_t sign, bool iss_sf)
+static void assist_trans_LDR_i(DisasContext *s, IR2_OPND *reg_t, IR2_OPND *reg_n, uint64_t offset, uint64_t sz, uint64_t sign, bool iss_sf)
 {
+    lata_emit_guest_mem_probe(s, *reg_n, (int64_t)offset, (size_t)1u << sz, false, NULL);
     switch (sz)
     {
     case 0:
@@ -3109,12 +3203,12 @@ static bool trans_LDR_i(DisasContext *s)
             IR2_OPND temp = ra_alloc_itemp();
             li_d(temp, offset);
             la_add_d(temp, reg_n, temp);
-            assist_trans_LDR_i(&reg_t, &temp, 0, a->sz, a->sign, iss_sf);
+            assist_trans_LDR_i(s, &reg_t, &temp, 0, a->sz, a->sign, iss_sf);
             free_alloc_gpr(temp);
         }
         else
         {
-            assist_trans_LDR_i(&reg_t, &reg_n, offset, a->sz, a->sign, iss_sf);
+            assist_trans_LDR_i(s, &reg_t, &reg_n, offset, a->sz, a->sign, iss_sf);
         }
     }
     else
@@ -3124,7 +3218,7 @@ static bool trans_LDR_i(DisasContext *s)
             la_addi_d(reg_n, reg_n, offset);
         }
 
-        assist_trans_LDR_i(&reg_t, &reg_n, 0, a->sz, a->sign, iss_sf);
+        assist_trans_LDR_i(s, &reg_t, &reg_n, 0, a->sz, a->sign, iss_sf);
 
         if (a->p && offset)
         {
@@ -3152,8 +3246,9 @@ static bool trans_LDR_i(DisasContext *s)
     return true;
 }
 
-static void assist_trans_STR_v_i(IR2_OPND *vreg_t, IR2_OPND *reg_n, uint64_t offset, uint64_t sz)
+static void assist_trans_STR_v_i(DisasContext *s, IR2_OPND *vreg_t, IR2_OPND *reg_n, uint64_t offset, uint64_t sz)
 {
+    lata_emit_guest_mem_probe(s, *reg_n, (int64_t)offset, (size_t)1u << sz, true, vreg_t);
     IR2_OPND temp = ra_alloc_itemp();
     switch (sz)
     {
@@ -3214,8 +3309,6 @@ static bool trans_STR_v_i(DisasContext *s)
         clear_gpr_high(a->rn);
     }
 
-    lata_clean_data_tbi(s, &reg_n, &reg_n, s->tbid);
-
     if (!a->w && offset)
     { // postindex = false
         /* Unsigned offset立即数是uimm12位，
@@ -3227,13 +3320,13 @@ static bool trans_STR_v_i(DisasContext *s)
             IR2_OPND temp = ra_alloc_itemp();
             li_d(temp, a->imm);
             la_add_d(temp, reg_n, temp);
+            assist_trans_STR_v_i(s, &vreg_t, &temp, 0, a->sz);
             free_alloc_gpr(temp);
-            assist_trans_STR_v_i(&vreg_t, &temp, 0, a->sz);
         }
         else
         {
             // la_addi_d(temp, reg_n, a->imm);
-            assist_trans_STR_v_i(&vreg_t, &reg_n, offset, a->sz);
+            assist_trans_STR_v_i(s, &vreg_t, &reg_n, offset, a->sz);
         }
     }
     else
@@ -3241,7 +3334,7 @@ static bool trans_STR_v_i(DisasContext *s)
         if (!a->p && offset)
             la_addi_d(reg_n, reg_n, offset);
 
-        assist_trans_STR_v_i(&vreg_t, &reg_n, 0, a->sz);
+        assist_trans_STR_v_i(s, &vreg_t, &reg_n, 0, a->sz);
 
         if (a->p && offset)
             la_addi_d(reg_n, reg_n, offset);
@@ -3254,8 +3347,9 @@ static bool trans_STR_v_i(DisasContext *s)
     return true;
 }
 
-static void assist_trans_LDR_v_i(IR2_OPND *vreg_t, IR2_OPND *reg_n, uint64_t offset, uint64_t sz)
+static void assist_trans_LDR_v_i(DisasContext *s, IR2_OPND *vreg_t, IR2_OPND *reg_n, uint64_t offset, uint64_t sz)
 {
+    lata_emit_guest_mem_probe(s, *reg_n, (int64_t)offset, (size_t)1u << sz, false, NULL);
     IR2_OPND temp = ra_alloc_itemp();
     switch (sz)
     {
@@ -3302,8 +3396,6 @@ static bool trans_LDR_v_i(DisasContext *s)
     IR2_OPND reg_n = alloc_gpr_src_sp(a->rn);
     IR2_OPND vreg_t = alloc_fpr_dst(a->rt);
 
-    lata_clean_data_tbi(s, &reg_n, &reg_n, s->tbid);
-
     if (clearGprHigh && arm_la_map[a->rn] >= 0) { /* all reg_n is 64-bit size*/
         clear_gpr_high(a->rn);
     }
@@ -3319,12 +3411,12 @@ static bool trans_LDR_v_i(DisasContext *s)
             IR2_OPND temp = ra_alloc_itemp();
             li_d(temp, offset);
             la_add_d(temp, reg_n, temp);
-            assist_trans_LDR_v_i(&vreg_t, &temp, 0, a->sz);
+            assist_trans_LDR_v_i(s, &vreg_t, &temp, 0, a->sz);
             free_alloc_gpr(temp);
         }
         else
         {
-            assist_trans_LDR_v_i(&vreg_t, &reg_n, offset, a->sz);
+            assist_trans_LDR_v_i(s, &vreg_t, &reg_n, offset, a->sz);
         }
     }
     else
@@ -3334,7 +3426,7 @@ static bool trans_LDR_v_i(DisasContext *s)
             la_addi_d(reg_n, reg_n, offset);
         }
 
-        assist_trans_LDR_v_i(&vreg_t, &reg_n, 0, a->sz);
+        assist_trans_LDR_v_i(s, &vreg_t, &reg_n, 0, a->sz);
 
         if (a->p && offset)
         {
@@ -9803,6 +9895,7 @@ static void disas_simd_tb(DisasContext *s, uint32_t insn)
                                 (len << 6) | (is_tbx << 5) | rn));
     li_d(temp, (int64_t)helper_simd_tblx);
     la_jirl(ra_ir2_opnd, temp, 0);
+    lata_note_vreg_v_write(rd);
     lata_gen_call_helper_epilogue(tcg_ctx);
 
     free_alloc_gpr(temp);
@@ -18748,6 +18841,10 @@ static void aarch64_tr_init_disas_context(DisasContext *dc,
     }
     dc->sme_excp_el = EX_TBFLAG_A64(tb_flags, SMEEXC_EL);
     dc->vl = (EX_TBFLAG_A64(tb_flags, VL) + 1) * 16;
+    if (EX_TBFLAG_A64(tb_flags, VL) == 0 &&
+        arm_sve_vl_is_valid(env->sve.active_vl_bits)) {
+        dc->vl = (int)(env->sve.active_vl_bits / 8u);
+    }
     dc->svl = (EX_TBFLAG_A64(tb_flags, SVL) + 1) * 16;
     dc->pauth_active = EX_TBFLAG_A64(tb_flags, PAUTH_ACTIVE);
     dc->bt = EX_TBFLAG_A64(tb_flags, BT);
@@ -18883,20 +18980,28 @@ static void set_base_isjump(DisasContext *s)
     }
 }
 
-static DisasContext ir1_list[TCG_MAX_INSNS];
-static DisasContextBase db_rel;
-
-/*
-    generate ir1_list
-*/
 DisasContext *get_ir1_list(CPUState *cpu, TranslationBlock *tb, vaddr pc, int max_insns)
 {
+    LataContext *ctx = lata_context_current();
+    DisasContext *ir1_list;
+    DisasContextBase *db;
     DisasContext *pir1 = NULL;
+
+    if (ctx->ir1_list == NULL)
+    {
+        ctx->ir1_list = mm_calloc(TCG_MAX_INSNS, sizeof(DisasContext));
+    }
+    if (ctx->db_rel == NULL)
+    {
+        ctx->db_rel = mm_calloc(1, sizeof(DisasContextBase));
+    }
+    ir1_list = (DisasContext *)ctx->ir1_list;
+    db = (DisasContextBase *)ctx->db_rel;
+    memset(db, 0, sizeof(*db));
 
     uint32_t cflags = tb_cflags(tb);
 
     /* Initialize DisasContextBase */
-    DisasContextBase *db = &db_rel;
     db->tb = tb;
     db->pc_first = pc;
     db->pc_next = pc;
@@ -19014,6 +19119,12 @@ void target_disasm(struct TranslationBlock *tb, int *max_insns, CPUState *cpu)
   b) use decode_ir1_a64.c.inc to generate insn_type and arg using translate_funtions
   c) determine whether it is jmp ins and mark DISAS_NORETURN if it is
 */
+static inline bool a64_insn_is_sve_encoding(uint32_t insn)
+{
+    /* ARMv8 C3.1: bits[28:25] == 0b0010 exclusively indexes the SVE space. */
+    return (insn & 0x1e000000u) == 0x04000000u;
+}
+
 void translate_aarch64_insn(DisasContext *s, CPUState *cpu)
 {
     CPUARMState *env = cpu->env_ptr;
@@ -19097,7 +19208,8 @@ void translate_aarch64_insn(DisasContext *s, CPUState *cpu)
             break;
         }
     }
-    else if (sve_status == A64_SVE_DECODE_UNSUPPORTED_ENCODING)
+    else if (sve_status == A64_SVE_DECODE_UNSUPPORTED_ENCODING &&
+             a64_insn_is_sve_encoding(insn))
     {
         /* Never route an unrecognized SVE-primary encoding to legacy decode. */
         s->insn_type = sve_ir1.insn_type;
@@ -19105,11 +19217,12 @@ void translate_aarch64_insn(DisasContext *s, CPUState *cpu)
     }
     else if (!decode_insn32(s, insn))
     {
-        if (dc_has_sve(s))
+        if (dc_has_sve(s) && a64_insn_is_sve_encoding(insn))
         {
             /*
-             * With FEAT_SVE present, do not let an unrecognized instruction
-             * reach the coarse legacy SIMD/data-register fallback.
+             * With FEAT_SVE present, only unrecognized encodings inside the
+             * architectural SVE space (bits[28:25] == 0b0010) trap as
+             * unsupported SVE; legacy SIMD/FP/GPR fallback keeps working.
              */
             s->insn_type = AARCH64_A64_SVE_UNSUPPORTED_ENCODING;
             s->arg.f_sve_unsupported_encoding.raw_insn = insn;
@@ -19162,7 +19275,7 @@ bool tr_ir2_generate(struct TranslationBlock *tb)
         {
             trans_success = translate_functions[pir1->insn_type](pir1);
         }
-        if (!trans_success)
+        if (!trans_success || ra_ftemp_alloc_failed())
         {
             lata_ir2_snapshot_rollback(&ir2_snap);
             sve_builder = sve_snap;

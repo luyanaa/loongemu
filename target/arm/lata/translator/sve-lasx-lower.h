@@ -6,8 +6,28 @@
 
 #include "target/arm/lata/include/la-pvir.h"
 #include "target/arm/lata/ir1/sve-decode.h"
+#include "target/arm/lata/ir1/sve-pvir.h"
 
 struct DisasContext;
+
+typedef struct LataSVEHelperDesc {
+    PvirInstruction pvir;
+    bool has_source;
+    A64SVEIR1Instruction source;
+    uint16_t vl_bytes;
+    uint8_t tbid;
+    uint64_t pc_curr;
+    uint64_t pc_next;
+    PvirValueId z_values[A64_SVE_PVIR_NUM_ZREGS];
+    PvirValueId p_values[A64_SVE_PVIR_NUM_PREGS];
+    PvirValueId ffr_value;
+} LataSVEHelperDesc;
+
+const LataSVEHelperDesc *lata_sve_alloc_helper_desc(
+    const struct DisasContext *s, const PvirInstruction *instruction,
+    const A64SVEIR1Instruction *source);
+uint64_t lata_sve_exec_helper(void *env_ptr, const LataSVEHelperDesc *desc);
+void lata_sve_helper_list_free(void *head);
 
 /* Lower one validated PVIR instruction (source optional for direct PVIR ops). */
 bool a64_sve_lower_pvir_instruction(struct DisasContext *s,

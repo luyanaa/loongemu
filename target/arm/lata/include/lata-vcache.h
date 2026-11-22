@@ -63,6 +63,27 @@ void lata_vcache_note_z_write(void);
 uint32_t lata_vcache_z_writes(void);
 uint32_t lata_vcache_exit_hooks(void);
 
+typedef struct LataVcacheState {
+    /* Window on by default; tests may disable it. */
+    bool enabled;
+    uint32_t hits;
+    uint32_t misses;
+    bool in_tb;
+    uint32_t exit_hooks;
+    uint32_t z_writes;
+    uint64_t dirty;
+    uint32_t vector_reads;
+    uint32_t vector_writes;
+    uint32_t scalar_reads;
+    uint32_t scalar_writes;
+    uint32_t tb_count;
+    uint32_t invariant_violations;
+} LataVcacheState;
+
+void lata_vcache_state_init(LataVcacheState *state, bool enabled);
+void lata_vcache_bind_state(LataVcacheState *state);
+LataVcacheState *lata_vcache_current_state(void);
+
 typedef struct LataVcacheSnapshot {
     bool in_tb;
     uint32_t exit_hooks;

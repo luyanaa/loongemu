@@ -384,10 +384,16 @@ static void test_lasx_dispatch_gate(void)
 
     latx_cpu_set_vector_features(1, 0);
     CHECK(a64_sve_ir2_dispatch(A64_SVE_ACCESS_ALLOWED) ==
-          A64_SVE_IR2_LASX_UNAVAILABLE);
+          A64_SVE_IR2_READY);
+    CHECK(a64_sve_select_backend() == A64_SVE_BACKEND_LSX);
+    latx_cpu_set_vector_features(0, 0);
+    CHECK(a64_sve_ir2_dispatch(A64_SVE_ACCESS_ALLOWED) ==
+          A64_SVE_IR2_READY);
+    CHECK(a64_sve_select_backend() == A64_SVE_BACKEND_SCALAR_HELPER);
     latx_cpu_set_vector_features(1, 1);
     CHECK(a64_sve_ir2_dispatch(A64_SVE_ACCESS_ALLOWED) ==
           A64_SVE_IR2_READY);
+    CHECK(a64_sve_select_backend() == A64_SVE_BACKEND_LASX);
 }
 
 static void test_fp_builder(void)

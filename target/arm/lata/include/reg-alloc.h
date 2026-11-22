@@ -114,16 +114,37 @@ static int ra_alloc_##name##_num(void)                                  \
     return name##_num;                                                  \
 }
 
+struct LataContext;
+int lata_ftemp_slot_for_phys(int phys);
+void lata_ftemp_init_context(struct LataContext *ctx);
+
 #define RA_FREE_CODE(name, phy_id)                                      \
     do {                                                                \
         int virt_id = reg_##name##_reverse_map[phy_id];                 \
         lsassertm(virt_id >= 0 &&                                       \
-                ((lsenv->tr_data->name##_status) & (1 << virt_id)),            \
+                ((lsenv->tr_data->name##_status) & (1 << virt_id)),     \
                 "\n%s:%d free " #name " failed, phy_id %d virt_id %d "  \
-                "lsenv->tr_data->"#name"_status 0x%x\n",                       \
+                "lsenv->tr_data->"#name"_status 0x%x\n",                \
                  __func__, __LINE__, phy_id, virt_id,                   \
-                lsenv->tr_data->name##_status);                                \
-        lsenv->tr_data->name##_status &= ~(1 << virt_id);                      \
+                lsenv->tr_data->name##_status);                         \
+        lsenv->tr_data->name##_status &= ~(1 << virt_id);               \
+    } while (0)
+
+#define RA_FREE_FTEMP_CODE(phy_id)                                      \
+    do {                                                                \
+        int virt_id = lata_ftemp_slot_for_phys(phy_id);                 \
+        if (lsenv->tr_data->ftemp_alloc_failed &&                       \
+            (virt_id < 0 ||                                             \
+             !(lsenv->tr_data->ftemp_status & (1 << virt_id)))) {       \
+            break;                                                      \
+        }                                                               \
+        lsassertm(virt_id >= 0 &&                                       \
+                ((lsenv->tr_data->ftemp_status) & (1 << virt_id)),      \
+                "\n%s:%d free ftemp failed, phy_id %d virt_id %d "      \
+                "lsenv->tr_data->ftemp_status 0x%x\n",                  \
+                 __func__, __LINE__, phy_id, virt_id,                   \
+                lsenv->tr_data->ftemp_status);                          \
+        lsenv->tr_data->ftemp_status &= ~(1 << virt_id);                \
     } while (0)
 
 #define INIT_RA(type, phyno)                                            \
@@ -151,7 +172,7 @@ RA_ALLOC_FUNC_DEF(scr);
 IR2_OPND ra_alloc_itemp(void);
 IR2_OPND ra_alloc_ftemp(void);
 #define ra_free_itemp(phy_id)   RA_FREE_CODE(itemp, phy_id)
-#define ra_free_ftemp(phy_id)   RA_FREE_CODE(ftemp, phy_id)
+#define ra_free_ftemp(phy_id)   RA_FREE_FTEMP_CODE(phy_id)
 void ra_free_all(void);
 IR2_OPND ra_alloc_num_4095(void);
 void ra_free_num_4095(IR2_OPND);

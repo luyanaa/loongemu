@@ -5,9 +5,7 @@ free
 malloc
 memcpy
 memset
-qemu_log
 realloc
-stderr
 sprintf
 strcat
 strcmp

@@ -22,8 +22,16 @@
 #include "target/arm/lata/include/macro-inst.h"
 #include "target/arm/lata/ir1/sve-pvir.h"
 #include "target/arm/lata/translator/sve-lasx-lower.h"
+#include "target/arm/lata/include/lata-mem.h"
 #include "lata-vcache.h"
 /* Declared locally: including lata.h clashes with the fixture CPU types. */
+typedef struct LataContext LataContext;
+extern LataContext *lata_context_new(void *env);
+extern void lata_context_delete(LataContext *ctx);
+extern void lata_context_bind(LataContext *ctx);
+extern LataContext *lata_context_current(void);
+extern void lata_vreg_clear_residency_for_test(void);
+extern uint32_t ra_ftemp_fallbacks(void);
 extern void lata_zcache_flush_for_exit(void);
 extern void lata_emit_dirty_vreg_stores(void);
 extern uint32_t lata_vreg_spills(void);
@@ -4227,6 +4235,315 @@ static __attribute__((noinline)) void run_sve_p2_trace_opt_runtime(void)
     check(read_le32(arm_sve_zreg(&env, 2)), 7u, "vcache Z2 updated after clean eviction");
 }
 
+static bool sve_run_a64_tb(uint32_t *guest, int insns, uint16_t vl_bits,
+                           uint64_t euen, bool init_zero, const char *what)
+{
+    if (init_zero) {
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+    }
+    for (size_t i = 0; i < sizeof(cpu); ++i) ((uint8_t *)&cpu)[i] = 0;
+    for (size_t i = 0; i < sizeof(tb); ++i) ((uint8_t *)&tb)[i] = 0;
+    cpu.env_ptr = &env;
+    arm_cpu_set_aa64_sve(&env.arm_cpu, true);
+    check(arm_sve_set_vl(&env, vl_bits), 1, what);
+    env.pc = (uint64_t)(uintptr_t)guest;
+    lata_tr_data_init(&env);
+    tcg_ctx->gen_insn_data = latx_tcg_gen_insn_data;
+    sve_setup_trampolines();
+    tb.pc = env.pc;
+    tb.tc.ptr = code_buf;
+    tb.cflags = 0;
+    int max_insns = insns;
+    target_disasm(&tb, &max_insns, &cpu);
+    check(tb.icount, (uint32_t)insns, what);
+    tr_init(&tb);
+    bool ok = tr_ir2_generate(&tb);
+    check(ok, 1, what);
+    if (!ok) {
+        tr_fini();
+        sve_clear_trampolines();
+        return false;
+    }
+    tr_ir2_assemble(code_buf);
+    tr_fini();
+    __asm__ volatile("ibar 0" ::: "memory");
+    __asm__ volatile("csrwr %0, 0x2" :: "r"(euen) : "memory");
+    lata_vreg_published = 0;
+    ((void (*)(void *, void *))(uintptr_t)context_switch_bt_to_native)(&env, code_buf);
+    sve_clear_trampolines();
+    return true;
+}
+
+static __attribute__((noinline)) void run_sve_p0_p1_gap_regression_runtime(void)
+{
+    /* P0-1: FEAT_SVE enabled mixed NEON -> SVE -> scalar FP -> legacy UDIV -> SVE */
+    {
+        static uint32_t p0_1_guest[] __attribute__((aligned(16))) = {
+            0x4f000460u, /* movi v0.4s, #3 */
+            0x25a0c0a0u, /* add z0.s, z0.s, #5 */
+            0x1e222821u, /* fadd s1, s1, s2 (rd=1, rn=1, rm=2 -> s1+s2 -> s1) */
+            0x9ac20823u, /* udiv x3, x1, x2 */
+            0x25a0c020u, /* add z0.s, z0.s, #1 */
+        };
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        write_le32(arm_sve_zreg(&env, 1), 0x3fc00000u); /* s1 = 1.5f */
+        write_le32(arm_sve_zreg(&env, 2), 0x40200000u); /* s2 = 2.5f */
+        env.xregs[1] = 84u;
+        env.xregs[2] = 4u;
+        check(sve_run_a64_tb(p0_1_guest, 5, 256, 0x0fu, false,
+                             "P0-1 mixed A64/NEON/SVE TB"),
+              1, "P0-1 executes");
+        check(env.sve_ctrl.last_exception_index, 0, "P0-1 no EXCP_UDEF");
+        check(read_le32(arm_sve_zreg(&env, 0)), 9u, "P0-1 mixed V0->Z0 low lane");
+        check(read_le32(arm_sve_zreg(&env, 0) + 16u), 6u,
+              "P0-1 MOVI cleared Z0[255:128] before SVE ADD");
+        check(read_le32(arm_sve_zreg(&env, 1)), 0x40800000u,
+              "P0-1 scalar FADD s1+s2=4.0f");
+        check(env.xregs[3], 21u, "P0-1 legacy UDIV X3=21");
+    }
+
+    /* P0-2: Standalone MOVI V0.16B and FADD S1 zero upper Z[VL-1:128] at VL=256 */
+    {
+        static uint32_t movi_zero_guest[] __attribute__((aligned(16))) = {
+            0x4f07e7e0u, /* movi v0.16b, #0xff */
+        };
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        for (size_t b = 0; b < 32u; ++b) {
+            arm_sve_zreg(&env, 0)[b] = 0x5au;
+        }
+        check(sve_run_a64_tb(movi_zero_guest, 1, 256, 0x0fu, false,
+                             "P0-2 MOVI V0.16B VL=256"),
+              1, "P0-2 MOVI runs");
+        for (size_t b = 0; b < 16u; ++b) {
+            check(arm_sve_zreg(&env, 0)[b], 0xffu, "P0-2 MOVI low 128-bit byte");
+        }
+        for (size_t b = 16u; b < 32u; ++b) {
+            check(arm_sve_zreg(&env, 0)[b], 0x00u, "P0-2 MOVI clears Z0[255:128]");
+        }
+
+        static uint32_t fadd_zero_guest[] __attribute__((aligned(16))) = {
+            0x1e222820u, /* fadd s0, s1, s2 */
+        };
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        for (size_t b = 0; b < 32u; ++b) {
+            arm_sve_zreg(&env, 0)[b] = 0xa5u;
+        }
+        write_le32(arm_sve_zreg(&env, 1), 0x3f800000u); /* 1.0f */
+        write_le32(arm_sve_zreg(&env, 2), 0x40000000u); /* 2.0f */
+        check(sve_run_a64_tb(fadd_zero_guest, 1, 256, 0x0fu, false,
+                             "P0-2 FADD S0 VL=256"),
+              1, "P0-2 FADD S0 runs");
+        check(read_le32(arm_sve_zreg(&env, 0)), 0x40400000u, "P0-2 FADD S0=3.0f");
+        for (size_t b = 4u; b < 32u; ++b) {
+            check(arm_sve_zreg(&env, 0)[b], 0x00u, "P0-2 FADD S0 clears upper bytes");
+        }
+    }
+
+    /* P0-3: LataGuestMemOps unified fault checking (scalar, NEON, SVE LD1, LDFF1 first/later) */
+    {
+        static uint32_t fault_buf[8] __attribute__((aligned(16))) = {
+            11u, 22u, 33u, 44u, 55u, 66u, 77u, 88u
+        };
+        /* Scalar STR X0, [X1] into read-only fault region */
+        static uint32_t scalar_str_fault[] __attribute__((aligned(16))) = {
+            0xf9000020u, /* str x0, [x1] */
+        };
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[0] = 0xdeadbeefULL;
+        env.xregs[1] = (uint64_t)(uintptr_t)fault_buf;
+        lata_guest_mem_clear_fault_regions(&env);
+        lata_guest_mem_add_fault_region(&env, (uint64_t)(uintptr_t)fault_buf, 32,
+                                        LATA_MEM_PERM_READ);
+        check(sve_run_a64_tb(scalar_str_fault, 1, 128, 0x0fu, false,
+                             "P0-3 scalar STR RO region"),
+              1, "P0-3 scalar STR runs");
+        check(env.sve_ctrl.last_exception_index, EXCP_DATA_ABORT,
+              "P0-3 scalar STR raises EXCP_DATA_ABORT");
+        check(env.pc, (uint64_t)(uintptr_t)&scalar_str_fault[0],
+              "P0-3 scalar STR keeps faulting PC");
+        check(fault_buf[0], 11u, "P0-3 scalar STR RO memory unmodified");
+
+        /* NEON LDR Q0, [X1] from unmapped fault region preserves Q0 */
+        static uint32_t neon_ldr_fault[] __attribute__((aligned(16))) = {
+            0x3dc00020u, /* ldr q0, [x1] */
+        };
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        write_le32(arm_sve_zreg(&env, 0), 0x55667788u);
+        write_le32(arm_sve_zreg(&env, 0) + 4u, 0x11223344u);
+        env.xregs[1] = (uint64_t)(uintptr_t)fault_buf;
+        lata_guest_mem_clear_fault_regions(&env);
+        lata_guest_mem_add_fault_region(&env, (uint64_t)(uintptr_t)fault_buf, 32, 0);
+        check(sve_run_a64_tb(neon_ldr_fault, 1, 128, 0x0fu, false,
+                             "P0-3 NEON LDR Q unmapped"),
+              1, "P0-3 NEON LDR Q runs");
+        check(env.sve_ctrl.last_exception_index, EXCP_DATA_ABORT,
+              "P0-3 NEON LDR Q raises EXCP_DATA_ABORT");
+        check(read_le64(arm_sve_zreg(&env, 0)), 0x1122334455667788ULL,
+              "P0-3 NEON LDR Q preserves Q0 on fault");
+
+        /* SVE LD1W with fault on lane 1 raises EXCP_DATA_ABORT and preserves Z0 */
+        static uint32_t sve_ld1w_fault[] __attribute__((aligned(16))) = {
+            0x2598e3e0u, /* ptrue p0.s, all */
+            0xa540a000u, /* ld1w {z0.s}, p0/z, [x0] */
+        };
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        write_le32(arm_sve_zreg(&env, 0), 0xfeedfaceu);
+        env.xregs[0] = (uint64_t)(uintptr_t)fault_buf;
+        lata_guest_mem_clear_fault_regions(&env);
+        lata_guest_mem_add_fault_region(&env, (uint64_t)(uintptr_t)&fault_buf[0], 4,
+                                        LATA_MEM_PERM_READ);
+        lata_guest_mem_add_fault_region(&env, (uint64_t)(uintptr_t)&fault_buf[1], 12, 0);
+        check(sve_run_a64_tb(sve_ld1w_fault, 2, 128, 0x0fu, false,
+                             "P0-3 SVE LD1W lane1 fault"),
+              1, "P0-3 SVE LD1W runs");
+        check(env.sve_ctrl.last_exception_index, EXCP_DATA_ABORT,
+              "P0-3 SVE LD1W raises EXCP_DATA_ABORT");
+        check(env.pc, (uint64_t)(uintptr_t)&sve_ld1w_fault[1],
+              "P0-3 SVE LD1W precise PC");
+        check(read_le32(arm_sve_zreg(&env, 0)), 0xfeedfaceu,
+              "P0-3 SVE LD1W leaves Z0 unmodified on fault");
+
+        /* SVE LDFF1W: first active element fault raises EXCP_DATA_ABORT, preserves Z/FFR */
+        static uint32_t sve_ldff1w_tb[] __attribute__((aligned(16))) = {
+            0x2598e3e0u, /* ptrue p0.s, all */
+            0x252c9000u, /* setffr */
+            0xa55f6000u, /* ldff1w {z0.s}, p0/z, [x0] */
+        };
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        write_le32(arm_sve_zreg(&env, 0), 0xcafebabeu);
+        env.xregs[0] = (uint64_t)(uintptr_t)fault_buf;
+        lata_guest_mem_clear_fault_regions(&env);
+        lata_guest_mem_add_fault_region(&env, (uint64_t)(uintptr_t)fault_buf, 16, 0);
+        check(sve_run_a64_tb(sve_ldff1w_tb, 3, 128, 0x0fu, false,
+                             "P0-3 LDFF1W first active fault"),
+              1, "P0-3 LDFF1W first fault runs");
+        check(env.sve_ctrl.last_exception_index, EXCP_DATA_ABORT,
+              "P0-3 LDFF1W first element raises EXCP_DATA_ABORT");
+        check(env.pc, (uint64_t)(uintptr_t)&sve_ldff1w_tb[2],
+              "P0-3 LDFF1W first fault exact PC");
+        check(read_le32(arm_sve_zreg(&env, 0)), 0xcafebabeu,
+              "P0-3 LDFF1W first fault preserves Z0");
+        check(arm_sve_ffr(&env)[0], 0xffu, "P0-3 LDFF1W first fault preserves FFR");
+        check(arm_sve_ffr(&env)[1], 0xffu, "P0-3 LDFF1W first fault preserves FFR[1]");
+
+        /* SVE LDFF1W: lane 0 succeeds, lane 1 faults -> suppresses, updates FFR & Z0 */
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        write_le32(arm_sve_zreg(&env, 0), 0xcafebabeu);
+        env.xregs[0] = (uint64_t)(uintptr_t)fault_buf;
+        lata_guest_mem_clear_fault_regions(&env);
+        lata_guest_mem_add_fault_region(&env, (uint64_t)(uintptr_t)&fault_buf[0], 4,
+                                        LATA_MEM_PERM_READ);
+        lata_guest_mem_add_fault_region(&env, (uint64_t)(uintptr_t)&fault_buf[1], 12, 0);
+        check(sve_run_a64_tb(sve_ldff1w_tb, 3, 128, 0x0fu, false,
+                             "P0-3 LDFF1W lane1 suppressed"),
+              1, "P0-3 LDFF1W suppress runs");
+        check(env.sve_ctrl.last_exception_index, 0,
+              "P0-3 LDFF1W lane1 fault is suppressed");
+        check(read_le32(arm_sve_zreg(&env, 0)), 11u, "P0-3 LDFF1W loads lane 0");
+        check(read_le32(arm_sve_zreg(&env, 0) + 4u), 0u, "P0-3 LDFF1W zeroes faulted lane 1");
+        check(arm_sve_ffr(&env)[0], 0x0fu, "P0-3 LDFF1W FFR keeps succeeded lane 0 bytes");
+        check(arm_sve_ffr(&env)[1], 0x00u, "P0-3 LDFF1W clears FFR high byte");
+        lata_guest_mem_clear_fault_regions(&env);
+    }
+
+    /* P0-4 & P1-2: Separate LataContext forced ftemp exhaustion rolls back and falls back cleanly */
+    {
+        static uint32_t ftemp_exhaust_guest[] __attribute__((aligned(16))) = {
+            0x2598e3e0u, /* ptrue p0.s, all */
+            0x04800020u, /* add z0.s, p0/m, z0.s, z1.s (needs multiple ftemps on LASX) */
+        };
+        LataContext *orig_ctx = lata_context_current();
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        for (size_t l = 0; l < 8u; ++l) {
+            write_le32(arm_sve_zreg(&env, 0) + l * 4u, 100u + (uint32_t)l);
+            write_le32(arm_sve_zreg(&env, 1) + l * 4u, 50u + (uint32_t)l * 2u);
+        }
+        LataContext *ex_ctx = lata_context_new(&env);
+        lata_context_bind(ex_ctx);
+        for (size_t i = 0; i < sizeof(cpu); ++i) ((uint8_t *)&cpu)[i] = 0;
+        for (size_t i = 0; i < sizeof(tb); ++i) ((uint8_t *)&tb)[i] = 0;
+        cpu.env_ptr = &env;
+        arm_cpu_set_aa64_sve(&env.arm_cpu, true);
+        arm_sve_set_vl(&env, 256);
+        env.pc = (uint64_t)(uintptr_t)ftemp_exhaust_guest;
+        lata_tr_data_init(&env);
+        tcg_ctx->gen_insn_data = latx_tcg_gen_insn_data;
+        sve_setup_trampolines();
+        lata_ftemp_set_base_pool(1);
+        tb.pc = env.pc;
+        tb.tc.ptr = code_buf;
+        tb.cflags = 0;
+        int ex_max = 2;
+        target_disasm(&tb, &ex_max, &cpu);
+        tr_init(&tb);
+        lata_vreg_clear_residency_for_test();
+        check(tr_ir2_generate(&tb), 1, "P0-4 ftemp exhaustion fallback translates");
+        tr_ir2_assemble(code_buf);
+        tr_fini();
+        __asm__ volatile("ibar 0" ::: "memory");
+        enable_all_sve_units();
+        lata_vreg_published = 0;
+        ((void (*)(void *, void *))(uintptr_t)context_switch_bt_to_native)(&env, code_buf);
+        sve_clear_trampolines();
+        check(ra_ftemp_alloc_failures() > 0, 1, "P0-4 exhaustion observed on isolated ctx");
+        check(ra_ftemp_fallbacks() > 0, 1, "P0-4 helper fallback triggered cleanly");
+        for (size_t l = 0; l < 8u; ++l) {
+            check(read_le32(arm_sve_zreg(&env, 0) + l * 4u),
+                  150u + (uint32_t)l * 3u, "P0-4 fallback Z0 result exact");
+        }
+        lata_context_bind(orig_ctx);
+        lata_context_delete(ex_ctx);
+    }
+
+    /* P1-1: LSX-only (ASXE=0) and Scalar-helper (SXE=0, ASXE=0) SVE execution on QEMU */
+    {
+        static uint32_t tier_guest[] __attribute__((aligned(16))) = {
+            0x2598e3e0u, /* ptrue p0.s, all */
+            0x05a03821u, /* dup z1.s, w1 */
+            0x04800020u, /* add z0.s, p0/m, z0.s, z1.s */
+        };
+        /* Tier 2: LSX-only, ASXE disabled in CSR.EUEN -> zero xv* instructions allowed! */
+        latx_cpu_set_vector_features(1, 0);
+        check(a64_sve_select_backend(), A64_SVE_BACKEND_LSX,
+              "P1-1 Tier 2 backend == LSX");
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[1] = 10u;
+        for (size_t l = 0; l < 8u; ++l) {
+            write_le32(arm_sve_zreg(&env, 0) + l * 4u, (uint32_t)(l + 1u));
+        }
+        check(sve_run_a64_tb(tier_guest, 3, 256, (1u << 0) | (1u << 1), false,
+                             "P1-1 SVE Tier 2 LSX ASXE=0"),
+              1, "P1-1 Tier 2 runs without ASXE trap");
+        for (size_t l = 0; l < 8u; ++l) {
+            check(read_le32(arm_sve_zreg(&env, 0) + l * 4u), (uint32_t)(l + 11u),
+                  "P1-1 Tier 2 LSX ADD result");
+        }
+
+        /* Tier 3: Scalar helper only, SXE=0 and ASXE=0 in CSR.EUEN -> zero v* or xv*! */
+        latx_cpu_set_vector_features(0, 0);
+        check(a64_sve_select_backend(), A64_SVE_BACKEND_SCALAR_HELPER,
+              "P1-1 Tier 3 backend == SCALAR_HELPER");
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[1] = 20u;
+        for (size_t l = 0; l < 8u; ++l) {
+            write_le32(arm_sve_zreg(&env, 0) + l * 4u, (uint32_t)(l + 5u));
+        }
+        check(sve_run_a64_tb(tier_guest, 3, 256, (1u << 0), false,
+                             "P1-1 SVE Tier 3 Scalar SXE=0/ASXE=0"),
+              1, "P1-1 Tier 3 runs without SXE/ASXE trap");
+        for (size_t l = 0; l < 8u; ++l) {
+            check(read_le32(arm_sve_zreg(&env, 0) + l * 4u), (uint32_t)(l + 25u),
+                  "P1-1 Tier 3 Scalar helper ADD result");
+        }
+
+        latx_cpu_set_vector_features(1, 1);
+        check(a64_sve_select_backend(), A64_SVE_BACKEND_LASX,
+              "P1-1 restored LASX backend");
+        enable_all_sve_units();
+        lata_tr_data_init(&env);
+    }
+}
+
 void kmain(void)
 {
     latx_bare_uart_puts("lata-isa: start\n");
@@ -5616,6 +5933,7 @@ void kmain(void)
         run_sve_direct_pvir_runtime();
         run_sve_extended_isa_runtime();
         run_sve_p2_trace_opt_runtime();
+        run_sve_p0_p1_gap_regression_runtime();
         latx_bare_uart_puts("sve-pvir: expanded suite done\n");
     } else {
         latx_bare_uart_puts("lata-isa: LSX-only run; skip LASX tests\n");

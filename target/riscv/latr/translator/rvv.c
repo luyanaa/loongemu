@@ -117,12 +117,21 @@ uint64_t latr_rvv_read_elem(const CPUArchState *env, unsigned reg,
     if (sew == 1u) {
         idx = lane / RVV_VLEN;
         off = lane % RVV_VLEN;
-        return (env->vreg[(reg + idx) & 31u][off >> 3] >> (off & 7u)) & 1u;
+        r = reg + idx;
+        if (r >= 32u) {
+            return 0;
+        }
+        return (env->vreg[r][off >> 3] >> (off & 7u)) & 1u;
     }
     per = rvv_elems_per_reg(sew);
     idx = lane / per;
     off = lane % per;
-    r = (reg + idx) & 31u;
+    r = reg + idx;
+    /* Group legality is enforced when the instruction is translated, so this
+     * bound is a backstop: never wrap into another architectural register. */
+    if (r >= 32u) {
+        return 0;
+    }
     bytes = sew / 8u;
     base = off * bytes;
 
@@ -147,7 +156,11 @@ void latr_rvv_write_elem(CPUArchState *env, unsigned reg, unsigned lane,
         uint8_t *cell;
         idx = lane / RVV_VLEN;
         off = lane % RVV_VLEN;
-        cell = (uint8_t *)&env->vreg[(reg + idx) & 31u][off >> 3];
+        r = reg + idx;
+        if (r >= 32u) {
+            return;
+        }
+        cell = (uint8_t *)&env->vreg[r][off >> 3];
         if (value & 1u) {
             *cell |= (uint8_t)(1u << (off & 7u));
         } else {
@@ -158,7 +171,10 @@ void latr_rvv_write_elem(CPUArchState *env, unsigned reg, unsigned lane,
     per = rvv_elems_per_reg(sew);
     idx = lane / per;
     off = lane % per;
-    r = (reg + idx) & 31u;
+    r = reg + idx;
+    if (r >= 32u) {
+        return;
+    }
     bytes = sew / 8u;
     base = off * bytes;
 
@@ -191,6 +207,14 @@ static void rvv_build_mask(CPUArchState *env, int masked)
     for (i = 0; i < RVV_MASK_WORDS; i++) {
         env->v_mask_words[i] = 0;
     }
+    /*
+     * The predicate covers the whole [0, vl) range on purpose: lanes below
+     * vstart are *already done*, not inactive, so they must not be mistaken
+     * for vma-inactive lanes that need filling with ones.  The restart itself
+     * is honoured further down -- pvir-exec.c runs its element loops from
+     * env->vstart, and the LSX fast path re-checks vstart at run time in
+     * latr_rvv_direct_prepare() because vstart is not part of the TB key.
+     */
     for (i = 0; i < (unsigned)env->vl; i++) {
         if (!masked || rvv_v0_bit(env, i)) {
             env->v_mask_words[i / 64] |= UINT64_C(1) << (i % 64);
@@ -519,10 +543,161 @@ static uint64_t rvv_store_lane(CPUArchState *env, uint64_t addr,
     return (uint64_t)latr_guest_store(env, addr, bytes, value);
 }
 
+/* ---- byte view of the vector register file ------------------------------ */
+
 /*
- * Unit-stride vector load/store (vle/vse, nf=1).
+ * Segment loads and stores address the register file in bytes: field k of a
+ * segment occupies the VLEN*EMUL bits that follow field k-1, and EMUL may be
+ * fractional. QEMU's vext_ldst_us() computes the same offset as
+ * `vd + k * max_elems + i` elements, which is byte offset
+ * `(k * VLENB * EMUL) + i * esz` from register vd. Working in bytes keeps the
+ * fractional-EMUL cases (e.g. e8 with SEW=64) exact.
+ */
+static unsigned rvv_emul_bytes(const CPUArchState *env, unsigned eew)
+{
+    int emul = (int)eew - (int)RVV_VTYPE_VSEW(env->vtype) + rvv_lmul(env);
+
+    if (emul >= 0) {
+        return LATR_RVV_VLENB << (unsigned)emul;
+    }
+    return LATR_RVV_VLENB >> (unsigned)(-emul);
+}
+
+static uint64_t rvv_get_bytes(const CPUArchState *env, unsigned off,
+                              unsigned bytes)
+{
+    uint64_t value = 0;
+    unsigned b;
+
+    if (off + bytes > 32u * LATR_RVV_VLENB) {
+        return 0;
+    }
+    for (b = 0; b < bytes; b++) {
+        unsigned pos = off + b;
+
+        value |= (uint64_t)env->vreg[pos / LATR_RVV_VLENB][pos % LATR_RVV_VLENB]
+                 << (8 * b);
+    }
+    return value;
+}
+
+static void rvv_put_bytes(CPUArchState *env, unsigned off, unsigned bytes,
+                          uint64_t value)
+{
+    unsigned b;
+
+    if (off + bytes > 32u * LATR_RVV_VLENB) {
+        return;
+    }
+    for (b = 0; b < bytes; b++) {
+        unsigned pos = off + b;
+
+        env->vreg[pos / LATR_RVV_VLENB][pos % LATR_RVV_VLENB] =
+            (uint8_t)(value >> (8 * b));
+    }
+}
+
+/*
+ * Segment (nf > 1) unit-stride, strided and indexed load/store.
+ *
+ * `mode` selects the address formula: 0 unit-stride (fields are interleaved
+ * lane by lane, stride nf*EEW), 1 strided (base + i*stride + k*EEW) and
+ * 2 indexed (base + index[i] + k*EEW). vstart is a *lane* index here: a fault
+ * names the lane and the fields already transferred for that lane stay
+ * written, exactly like QEMU's per-(i, k) emission order.
+ */
+static uint64_t rvv_ldst_segment(CPUArchState *env, uint64_t base, unsigned vd,
+                                 unsigned eew, unsigned nf, int is_load,
+                                 int vm, unsigned mode, uint64_t stride,
+                                 unsigned index_reg)
+{
+    unsigned esz = 1u << eew;
+    unsigned bits = esz * 8u;
+    unsigned span = rvv_emul_bytes(env, eew);
+    unsigned vd_off = (vd & 31u) * LATR_RVV_VLENB;
+    unsigned start = (unsigned)env->vstart;
+    unsigned i;
+    unsigned k;
+
+    env->mem_fault_cause = 0;
+    if (start >= (unsigned)env->vl) {
+        env->vstart = 0;
+        return 0;
+    }
+    rvv_build_mask(env, !vm);
+    for (i = start; i < (unsigned)env->vl; i++) {
+        if (!rvv_mask_bit(env, i)) {
+            if (RVV_VTYPE_VMA(env->vtype)) {
+                for (k = 0; k < nf; k++) {
+                    rvv_put_bytes(env, vd_off + k * span + i * esz, esz,
+                                  rvv_sew_mask(bits));
+                }
+            }
+            continue;
+        }
+        for (k = 0; k < nf; k++) {
+            unsigned off = vd_off + k * span + i * esz;
+            uint64_t addr;
+            uint64_t value = 0;
+            uint64_t cause;
+
+            if (mode == 0) {
+                addr = base + (uint64_t)(i * nf + k) * esz;
+            } else if (mode == 1) {
+                addr = base + stride * (uint64_t)i + (uint64_t)k * esz;
+            } else {
+                addr = base + stride + (uint64_t)k * esz;
+            }
+            if (is_load) {
+                if (mode == 2 && k == 0) {
+                    /* The index vector is read once per lane, before any field
+                     * of that lane touches memory. */
+                    stride = latr_rvv_read_elem(env, index_reg, i, esz * 8u);
+                    addr = base + stride;
+                }
+                cause = rvv_load_lane(env, addr, esz, &value);
+                if (cause) {
+                    env->vstart = i;
+                    return cause;
+                }
+                rvv_put_bytes(env, off, esz, value);
+            } else {
+                if (mode == 2 && k == 0) {
+                    stride = latr_rvv_read_elem(env, index_reg, i, esz * 8u);
+                    addr = base + stride;
+                }
+                value = rvv_get_bytes(env, off, esz);
+                cause = rvv_store_lane(env, addr, esz, value);
+                if (cause) {
+                    env->vstart = i;
+                    return cause;
+                }
+            }
+        }
+    }
+    env->vstart = 0;
+    if (is_load && RVV_VTYPE_VTA(env->vtype)) {
+        for (k = 0; k < nf; k++) {
+            unsigned off = vd_off + k * span + (unsigned)env->vl * esz;
+
+            if (off + span > 32u * LATR_RVV_VLENB) {
+                continue;
+            }
+            memset(&env->vreg[off / LATR_RVV_VLENB][off % LATR_RVV_VLENB], 0xff,
+                   span - (unsigned)env->vl * esz);
+        }
+    }
+    return 0;
+}
+
+/*
+ * Unit-stride vector load/store (vle/vse, nf=1) and the mask forms.
  * Returns the exception cause; on a fault env->vstart is the faulting lane
  * and env->mem_va holds the element address, ready for latr_raise_mem_fault.
+ *
+ * rvv_args[5] selects the flavour: 0 unit-stride elements, 1 mask register
+ * (vlm.v/vsm.v, byte granular) and 2 fault-only-first (vle<eew>ff.v).
+ * rvv_args[6] is the segment field count nf.
  */
 uint64_t latr_rvv_mem(CPUArchState *env)
 {
@@ -531,29 +706,77 @@ uint64_t latr_rvv_mem(CPUArchState *env)
     unsigned eew = (unsigned)env->rvv_args[2];
     int is_load = (int)env->rvv_args[3];
     int vm = (int)env->rvv_args[4];
-    int is_mask = (int)env->rvv_args[5];
-    unsigned bytes = is_mask ? 1u : (1u << eew);
+    unsigned flavour = (unsigned)env->rvv_args[5];
+    unsigned nf = (unsigned)env->rvv_args[6];
+    unsigned bytes = 1u << eew;
     unsigned start = (unsigned)env->vstart;
     PvirInstruction insn;
     PvirVectorOperation *o = &insn.operation.vector;
 
+    if (nf == 0) {
+        nf = 1;
+    }
     env->mem_fault_cause = 0;
-    if (env->vstart >= env->vl) {
+
+    if (flavour == 1) {
+        /*
+         * vlm.v / vsm.v: one bit per lane, but the transfer is byte granular.
+         * QEMU's vext_ldst_mask() moves ceil(vl/8) whole bytes and leaves the
+         * remaining bits of the last byte exactly as memory had them.
+         *
+         * The tail is *not* filled even when vta=1: QEMU defaults to
+         * cfg_vta_all_1s=false, so a tail-agnostic destination keeps its old
+         * contents (same rule DESIGN.md §5.4 uses for the vector families, and
+         * the one `DESIGN.md` "掩码" note already relies on).  Probe #8 read
+         * v8[1]=v8[15]=0x03 with vta=ma *and* with vta=ta, confirming it.
+         *
+         * vstart counts bytes here, not lanes.
+         */
+        unsigned nbytes = ((unsigned)env->vl + 7u) / 8u;
+        unsigned i;
+
+        if (nbytes > LATR_RVV_VLENB) {
+            nbytes = LATR_RVV_VLENB;
+        }
+        for (i = start; i < nbytes; i++) {
+            uint64_t value = 0;
+            uint64_t cause;
+
+            if (is_load) {
+                cause = rvv_load_lane(env, base + i, 1, &value);
+                if (cause) {
+                    env->vstart = i;
+                    return cause;
+                }
+                env->vreg[vd & 31u][i] = (uint8_t)value;
+            } else {
+                cause = rvv_store_lane(env, base + i, 1,
+                                       env->vreg[vd & 31u][i]);
+                if (cause) {
+                    env->vstart = i;
+                    return cause;
+                }
+            }
+        }
         env->vstart = 0;
         return 0;
     }
-    rvv_build_mask(env, is_mask ? 0 : !vm);
+
+    if (nf > 1) {
+        return rvv_ldst_segment(env, base, vd, eew, nf, is_load, vm, 0, 0, 0);
+    }
+
+    if (start >= (unsigned)env->vl) {
+        env->vstart = 0;
+        return 0;
+    }
+    rvv_build_mask(env, !vm);
     rvv_pvir_init(&insn);
     insn.opcode = is_load ? PVIR_OP_LOAD : PVIR_OP_STORE;
-    o->type = is_mask
-                  ? rvv_pvir_type(PVIR_ELEMENT_MASK, PVIR_SIGNLESS, 1,
-                                  (unsigned)env->vl)
-                  : rvv_pvir_type(PVIR_ELEMENT_INTEGER, PVIR_UNSIGNED,
-                                  bytes * 8u, (unsigned)env->vl);
-    o->predicate = is_mask ? pvir_predicate_all_true((size_t)env->vl)
-                           : rvv_pvir_mask(env);
-    o->inactive_policy = is_load ? (is_mask ? PVIR_INACTIVE_ZERO
-                                            : PVIR_INACTIVE_UNKNOWN)
+    o->type = rvv_pvir_type(PVIR_ELEMENT_INTEGER, PVIR_UNSIGNED,
+                            bytes * 8u, (unsigned)env->vl);
+    o->predicate = rvv_pvir_mask(env);
+    o->inactive_policy = is_load ? PVIR_INACTIVE_UNKNOWN
                                  : PVIR_INACTIVE_NOT_APPLICABLE;
     o->merge_value = PVIR_NO_VALUE;
     o->destination = is_load ? vd : PVIR_NO_VALUE;
@@ -573,11 +796,9 @@ uint64_t latr_rvv_mem(CPUArchState *env)
     insn.effects.memory.inactive_lanes = PVIR_INACTIVE_MEMORY_NO_TRANSACTION;
     env->rvv_scalar = base;
     latr_pvir_execute_cached(env,
-                             UINT64_C(0x380) ^ ((unsigned)is_load << 1) ^
-                                 (unsigned)is_mask,
+                             UINT64_C(0x380) ^ ((unsigned)is_load << 1),
                              &insn);
-    if (!is_mask && env->pvir_status == PVIR_STATUS_OK &&
-        RVV_VTYPE_VMA(env->vtype)) {
+    if (env->pvir_status == PVIR_STATUS_OK && RVV_VTYPE_VMA(env->vtype)) {
         unsigned stop =
             env->mem_fault_cause ? (unsigned)env->vstart : (unsigned)env->vl;
         unsigned k;
@@ -592,10 +813,160 @@ uint64_t latr_rvv_mem(CPUArchState *env)
         return env->mem_fault_cause;
     }
     env->vstart = 0;
-    if (is_load && !is_mask) {
+    if (is_load) {
         rvv_tail_ones(env, vd, bytes * 8u);
     }
     return 0;
+}
+
+/*
+ * Fault-only-first unit-stride load (vle<eew>ff.v).
+ *
+ * A fault is not reported: vl is narrowed to the first lane that could not be
+ * loaded and the instruction retires normally, so the translator has to leave
+ * the translation block (vl is part of its specialization key). Returns 1 when
+ * vl changed and the TB must exit, 0 otherwise.
+ *
+ * QEMU's vext_ldff() leaves masked-off and tail lanes undisturbed, so neither
+ * vma nor vta applies here.
+ */
+uint64_t latr_rvv_ldff(CPUArchState *env)
+{
+    uint64_t base = env->rvv_args[0];
+    unsigned vd = (unsigned)env->rvv_args[1];
+    unsigned eew = (unsigned)env->rvv_args[2];
+    int vm = (int)env->rvv_args[4];
+    unsigned bytes = 1u << eew;
+    unsigned start = (unsigned)env->vstart;
+    unsigned i;
+
+    env->mem_fault_cause = 0;
+    for (i = start; i < (unsigned)env->vl; i++) {
+        uint64_t value = 0;
+        uint64_t cause;
+
+        if (!vm && !rvv_v0_bit(env, i)) {
+            continue;
+        }
+        cause = rvv_load_lane(env, base + (uint64_t)i * bytes, bytes, &value);
+        if (cause) {
+            env->vl = i;
+            env->vstart = 0;
+            env->mem_fault_cause = 0;
+            return 1;
+        }
+        latr_rvv_write_elem(env, vd, i, bytes * 8u, value);
+    }
+    env->vstart = 0;
+    if (RVV_VTYPE_VTA(env->vtype)) {
+        rvv_tail_ones(env, vd, bytes * 8u);
+    }
+    return 0;
+}
+
+/*
+ * Whole-register transfers that ignore vl and vtype.
+ *
+ * vl<n>re<eew>.v loads (and vs<n>r.v stores) nf complete registers as one
+ * contiguous VLEN*nf-bit block starting at rs1.  The block size comes from nf
+ * alone: SEW, LMUL and the instruction's EEW only decide how the block is cut
+ * into elements (and therefore what vstart counts).  Probe #10 pinned this
+ * down -- with SEW=8 and vtype untouched, `vl2re32.v v4` filled v4/v5 and left
+ * v6..v11 alone, and `vs2r.v` stopped at byte 31.
+ *
+ * vstart is an element index inside that block, so the restart offset is
+ * vstart*esz rather than a lane of the current vtype.
+ */
+uint64_t latr_rvv_whole_mem(CPUArchState *env)
+{
+    uint64_t base = env->rvv_args[0];
+    unsigned vd = (unsigned)env->rvv_args[1];
+    unsigned eew = (unsigned)env->rvv_args[2];
+    int is_load = (int)env->rvv_args[3];
+    unsigned nf = (unsigned)env->rvv_args[4];
+    unsigned esz = 1u << eew;
+    unsigned per_reg = LATR_RVV_VLENB >> eew; /* elements in one register */
+    unsigned evl = nf * per_reg;
+    unsigned off = (vd & 31u) * LATR_RVV_VLENB;
+    unsigned i;
+
+    env->mem_fault_cause = 0;
+    if ((unsigned)env->vstart >= evl) { /* vstart past the end: nothing to do */
+        env->vstart = 0;
+        return 0;
+    }
+    for (i = (unsigned)env->vstart; i < evl; i++) {
+        unsigned pos = off + i * esz;
+        uint64_t value = 0;
+        uint64_t cause;
+
+        if (is_load) {
+            cause = rvv_load_lane(env, base + (uint64_t)i * esz, esz, &value);
+            if (cause) {
+                env->vstart = i;
+                return cause;
+            }
+            rvv_put_bytes(env, pos, esz, value);
+        } else {
+            value = rvv_get_bytes(env, pos, esz);
+            cause = rvv_store_lane(env, base + (uint64_t)i * esz, esz, value);
+            if (cause) {
+                env->vstart = i;
+                return cause;
+            }
+        }
+    }
+    env->vstart = 0;
+    return 0;
+}
+
+/*
+ * Group copy for vmv<n>r.v.  Only alignment is constrained by the ISA, so the
+ * two groups may overlap and the transfer has to pass through a scratch buffer.
+ * memmove is not in the freestanding symbol set (latr_externals.allowlist), so
+ * the copy is spelled out here.
+ */
+static void rvv_copy_whole(uint8_t *dst, const uint8_t *src, unsigned bytes)
+{
+    uint8_t scratch[8u * LATR_RVV_VLENB];
+    unsigned i;
+
+    if (bytes > sizeof(scratch)) {
+        bytes = (unsigned)sizeof(scratch);
+    }
+    for (i = 0; i < bytes; i++) {
+        scratch[i] = src[i];
+    }
+    for (i = 0; i < bytes; i++) {
+        dst[i] = scratch[i];
+    }
+}
+
+/* vmv<n>r.v: copy nf complete registers, vd and vs2 group aligned. */
+void latr_rvv_whole_move(CPUArchState *env)
+{
+    unsigned vd = (unsigned)env->rvv_args[0];
+    unsigned vs2 = (unsigned)env->rvv_args[1];
+    unsigned nf = (unsigned)env->rvv_args[2];
+    unsigned bytes = nf * LATR_RVV_VLENB;
+
+    /*
+     * There is no partial whole-register move: with vstart != 0 the
+     * instruction transfers nothing but still consumes vstart.  QEMU's
+     * trans_vmv_nr() guards the body with `s->vstart == 0` and clears vstart
+     * through the generic gen_helper path; probe #8 case C confirmed it
+     * (v4=v5 untouched, vstart read back as 0 afterwards).
+     */
+    if (env->vstart != 0) {
+        env->vstart = 0;
+        return;
+    }
+    if (vd + nf > 32u || vs2 + nf > 32u) {
+        env->vstart = 0;
+        return;
+    }
+    rvv_copy_whole(&env->vreg[vd][0], &env->vreg[vs2][0], bytes);
+    env->vstart = 0;
 }
 
 /*
@@ -613,10 +984,23 @@ uint64_t latr_rvv_stride_mem(CPUArchState *env)
     int vm = (int)env->rvv_args[4];
     uint64_t stride_or_index = env->rvv_args[5];
     unsigned mode = (unsigned)env->rvv_args[6];
+    unsigned nf = (unsigned)env->rvv_args[7];
     unsigned index_bytes = 1u << eew;
     unsigned data_bytes = mode == 1 ? index_bytes : rvv_sew(env) / 8u;
     unsigned data_bits = data_bytes * 8u;
     unsigned i;
+
+    if (nf == 0) {
+        nf = 1;
+    }
+    if (nf > 1) {
+        /* vlsseg / vlsxseg: nf fields per lane, contiguous from the lane
+         * address. `stride_or_index` is the byte stride (mode 1) or the index
+         * vector register number (mode 2). */
+        return rvv_ldst_segment(env, base, vd, eew, nf, is_load, vm, mode,
+                                mode == 1 ? stride_or_index : 0,
+                                (unsigned)stride_or_index);
+    }
 
     env->mem_fault_cause = 0;
     if (env->vstart >= env->vl) {

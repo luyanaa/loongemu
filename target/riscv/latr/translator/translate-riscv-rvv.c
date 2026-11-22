@@ -6,6 +6,7 @@
 #include "latr.h"
 #include "translate.h"
 #include "riscv-env.h"
+#include "latr-rvv-legality.h"
 
 #define CSR_MSTATUS_ADDR 0x300
 #define MSTATUS_VS_BITS (UINT64_C(3) << 9)
@@ -30,6 +31,58 @@ static void emit_vs_gate(const RiscvIR1 *ir1)
     latr_raise_illegal_instruction(ir1);
     la_label(allowed);
     ra_free_temp(status);
+}
+
+/*
+ * Register-group alignment, overlap and EMUL depend only on vtype, not on the
+ * dynamic vl/vstart, so they can be decided while translating. QEMU rejects
+ * these encodings outright; executing them against `reg + idx` would otherwise
+ * wrap at v31 and silently address a different architectural register.
+ */
+static bool emit_operand_legality(const RiscvIR1 *ir1)
+{
+    const CPUArchState *env = lsenv != 0 ? lsenv->cpu_state : 0;
+    LatrVectorState state;
+    LatrRvvLegality why;
+
+    if (env == 0) {
+        return true;
+    }
+    state.vtype = env->vtype;
+    state.vill = (uint8_t)(env->vill != 0);
+    state.elen = 64;
+    state.xlen = 64;
+    why = latr_rvv_check_operands(ir1, &state);
+    if (why == LATR_RVV_LEGAL) {
+        return true;
+    }
+    latr_raise_illegal_instruction(ir1);
+    return false;
+}
+
+/*
+ * frm is only sampled by the vector FP instructions that QEMU routes through
+ * gen_set_rm()/gen_set_rm_chkfrm(); both raise ILLEGAL_INST for a reserved
+ * value, while RMM (4) remains valid. Gating here keeps the SoftFloat status
+ * from being initialised with an undefined rounding mode.
+ */
+static void emit_frm_gate(const RiscvIR1 *ir1)
+{
+    IR2_OPND illegal = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND allowed = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND value = ra_alloc_itemp();
+    IR2_OPND frm = ra_alloc_itemp();
+
+    latr_env_load_d(value, env_offset_fcsr());
+    la_bstrpick_d(frm, value, 7, 5);
+    la_sltui(value, frm, 5);
+    la_beqz(value, illegal);
+    la_b(allowed);
+    la_label(illegal);
+    latr_raise_illegal_instruction(ir1);
+    la_label(allowed);
+    ra_free_temp(frm);
+    ra_free_temp(value);
 }
 
 static void emit_vstart_zero_gate(const RiscvIR1 *ir1)
@@ -411,9 +464,34 @@ static bool rvv_reduce_op(int opcode, unsigned *op)
     }
 }
 
-static bool rvv_mem_op(int opcode, unsigned *eew, int *is_load,
-                       unsigned *mode)
+/*
+ * QEMU requires vstart == 0 for the mask scans, viota, vcompress and every
+ * reduction (vext_check_reduction): those instructions cannot resume, because
+ * the lanes below vstart were already folded into state that is not kept.
+ */
+static bool rvv_requires_vstart_zero(LatrRiscvOpcode opcode)
 {
+    unsigned unused_op = 0;
+
+    if (rvv_reduce_op((int)opcode, &unused_op)) {
+        return true;
+    }
+    switch (opcode) {
+    case LATR_RV_VCPOP_M:
+    case LATR_RV_VFIRST_M:
+    case LATR_RV_VMSBF_M:
+    case LATR_RV_VMSIF_M:
+    case LATR_RV_VMSOF_M:
+    case LATR_RV_VIOTA_M:
+    case LATR_RV_VCOMPRESS_VM:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool rvv_mem_op(int opcode, unsigned *eew, int *is_load,
+                       unsigned *mode){
     *mode = 0;
     switch (opcode) {
     case LATR_RV_VLE8_V:  *eew = 0; *is_load = 1; return true;
@@ -442,6 +520,10 @@ static bool rvv_mem_op(int opcode, unsigned *eew, int *is_load,
     case LATR_RV_VSXEI64_V: *eew = 3; *is_load = 0; *mode = 2; return true;
     case LATR_RV_VLM_V:     *eew = 0; *is_load = 1; *mode = 3; return true;
     case LATR_RV_VSM_V:     *eew = 0; *is_load = 0; *mode = 3; return true;
+    case LATR_RV_VLE8FF_V:  *eew = 0; *is_load = 1; *mode = 4; return true;
+    case LATR_RV_VLE16FF_V: *eew = 1; *is_load = 1; *mode = 4; return true;
+    case LATR_RV_VLE32FF_V: *eew = 2; *is_load = 1; *mode = 4; return true;
+    case LATR_RV_VLE64FF_V: *eew = 3; *is_load = 1; *mode = 4; return true;
     default: return false;
     }
 }
@@ -490,32 +572,38 @@ static bool translate_vector_op(const RiscvIR1 *ir1)
     bool is_fp = rvv_fp_op(ir1->opcode, &fp_op, &fp_kind);
     bool is_cvt = !is_fp && rvv_cvt_op(ir1->opcode, &cvt_op);
     bool is_mem = rvv_mem_op(ir1->opcode, &eew, &is_load, &mem_mode);
+    LatrRvvWholeKind whole = latr_rvv_whole_kind((unsigned)ir1->opcode);
+    unsigned whole_nf = latr_rvv_whole_nf((unsigned)ir1->opcode);
+    bool is_ff = is_mem && mem_mode == 4;
+    IR2_OPND ff_exit = { 0 };
+    IR2_OPND ff_done = { 0 };
 
     bool is_mv_scalar = ir1->opcode == LATR_RV_VMV_X_S ||
                         ir1->opcode == LATR_RV_VMV_S_X;
 
     if (!is_alu && !is_cmp && !is_merge && !is_mv && !is_mv_scalar &&
         !is_mask_logic && !is_mask_scan && !is_reduce && !is_perm &&
-        !is_extra && !is_fp && !is_cvt && !is_mem) {
+        !is_extra && !is_fp && !is_cvt && !is_mem &&
+        whole == LATR_RVV_WHOLE_NONE) {
         return false;
     }
     emit_vs_gate(ir1);
-
-    /* Only unit-stride (nf=1) forms are implemented; segment loads/stores
-     * share the same decode tags, so reject nf>1 instead of mis-executing.
-     * vlm.v/vsm.v (mem_mode == 3) use arg_r2 without nf. */
-    if (is_mem && mem_mode != 3 && ir1->arg.nf != 1) {
-        latr_raise_illegal_instruction(ir1);
+    if (!emit_operand_legality(ir1)) {
         return true;
     }
-    if (ir1->opcode == LATR_RV_VCPOP_M ||
-        ir1->opcode == LATR_RV_VFIRST_M ||
-        ir1->opcode == LATR_RV_VMSBF_M ||
-        ir1->opcode == LATR_RV_VMSIF_M ||
-        ir1->opcode == LATR_RV_VMSOF_M ||
-        ir1->opcode == LATR_RV_VIOTA_M ||
-        ir1->opcode == LATR_RV_VCOMPRESS_VM) {
+    if (latr_rvv_uses_frm((unsigned)ir1->opcode)) {
+        emit_frm_gate(ir1);
+    }
+
+    /* Segment (nf>1) forms share their decode tags with the unit-stride ones;
+     * all three address modes handle nf in the helper now. vlm.v/vsm.v use
+     * arg_r2, which has no nf field at all (mem_mode 3). */
+    if (rvv_requires_vstart_zero(ir1->opcode)) {
         emit_vstart_zero_gate(ir1);
+    }
+    if (is_ff) {
+        ff_exit = ir2_opnd_new_type(IR2_OPND_LABEL);
+        ff_done = ir2_opnd_new_type(IR2_OPND_LABEL);
     }
 
     emitted_direct = latr_pvir_try_lower_lsx(ir1, &direct_fallback,
@@ -663,6 +751,22 @@ static bool translate_vector_op(const RiscvIR1 *ir1)
         emit_rvv_arg_const(3, (uint64_t)ir1->arg.rs1);
         emit_rvv_arg_const(4, (uint64_t)vm);
         emit_rvv_call((uintptr_t)&latr_rvv_reduce);
+    } else if (whole == LATR_RVV_WHOLE_MOVE) {
+        emit_rvv_arg_const(0, (uint64_t)ir1->arg.rd);
+        emit_rvv_arg_const(1, (uint64_t)ir1->arg.rs2);
+        emit_rvv_arg_const(2, (uint64_t)whole_nf);
+        emit_rvv_call((uintptr_t)&latr_rvv_whole_move);
+    } else if (whole != LATR_RVV_WHOLE_NONE) {
+        base = alloc_gpr_src(ir1->arg.rs1);
+        emit_rvv_arg_opnd(0, base);
+        free_alloc_gpr(base);
+        emit_rvv_arg_const(1, (uint64_t)ir1->arg.rd);
+        emit_rvv_arg_const(2, (uint64_t)latr_rvv_whole_eew((unsigned)
+                                                               ir1->opcode));
+        emit_rvv_arg_const(3, (uint64_t)(whole == LATR_RVV_WHOLE_LOAD));
+        emit_rvv_arg_const(4, (uint64_t)whole_nf);
+        emit_rvv_call((uintptr_t)&latr_rvv_whole_mem);
+        emit_rvv_fault_check(ir1);
     } else if (is_mem) {
 
         base = alloc_gpr_src(ir1->arg.rs1);
@@ -672,9 +776,16 @@ static bool translate_vector_op(const RiscvIR1 *ir1)
         emit_rvv_arg_const(2, (uint64_t)eew);
         emit_rvv_arg_const(3, (uint64_t)is_load);
         emit_rvv_arg_const(4, (uint64_t)vm);
-        if (mem_mode == 0 || mem_mode == 3) {
-            emit_rvv_arg_const(5, mem_mode == 3 ? 1u : 0u);
-            emit_rvv_call((uintptr_t)&latr_rvv_mem);
+        if (mem_mode == 0 || mem_mode == 3 || mem_mode == 4) {
+            emit_rvv_arg_const(5, mem_mode == 3 ? 1u
+                                             : (mem_mode == 4 ? 2u : 0u));
+            emit_rvv_arg_const(6, mem_mode == 3
+                                      ? 1u
+                                      : (uint64_t)(ir1->arg.nf == 0
+                                                       ? 1
+                                                       : ir1->arg.nf));
+            emit_rvv_call((uintptr_t)(mem_mode == 4 ? &latr_rvv_ldff
+                                                    : &latr_rvv_mem));
         } else {
             if (mem_mode == 1) {
                 extra = alloc_gpr_src(ir1->arg.rs2);
@@ -684,9 +795,18 @@ static bool translate_vector_op(const RiscvIR1 *ir1)
                 emit_rvv_arg_const(5, (uint64_t)ir1->arg.rs2);
             }
             emit_rvv_arg_const(6, (uint64_t)mem_mode);
+            emit_rvv_arg_const(7, (uint64_t)(ir1->arg.nf == 0
+                                                 ? 1
+                                                 : ir1->arg.nf));
             emit_rvv_call((uintptr_t)&latr_rvv_stride_mem);
         }
-        emit_rvv_fault_check(ir1);
+        if (is_ff) {
+            /* vl narrowed: the rest of this block was specialised for the old
+             * vl, so retire the instruction and restart after it. */
+            la_bnez(a0_ir2_opnd, ff_exit);
+        } else {
+            emit_rvv_fault_check(ir1);
+        }
     }
 
     if (emitted_direct) {
@@ -694,6 +814,19 @@ static bool translate_vector_op(const RiscvIR1 *ir1)
     }
     latr_emit_mark_vs_dirty();
     latr_emit_instret();
+    if (is_ff) {
+        IR2_OPND next_pc = ra_alloc_itemp();
+
+        la_b(ff_done);
+        la_label(ff_exit);
+        latr_emit_mark_vs_dirty();
+        latr_emit_instret();
+        li_d(next_pc, (int64_t)(ir1->pc + ir1->raw_len));
+        la_st_d(next_pc, env_ir2_opnd, env_offset_pc());
+        ra_free_temp(next_pc);
+        la_jirl(zero_ir2_opnd, ra_ir2_opnd, 0);
+        la_label(ff_done);
+    }
     return true;
 }
 

@@ -1,4 +1,5 @@
 #include "latr.h"
+#include "lata.h"
 #include "translate.h"
 #include "mmu.h"
 #include "loongemu/riscv_sbi.h"
@@ -14,6 +15,23 @@ LATR_TLS TRANSLATION_DATA *tr_data;
 LATR_TLS ENV *lsenv;
 bool latr_dump;
 
+/* IR2 list probes; see label_dispose(). Compiled out by default: the cycle they
+ * detect is now also prevented at the source (ir2_append), and a full list walk
+ * per TB is pure overhead in the dispatch hot path. Turn it on when touching
+ * IR2 insertion, label handling or the instruction array growth. */
+#ifndef LATR_IR2_LIST_CHECK
+#define LATR_IR2_LIST_CHECK 0
+#endif
+
+#if LATR_IR2_LIST_CHECK
+static int latr_ir2_cap_at_tb_start;
+static int latr_ir2_used_high_water;
+#endif
+
+/* The freestanding build has no qemu/osdep.h; the host log sink is provided by
+ * latx/compat/libc_min.c (bare-metal) or latr/runtime.c (weak no-op). */
+void qemu_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
 const int latr_la_map[32] = {
     -1, -1, -1, -1, -1, -1, -1, -1,
     -1, -1, -1, -1, -1, -1, -1, -1,
@@ -26,6 +44,16 @@ const int latr_la_fmap[32] = {
     -1, -1, -1, -1, -1, -1, -1, -1,
     -1, -1, -1, -1, -1, -1, -1, -1
 };
+
+/* The shared target/arm/lata/ir2/ir2.c dump path asks for a LataContext it can
+ * tag lines with. LATR has no ARM translation context, so hand it a single
+ * process-wide counter; see include/lata.h for why the shim exists at all. */
+static LataContext latr_dump_context;
+
+LataContext *lata_context_current(void)
+{
+    return &latr_dump_context;
+}
 
 static CPUArchState *latr_cpu_env(void)
 {
@@ -125,6 +153,9 @@ LatrTranslatorContext *latr_context_create(CPUArchState *cpu,
     ctx->tb_cache = tb_cache;
     ctx->code_buf = code_buf;
     ctx->code_buf_size = code_buf_size;
+    /* Adopt the cache's current generation so the first safepoint does not
+     * throw away descriptors that are still valid. */
+    ctx->pvir_generation = tb_cache != NULL ? tb_cache->generation : 0;
     ctx->env.cpu_state = cpu;
     ctx->env.tr_data = &ctx->tr_data;
     return ctx;
@@ -147,10 +178,12 @@ void latr_context_destroy(LatrTranslatorContext *ctx)
     mm_free(ctx);
 }
 
-void latr_context_bind(LatrTranslatorContext *ctx)
+LatrTranslatorContext *latr_context_bind(LatrTranslatorContext *ctx)
 {
+    LatrTranslatorContext *prev = latr_active_context;
+
     if (ctx == NULL) {
-        return;
+        return prev;
     }
     latr_active_context = ctx;
     lsenv = &ctx->env;
@@ -158,6 +191,18 @@ void latr_context_bind(LatrTranslatorContext *ctx)
     ctx->env.tr_data = &ctx->tr_data;
     ctx->env.cpu_state = ctx->cpu;
     env_ir2_opnd = ir2_opnd_new(IR2_OPND_GPR, la_s8);
+    return prev;
+}
+
+void latr_context_restore(LatrTranslatorContext *ctx)
+{
+    if (ctx == NULL) {
+        latr_active_context = NULL;
+        tr_data = NULL;
+        lsenv = NULL;
+        return;
+    }
+    (void)latr_context_bind(ctx);
 }
 
 LatrTranslatorContext *latr_context_current(void)
@@ -172,11 +217,37 @@ void latr_context_safepoint(LatrTranslatorContext *ctx)
     if (ctx == NULL) {
         return;
     }
-    latr_tb_cache_safepoint(ctx->tb_cache);
+    /*
+     * Reclaiming the arena rewrites the bytes every native-offset map in this
+     * context points at. Drop those maps in the same breath, or a host fault
+     * inside a recycled arena would resolve to the guest instruction that used
+     * to occupy that offset.
+     */
+    if (latr_tb_cache_safepoint(ctx->tb_cache) && ctx->tb_cache != NULL) {
+        latr_tb_insn_map_forget_range(ctx->tb_cache->arena,
+                                      ctx->tb_cache->arena_size);
+    }
     generation = ctx->tb_cache != NULL ? ctx->tb_cache->generation : 0;
     if (generation != ctx->pvir_generation) {
         latr_pvir_cache_reset(ctx->pvir_cache);
         ctx->pvir_generation = generation;
+    }
+}
+
+/*
+ * Switches the current hart's guest environment. The translator reaches the
+ * CPU state through `lsenv->cpu_state`; keeping the context in step here means
+ * a fault dispatcher can rebind a hart and immediately resolve host PCs.
+ */
+void latr_set_cpu_env(CPUArchState *env)
+{
+    LatrTranslatorContext *ctx = latr_active_context;
+
+    if (ctx != NULL) {
+        ctx->cpu = env;
+    }
+    if (lsenv != NULL) {
+        lsenv->cpu_state = env;
     }
 }
 
@@ -217,6 +288,9 @@ void tr_init(void *tb)
     data->first_ir2 = NULL;
     data->last_ir2 = NULL;
     data->label_num = 0;
+#if LATR_IR2_LIST_CHECK
+    latr_ir2_cap_at_tb_start = data->ir2_inst_num_max;
+#endif
 }
 
 /*
@@ -523,8 +597,82 @@ void target_disasm(TranslationBlock *tb, int *max_insns, CPUState *cpu)
     }
 }
 
+/*
+ * IR2 list integrity probe.
+ *
+ * label_dispose() walks the _next chain twice. If that chain ever contains a
+ * cycle the walk never terminates, the translator never returns, and the guest
+ * simply stops between two TBs with no diagnostic at all -- which looks exactly
+ * like a wedged TB. The chain is built only by ir2_append()/ir2_remove(), so a
+ * cycle means some structural invariant was already violated; report it with
+ * enough state to tell which one.
+ *
+ * Cost is O(IR2 per TB) on top of two walks that already cost the same, which is
+ * why it is off by default now that ir2_append() itself refuses to close a cycle.
+ */
+#if LATR_IR2_LIST_CHECK
+static void latr_ir2_report(const char *why, IR2_INST *at, int steps)
+{
+    TRANSLATION_DATA *d = lsenv->tr_data;
+    int i;
+
+    qemu_log("[LATR] ir2-list %s steps=%d used=%d cap=%d(cap@tb=%d) "
+             "labels=%d first=%d last=%d\n",
+             why, steps, d->ir2_inst_num_current, d->ir2_inst_num_max,
+             latr_ir2_cap_at_tb_start, d->label_num,
+             d->first_ir2 != NULL ? ir2_get_id(d->first_ir2) : -1,
+             d->last_ir2 != NULL ? ir2_get_id(d->last_ir2) : -1);
+
+    qemu_log("[LATR] ir2-list high-water used=%d\n", latr_ir2_used_high_water);
+    for (i = 0; i < 32 && at != NULL; i++) {
+        qemu_log("  [%d] op=%d prev=%d next=%d\n", at->_id, at->_opcode,
+                 at->_prev, at->_next);
+        at = ir2_next(at);
+    }
+}
+
+static void latr_ir2_list_check(void)
+{
+    TRANSLATION_DATA *d = lsenv->tr_data;
+    int bound = d->ir2_inst_num_current + 8;
+    int steps = 0;
+    IR2_INST *p = d->first_ir2;
+
+    if (d->ir2_inst_num_current > latr_ir2_used_high_water) {
+        latr_ir2_used_high_water = d->ir2_inst_num_current;
+    }
+
+    while (p != NULL) {
+        if (++steps > bound) {
+            latr_ir2_report("CYCLE", p, steps);
+            return;
+        }
+        p = ir2_next(p);
+    }
+
+    if ((d->first_ir2 == NULL) != (d->last_ir2 == NULL)) {
+        latr_ir2_report("HEAD/TAIL-MISMATCH", d->first_ir2, steps);
+    } else if (d->last_ir2 != NULL && d->last_ir2->_next != -1) {
+        latr_ir2_report("TAIL-HAS-SUCCESSOR", d->last_ir2, steps);
+    }
+}
+
+void latr_ir2_list_stats(void)
+{
+    TRANSLATION_DATA *d = lsenv->tr_data;
+
+    qemu_log("[LATR] ir2-list stats: high_water=%d cap=%d\n",
+             latr_ir2_used_high_water, d->ir2_inst_num_max);
+}
+#else
+void latr_ir2_list_stats(void) {}
+#endif
+
 void label_dispose(void)
 {
+#if LATR_IR2_LIST_CHECK
+    latr_ir2_list_check();
+#endif
     int label_count = lsenv->tr_data->label_num;
     int positions[label_count + 1];
     for (int i = 0; i <= label_count; i++) {

@@ -14,6 +14,14 @@
 #include "tcg/tcg.h"
 //#include "env.h"
 
+#ifndef LATA_TLS
+#if defined(LATA_ENABLE_TLS) || (!defined(CONFIG_LATA_STANDALONE) && defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L)
+#define LATA_TLS _Thread_local
+#else
+#define LATA_TLS
+#endif
+#endif
+
 #define B_STUB_SIZE 4
 
 typedef struct TRANSLATION_DATA {
@@ -62,6 +70,10 @@ typedef struct TRANSLATION_DATA {
     uint32_t vreg_resident_touched;
     /* Resident registers written in this TB; discharged by the exit code. */
     uint32_t vreg_resident_dirty;
+    /* Guest V registers written by A64 NEON/FP insns requiring Z[VL-1:128]=0. */
+    uint32_t vreg_v_written_mask;
+    /* Explicit temporary FPR allocation exhaustion flag (checked on rollback). */
+    bool ftemp_alloc_failed;
 
     /* TODO : support static translation */
     uint8 curr_ir1_skipped_eflags; /* these eflag calculation can be skipped */
@@ -74,6 +86,53 @@ typedef struct ENV {
     TRANSLATION_DATA *tr_data;  /* from LATR */
 } ENV;
 
+struct LataGuestMemOps;
+struct TUControl;
+
+#define LATA_VCACHE_ENTRIES 2
+
+typedef struct LataContext {
+    TRANSLATION_DATA tr_data;
+    ENV env;
+    CPUArchState *cpu_state;
+    LataVcacheState vcache;
+    struct {
+        bool valid;
+        bool dirty;
+        int offset;
+    } zcache[LATA_VCACHE_ENTRIES];
+    unsigned zcache_victim;
+    uint32_t vreg_resident_mask;
+    uint32_t vreg_spill_count;
+    uint32_t vreg_tb_resident;
+    uint32_t vreg_publish_count;
+    uint32_t vreg_exit_violations;
+    uint32_t vreg_lazy_loads;
+    uint32_t vreg_temp_loads;
+    int ftemp_base;
+    int ftemp_pool_entries;
+    int reg_ftemp_map[32];
+    int reg_ftemp_reverse_map[32];
+    uint32_t ftemp_alloc_failures;
+    uint32_t ftemp_fallbacks;
+    bool sve_const_pred_opt_enabled;
+    size_t sve_const_pred_folds;
+    int ir2_dump_ir1_id;
+    const struct LataGuestMemOps *mem_ops;
+    void *ir1_list;
+    void *db_rel;
+    void *sve_helper_list;
+    struct TUControl *tu_data;
+    void *tu_search_offsets;
+    bool initialized;
+} LataContext;
+
+void lata_context_init(LataContext *ctx, CPUArchState *env);
+void lata_context_destroy(LataContext *ctx);
+LataContext *lata_context_new(CPUArchState *env);
+void lata_context_delete(LataContext *ctx);
+void lata_context_bind(LataContext *ctx);
+LataContext *lata_context_current(void);
 
 void lata_tr_data_init(CPUArchState *env);
 void tr_init(void*);
@@ -81,8 +140,8 @@ void tr_fini(void);
 
 extern const int arm_la_map[];
 extern const int arm_la_fmap[];
-extern __thread TRANSLATION_DATA *tr_data;
-extern __thread ENV *lsenv;
+extern LATA_TLS TRANSLATION_DATA *tr_data;
+extern LATA_TLS ENV *lsenv;
 extern bool lata_dump;
 
 extern uint64_t context_switch_bt_to_native;
@@ -107,6 +166,13 @@ void lata_zcache_flush_for_exit(void);
 
 /* Emit per-TB stores for resident registers this TB wrote, then clear them. */
 void lata_emit_dirty_vreg_stores(void);
+/* Record a V-register write (clears Z[VL-1:128] on SVE VLs > 128). */
+void lata_note_vreg_v_write(int rd);
+/* Flush dirty V-registers (with Z upper-half zeroing) before SVE ops read Z. */
+void lata_flush_vregs_for_sve(void);
+/* Flush/invalidate any zcache chunk covering Z register `reg`. */
+void lata_zcache_flush_reg(int reg);
+void lata_zcache_invalidate_reg(int reg);
 /* TBs that reached tr_fini() without discharging their dirty registers. */
 uint32_t lata_vreg_exit_violations(void);
 /* Number of per-TB vector stores emitted (proves the per-TB exit ran). */
@@ -116,6 +182,10 @@ uint32_t lata_vreg_lazy_loads(void);
 uint32_t lata_vreg_temp_loads(void);
 /* Temporary-pool allocations that could not be satisfied (must stay 0). */
 uint32_t ra_ftemp_alloc_failures(void);
+bool ra_ftemp_alloc_failed(void);
+void ra_ftemp_clear_failed(void);
+void ra_ftemp_note_fallback(void);
+uint32_t ra_ftemp_fallbacks(void);
 
 /*
  * Guest V-register residency.  A resident register holds the live value; a
@@ -124,6 +194,7 @@ uint32_t ra_ftemp_alloc_failures(void);
  */
 bool lata_vreg_resident(int index);
 void lata_vreg_init_residency(void);
+void lata_vreg_clear_residency_for_test(void);
 int lata_vreg_spill_cold(void);
 uint32_t lata_vreg_spills(void);
 /* Number of guest V registers currently resident in host registers. */
@@ -178,8 +249,10 @@ typedef struct LataIr2Snapshot {
     uint32_t all_temp_status;
     uint32_t vreg_resident_touched;
     uint32_t vreg_resident_dirty;
+    uint32_t vreg_v_written_mask;
     uint32_t vreg_tb_resident;
     uint32_t w_write_flag;
+    bool ftemp_alloc_failed;
     struct {
         bool valid;
         bool dirty;
