@@ -904,6 +904,11 @@ static void exec_while(CPUARMState *env, size_t vl_bytes,
 
 
 
+uint64_t lata_dbg_base, lata_dbg_ea, lata_dbg_status, lata_dbg_ffr0;
+uint64_t lata_dbg_x0, lata_dbg_x1, lata_dbg_hasSrc;
+int lata_dbg_rn = -1, lata_dbg_hassrc = -1;
+int lata_dbg_lane = -1, lata_dbg_zt = -1, lata_dbg_pg = -1;
+
 static uint64_t exec_fault_or_contiguous_mem(CPUARMState *env,
                                              const LataSVEHelperDesc *d)
 {

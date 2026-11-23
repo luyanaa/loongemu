@@ -6842,6 +6842,24 @@ void kmain(void)
         check(env.sve_ctrl.last_exception_index, 0,
               "LDNF1B does not raise on a faulting lane");
 
+        static uint32_t ldff1b_fix[] __attribute__((aligned(16))) = {
+            0x252c9000u, /* setffr */
+            0x2518e3e0u, /* ptrue p0.b, all */
+            0xa41f6000u, /* ldff1b { z0.b }, p0/z, [x0] */
+        };
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[0] = (uint64_t)(uintptr_t)fbuf;
+        lata_guest_mem_clear_fault_regions(&env);
+        lata_guest_mem_add_fault_region(&env, (uint64_t)(uintptr_t)&fbuf[2], 14, 0);
+        check(sve_run_a64_tb(ldff1b_fix, 3, 128, 0x0fu, false, "LDFF1B fault"),
+              1, "LDFF1B faulting run completes");
+        check(arm_sve_ffr(&env)[0], 0x03u,
+              "LDFF1B FFR marks the lanes before the fault");
+        check(arm_sve_zreg(&env, 0)[0], 0x40u,
+              "LDFF1B commits the lane before the fault");
+        check(env.sve_ctrl.last_exception_index, 0,
+              "LDFF1B reports the fault through FFR, not an exception");
+
 
 
     }
