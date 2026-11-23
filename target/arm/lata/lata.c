@@ -939,10 +939,20 @@ static void generate_context_switch_native_to_bt(void)
         li_d(t1_ir2_opnd, env_offset(sve_ctrl.last_exception_syndrome));
         la_stx_w(t0_ir2_opnd, env_ir2_opnd, t1_ir2_opnd);
         /*
-         * Delivery: resume at the synchronous exception vector
-         * (VBAR_EL1 + 0x400, lower-EL synchronous entry).  SPSR/PSTATE and the
-         * vector-group selection by EL are not modelled yet.
+         * Delivery to EL1: ESR_EL1 = (EC 0x2C << 26) | FSC, ELR_EL1 = the
+         * faulting instruction, SPSR_EL1 = PSTATE, then resume at
+         * VBAR_EL1 + 0x400 (lower-EL synchronous entry).
          */
+        li_d(t1_ir2_opnd, env_offset(esr_el1));
+        la_stx_w(t0_ir2_opnd, env_ir2_opnd, t1_ir2_opnd);
+        li_d(t1_ir2_opnd, env_offset(fp_trap_pc));
+        la_ldx_d(t0_ir2_opnd, env_ir2_opnd, t1_ir2_opnd);
+        li_d(t1_ir2_opnd, env_offset(elr_el1));
+        la_stx_d(t0_ir2_opnd, env_ir2_opnd, t1_ir2_opnd);
+        li_d(t1_ir2_opnd, env_offset_PSTATE());
+        la_ldx_wu(t0_ir2_opnd, env_ir2_opnd, t1_ir2_opnd);
+        li_d(t1_ir2_opnd, env_offset(spsr_el1));
+        la_stx_d(t0_ir2_opnd, env_ir2_opnd, t1_ir2_opnd);
         li_d(t1_ir2_opnd, env_offset(vbar_el1));
         la_ldx_d(t0_ir2_opnd, env_ir2_opnd, t1_ir2_opnd);
         la_addi_d(t0_ir2_opnd, t0_ir2_opnd, 0x400);

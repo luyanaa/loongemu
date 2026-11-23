@@ -7618,6 +7618,53 @@ cun_probe_done:;
               "the trap is still recorded");
     }
 
+    /* Exception state written on delivery: ESR/ELR/SPSR. */
+    if (latx_cpu_has_lasx() != 0) {
+        DisasContext ds;
+        A64SVEPvirBuilder bs;
+        static uint32_t fadd_probe[] __attribute__((aligned(16))) = {
+            0x65808440u, /* FADD z0.s, p1/m, z0.s, z2.s */
+        };
+
+        sve_init_direct(&ds, &bs, 256);
+        ds.pc_curr = (uintptr_t)fadd_probe;
+        env.vbar_el1 = UINT64_C(0x40000000);
+        env.pstate = UINT64_C(0x5); /* something recognisable */
+        env.vfp.xregs[0] = UINT64_C(1) << 8; /* FPCR.IOE */
+        arm_sve_preg(&env, 1)[0] = 0x11u;
+        arm_sve_preg(&env, 1)[1] = 0x11u;
+        arm_sve_preg(&env, 1)[2] = 0x11u;
+        arm_sve_preg(&env, 1)[3] = 0x11u;
+        for (size_t l = 0; l < 8; ++l) {
+            write_le32(arm_sve_zreg(&env, 0) + l * 4u, 0x3f800000u);
+            write_le32(arm_sve_zreg(&env, 2) + l * 4u, 0x7f800001u);
+        }
+        (void)sve_emit_decoded(&ds, 0x65808440u, "FADD z0.s exception state");
+        sve_exec_direct();
+        check(env.esr_el1, (uint64_t)((uint32_t)(0x2C << 26) | 1u),
+              "ESR_EL1 carries EC 0x2C and FSC=invalid");
+        check(env.elr_el1, (uint64_t)(uintptr_t)fadd_probe,
+              "ELR_EL1 points at the faulting instruction");
+        check(env.spsr_el1, UINT64_C(0x5), "SPSR_EL1 captures PSTATE");
+        check(env.pc, UINT64_C(0x40000400), "PC moves to the vector");
+
+        /* The guest can read them back. */
+        static uint32_t read_back[] __attribute__((aligned(16))) = {
+            0xd5385201u, /* mrs x1, ESR_EL1 */
+            0xd5384022u, /* mrs x2, ELR_EL1 */
+            0xd5384003u, /* mrs x3, SPSR_EL1 */
+        };
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.esr_el1 = UINT64_C(0x00000000b0000001);
+        env.elr_el1 = UINT64_C(0x1234);
+        env.spsr_el1 = UINT64_C(0x3c5);
+        check(sve_run_a64_tb(read_back, 3, 128, 0x0fu, false, "read ESR/ELR/SPSR"),
+              1, "MRS of the exception registers runs");
+        check(env.xregs[1], UINT64_C(0xb0000001), "MRS ESR_EL1");
+        check(env.xregs[2], UINT64_C(0x1234), "MRS ELR_EL1");
+        check(env.xregs[3], UINT64_C(0x3c5), "MRS SPSR_EL1");
+    }
+
     latx_bare_uart_puts("lata-isa: checks=");
     putdec((uint64_t)checks);
     latx_bare_uart_puts(" fails=");

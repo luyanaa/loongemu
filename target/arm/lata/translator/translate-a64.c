@@ -1713,6 +1713,24 @@ static const ARMCPRegInfo lata_fpcr_reginfo = {
     .fieldoffset = offsetof(CPUARMState, vfp.xregs[ARM_VFP_FPCR]),
 };
 
+static const ARMCPRegInfo lata_spsr_reginfo = {
+    .name = "SPSR_EL1",
+    .type = 0,
+    .fieldoffset = offsetof(CPUARMState, spsr_el1),
+};
+
+static const ARMCPRegInfo lata_elr_reginfo = {
+    .name = "ELR_EL1",
+    .type = 0,
+    .fieldoffset = offsetof(CPUARMState, elr_el1),
+};
+
+static const ARMCPRegInfo lata_esr_reginfo = {
+    .name = "ESR_EL1",
+    .type = 0,
+    .fieldoffset = offsetof(CPUARMState, esr_el1),
+};
+
 static const ARMCPRegInfo lata_vbar_reginfo = {
     .name = "VBAR_EL1",
     .type = 0,
@@ -1725,21 +1743,31 @@ static const ARMCPRegInfo lata_fpsr_reginfo = {
     .fieldoffset = offsetof(CPUARMState, vfp.xregs[ARM_VFP_FPSR]),
 };
 
-static const ARMCPRegInfo *lata_local_sysreg(uint32_t key)
+static const ARMCPRegInfo *lata_local_sysreg(unsigned op0, unsigned op1,
+                                              unsigned op2, unsigned crn,
+                                              unsigned crm)
 {
-    const uint32_t fpcr_key =
-        ENCODE_AA64_CP_REG(CP_REG_ARM64_SYSREG_CP, 4, 4, 3, 3, 0);
-    const uint32_t fpsr_key =
-        ENCODE_AA64_CP_REG(CP_REG_ARM64_SYSREG_CP, 4, 4, 3, 3, 1);
-
-    if (key == fpcr_key) {
-        return &lata_fpcr_reginfo;
+    /* Compare the raw fields: the packed key XORs them together and VBAR_EL1
+     * collides with ELR_EL1 (0x330000 both ways). */
+    if (op0 != 3) {
+        return NULL;
     }
-    if (key == fpsr_key) {
-        return &lata_fpsr_reginfo;
+    if (op1 == 3 && crn == 4 && crm == 4 && op2 <= 1) {
+        return (op2 == 0) ? &lata_fpcr_reginfo : &lata_fpsr_reginfo;
     }
-    if (key == ENCODE_AA64_CP_REG(CP_REG_ARM64_SYSREG_CP, 12, 0, 3, 0, 0)) {
-        return &lata_vbar_reginfo;
+    if (op1 == 0 && crm == 0) {
+        if (crn == 12 && op2 == 0) {
+            return &lata_vbar_reginfo;
+        }
+        if (crn == 4 && op2 == 0) {
+            return &lata_spsr_reginfo;
+        }
+        if (crn == 4 && op2 == 1) {
+            return &lata_elr_reginfo;
+        }
+    }
+    if (op1 == 0 && crn == 5 && crm == 2 && op2 == 0) {
+        return &lata_esr_reginfo;
     }
     return NULL;
 }
@@ -1753,7 +1781,7 @@ static void handle_sys(DisasContext *s, bool isread,
     const ARMCPRegInfo *ri = get_arm_cp_reginfo(s->cp_regs, key);
 
     if (ri == NULL) {
-        ri = lata_local_sysreg(key);
+        ri = lata_local_sysreg(op0, op1, op2, crn, crm);
     }
     bool need_exit_tb = false;
     void *la_ri = NULL;

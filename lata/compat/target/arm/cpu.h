@@ -102,6 +102,12 @@ typedef struct CPUARMState {
     } sve_ctrl;
     /* Synchronous exception vector base (AArch64 VBAR_EL1). */
     uint64_t vbar_el1;
+    /* EL1 exception state for synchronous traps. */
+    uint64_t elr_el1;
+    uint64_t esr_el1;
+    uint64_t spsr_el1;
+    /* PC of the FP instruction that may raise a trap (set by its lowering). */
+    uint64_t fp_trap_pc;
 } CPUARMState;
 
 static inline void arm_sve_set_cpacr_el1_zen(CPUARMState *env, unsigned zen)

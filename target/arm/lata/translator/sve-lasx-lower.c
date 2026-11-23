@@ -1373,6 +1373,10 @@ static bool lower_fp_binary(DisasContext *s,
                             const A64SVEIR1Instruction *source,
                             const PvirInstruction *instruction)
 {
+    /* The exit stub needs the faulting instruction's PC for ELR_EL1. */
+    li_d(t0_ir2_opnd, (int64_t)(uintptr_t)s->pc_curr);
+    li_d(t1_ir2_opnd, env_offset(fp_trap_pc));
+    la_stx_d(t0_ir2_opnd, env_ir2_opnd, t1_ir2_opnd);
     const PvirVectorOperation *operation = &instruction->operation.vector;
     const arg_sve_fp_binary *binary;
     PvirOpcode expected_op;
