@@ -7421,6 +7421,44 @@ cun_probe_done:;
         check(env.vfp.xregs[8] & 1u, 1u, "IOC stays set under DN=1");
     }
 
+    /* FPCR traps: with IOE set an sNaN input records an FP trap at TB exit. */
+    if (latx_cpu_has_lasx() != 0) {
+        DisasContext ds;
+        A64SVEPvirBuilder bs;
+
+        sve_init_direct(&ds, &bs, 256);
+        env.vfp.xregs[0] = UINT64_C(1) << 8; /* FPCR.IOE */
+        arm_sve_preg(&env, 1)[0] = 0x11u;
+        arm_sve_preg(&env, 1)[1] = 0x11u;
+        arm_sve_preg(&env, 1)[2] = 0x11u;
+        arm_sve_preg(&env, 1)[3] = 0x11u;
+        for (size_t l = 0; l < 8; ++l) {
+            write_le32(arm_sve_zreg(&env, 0) + l * 4u, 0x3f800000u);
+            write_le32(arm_sve_zreg(&env, 2) + l * 4u, 0x7f800001u); /* sNaN */
+        }
+        (void)sve_emit_decoded(&ds, 0x65808440u, "FADD z0.s sNaN + IOE");
+        sve_exec_direct();
+        check(env.sve_ctrl.last_exception_index, EXCP_AA64_FPTRAP,
+              "IOE=1 traps the invalid operation");
+        check(env.sve_ctrl.last_exception_syndrome, (uint32_t)(0x2C << 26) | 1u,
+              "the trap syndrome carries FSC=invalid");
+
+        /* Without IOE the same input does not trap. */
+        sve_init_direct(&ds, &bs, 256);
+        arm_sve_preg(&env, 1)[0] = 0x11u;
+        arm_sve_preg(&env, 1)[1] = 0x11u;
+        arm_sve_preg(&env, 1)[2] = 0x11u;
+        arm_sve_preg(&env, 1)[3] = 0x11u;
+        for (size_t l = 0; l < 8; ++l) {
+            write_le32(arm_sve_zreg(&env, 0) + l * 4u, 0x3f800000u);
+            write_le32(arm_sve_zreg(&env, 2) + l * 4u, 0x7f800001u);
+        }
+        (void)sve_emit_decoded(&ds, 0x65808440u, "FADD z0.s sNaN no IOE");
+        sve_exec_direct();
+        check(env.sve_ctrl.last_exception_index, 0,
+              "IOE=0 leaves the exception untrapped");
+    }
+
     latx_bare_uart_puts("lata-isa: checks=");
     putdec((uint64_t)checks);
     latx_bare_uart_puts(" fails=");

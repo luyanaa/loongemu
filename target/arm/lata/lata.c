@@ -897,6 +897,49 @@ static void generate_context_switch_native_to_bt(void)
     /* Sticky flags: a repeated exception must not carry into the next bit. */
     la_or(t0_ir2_opnd, t0_ir2_opnd, t1_ir2_opnd);
     la_stx_w(t0_ir2_opnd, env_ir2_opnd, t2_ir2_opnd);
+    /*
+     * Deferred FP trap: FPCR bits 12:8 enable trapping on the raised flags.
+     * Raising it from inside a lowering would end that block's emission early,
+     * so the pending exception is recorded here, at the single exit point.
+     */
+    {
+        IR2_OPND no_trap = ir2_opnd_new_type(IR2_OPND_LABEL);
+        IR2_OPND fsc_ready = ir2_opnd_new_type(IR2_OPND_LABEL);
+
+        li_d(t1_ir2_opnd, env_offset_FPCR());
+        la_ldx_wu(t2_ir2_opnd, env_ir2_opnd, t1_ir2_opnd);
+        la_srli_d(t2_ir2_opnd, t2_ir2_opnd, 8);
+        la_andi(t2_ir2_opnd, t2_ir2_opnd, 0x1f);
+        li_d(t1_ir2_opnd, env_offset_fpsr());
+        la_ldx_wu(t0_ir2_opnd, env_ir2_opnd, t1_ir2_opnd);
+        la_and(t2_ir2_opnd, t2_ir2_opnd, t0_ir2_opnd);
+        la_beqz(t2_ir2_opnd, no_trap);
+
+        /* Priority: invalid, div0, overflow, underflow, inexact. */
+        li_d(t3_ir2_opnd, 1);
+        la_andi(t4_ir2_opnd, t2_ir2_opnd, 2);
+        la_beqz(t4_ir2_opnd, fsc_ready);
+        li_d(t3_ir2_opnd, 2);
+        la_andi(t4_ir2_opnd, t2_ir2_opnd, 4);
+        la_beqz(t4_ir2_opnd, fsc_ready);
+        li_d(t3_ir2_opnd, 3);
+        la_andi(t4_ir2_opnd, t2_ir2_opnd, 8);
+        la_beqz(t4_ir2_opnd, fsc_ready);
+        li_d(t3_ir2_opnd, 4);
+        la_andi(t4_ir2_opnd, t2_ir2_opnd, 16);
+        la_beqz(t4_ir2_opnd, fsc_ready);
+        li_d(t3_ir2_opnd, 5);
+        la_label(fsc_ready);
+
+        li_d(t0_ir2_opnd, EXCP_AA64_FPTRAP);
+        li_d(t1_ir2_opnd, env_offset(sve_ctrl.last_exception_index));
+        la_stx_w(t0_ir2_opnd, env_ir2_opnd, t1_ir2_opnd);
+        li_d(t0_ir2_opnd, (int64_t)(0x2C << 26));
+        la_or(t0_ir2_opnd, t0_ir2_opnd, t3_ir2_opnd);
+        li_d(t1_ir2_opnd, env_offset(sve_ctrl.last_exception_syndrome));
+        la_stx_w(t0_ir2_opnd, env_ir2_opnd, t1_ir2_opnd);
+        la_label(no_trap);
+    }
     /* store fcsr(rouding mode) to vfp.xregs[ARM_VFP_FPSCR] */
     la_movfcsr2gr(t0_ir2_opnd, fcsr3_ir2_opnd);
     li_d(t1_ir2_opnd, 2 << 6 | 1 << 4 | 3 << 2 | 0);

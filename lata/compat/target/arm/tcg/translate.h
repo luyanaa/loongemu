@@ -82,6 +82,8 @@ typedef struct DisasContext {
 #define LOG2_TAG_GRANULE 4
 #define EXCP_UDEF 1
 #define EXCP_DATA_ABORT 4
+/* AArch64 synchronous FP trap (EC 0x2C). */
+#define EXCP_AA64_FPTRAP 7
 extern int option_fam_jmp_cache;
 extern CPUState *current_cpu;
 static inline CPUARMState *arm_env(CPUState *cpu) { return (CPUARMState *)cpu->env_ptr; }
