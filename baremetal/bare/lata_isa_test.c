@@ -6807,6 +6807,45 @@ void kmain(void)
         lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
     }
 
+    /* LDNF1B / LDFF1B guest-level coverage (FFR must be primed by SETFFR). */
+    {
+        static uint32_t ldnf1b[] __attribute__((aligned(16))) = {
+            0x252c9000u, /* setffr */
+            0x2518e3e0u, /* ptrue p0.b, all */
+            0xa410a000u, /* ldnf1b { z0.b }, p0/z, [x0] */
+        };
+        static uint8_t fbuf[16] __attribute__((aligned(16)));
+
+        for (size_t i = 0; i < 16; ++i) fbuf[i] = (uint8_t)(0x40u + i);
+
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[0] = (uint64_t)(uintptr_t)fbuf;
+        lata_guest_mem_clear_fault_regions(&env);
+        check(sve_run_a64_tb(ldnf1b, 3, 128, 0x0fu, false, "LDNF1B clean"),
+              1, "LDNF1B clean runs");
+        check(arm_sve_zreg(&env, 0)[0], 0x40u, "LDNF1B loads lane 0");
+        check(arm_sve_zreg(&env, 0)[15], 0x4fu, "LDNF1B loads lane 15");
+        check(arm_sve_ffr(&env)[0], 0xffu, "LDNF1B sets FFR for active lanes");
+        check(env.sve_ctrl.last_exception_index, 0,
+              "LDNF1B clean raises no exception");
+
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[0] = (uint64_t)(uintptr_t)fbuf;
+        lata_guest_mem_clear_fault_regions(&env);
+        lata_guest_mem_add_fault_region(&env, (uint64_t)(uintptr_t)&fbuf[2], 14, 0);
+        check(sve_run_a64_tb(ldnf1b, 3, 128, 0x0fu, false, "LDNF1B fault"),
+              1, "LDNF1B faulting run completes");
+        check(arm_sve_zreg(&env, 0)[0], 0x40u,
+              "LDNF1B keeps the lane before the fault");
+        check(arm_sve_ffr(&env)[0], 0x03u,
+              "LDNF1B clears FFR from the faulting lane");
+        check(env.sve_ctrl.last_exception_index, 0,
+              "LDNF1B does not raise on a faulting lane");
+
+
+
+    }
+
     latx_bare_uart_puts("lata-isa: checks=");
     putdec((uint64_t)checks);
     latx_bare_uart_puts(" fails=");

@@ -1884,6 +1884,40 @@ static void emit_inline_mem_fault_abort(const DisasContext *s,
     }
 }
 
+/*
+ * Helper calls exchange vector state through env, while inline lowering keeps
+ * it in host registers.  The rule is: env becomes authoritative around the
+ * call (flush what the host owns), and afterwards every mapped host register is
+ * reloaded from env, so the ordinary TB-exit publish writes back identical
+ * values instead of stale ones.  This single rule covers every helper-based
+ * lowering, including the fault-tolerant loads.
+ */
+static void lata_emit_vector_state_to_env(void)
+{
+    if (!latx_cpu_has_lsx()) {
+        return;
+    }
+    for (int i = 0; i <= 31; ++i) {
+        if (arm_la_fmap[i] >= 0 && lata_vreg_resident(i)) {
+            lata_env_vst(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]),
+                         env_offset_vreg(i));
+        }
+    }
+}
+
+static void lata_emit_vector_state_from_env(void)
+{
+    if (!latx_cpu_has_lsx()) {
+        return;
+    }
+    for (int i = 0; i <= 31; ++i) {
+        if (arm_la_fmap[i] >= 0) {
+            lata_env_vld(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]),
+                         env_offset_vreg(i));
+        }
+    }
+}
+
 static bool emit_sve_helper_call_body(DisasContext *s,
                                       const PvirInstruction *instruction,
                                       const A64SVEIR1Instruction *source,
@@ -2451,7 +2485,12 @@ static bool lower_fault_load(DisasContext *s,
      * suppression exactly.
      */
     if (has_index || sve_mem_direct_fast_path_declined()) {
-        return emit_sve_helper_call(s, instruction, source);
+        lata_emit_vector_state_to_env();
+        if (!emit_sve_helper_call(s, instruction, source)) {
+            return false;
+        }
+        lata_emit_vector_state_from_env();
+        return true;
     }
     fallback = lata_sve_alloc_helper_desc(s, instruction, source);
     if (fallback == NULL) {
