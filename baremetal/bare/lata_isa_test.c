@@ -25,6 +25,10 @@
 #include "target/arm/lata/include/lata-mem.h"
 #include "target/arm/lata/include/lata-snapshot.h"
 /* Declared by the translator; lata.h cannot be included here (CPU header clash). */
+/* Translator internals used by the IR2 micro-tests. */
+void lata_env_xvld(IR2_OPND vector, int offset);
+void lata_env_xvst(IR2_OPND vector, int offset);
+IR2_OPND ra_alloc_ftemp(void);
 bool lata_vreg_resident(int index);
 void lata_vreg_init_residency(void);
 void lata_vreg_clear_residency_for_test(void);
@@ -7259,6 +7263,36 @@ void kmain(void)
             }
         }
     }
+
+    /* IR2 micro-test: what does xvfcmp CUN write for a NaN lane?
+     * Lane 0 input NaN, lane 1 = 3.0f; the mask lands in Z2. */
+    {
+        DisasContext ds;
+        A64SVEPvirBuilder bs;
+        IR2_OPND a, b, m;
+
+        /* xv* instructions need LASX; skip on an LSX-only host. */
+        if (latx_cpu_has_lasx() == 0) {
+            goto cun_probe_done;
+        }
+        sve_init_direct(&ds, &bs, 128);
+        for (size_t l = 0; l < 4; ++l) {
+            write_le32(arm_sve_zreg(&env, 0) + l * 4u, 0x7fc00001u); /* qNaN */
+            write_le32(arm_sve_zreg(&env, 1) + l * 4u, 0x40400000u); /* 3.0f */
+        }
+        a = ra_alloc_ftemp();
+        b = ra_alloc_ftemp();
+        m = ra_alloc_ftemp();
+        lata_env_xvld(a, env_offset_zreg(0));
+        lata_env_xvld(b, env_offset_zreg(1));
+        la_xvfcmp_cond_s(m, a, b, FCMP_COND_CUN);
+        lata_env_xvst(m, env_offset_zreg(2));
+        /* temps are released with the translation below */
+        sve_exec_direct();
+        check(read_le64(arm_sve_zreg(&env, 2)), UINT64_MAX,
+              "xvfcmp CUN sets a mask bit in NaN lanes");
+    }
+cun_probe_done:;
 
     latx_bare_uart_puts("lata-isa: checks=");
     putdec((uint64_t)checks);
