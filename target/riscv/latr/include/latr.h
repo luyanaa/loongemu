@@ -48,6 +48,23 @@ typedef struct LatrTbInsnMap {
     LatrTbInsnSpan spans[LATR_TB_MAP_SPANS];
 } LatrTbInsnMap;
 
+typedef struct LatrRegCacheEntry {
+    int8_t temp;
+    uint8_t valid;
+    uint8_t dirty;
+    uint64_t age;
+} LatrRegCacheEntry;
+
+typedef struct LatrRegCache {
+    LatrRegCacheEntry gpr[32];
+    LatrRegCacheEntry fpr[32];
+    uint8_t itemp_borrows[6];
+    uint8_t ftemp_borrows[6];
+    uint64_t clock;
+} LatrRegCache;
+
+
+
 typedef struct TRANSLATION_DATA {
     void *curr_tb;
     uint32_t w_write_flag;
@@ -64,7 +81,7 @@ typedef struct TRANSLATION_DATA {
             uint16_t itemp_status;
             uint16_t ftemp_status;
         };
-    };
+    LatrRegCache regcache;
     uint8_t curr_ir1_skipped_eflags;
 
     /* Filled by tr_ir2_generate(), consumed by tr_ir2_assemble(). */
@@ -203,6 +220,103 @@ void free_alloc_gpr(IR2_OPND opnd);
 IR2_OPND alloc_fpr_src(int reg);
 IR2_OPND alloc_fpr_dst(int reg);
 void store_fpr_dst(int reg, IR2_OPND opnd);
+
+/* TB-local guest register cache hooks. */
+void latr_regcache_reset(void);
+void latr_regcache_flush(void);
+bool latr_regcache_evict_itemp(void);
+bool latr_regcache_evict_ftemp(void);
+void latr_regcache_prepare_fpr_write(IR2_OPND value);
+
+/*
+ * Register-cache state must agree across every control-flow edge. Flush on
+ * both branch emission and target labels: a branch can bypass the fallthrough
+ * flush immediately before its label.
+ */
+static inline IR2_INST *latr_regcache_label(IR2_OPND label)
+{
+    latr_regcache_flush();
+    return (la_label)(label);
+}
+
+static inline IR2_INST *latr_regcache_jirl(IR2_OPND rd, IR2_OPND rj,
+                                            int offset)
+{
+    latr_regcache_flush();
+    return (la_jirl)(rd, rj, offset);
+}
+
+static inline IR2_INST *latr_regcache_b(IR2_OPND label)
+{
+    latr_regcache_flush();
+    return (la_b)(label);
+}
+
+static inline IR2_INST *latr_regcache_beqz(IR2_OPND reg, IR2_OPND label)
+{
+    latr_regcache_flush();
+    return (la_beqz)(reg, label);
+}
+
+static inline IR2_INST *latr_regcache_bnez(IR2_OPND reg, IR2_OPND label)
+{
+    latr_regcache_flush();
+    return (la_bnez)(reg, label);
+}
+
+static inline IR2_INST *latr_regcache_beq(IR2_OPND lhs, IR2_OPND rhs,
+                                           IR2_OPND label)
+{
+    latr_regcache_flush();
+    return (la_beq)(lhs, rhs, label);
+}
+
+static inline IR2_INST *latr_regcache_bne(IR2_OPND lhs, IR2_OPND rhs,
+                                           IR2_OPND label)
+{
+    latr_regcache_flush();
+    return (la_bne)(lhs, rhs, label);
+}
+
+static inline IR2_INST *latr_regcache_blt(IR2_OPND lhs, IR2_OPND rhs,
+                                           IR2_OPND label)
+{
+    latr_regcache_flush();
+    return (la_blt)(lhs, rhs, label);
+}
+
+static inline IR2_INST *latr_regcache_bge(IR2_OPND lhs, IR2_OPND rhs,
+                                           IR2_OPND label)
+{
+    latr_regcache_flush();
+    return (la_bge)(lhs, rhs, label);
+}
+
+static inline IR2_INST *latr_regcache_bltu(IR2_OPND lhs, IR2_OPND rhs,
+                                            IR2_OPND label)
+{
+    latr_regcache_flush();
+    return (la_bltu)(lhs, rhs, label);
+}
+
+static inline IR2_INST *latr_regcache_bgeu(IR2_OPND lhs, IR2_OPND rhs,
+                                            IR2_OPND label)
+{
+    latr_regcache_flush();
+    return (la_bgeu)(lhs, rhs, label);
+}
+
+#define la_label(label) latr_regcache_label(label)
+#define la_jirl(rd, rj, offset) latr_regcache_jirl(rd, rj, offset)
+#define la_b(label) latr_regcache_b(label)
+#define la_beqz(reg, label) latr_regcache_beqz(reg, label)
+#define la_bnez(reg, label) latr_regcache_bnez(reg, label)
+#define la_beq(lhs, rhs, label) latr_regcache_beq(lhs, rhs, label)
+#define la_bne(lhs, rhs, label) latr_regcache_bne(lhs, rhs, label)
+#define la_blt(lhs, rhs, label) latr_regcache_blt(lhs, rhs, label)
+#define la_bge(lhs, rhs, label) latr_regcache_bge(lhs, rhs, label)
+#define la_bltu(lhs, rhs, label) latr_regcache_bltu(lhs, rhs, label)
+#define la_bgeu(lhs, rhs, label) latr_regcache_bgeu(lhs, rhs, label)
 void free_alloc_fpr(IR2_OPND opnd);
 
 uint16_t latr_guest_lduw(uint64_t address);

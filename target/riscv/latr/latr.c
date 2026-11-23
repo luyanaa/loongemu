@@ -272,10 +272,235 @@ void latr_tr_data_init(CPUArchState *env)
     env_ir2_opnd = ir2_opnd_new(IR2_OPND_GPR, la_s8);
 }
 
+static int regcache_temp_slot(int reg, bool is_fpr)
+{
+    if (reg < 0 || reg >= 32) {
+        return -1;
+    }
+    int slot = is_fpr ? reg_ftemp_reverse_map[reg]
+                      : reg_itemp_reverse_map[reg];
+    return slot >= 0 && slot < 6 ? slot : -1;
+}
+
+static LatrRegCacheEntry *regcache_entries(bool is_fpr)
+{
+    LatrRegCache *cache = &lsenv->tr_data->regcache;
+    return is_fpr ? cache->fpr : cache->gpr;
+}
+
+static uint8_t *regcache_borrows(bool is_fpr)
+{
+    LatrRegCache *cache = &lsenv->tr_data->regcache;
+    return is_fpr ? cache->ftemp_borrows : cache->itemp_borrows;
+}
+
+static LatrRegCacheEntry *regcache_owner(bool is_fpr, int temp)
+{
+    LatrRegCacheEntry *entries = regcache_entries(is_fpr);
+    for (int i = 0; i < 32; i++) {
+        if (entries[i].valid && entries[i].temp == temp) {
+            return &entries[i];
+        }
+    }
+    return NULL;
+}
+
+static void regcache_touch(LatrRegCacheEntry *entry)
+{
+    entry->age = ++lsenv->tr_data->regcache.clock;
+}
+
+static void regcache_writeback(LatrRegCacheEntry *entry, bool is_fpr)
+{
+    IR2_OPND value = ir2_opnd_new(is_fpr ? IR2_OPND_FPR : IR2_OPND_GPR,
+                                  entry->temp);
+    if (is_fpr) {
+        la_fst_d(value, env_ir2_opnd, env_offset_fpr(
+            (int)(entry - lsenv->tr_data->regcache.fpr)));
+    } else {
+        la_st_d(value, env_ir2_opnd, env_offset_gpr(
+            (int)(entry - lsenv->tr_data->regcache.gpr)));
+    }
+}
+
+static void regcache_release(LatrRegCacheEntry *entry, bool is_fpr,
+                             bool writeback)
+{
+    if (!entry->valid) {
+        return;
+    }
+    if (entry->dirty && writeback) {
+        regcache_writeback(entry, is_fpr);
+    }
+
+    int temp = entry->temp;
+    int slot = regcache_temp_slot(temp, is_fpr);
+    uint8_t *borrows = regcache_borrows(is_fpr);
+    entry->temp = -1;
+    entry->valid = 0;
+    entry->dirty = 0;
+    entry->age = 0;
+    if (slot >= 0 && borrows[slot] == 0) {
+        if (is_fpr) {
+            ra_free_ftemp(temp);
+        } else {
+            ra_free_itemp(temp);
+        }
+    }
+}
+
+static bool regcache_evict(bool is_fpr)
+{
+    LatrRegCacheEntry *entries = regcache_entries(is_fpr);
+    uint8_t *borrows = regcache_borrows(is_fpr);
+    LatrRegCacheEntry *victim = NULL;
+    bool victim_dirty = false;
+
+    /* Reuse clean entries before forcing a pending architectural write. */
+    for (int pass = 0; pass < 2 && victim == NULL; pass++) {
+        for (int i = 0; i < 32; i++) {
+            LatrRegCacheEntry *entry = &entries[i];
+            int slot;
+            if (!entry->valid || (slot = regcache_temp_slot(entry->temp,
+                                                             is_fpr)) < 0 ||
+                borrows[slot] != 0 || (pass == 0 && entry->dirty)) {
+                continue;
+            }
+            if (victim == NULL || entry->age < victim->age) {
+                victim = entry;
+                victim_dirty = entry->dirty;
+            }
+        }
+    }
+    if (victim == NULL) {
+        return false;
+    }
+    regcache_release(victim, is_fpr, victim_dirty);
+    return true;
+}
+
+void latr_regcache_reset(void)
+{
+    LatrRegCache *cache = &lsenv->tr_data->regcache;
+    memset(cache, 0, sizeof(*cache));
+    for (int i = 0; i < 32; i++) {
+        cache->gpr[i].temp = -1;
+        cache->fpr[i].temp = -1;
+    }
+}
+
+void latr_regcache_flush(void)
+{
+    LatrRegCacheEntry *gpr = regcache_entries(false);
+    LatrRegCacheEntry *fpr = regcache_entries(true);
+
+    for (int i = 0; i < 32; i++) {
+        if (gpr[i].valid && gpr[i].dirty) {
+            regcache_writeback(&gpr[i], false);
+        }
+        if (fpr[i].valid && fpr[i].dirty) {
+            regcache_writeback(&fpr[i], true);
+        }
+    }
+    for (int i = 0; i < 32; i++) {
+        regcache_release(&gpr[i], false, false);
+        regcache_release(&fpr[i], true, false);
+    }
+}
+
+bool latr_regcache_evict_itemp(void)
+{
+    return regcache_evict(false);
+}
+
+bool latr_regcache_evict_ftemp(void)
+{
+    return regcache_evict(true);
+}
+
+static void regcache_borrow(IR2_OPND value, bool is_fpr)
+{
+    int slot = regcache_temp_slot(value._reg_num, is_fpr);
+    lsassertm(slot >= 0, "guest register cache requires a temporary operand");
+    uint8_t *borrows = regcache_borrows(is_fpr);
+    lsassertm(borrows[slot] != UINT8_MAX, "register-cache borrow overflow");
+    borrows[slot]++;
+}
+
+static void regcache_free_borrow(IR2_OPND value, bool is_fpr)
+{
+    int slot = regcache_temp_slot(value._reg_num, is_fpr);
+    if (slot < 0) {
+        if (is_fpr) {
+            ra_free_ftemp(value._reg_num);
+        } else {
+            ra_free_itemp(value._reg_num);
+        }
+        return;
+    }
+    uint8_t *borrows = regcache_borrows(is_fpr);
+    if (borrows[slot] != 0) {
+        borrows[slot]--;
+        if (borrows[slot] == 0 &&
+            regcache_owner(is_fpr, value._reg_num) == NULL) {
+            if (is_fpr) {
+                ra_free_ftemp(value._reg_num);
+            } else {
+                ra_free_itemp(value._reg_num);
+            }
+        }
+    } else if (regcache_owner(is_fpr, value._reg_num) == NULL) {
+        if (is_fpr) {
+            ra_free_ftemp(value._reg_num);
+        } else {
+            ra_free_itemp(value._reg_num);
+        }
+    }
+}
+
+static void regcache_store(int reg, IR2_OPND value, bool is_fpr)
+{
+    LatrRegCacheEntry *entries = regcache_entries(is_fpr);
+    LatrRegCacheEntry *entry = &entries[reg];
+    int slot = regcache_temp_slot(value._reg_num, is_fpr);
+    lsassertm(slot >= 0, "guest register writeback requires a temporary operand");
+
+    if (entry->valid && entry->temp == value._reg_num) {
+        entry->dirty = 1;
+        regcache_touch(entry);
+        return;
+    }
+    regcache_release(entry, is_fpr, false);
+
+    LatrRegCacheEntry *old_owner = regcache_owner(is_fpr, value._reg_num);
+    if (old_owner != NULL) {
+        if (old_owner->dirty) {
+            regcache_writeback(old_owner, is_fpr);
+        }
+        old_owner->temp = -1;
+        old_owner->valid = 0;
+        old_owner->dirty = 0;
+        old_owner->age = 0;
+    }
+    entry->temp = value._reg_num;
+    entry->valid = 1;
+    entry->dirty = 1;
+    regcache_touch(entry);
+}
+
+void latr_regcache_prepare_fpr_write(IR2_OPND value)
+{
+    LatrRegCacheEntry *entry = regcache_owner(true, value._reg_num);
+    if (entry != NULL) {
+        regcache_release(entry, true, true);
+    }
+}
+
 void tr_init(void *tb)
 {
     TRANSLATION_DATA *data = lsenv->tr_data;
     data->curr_tb = tb;
+    latr_regcache_reset();
     ra_free_all();
     latr_pvir_cache_clear();
     if (data->ir2_inst_array == NULL) {
@@ -325,7 +550,9 @@ bool latr_service_sbi(CPUArchState *env, LoongemuSbi *sbi)
 void tr_fini(void)
 {
     TRANSLATION_DATA *data = lsenv->tr_data;
+    latr_regcache_flush();
     ra_free_all();
+    latr_regcache_reset();
     data->ir2_inst_num_current = 0;
     data->real_ir2_inst_num = 0;
     data->first_ir2 = NULL;
@@ -339,7 +566,21 @@ IR2_OPND alloc_gpr_src(int reg)
     if (reg == 0) {
         return zero_ir2_opnd;
     }
+
+    LatrRegCacheEntry *entry = &lsenv->tr_data->regcache.gpr[reg];
+    if (entry->valid) {
+        IR2_OPND value = ir2_opnd_new(IR2_OPND_GPR, entry->temp);
+        regcache_borrow(value, false);
+        regcache_touch(entry);
+        return value;
+    }
+
     IR2_OPND value = ra_alloc_itemp();
+    regcache_borrow(value, false);
+    entry->temp = value._reg_num;
+    entry->valid = 1;
+    entry->dirty = 0;
+    regcache_touch(entry);
     la_ld_d(value, env_ir2_opnd, env_offset_gpr(reg));
     return value;
 }
@@ -347,27 +588,47 @@ IR2_OPND alloc_gpr_src(int reg)
 IR2_OPND alloc_gpr_dst(int reg)
 {
     lsassertm(reg >= 0 && reg < 32, "invalid RISC-V destination register %d", reg);
-    return reg == 0 ? zero_ir2_opnd : ra_alloc_itemp();
+    if (reg == 0) {
+        return zero_ir2_opnd;
+    }
+    IR2_OPND value = ra_alloc_itemp();
+    regcache_borrow(value, false);
+    return value;
 }
 
 void store_gpr_dst(int reg, IR2_OPND value)
 {
     if (reg != 0) {
-        la_st_d(value, env_ir2_opnd, env_offset_gpr(reg));
+        lsassertm(reg >= 0 && reg < 32, "invalid RISC-V destination register %d", reg);
+        regcache_store(reg, value, false);
     }
 }
 
 void free_alloc_gpr(IR2_OPND value)
 {
     if (ir2_opnd_is_itemp(&value)) {
-        ra_free_itemp(value._reg_num);
+        regcache_free_borrow(value, false);
     }
 }
 
 IR2_OPND alloc_fpr_src(int reg)
 {
     lsassertm(reg >= 0 && reg < 32, "invalid RISC-V FP source register %d", reg);
+
+    LatrRegCacheEntry *entry = &lsenv->tr_data->regcache.fpr[reg];
+    if (entry->valid) {
+        IR2_OPND value = ir2_opnd_new(IR2_OPND_FPR, entry->temp);
+        regcache_borrow(value, true);
+        regcache_touch(entry);
+        return value;
+    }
+
     IR2_OPND value = ra_alloc_ftemp();
+    regcache_borrow(value, true);
+    entry->temp = value._reg_num;
+    entry->valid = 1;
+    entry->dirty = 0;
+    regcache_touch(entry);
     la_fld_d(value, env_ir2_opnd, env_offset_fpr(reg));
     return value;
 }
@@ -375,18 +636,21 @@ IR2_OPND alloc_fpr_src(int reg)
 IR2_OPND alloc_fpr_dst(int reg)
 {
     lsassertm(reg >= 0 && reg < 32, "invalid RISC-V FP destination register %d", reg);
-    return ra_alloc_ftemp();
+    IR2_OPND value = ra_alloc_ftemp();
+    regcache_borrow(value, true);
+    return value;
 }
 
 void store_fpr_dst(int reg, IR2_OPND value)
 {
-    la_fst_d(value, env_ir2_opnd, env_offset_fpr(reg));
+    lsassertm(reg >= 0 && reg < 32, "invalid RISC-V FP destination register %d", reg);
+    regcache_store(reg, value, true);
 }
 
 void free_alloc_fpr(IR2_OPND value)
 {
     if (ir2_opnd_is_ftemp(&value)) {
-        ra_free_ftemp(value._reg_num);
+        regcache_free_borrow(value, true);
     }
 }
 
@@ -433,6 +697,7 @@ bool tr_ir2_generate(TranslationBlock *tb)
 
     RiscvIR1 insns[TCG_MAX_INSNS];
     IR2_OPND labels[TCG_MAX_INSNS + 1];
+    bool labels_are_targets[TCG_MAX_INSNS + 1] = { false };
     struct {
         uint64_t pc;
         IR2_OPND label;
@@ -476,6 +741,7 @@ bool tr_ir2_generate(TranslationBlock *tb)
         uint64_t target = insns[i].pc + (int64_t)insns[i].arg.imm;
         int target_index = find_pc(insns, count, target);
         if (target_index > i) {
+            labels_are_targets[target_index] = true;
             continue;
         }
         int j;
@@ -509,18 +775,23 @@ bool tr_ir2_generate(TranslationBlock *tb)
             }
             ctx.has_target_label = true;
         }
-        la_label(labels[i]);
+        if (labels_are_targets[i]) {
+            latr_regcache_flush();
+        }
+        (la_label)(labels[i]);
         if (!latr_translate_ir1(&ctx)) {
             return false;
         }
     }
 
-    la_label(labels[count]);
+    latr_regcache_flush();
+    (la_label)(labels[count]);
     store_pc_constant(pc);
     la_jirl(zero_ir2_opnd, ra_ir2_opnd, 0);
 
     for (int i = 0; i < exit_count; i++) {
-        la_label(exits[i].label);
+        latr_regcache_flush();
+        (la_label)(exits[i].label);
         store_pc_constant(exits[i].pc);
         la_jirl(zero_ir2_opnd, ra_ir2_opnd, 0);
     }

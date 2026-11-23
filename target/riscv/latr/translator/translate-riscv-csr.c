@@ -1062,6 +1062,14 @@ static bool translate_csr(const RiscvIR1 *ir1)
     IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
     emit_csr_access_checks(csr, illegal);
 
+
+    IR2_OPND old_value = zero_ir2_opnd;
+    bool have_old_value = !csrrw || rd != 0;
+    if (have_old_value) {
+        old_value = ra_alloc_itemp();
+        load_csr(old_value, kind, csr);
+    }
+
     IR2_OPND source;
     bool free_source = false;
     if (immediate) {
@@ -1076,14 +1084,6 @@ static bool translate_csr(const RiscvIR1 *ir1)
         source = alloc_gpr_src(source_index);
         free_source = source_index != 0;
     }
-
-    IR2_OPND old_value = zero_ir2_opnd;
-    bool have_old_value = !csrrw || rd != 0;
-    if (have_old_value) {
-        old_value = ra_alloc_itemp();
-        load_csr(old_value, kind, csr);
-    }
-
     if (rd != 0 && have_old_value) {
         IR2_OPND dst = alloc_gpr_dst(rd);
         la_mov64(dst, old_value);

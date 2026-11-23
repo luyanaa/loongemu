@@ -101,6 +101,10 @@ static void free_temp(uint16_t *status, const int *reverse, int reg)
 
 IR2_OPND ra_alloc_itemp(void)
 {
+    uint16_t full = (uint16_t)((1u << itemp_status_num) - 1);
+    if ((lsenv->tr_data->itemp_status & full) == full) {
+        latr_regcache_evict_itemp();
+    }
     int reg = allocate_temp(&lsenv->tr_data->itemp_status,
                             reg_itemp_map, itemp_status_num);
     return ir2_opnd_new(IR2_OPND_GPR, reg);
@@ -108,8 +112,13 @@ IR2_OPND ra_alloc_itemp(void)
 
 IR2_OPND ra_alloc_ftemp(void)
 {
+    int count = ftemp_status_num;
+    uint16_t full = (uint16_t)((1u << count) - 1);
+    if ((lsenv->tr_data->ftemp_status & full) == full) {
+        latr_regcache_evict_ftemp();
+    }
     int reg = allocate_temp(&lsenv->tr_data->ftemp_status,
-                            reg_ftemp_map, ftemp_status_num);
+                            reg_ftemp_map, count);
     return ir2_opnd_new(IR2_OPND_FPR, reg);
 }
 

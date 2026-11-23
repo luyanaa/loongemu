@@ -353,7 +353,7 @@ RISC-V 有 31 个可写 GPR（x0 恒零）。LATA 的 A64 映射只直映 21 个
 - `sp` 必须映射到可用的 LA 寄存器（不能是 host `$sp`）；TB 出口/helper 前后要与 env 同步。
 - `ra` 是普通 guest 寄存器；LATR 不用 `$ra` 做 guest x0（那是 LATA 的 A64 特例）。
 - spilled guest 寄存器通过 `la_ld_d/la_st_d` 访问 env，复用 LATA 的 `alloc_gpr_src/dst` 模式。
-- `$t0-$t5` 作为 itemp 时，不能同时作为 guest 映射；helper 调用前后要保存/恢复 guest 映射。
+- `$t0-$t5` 作为 itemp 时不能同时作为 guest 映射；spill GPR/FPR 使用 TB-local 6-itemp 缓存，clean-first LRU 淘汰，helper/jirl、原子操作、控制流边/目标标签和 TB exit 前写回 env。env 不与 guest memory alias，普通访存本身无需 flush；resolver/helper 和 store-lock 原子边界仍会 flush。
 - **重写 `reg_statics_map`**：LATA 把 `S_UD0/S_UD1` 放在 `$fp/$r21`（`target/arm/lata/translator/reg-alloc.c`），而本表把这两个寄存器分给 guest x3/x4。LATR 不能沿用这两个 statics；要么删掉未使用的 `S_UD*`，要么把它们指到不用的槽。`S_ENV=$s8`、`S_EFLAGS` 对 RISC-V 无意义（RISC-V 无 flags），只保留 `S_ENV`。
 - **helper 返回值一律用 `uint64_t`**：LoongArch 的 C ABI 对 `int` 只保证 `$a0` 的低 32 位，高半仍是调用方留下的残值（这里就是 env 指针）。生成代码若用 `beqz $a0` 判成功/失败，高半非零时会把成功误判成失败——`latr_riscv_fp_rmm` 曾因此在 `fadd.s ..., rmm` 之后直接 `raise_illegal` 并退出 TB，表现为"helper 算出了正确结果，落到 env 里却全是旧值"。返回值类型统一成 64 位之外，生成侧仍加一条 `bstrpick.d $a0, $a0, 31, 0` 作双保险。
 

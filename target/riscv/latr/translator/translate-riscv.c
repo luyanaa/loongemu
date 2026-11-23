@@ -39,6 +39,7 @@ typedef struct LatrStoreLock {
 
 static LatrStoreLock emit_store_lock_acquire(void)
 {
+    latr_regcache_flush();
     LatrStoreLock lock = {
         .address = ra_alloc_itemp(),
         .epoch = ra_alloc_itemp(),
@@ -451,6 +452,7 @@ static void emit_mmio_atomic_guard(const RiscvIR1 *ir1)
 
 static void emit_amo(const RiscvIR1 *ir1, LatrAmoOp op, bool word)
 {
+    latr_regcache_flush();
     IR2_OPND address = alloc_gpr_src(ir1->arg.rs1);
     IR2_OPND source = alloc_gpr_src(ir1->arg.rs2);
     IR2_OPND fault = ir2_opnd_new_type(IR2_OPND_LABEL);
@@ -461,6 +463,7 @@ static void emit_amo(const RiscvIR1 *ir1, LatrAmoOp op, bool word)
     latr_env_store_d(source, env_offset_mem_value());
     free_alloc_gpr(source);
     latr_emit_resolve(address, LATR_ACCESS_STORE, size);
+    free_alloc_gpr(address);
     latr_emit_branch_on_fault(fault);
     emit_mmio_atomic_guard(ir1);
 
@@ -497,6 +500,7 @@ static void emit_amo(const RiscvIR1 *ir1, LatrAmoOp op, bool word)
 
 static void emit_lr(const RiscvIR1 *ir1, bool word)
 {
+    latr_regcache_flush();
     IR2_OPND address = alloc_gpr_src(ir1->arg.rs1);
     IR2_OPND fault = ir2_opnd_new_type(IR2_OPND_LABEL);
     IR2_OPND inval = ir2_opnd_new_type(IR2_OPND_LABEL);
@@ -506,6 +510,7 @@ static void emit_lr(const RiscvIR1 *ir1, bool word)
 
     emit_aligned_or_trap(ir1, address, size, false);
     latr_emit_resolve(address, LATR_ACCESS_LOAD, size);
+    free_alloc_gpr(address);
     latr_emit_branch_on_fault(fault);
     emit_mmio_atomic_guard(ir1);
 
@@ -560,6 +565,7 @@ static void emit_lr(const RiscvIR1 *ir1, bool word)
 
 static void emit_sc(const RiscvIR1 *ir1, bool word)
 {
+    latr_regcache_flush();
     IR2_OPND address = alloc_gpr_src(ir1->arg.rs1);
     IR2_OPND value = alloc_gpr_src(ir1->arg.rs2);
     IR2_OPND fault = ir2_opnd_new_type(IR2_OPND_LABEL);
@@ -572,13 +578,16 @@ static void emit_sc(const RiscvIR1 *ir1, bool word)
     latr_env_store_d(value, env_offset_mem_value());
     free_alloc_gpr(value);
     latr_emit_resolve(address, LATR_ACCESS_STORE, size);
+    free_alloc_gpr(address);
     latr_emit_branch_on_fault(fault);
     emit_mmio_atomic_guard(ir1);
 
     /* Five live temporaries at most: result, scratch and the three lock
      * registers. The comparison reuses result/scratch so the six-register
      * itemp pool never overflows. */
-    IR2_OPND result = ra_alloc_itemp();
+    IR2_OPND result = ir1->arg.rd == 0
+                          ? ra_alloc_itemp()
+                          : alloc_gpr_dst(ir1->arg.rd);
     IR2_OPND scratch = ra_alloc_itemp();
     LatrStoreLock lock = emit_store_lock_acquire();
 
@@ -621,7 +630,11 @@ static void emit_sc(const RiscvIR1 *ir1, bool word)
     store_gpr_dst(ir1->arg.rd, result);
     emit_store_lock_release_sc(lock, result);
     ra_free_temp(scratch);
-    ra_free_temp(result);
+    if (ir1->arg.rd == 0) {
+        ra_free_temp(result);
+    } else {
+        free_alloc_gpr(result);
+    }
     la_b(tail);
     la_label(fault);
     latr_raise_mem_fault(ir1);

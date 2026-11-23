@@ -545,6 +545,7 @@ static void emit_broadcast_scalar(IR2_OPND b_vec, const RiscvIR1 *ir1,
         emit_repl_gpr(b_vec, src, sew_shift, lasx);
         free_alloc_gpr(src);
     } else if (m->src_kind == DIRECT_SRC_VF) {
+        latr_regcache_flush();
         IR2_OPND val = ra_alloc_itemp();
         latr_env_load_d(val, env_offset_fpr(ir1->arg.rs1 & 31));
         if (sew_shift == 2u) {

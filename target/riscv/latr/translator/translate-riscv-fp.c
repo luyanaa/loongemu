@@ -168,6 +168,7 @@ static void emit_fp_set_guest_nv(void)
 /* QEMU's check_nanbox_s turns every malformed S register into canonical qNaN. */
 static void emit_check_nanbox_s(IR2_OPND value)
 {
+    latr_regcache_prepare_fpr_write(value);
     IR2_OPND raw = ra_alloc_itemp();
     IR2_OPND valid = ra_alloc_itemp();
     IR2_OPND mask = ra_alloc_itemp();
