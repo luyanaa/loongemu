@@ -1689,6 +1689,38 @@ static void gen_never_reach(DisasContext *ctx, const char* msg)
  * These are all essentially the same insn in 'read' and 'write'
  * versions, with varying op0 fields.
  */
+/*
+ * The bare-metal build has no host cp_regs registry, so the few system
+ * registers LATA models itself are served from here.
+ */
+static const ARMCPRegInfo lata_fpcr_reginfo = {
+    .name = "FPCR",
+    .type = 0,
+    .fieldoffset = offsetof(CPUARMState, vfp.xregs[ARM_VFP_FPCR]),
+};
+
+static const ARMCPRegInfo lata_fpsr_reginfo = {
+    .name = "FPSR",
+    .type = 0,
+    .fieldoffset = offsetof(CPUARMState, vfp.xregs[ARM_VFP_FPSR]),
+};
+
+static const ARMCPRegInfo *lata_local_sysreg(uint32_t key)
+{
+    const uint32_t fpcr_key =
+        ENCODE_AA64_CP_REG(CP_REG_ARM64_SYSREG_CP, 4, 4, 3, 3, 0);
+    const uint32_t fpsr_key =
+        ENCODE_AA64_CP_REG(CP_REG_ARM64_SYSREG_CP, 4, 4, 3, 3, 1);
+
+    if (key == fpcr_key) {
+        return &lata_fpcr_reginfo;
+    }
+    if (key == fpsr_key) {
+        return &lata_fpsr_reginfo;
+    }
+    return NULL;
+}
+
 static void handle_sys(DisasContext *s, bool isread,
                        unsigned int op0, unsigned int op1, unsigned int op2,
                        unsigned int crn, unsigned int crm, unsigned int rt)
@@ -1696,6 +1728,10 @@ static void handle_sys(DisasContext *s, bool isread,
     uint32_t key = ENCODE_AA64_CP_REG(CP_REG_ARM64_SYSREG_CP,
                                       crn, crm, op0, op1, op2);
     const ARMCPRegInfo *ri = get_arm_cp_reginfo(s->cp_regs, key);
+
+    if (ri == NULL) {
+        ri = lata_local_sysreg(key);
+    }
     bool need_exit_tb = false;
     void *la_ri = NULL;
 
@@ -1873,6 +1909,28 @@ static void handle_sys(DisasContext *s, bool isread,
             else
             {
                 la_st_d(reg_t, env_ir2_opnd, ri->fieldoffset);
+            }
+            if (ri == &lata_fpcr_reginfo) {
+                /*
+                 * The rounding mode takes effect for the very next
+                 * instruction, but the host FCSR is only programmed at block
+                 * entry, so apply it here as well.
+                 */
+                IR2_OPND rm = ra_alloc_itemp();
+                IR2_OPND sel = ra_alloc_itemp();
+
+                li_d(rm, ri->fieldoffset);
+                la_ldx_wu(rm, env_ir2_opnd, rm);
+                la_bstrpick_d(rm, rm, 23, 22);
+                /* Map the 2-bit RMode onto the FCSR rounding field. */
+                li_d(sel, 1 << 6 | 3 << 4 | 2 << 2 | 0);
+                la_slli_d(rm, rm, 1);
+                la_srl_d(rm, sel, rm);
+                la_andi(rm, rm, 0x3);
+                la_slli_d(rm, rm, 8);
+                la_movgr2fcsr(fcsr_ir2_opnd, rm);
+                ra_free_temp(sel);
+                ra_free_temp(rm);
             }
         }
 

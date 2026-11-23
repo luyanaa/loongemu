@@ -798,8 +798,8 @@ static void generate_context_switch_bt_to_native(void)
     la_mov64(a0_ir2_opnd, a1_ir2_opnd);
 
     /* NZCV remains in env->pstate; context entry does not use LBT flags. */
-    /* set fcsr, rm set by FPSCR[23:22], others was cleared */
-    li_d(a5_ir2_opnd, env_offset_FPSCR());
+    /* set fcsr, rm set by FPCR[23:22] (the AArch64 location), rest cleared */
+    li_d(a5_ir2_opnd, env_offset_FPCR());
     la_ldx_wu(a7_ir2_opnd, env_ir2_opnd, a5_ir2_opnd);
     la_bstrpick_d(a7_ir2_opnd, a7_ir2_opnd, 23, 22);
     li_d(a6_ir2_opnd, 1 << 6 | 3 << 4 | 2 << 2 | 0);
@@ -904,6 +904,11 @@ static void generate_context_switch_native_to_bt(void)
     la_srl_d(t0_ir2_opnd, t1_ir2_opnd, t0_ir2_opnd);
     la_andi(t0_ir2_opnd, t0_ir2_opnd, 0x3);
     li_d(t2_ir2_opnd, env_offset_FPSCR());
+    la_ldx_wu(t1_ir2_opnd, env_ir2_opnd, t2_ir2_opnd);
+    la_bstrins_d(t1_ir2_opnd, t0_ir2_opnd, 23, 22);
+    la_stx_w(t1_ir2_opnd, env_ir2_opnd, t2_ir2_opnd);
+    /* FPCR is the architectural home of the rounding mode on AArch64. */
+    li_d(t2_ir2_opnd, env_offset_FPCR());
     la_ldx_wu(t1_ir2_opnd, env_ir2_opnd, t2_ir2_opnd);
     la_bstrins_d(t1_ir2_opnd, t0_ir2_opnd, 23, 22);
     la_stx_w(t1_ir2_opnd, env_ir2_opnd, t2_ir2_opnd);

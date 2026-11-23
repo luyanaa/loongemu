@@ -7130,6 +7130,61 @@ void kmain(void)
         check(read_le32(npbuf + 4), 0x44444444u, "narrow STP stores the second half");
     }
 
+    /* Reconnaissance: does the translator model MRS/MSR of FPCR and FPSR? */
+    {
+        static uint32_t fpc[] __attribute__((aligned(16))) = {
+            0xd51b4400u, /* msr FPCR, x0 */
+            0xd53b4401u, /* mrs x1, FPCR */
+        };
+        static uint32_t fps[] __attribute__((aligned(16))) = {
+            0xd53b4422u, /* mrs x2, FPSR */
+            0xd51b4423u, /* msr FPSR, x3 */
+        };
+
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[0] = UINT64_C(0x00c00000); /* FPCR.RMode = RZ */
+        check(sve_run_a64_tb(fpc, 2, 128, 0x0fu, false, "FPCR access"),
+              1, "MSR/MRS FPCR translate");
+        latx_bare_uart_puts("dbg fpcr read="); puthex(env.xregs[1]);
+        latx_bare_uart_puts("\n");
+
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[3] = UINT64_C(0x11);
+        check(sve_run_a64_tb(fps, 2, 128, 0x0fu, false, "FPSR access"),
+              1, "MSR/MRS FPSR translate");
+        latx_bare_uart_puts("dbg fpsr read="); puthex(env.xregs[2]);
+        latx_bare_uart_puts("\n");
+    }
+
+    /* FPCR rounding mode must reach the arithmetic: 1.0/3.0 rounds to ...ab
+     * (RNE) by default and truncates to ...aa under RZ. */
+    {
+        static uint32_t fdiv_s[] __attribute__((aligned(16))) = {
+            0x1e221820u, /* fdiv s0, s1, s2 */
+        };
+        static uint32_t set_rz[] __attribute__((aligned(16))) = {
+            0xd51b4400u, /* msr FPCR, x0 */
+            0x1e221820u, /* fdiv s0, s1, s2 */
+        };
+
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        write_le32(arm_sve_zreg(&env, 1), 0x3f800000u); /* 1.0 */
+        write_le32(arm_sve_zreg(&env, 2), 0x40400000u); /* 3.0 */
+        check(sve_run_a64_tb(fdiv_s, 1, 128, 0x0fu, false, "FPCR default RNE"),
+              1, "1.0/3.0 runs with the default mode");
+        check(read_le32(arm_sve_zreg(&env, 0)), UINT32_C(0x3eaaaaab),
+              "default rounding is round-to-nearest-even");
+
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[0] = UINT64_C(0x00c00000); /* FPCR.RMode = RZ */
+        write_le32(arm_sve_zreg(&env, 1), 0x3f800000u);
+        write_le32(arm_sve_zreg(&env, 2), 0x40400000u);
+        check(sve_run_a64_tb(set_rz, 2, 128, 0x0fu, false, "FPCR RZ"),
+              1, "1.0/3.0 runs under RZ");
+        check(read_le32(arm_sve_zreg(&env, 0)), UINT32_C(0x3eaaaaaa),
+              "FPCR.RMode=RZ truncates the quotient");
+    }
+
     latx_bare_uart_puts("lata-isa: checks=");
     putdec((uint64_t)checks);
     latx_bare_uart_puts(" fails=");

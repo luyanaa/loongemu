@@ -167,6 +167,7 @@ static inline int arm_sve_evaluate_excp_el(const CPUARMState *env,
 }
 
 #define ARM_VFP_FPSCR 1
+#define ARM_VFP_FPCR 0
 /* FPSR lives in the legacy vfp.xregs array, like QEMU's CPUARMState. */
 #define ARM_VFP_FPSR 8
 #undef env_archcpu
