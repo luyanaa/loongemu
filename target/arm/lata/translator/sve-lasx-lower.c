@@ -1260,6 +1260,8 @@ static bool lower_integer_binary(
     return true;
 }
 
+int lata_last_fp_route = 0;
+
 static bool lower_fp_binary(DisasContext *s,
                             const A64SVEIR1Instruction *source,
                             const PvirInstruction *instruction)
@@ -1276,6 +1278,7 @@ static bool lower_fp_binary(DisasContext *s,
     bool expanded_mask_cache_hit;
     A64SVEPredicateMaskCacheKey expanded_mask_key;
 
+    lata_last_fp_route = 1;
     switch (source->insn_type) {
     case AARCH64_A64_SVE_FADD:
         binary = &source->arg.f_sve_fadd;
@@ -1974,6 +1977,7 @@ static bool emit_sve_helper_call(DisasContext *s,
                                  const PvirInstruction *instruction,
                                  const A64SVEIR1Instruction *source)
 {
+    lata_last_fp_route = 3;
     const LataSVEHelperDesc *desc =
         lata_sve_alloc_helper_desc(s, instruction, source);
 

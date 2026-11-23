@@ -7229,6 +7229,37 @@ void kmain(void)
         check(read_le32(arm_sve_zreg(&env, 0)), 0u, "UQSUB clamps to zero");
     }
 
+    /* Path mapping: which lowering actually handles each SVE FP instruction. */
+    {
+        static const struct { uint32_t word; const char *name; int route; }
+        insns[] = {
+            { 0x65808440u, "FADD z0.s", 1 },
+            { 0x658d8440u, "FDIV z0.s", 1 },
+            { 0x65878440u, "FMIN z0.s", 0 },
+            { 0x65868440u, "FMAX z0.s", 0 },
+            { 0x65848440u, "FMAXNM z0.s", 0 },
+            { 0x65828440u, "FMINNM z0.s", 1 },
+        };
+        DisasContext ds;
+        A64SVEPvirBuilder bs;
+
+        for (size_t i = 0; i < sizeof(insns) / sizeof(insns[0]); ++i) {
+            extern int lata_last_fp_route;
+            for (size_t b = 0; b < sizeof(env); ++b) ((uint8_t *)&env)[b] = 0;
+            sve_init_direct(&ds, &bs, 256);
+            arm_sve_preg(&env, 1)[0] = 0x11u;
+            lata_last_fp_route = 0;
+            (void)sve_emit_decoded(&ds, insns[i].word, insns[i].name);
+            /* Routes differ without LASX: the SVE lowerings are unavailable and
+             * the helper path is taken, so only assert the table where the
+             * inline lowerings exist. */
+            if (latx_cpu_has_lasx() != 0) {
+                check((uint64_t)lata_last_fp_route, (uint64_t)insns[i].route,
+                      insns[i].name);
+            }
+        }
+    }
+
     latx_bare_uart_puts("lata-isa: checks=");
     putdec((uint64_t)checks);
     latx_bare_uart_puts(" fails=");
