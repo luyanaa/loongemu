@@ -169,11 +169,45 @@ static LataGuestMemStatus default_store(CPUARMState *env, uint64_t vaddr,
  * lowering then has no fast path to emit and every access goes through
  * probe/load/store, which report an architectural status.
  */
+static LataGuestMemStatus default_load_bytes(CPUARMState *env, uint64_t vaddr,
+                                             void *dst, size_t size)
+{
+    LataGuestMemStatus st = default_probe(env, vaddr, size, false, false);
+
+    if (st != LATA_MEM_OK) {
+        return st;
+    }
+    if (dst == NULL || size == 0) {
+        return LATA_MEM_FAULT_TRANSLATION;
+    }
+    memcpy(dst, (const void *)(uintptr_t)vaddr, size);
+    return LATA_MEM_OK;
+}
+
+static LataGuestMemStatus default_store_bytes(CPUARMState *env, uint64_t vaddr,
+                                              const void *src, size_t size)
+{
+    LataGuestMemStatus st = default_probe(env, vaddr, size, true, false);
+
+    if (st != LATA_MEM_OK) {
+        return st;
+    }
+    if (src == NULL || size == 0) {
+        return LATA_MEM_FAULT_TRANSLATION;
+    }
+    memcpy((void *)(uintptr_t)vaddr, src, size);
+    return LATA_MEM_OK;
+}
+
 const LataGuestMemOps lata_default_guest_mem_ops = {
     .probe = default_probe,
     .load = default_load,
     .store = default_store,
+    .load_bytes = default_load_bytes,
+    .store_bytes = default_store_bytes,
     .direct = NULL,
+    /* Controlled bare-metal environment: guest VAs are host VAIs. */
+    .va_is_hpa_identity = true,
 };
 
 void lata_set_guest_mem_ops(const LataGuestMemOps *ops)
@@ -233,6 +267,17 @@ static const LataGuestMemDirectPolicy *direct_policy(void)
 bool lata_guest_mem_direct_available(void)
 {
     return direct_policy() != NULL;
+}
+
+/* Inline host access needs either a published policy or the identity claim. */
+bool lata_guest_mem_inline_host_access_ok(void)
+{
+    const LataGuestMemOps *ops = lata_get_guest_mem_ops();
+
+    if (ops == NULL) {
+        return false;
+    }
+    return ops->direct != NULL || ops->va_is_hpa_identity;
 }
 
 static CPUARMState *mapping_env(void)

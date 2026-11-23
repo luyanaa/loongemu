@@ -19,7 +19,8 @@ BASE := --target=$(TARGET) -ffreestanding -nostdinc -fno-builtin \
 CFLAGS := $(BASE) $(INCS) $(DEFS)
 
 SRCS := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \
-        $(LATA)/mem.c $(LATA)/pvir.c $(LATA)/lata.c runtime.c \
+        $(LATA)/mem.c $(LATA)/pvir.c $(LATA)/lata.c \
+        $(LATA)/ftemp-snapshot.c $(LATA)/fpsr.c runtime.c \
         $(LATA)/optimization/clear-high.c $(LATA)/optimization/insts-pattern.c \
         $(LATA)/optimization/tu.c glib_tree.c \
         $(LATA)/ir1/ir1.c $(LATA)/ir1/sve-decode.c $(LATA)/ir1/sve-pvir.c \

@@ -866,6 +866,36 @@ static void generate_context_switch_native_to_bt(void)
         la_st_w(zero_ir2_opnd, t0_ir2_opnd, 0);
     }
     /* NZCV remains in env->pstate; context exit does not use LBT flags. */
+    /*
+     * Accumulate the host exception flags into the guest FPSR while env is
+     * still live in its register (the callee-saved restores below drop it).
+     * LoongArch keeps V/Z/O/U/I in FCSR bits 4..0; the guest wants
+     * IOC/DZC/OFC/UFC/IXC in bits 0..4, so build the reversed word by hand.
+     */
+    la_movfcsr2gr(t0_ir2_opnd, fcsr_ir2_opnd);
+    /* FCSR0 bits 20:16 hold V/Z/O/U/I; bits 4:0 are the enables. */
+    la_srli_d(t0_ir2_opnd, t0_ir2_opnd, 16);
+    la_srli_d(t1_ir2_opnd, t0_ir2_opnd, 4);
+    la_andi(t1_ir2_opnd, t1_ir2_opnd, 1);
+    la_srli_d(t2_ir2_opnd, t0_ir2_opnd, 3);
+    la_andi(t2_ir2_opnd, t2_ir2_opnd, 1);
+    la_slli_d(t2_ir2_opnd, t2_ir2_opnd, 1);
+    la_add_d(t1_ir2_opnd, t1_ir2_opnd, t2_ir2_opnd);
+    la_srli_d(t2_ir2_opnd, t0_ir2_opnd, 2);
+    la_andi(t2_ir2_opnd, t2_ir2_opnd, 1);
+    la_slli_d(t2_ir2_opnd, t2_ir2_opnd, 2);
+    la_add_d(t1_ir2_opnd, t1_ir2_opnd, t2_ir2_opnd);
+    la_srli_d(t2_ir2_opnd, t0_ir2_opnd, 1);
+    la_andi(t2_ir2_opnd, t2_ir2_opnd, 1);
+    la_slli_d(t2_ir2_opnd, t2_ir2_opnd, 3);
+    la_add_d(t1_ir2_opnd, t1_ir2_opnd, t2_ir2_opnd);
+    la_andi(t2_ir2_opnd, t0_ir2_opnd, 1);
+    la_slli_d(t2_ir2_opnd, t2_ir2_opnd, 4);
+    la_add_d(t1_ir2_opnd, t1_ir2_opnd, t2_ir2_opnd);
+    li_d(t2_ir2_opnd, env_offset_fpsr());
+    la_ldx_wu(t0_ir2_opnd, env_ir2_opnd, t2_ir2_opnd);
+    la_add_d(t0_ir2_opnd, t0_ir2_opnd, t1_ir2_opnd);
+    la_stx_w(t0_ir2_opnd, env_ir2_opnd, t2_ir2_opnd);
     /* store fcsr(rouding mode) to vfp.xregs[ARM_VFP_FPSCR] */
     la_movfcsr2gr(t0_ir2_opnd, fcsr3_ir2_opnd);
     li_d(t1_ir2_opnd, 2 << 6 | 1 << 4 | 3 << 2 | 0);
@@ -894,7 +924,6 @@ static void generate_context_switch_native_to_bt(void)
 
     la_addi_d(sp_ir2_opnd, sp_ir2_opnd, 256);
 
-    /* TODO: clear fcsr*/
     la_movgr2fcsr(fcsr_ir2_opnd, zero_ir2_opnd);
 
     la_jirl(zero_ir2_opnd, ra_ir2_opnd, 0);
@@ -1555,7 +1584,14 @@ void lata_ir2_snapshot_take(LataIr2Snapshot *snap)
     TRANSLATION_DATA *t;
     LataContext *ctx = lata_context_current();
 
-    if (snap == NULL || lsenv == NULL || lsenv->tr_data == NULL) {
+    if (snap == NULL || ctx == NULL) {
+        return;
+    }
+    /* The temp pool lives in the context, so it is snapshot-able even when no
+     * translation is active.  Spills grow it permanently for the TB; a
+     * rollback that kept the growth would leave stale phy<->slot maps behind. */
+    lata_ftemp_pool_snapshot(ctx, snap);
+    if (lsenv == NULL || lsenv->tr_data == NULL) {
         return;
     }
     t = lsenv->tr_data;
@@ -1586,7 +1622,11 @@ void lata_ir2_snapshot_rollback(const LataIr2Snapshot *snap)
     TRANSLATION_DATA *t;
     LataContext *ctx = lata_context_current();
 
-    if (snap == NULL || lsenv == NULL || lsenv->tr_data == NULL) {
+    if (snap == NULL || ctx == NULL) {
+        return;
+    }
+    lata_ftemp_pool_rollback(ctx, snap);
+    if (lsenv == NULL || lsenv->tr_data == NULL) {
         return;
     }
     t = lsenv->tr_data;

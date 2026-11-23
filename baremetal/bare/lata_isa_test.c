@@ -23,6 +23,19 @@
 #include "target/arm/lata/ir1/sve-pvir.h"
 #include "target/arm/lata/translator/sve-lasx-lower.h"
 #include "target/arm/lata/include/lata-mem.h"
+#include "target/arm/lata/include/lata-snapshot.h"
+/* Declared by the translator; lata.h cannot be included here (CPU header clash). */
+bool lata_vreg_resident(int index);
+void lata_vreg_init_residency(void);
+void lata_vreg_clear_residency_for_test(void);
+int lata_vreg_spill_cold(void);
+uint32_t lata_vreg_spills(void);
+uint32_t lata_vreg_resident_count(void);
+void lata_ftemp_set_base_pool(int pool);
+bool ra_ftemp_phys_in_pool(int phys);
+IR2_OPND ra_alloc_ftemp(void);
+bool lata_ir2_ftemp_pool_state_matches(const LataIr2Snapshot *snap);
+int lata_vreg_partition_violations(void);
 #include "lata-vcache.h"
 /* Declared locally: including lata.h clashes with the fixture CPU types. */
 typedef struct LataContext LataContext;
@@ -2009,6 +2022,171 @@ static void run_sve_minmax_chunk_runtime(uint16_t vl_bits, unsigned zd,
     }
 }
 
+/* Parameterised SVE integer-binop differential: synthesise the encoding from
+ * (op, size, VL) and compare the whole Z register against a C model. */
+typedef struct {
+    uint32_t base;
+    const char *name;
+    int kind; /* 0 add 1 sub 2 mul 3 and 4 orr 5 eor 6 shl 7 shr 8 sar
+                 9 smax 10 umax 11 smin 12 umin */
+} SveBinopDesc;
+
+/* Same registers the existing chunk fixtures use: they are not resident, so
+ * alloc_fpr_src() hands out a temp that the lowering can free. */
+#define SVE_FUZZ_ZD 10u
+#define SVE_FUZZ_ZM 11u
+
+static const SveBinopDesc sve_binops[] = {
+    { 0x04000000u, "ADD", 0 },  { 0x04010000u, "SUB", 1 },
+    { 0x04100000u, "MUL", 2 },  { 0x041a0000u, "AND", 3 },
+    { 0x04180000u, "ORR", 4 },  { 0x04190000u, "EOR", 5 },
+    { 0x04138000u, "LSL", 6 },  { 0x04118000u, "LSR", 7 },
+    { 0x04108000u, "ASR", 8 },  { 0x04080000u, "SMAX", 9 },
+    { 0x04090000u, "UMAX", 10 }, { 0x040a0000u, "SMIN", 11 },
+    { 0x040b0000u, "UMIN", 12 },
+};
+
+static bool sve_run_a64_tb(uint32_t *guest, int insns, uint16_t vl_bits,
+                           uint64_t euen, bool init_zero, const char *what);
+
+static uint64_t sve_fuzz_state = 0x9e3779b97f4a7c15ULL;
+
+static uint64_t sve_fuzz_rand(void)
+{
+    uint64_t x = sve_fuzz_state;
+
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    sve_fuzz_state = x;
+    return x;
+}
+
+static uint64_t sve_elem_mask(unsigned bits)
+{
+    return (bits >= 64) ? UINT64_MAX : ((UINT64_C(1) << bits) - 1);
+}
+
+static int64_t sve_elem_signed(uint64_t v, unsigned bits)
+{
+    uint64_t sign = UINT64_C(1) << (bits - 1);
+    uint64_t mask = sve_elem_mask(bits);
+
+    v &= mask;
+    return (v & sign) ? (int64_t)(v | ~mask) : (int64_t)v;
+}
+
+static void run_sve_binop_fuzz(void)
+{
+    for (size_t op = 0; op < sizeof(sve_binops) / sizeof(sve_binops[0]); ++op) {
+        for (unsigned size = 0; size < 4; ++size) {
+            static const uint16_t vls[] = { 128, 256 };
+            unsigned bits = 8u << size;
+            for (size_t vi = 0; vi < sizeof(vls) / sizeof(vls[0]); ++vi) {
+                uint16_t vl_bits = vls[vi];
+                size_t vl_bytes = vl_bits / 8u;
+                size_t lanes = vl_bytes / (bits / 8u);
+                size_t active_lanes = lanes / 2u + 1u;
+                uint32_t guest[1];
+                uint8_t orig[ARM_SVE_MAX_VL_BYTES];
+                uint8_t rhs[ARM_SVE_MAX_VL_BYTES];
+                bool ok = true;
+
+                for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+                for (size_t b = 0; b < vl_bytes; ++b) {
+                    orig[b] = (uint8_t)sve_fuzz_rand();
+                    rhs[b] = (uint8_t)sve_fuzz_rand();
+                    arm_sve_zreg(&env, SVE_FUZZ_ZD)[b] = orig[b];
+                    arm_sve_zreg(&env, SVE_FUZZ_ZM)[b] = rhs[b];
+                }
+                /* Same predicate image the proven chunk fixtures build: set the
+                 * element's first byte bit for active lanes, leave the rest
+                 * clear.  arm_sve_set_vl() must run first or it can clear it. */
+                check(arm_sve_set_vl(&env, vl_bits), 1, "fuzz VL is valid");
+                for (size_t lane = 0; lane < lanes; ++lane) {
+                    size_t bit = lane * (bits / 8u);
+                    uint8_t *p = &arm_sve_preg(&env, 7)[bit / 8u];
+                    *p = (uint8_t)((*p & ~(1u << (bit % 8u))) |
+                                   ((lane < active_lanes) ? (1u << (bit % 8u)) : 0));
+                }
+                guest[0] = sve_binops[op].base | ((uint32_t)size << 22) |
+                           (7u << 10) |
+                           ((uint32_t)SVE_FUZZ_ZM << 5) |
+                           (uint32_t)SVE_FUZZ_ZD;
+                if (!sve_run_a64_tb(guest, 1, vl_bits, 0x0fu, false,
+                                    "sve binop fuzz")) {
+                    continue;
+                }
+                for (size_t lane = 0; lane < lanes; ++lane) {
+                    unsigned shift = bits - 1u;
+                    uint64_t mask = sve_elem_mask(bits);
+                    uint64_t a = 0, b = 0, want, got;
+                    size_t off = lane * (bits / 8u);
+
+                    for (unsigned k = 0; k < bits / 8u; ++k) {
+                        a |= (uint64_t)orig[off + k] << (8u * k);
+                        b |= (uint64_t)rhs[off + k] << (8u * k);
+                    }
+                    a &= mask;
+                    b &= mask;
+                    switch (sve_binops[op].kind) {
+                    case 0: want = (a + b) & mask; break;
+                    case 1: want = (a - b) & mask; break;
+                    case 2: want = (a * b) & mask; break;
+                    case 3: want = a & b; break;
+                    case 4: want = a | b; break;
+                    case 5: want = a ^ b; break;
+                    case 6: want = (a << (b & shift)) & mask; break;
+                    case 7: want = (a & mask) >> (b & shift); break;
+                    case 8:
+                        want = (uint64_t)(sve_elem_signed(a, bits) >>
+                                          (b & shift)) & mask;
+                        break;
+                    case 9:
+                        want = (sve_elem_signed(a, bits) >
+                                sve_elem_signed(b, bits)) ? a : b;
+                        break;
+                    case 11:
+                        want = (sve_elem_signed(a, bits) <
+                                sve_elem_signed(b, bits)) ? a : b;
+                        break;
+                    default:
+                        want = (a > b) ? a : b;
+                        if (sve_binops[op].kind == 12) {
+                            want = (a < b) ? a : b;
+                        }
+                        break;
+                    }
+                    if (lane >= active_lanes) {
+                        want = a; /* merge */
+                    }
+                    got = 0;
+                    for (unsigned k = 0; k < bits / 8u; ++k) {
+                        got |= (uint64_t)arm_sve_zreg(&env, SVE_FUZZ_ZD)[off + k]
+                               << (8u * k);
+                    }
+                    got &= mask;
+                    if (got != want) {
+                        if (ok) {
+                            latx_bare_uart_puts("fuzz-miss ");
+                            latx_bare_uart_puts(sve_binops[op].name);
+                            latx_bare_uart_puts(" size=");
+                            putdec(bits);
+                            latx_bare_uart_puts(" vl=");
+                            putdec(vl_bits);
+                            latx_bare_uart_puts(" lane=");
+                            putdec(lane);
+                            latx_bare_uart_puts("\n");
+                        }
+                        ok = false;
+                    }
+                }
+                check(ok, 1, "SVE binop differential matches the C model");
+            }
+        }
+    }
+}
+
 /* Byte-element /M ADD: exercises the 8-bit branch of lower_integer_binary,
  * which the 32-bit chunk helper never reaches. */
 static void run_sve_integer_chunk_b(uint16_t vl_bits, unsigned zd, unsigned zm,
@@ -2156,6 +2334,83 @@ static void run_sve_integer_chunk_gen(uint16_t vl_bits, unsigned zd,
     check(1, 1, "SVE wide /M ADD lane results");
     check(destination[vl_bytes], 0x5a, "SVE wide /M preserves above VL");
 }
+
+/* Provider that cannot claim VA==HPA: every scalar access must be lowered as a
+ * provider call, never as a raw host load/store. */
+static unsigned prov_loads, prov_stores;
+
+static LataGuestMemStatus prov_probe(CPUARMState *env, uint64_t vaddr,
+                                     size_t size, bool is_write,
+                                     bool clean_tbi)
+{
+    (void)env; (void)size; (void)is_write; (void)clean_tbi; (void)vaddr;
+    return LATA_MEM_OK;
+}
+
+static LataGuestMemStatus prov_load(CPUARMState *env, uint64_t vaddr,
+                                    size_t size, bool is_signed,
+                                    uint64_t *out_value)
+{
+    uint64_t value = 0;
+    (void)env;
+    prov_loads++;
+    for (size_t i = 0; i < size; ++i) {
+        value |= (uint64_t)((const uint8_t *)(uintptr_t)vaddr)[i] << (8u * i);
+    }
+    if (is_signed && size < 8) {
+        uint64_t sign = 1ULL << (8u * size - 1u);
+        if (value & sign) {
+            value |= ~((1ULL << (8u * size)) - 1u);
+        }
+    }
+    *out_value = value;
+    return LATA_MEM_OK;
+}
+
+static LataGuestMemStatus prov_store(CPUARMState *env, uint64_t vaddr,
+                                     size_t size, uint64_t value)
+{
+    (void)env;
+    prov_stores++;
+    for (size_t i = 0; i < size; ++i) {
+        ((uint8_t *)(uintptr_t)vaddr)[i] = (uint8_t)(value >> (8u * i));
+    }
+    return LATA_MEM_OK;
+}
+
+static unsigned prov_bulk_loads, prov_bulk_stores;
+
+static LataGuestMemStatus prov_load_bytes(CPUARMState *env, uint64_t vaddr,
+                                          void *dst, size_t size)
+{
+    (void)env;
+    prov_bulk_loads++;
+    for (size_t i = 0; i < size; ++i) {
+        ((uint8_t *)dst)[i] = ((const uint8_t *)(uintptr_t)vaddr)[i];
+    }
+    return LATA_MEM_OK;
+}
+
+static LataGuestMemStatus prov_store_bytes(CPUARMState *env, uint64_t vaddr,
+                                           const void *src, size_t size)
+{
+    (void)env;
+    prov_bulk_stores++;
+    for (size_t i = 0; i < size; ++i) {
+        ((uint8_t *)(uintptr_t)vaddr)[i] = ((const uint8_t *)src)[i];
+    }
+    return LATA_MEM_OK;
+}
+
+static const LataGuestMemOps prov_no_identity_ops = {
+    .probe = prov_probe,
+    .load = prov_load,
+    .store = prov_store,
+    .load_bytes = prov_load_bytes,
+    .store_bytes = prov_store_bytes,
+    .direct = NULL,
+    .va_is_hpa_identity = false,
+};
 
 static void enable_fpe_sxe_asxe(void)
 {
@@ -4380,6 +4635,131 @@ static __attribute__((noinline)) void run_sve_p0_p1_gap_regression_runtime(void)
               "P0-3 NEON LDR Q raises EXCP_DATA_ABORT");
         check(read_le64(arm_sve_zreg(&env, 0)), 0x1122334455667788ULL,
               "P0-3 NEON LDR Q preserves Q0 on fault");
+        /* Provider-mediated scalar path: no identity claim, so LDR/STR must go
+         * through the provider instead of a raw host access. */
+        {
+            static uint32_t prov_fix[] __attribute__((aligned(16))) = {
+                0xd2800b40u, /* mov  x0, #0x5a */
+                0xf9000020u, /* str  x0, [x1] */
+                0xf9400022u, /* ldr  x2, [x1] */
+            };
+            static uint64_t prov_target = 0;
+            for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+            prov_loads = 0;
+            prov_stores = 0;
+            env.xregs[1] = (uint64_t)(uintptr_t)&prov_target;
+            lata_guest_mem_clear_fault_regions(&env);
+            lata_set_guest_mem_ops(&prov_no_identity_ops);
+            check(sve_run_a64_tb(prov_fix, 3, 128, 0x0fu, false,
+                                 "provider-mediated LDR/STR"),
+                  1, "provider-mediated LDR/STR runs");
+            lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
+            check(env.xregs[2], 0x5a, "provider-mediated LDR returns the stored value");
+            check(prov_target, 0x5a, "provider-mediated STR reached the provider");
+            check(prov_stores >= 1, 1, "STR was lowered as a provider store");
+            check(prov_loads >= 1, 1, "LDR was lowered as a provider load");
+        }
+        /* SIMD Q access through the bulk provider hooks. */
+        {
+            static uint32_t prov_q[] __attribute__((aligned(16))) = {
+                0x3d800020u, /* str  q0, [x1] */
+                0x3dc00022u, /* ldr  q2, [x1] */
+            };
+            static uint8_t prov_q_buf[16] __attribute__((aligned(16)));
+            for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+            for (size_t i = 0; i < 16; ++i) {
+                prov_q_buf[i] = 0;
+                arm_sve_zreg(&env, 0)[i] = (uint8_t)(0x10 + i);
+            }
+            prov_bulk_loads = 0;
+            prov_bulk_stores = 0;
+            env.xregs[1] = (uint64_t)(uintptr_t)prov_q_buf;
+            lata_guest_mem_clear_fault_regions(&env);
+            lata_set_guest_mem_ops(&prov_no_identity_ops);
+            check(sve_run_a64_tb(prov_q, 2, 128, 0x0fu, false,
+                                 "provider bulk SIMD LDR/STR"),
+                  1, "provider bulk SIMD LDR/STR runs");
+            lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
+            check(prov_bulk_stores >= 1, 1, "SIMD STR used the bulk provider hook");
+            check(prov_bulk_loads >= 1, 1, "SIMD LDR used the bulk provider hook");
+            check(read_le64(prov_q_buf), UINT64_C(0x1716151413121110),
+                  "SIMD STR Q0 stores the low half via the provider");
+            check(read_le64(prov_q_buf + 8), UINT64_C(0x1f1e1d1c1b1a1918),
+                  "SIMD STR Q0 stores the high half via the provider");
+            check(read_le64(arm_sve_zreg(&env, 2)), UINT64_C(0x1716151413121110),
+                  "SIMD LDR Q2 loads the low half via the provider");
+            check(read_le64(arm_sve_zreg(&env, 2) + 8), UINT64_C(0x1f1e1d1c1b1a1918),
+                  "SIMD LDR Q2 loads the high half via the provider");
+        }
+        /* LDP/STP through the provider (pair path). */
+        {
+            static uint32_t prov_pair[] __attribute__((aligned(16))) = {
+                0xa9000c22u, /* stp x2, x3, [x1] */
+                0xa9401424u, /* ldp x4, x5, [x1] */
+            };
+            static uint64_t prov_pair_buf[2] __attribute__((aligned(16)));
+
+            for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+            prov_pair_buf[0] = 0;
+            prov_pair_buf[1] = 0;
+            prov_loads = 0;
+            prov_stores = 0;
+            env.xregs[1] = (uint64_t)(uintptr_t)prov_pair_buf;
+            env.xregs[2] = UINT64_C(0x1122334455667788);
+            env.xregs[3] = UINT64_C(0x99aabbccddeeff00);
+            lata_guest_mem_clear_fault_regions(&env);
+            lata_set_guest_mem_ops(&prov_no_identity_ops);
+            check(sve_run_a64_tb(prov_pair, 2, 128, 0x0fu, false,
+                                 "provider pair LDP/STP"),
+                  1, "provider pair LDP/STP runs");
+            lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
+            check(prov_stores >= 2, 1, "STP issued two provider stores");
+            check(prov_loads >= 2, 1, "LDP issued two provider loads");
+            check(prov_pair_buf[0], UINT64_C(0x1122334455667788),
+                  "STP stored the first register via the provider");
+            check(prov_pair_buf[1], UINT64_C(0x99aabbccddeeff00),
+                  "STP stored the second register via the provider");
+            check(env.xregs[4], UINT64_C(0x1122334455667788),
+                  "LDP reloaded the first register via the provider");
+            check(env.xregs[5], UINT64_C(0x99aabbccddeeff00),
+                  "LDP reloaded the second register via the provider");
+        }
+        /* Vector pair through the provider. */
+        {
+            static uint32_t prov_vpair[] __attribute__((aligned(16))) = {
+                0xad000420u, /* stp q0, q1, [x1] */
+                0xad400c22u, /* ldp q2, q3, [x1] */
+            };
+            static uint8_t prov_vbuf[32] __attribute__((aligned(16)));
+
+            for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+            for (size_t i = 0; i < 32; ++i) {
+                prov_vbuf[i] = 0;
+            }
+            for (size_t i = 0; i < 16; ++i) {
+                arm_sve_zreg(&env, 0)[i] = (uint8_t)(0x20 + i);
+                arm_sve_zreg(&env, 1)[i] = (uint8_t)(0x40 + i);
+            }
+            prov_bulk_loads = 0;
+            prov_bulk_stores = 0;
+            env.xregs[1] = (uint64_t)(uintptr_t)prov_vbuf;
+            lata_guest_mem_clear_fault_regions(&env);
+            lata_set_guest_mem_ops(&prov_no_identity_ops);
+            check(sve_run_a64_tb(prov_vpair, 2, 128, 0x0fu, false,
+                                 "provider vector pair LDP/STP"),
+                  1, "provider vector pair LDP/STP runs");
+            lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
+            check(prov_bulk_stores >= 2, 1, "vector STP used two bulk stores");
+            check(prov_bulk_loads >= 2, 1, "vector LDP used two bulk loads");
+            check(read_le64(prov_vbuf), UINT64_C(0x2726252423222120),
+                  "vector STP stored Q0 via the provider");
+            check(read_le64(prov_vbuf + 16), UINT64_C(0x4746454443424140),
+                  "vector STP stored Q1 via the provider");
+            check(read_le64(arm_sve_zreg(&env, 2)), UINT64_C(0x2726252423222120),
+                  "vector LDP reloaded Q2 via the provider");
+            check(read_le64(arm_sve_zreg(&env, 3)), UINT64_C(0x4746454443424140),
+                  "vector LDP reloaded Q3 via the provider");
+        }
 
         /* SVE LD1W with fault on lane 1 raises EXCP_DATA_ABORT and preserves Z0 */
         static uint32_t sve_ld1w_fault[] __attribute__((aligned(16))) = {
@@ -5952,6 +6332,165 @@ void kmain(void)
           "translated TB exits publish their own vector registers");
     check(lata_vreg_lazy_loads() > 0, 1,
           "vector registers load lazily on first use");
+
+    /* Tiny temp pool + real spill + IR2 rollback: the pool maps, residency and
+     * the partition invariant must all come back. */
+    {
+        LataIr2Snapshot snap;
+        uint32_t spills_before;
+
+        lata_vreg_clear_residency_for_test();
+        lata_vreg_init_residency();
+        lata_ftemp_set_base_pool(1);
+        check((int)ra_ftemp_pool_size() >= 1, 1, "tiny ftemp pool is accepted");
+
+        lata_ir2_snapshot_take(&snap);
+        spills_before = lata_vreg_spills();
+        /* Two allocations: the second must spill a cold resident vector. */
+        (void)ra_alloc_ftemp();
+        (void)ra_alloc_ftemp();
+        check(lata_vreg_spills() > spills_before, 1,
+              "tiny pool forces a resident spill");
+
+        lata_ir2_snapshot_rollback(&snap);
+        check(lata_ir2_ftemp_pool_state_matches(&snap), 1,
+              "rollback restores the ftemp pool state");
+        check(lata_vreg_partition_violations(), 0,
+              "residency partition stays consistent after rollback");
+
+        lata_ftemp_set_base_pool(6);
+        lata_vreg_clear_residency_for_test();
+    }
+
+    run_sve_binop_fuzz();
+
+    /* Scalar + NEON + SVE mixed in one block: each stage consumes the previous
+     * stage's architectural state, so a stale cache or a broken merge shows up
+     * as a wrong value somewhere in the chain. */
+    {
+        static uint32_t mixed_guest[] __attribute__((aligned(16))) = {
+            0x91001c00u, /* add  x0, x0, #7 */
+            0x4e040c01u, /* dup  v1.4s, w0 */
+            0x4ea18421u, /* add  v1.4s, v1.4s, v1.4s */
+            0x2598e3e0u, /* ptrue p0.s, all */
+            0x04800042u, /* add  z2.s, p0/m, z2.s, z2.s */
+            0x4e083c23u, /* mov  x3, v1.d[0] */
+        };
+        uint64_t base = 0x100;
+
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[0] = base;
+        for (size_t lane = 0; lane < 4; ++lane) {
+            write_le32(arm_sve_zreg(&env, 2) + lane * 4u,
+                       (uint32_t)(0x10u + lane));
+        }
+        check(sve_run_a64_tb(mixed_guest, 6, 128, 0x0fu, false,
+                             "mixed scalar+NEON+SVE"),
+              1, "mixed scalar+NEON+SVE runs");
+        check(env.xregs[0], base + 7, "mixed chain: scalar stage");
+        check((uint32_t)env.xregs[3], (uint32_t)((base + 7) * 2),
+              "mixed chain: NEON stage sees the scalar result");
+        for (size_t lane = 0; lane < 4; ++lane) {
+            check(read_le32(arm_sve_zreg(&env, 2) + lane * 4u),
+                  (uint32_t)(0x20u + 2u * lane),
+                  "mixed chain: SVE stage doubles its input");
+        }
+    }
+
+    /* FP NaN/Inf matrix.  Expected values follow the default-NaN rule (AArch64
+     * returns the positive quiet NaN when DN or an invalid operation forces
+     * one).  FPSR is not modelled by LATA, so flags are not asserted here - that
+     * gap is recorded in the project notes. */
+    {
+        static uint32_t fadd_s[] __attribute__((aligned(16))) = {
+            0x1e222820u, /* fadd s0, s1, s2 */
+        };
+        struct {
+            uint32_t a, b, want;
+            const char *what;
+        } cases[] = {
+            { 0x7fc00000u, 0x3f800000u, 0x7fc00000u, "NaN + 1.0 keeps a quiet NaN" },
+            { 0x7f800000u, 0xff800000u, 0x7fc00000u, "+Inf + -Inf is the default NaN" },
+            { 0x7f800000u, 0x3f800000u, 0x7f800000u, "+Inf + 1.0 stays +Inf" },
+            { 0x3f800000u, 0x80000000u, 0x3f800000u, "1.0 + -0.0 is 1.0" },
+        };
+
+        for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); ++c) {
+            for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+            write_le32(arm_sve_zreg(&env, 1), cases[c].a);
+            write_le32(arm_sve_zreg(&env, 2), cases[c].b);
+            check(sve_run_a64_tb(fadd_s, 1, 128, 0x0fu, false,
+                                 "FP NaN/Inf matrix"),
+                  1, cases[c].what);
+            check(read_le32(arm_sve_zreg(&env, 0)), cases[c].want, cases[c].what);
+        }
+    }
+
+    /* Direct helper test for non-faulting / first-fault loads: separates the C
+     * model from the emitted glue. */
+    {
+        static uint8_t hbuf[16] __attribute__((aligned(16)));
+
+        for (size_t i = 0; i < 16; ++i) {
+            hbuf[i] = (uint8_t)(0x40u + i);
+        }
+        LataSVEHelperDesc d;
+        memset(&d, 0, sizeof(d));
+        d.vl_bytes = 16;
+        d.pvir.opcode = PVIR_OP_LOAD;
+        d.pvir.operation.vector.type.kind = PVIR_ELEMENT_INTEGER;
+        d.pvir.operation.vector.type.signedness = PVIR_UNSIGNED;
+        d.pvir.operation.vector.type.element_bits = 8;
+        d.pvir.operation.vector.type.vector_bits = 128;
+        d.pvir.operation.vector.memory_element_bits = 8;
+        d.pvir.operation.vector.destination = 100;
+        d.pvir.operation.vector.predicate.source.kind =
+            PVIR_PREDICATE_SOURCE_PREDICATE;
+        d.pvir.operation.vector.predicate.source.id = 200;
+        d.pvir.operation.vector.memory_address.base_kind =
+            PVIR_MEMORY_BASE_VALUE;
+        d.pvir.operation.vector.memory_address.base_value =
+            A64_SVE_PVIR_GPR_VALUE_BASE + 0;
+        d.pvir.effects.fault.behavior = PVIR_FAULT_NONFAULTING;
+        d.z_values[0] = 100;
+        d.p_values[0] = 200;
+
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[0] = (uint64_t)(uintptr_t)hbuf;
+        memset(arm_sve_preg(&env, 0), 0xff, 2);
+        /* SETFFR semantics: FFR starts all-ones, otherwise every lane counts as
+         * already faulted and nothing is loaded. */
+        memset(arm_sve_ffr(&env), 0xff, 2);
+        check(lata_sve_exec_helper(&env, &d), 0,
+              "non-faulting helper reports success");
+        check(arm_sve_zreg(&env, 0)[0], 0x40u, "helper loads lane 0 into Z0");
+        check(arm_sve_zreg(&env, 0)[15], 0x4fu, "helper loads lane 15 into Z0");
+        check(arm_sve_ffr(&env)[0], 0xffu, "helper sets FFR for active lanes");
+    }
+
+    /* FPSR accumulation from the host FCSR flag field (bits 20:16). */
+    {
+        static uint32_t fdiv_s[] __attribute__((aligned(16))) = {
+            0x1e221820u, /* fdiv s0, s1, s2 */
+        };
+        uint64_t fpsr;
+
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        write_le32(arm_sve_zreg(&env, 1), 0x3f800000u); /* 1.0 */
+        write_le32(arm_sve_zreg(&env, 2), 0x40400000u); /* 3.0 -> inexact */
+        check(sve_run_a64_tb(fdiv_s, 1, 128, 0x0fu, false, "FPSR inexact"),
+              1, "FPSR inexact division runs");
+        fpsr = env.vfp.xregs[8];
+        check((fpsr & (1u << 4)) != 0, 1, "inexact division sets FPSR.IXC");
+
+        write_le32(arm_sve_zreg(&env, 1), 0x3f800000u);
+        write_le32(arm_sve_zreg(&env, 2), 0x00000000u);
+        check(sve_run_a64_tb(fdiv_s, 1, 128, 0x0fu, false, "FPSR divzero"),
+              1, "FPSR divide-by-zero runs");
+        fpsr = env.vfp.xregs[8];
+        check((fpsr & (1u << 1)) != 0, 1, "divide by zero sets FPSR.DZC");
+        check((fpsr & (1u << 4)) != 0, 1, "FPSR flags are sticky");
+    }
 
     latx_bare_uart_puts("lata-isa: checks=");
     putdec((uint64_t)checks);

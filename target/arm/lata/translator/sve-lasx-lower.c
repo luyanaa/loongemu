@@ -1949,6 +1949,38 @@ static bool emit_sve_helper_call(DisasContext *s,
     return emit_sve_helper_call_body(s, instruction, source, desc);
 }
 
+/*
+ * Fault-tolerant loads are the one class whose helper must observe and update
+ * architectural vector state through env.  Flush the resident registers before
+ * the call and reload them afterwards; other helper-based lowerings keep the
+ * inline convention (values live in host registers until the TB exits).
+ */
+static void lata_emit_flush_resident_vectors(void)
+{
+    if (!latx_cpu_has_lsx()) {
+        return;
+    }
+    for (int i = 0; i <= 31; ++i) {
+        if (arm_la_fmap[i] >= 0 && lata_vreg_resident(i)) {
+            lata_env_vst(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]),
+                         env_offset_vreg(i));
+        }
+    }
+}
+
+static void lata_emit_reload_resident_vectors(void)
+{
+    if (!latx_cpu_has_lsx()) {
+        return;
+    }
+    for (int i = 0; i <= 31; ++i) {
+        if (arm_la_fmap[i] >= 0 && lata_vreg_resident(i)) {
+            lata_env_vld(ir2_opnd_new(IR2_OPND_FPR, arm_la_fmap[i]),
+                         env_offset_vreg(i));
+        }
+    }
+}
+
 static bool lower_contiguous_memory(
     DisasContext *s, const A64SVEIR1Instruction *source,
     const PvirInstruction *instruction)
@@ -2063,7 +2095,9 @@ static bool lower_contiguous_memory(
     guest_base = alloc_gpr_src_sp(memory->rn);
     /* Mirror lata_clean_data_tbi() in translate-a64.c. */
     if (s->tbid != 0) {
-        la_bstrpick_d(guest_base, guest_base, 56, 0);
+        /* TBI ignores bits 63:56; keep 56 bits so this matches mem.c and
+         * the helper path (0x00ffffffffffffff). */
+        la_bstrpick_d(guest_base, guest_base, 55, 0);
     }
 
     adjusted_base = ra_alloc_itemp();
@@ -2435,7 +2469,7 @@ static bool lower_fault_load(DisasContext *s,
         ra_free_temp(d);
     }
     if (s->tbid != 0) {
-        la_bstrpick_d(addr, addr, 56, 0);
+        la_bstrpick_d(addr, addr, 55, 0);
     }
 
     admitted = ir2_opnd_new_type(IR2_OPND_LABEL);

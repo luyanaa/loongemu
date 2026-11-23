@@ -83,9 +83,20 @@ const LataSVEHelperDesc *lata_sve_alloc_helper_desc(
  * releases them. Before this existed the list only shrank at context
  * destruction, so a long-running guest grew it without limit.
  */
+/*
+ * Chunk ownership is keyed by the block's code pointer (`tb->tc.ptr`), not by
+ * the TranslationBlock address: a flushed TB can have its struct reused by a
+ * later block, but its code pointer comes from a fresh region of the current
+ * cache generation, so a reused struct cannot alias an old descriptor group.
+ * Combined with the code-cache rewind check, that gives each group a lifetime
+ * bounded by the code it serves.
+ */
 void lata_sve_helper_begin_tb(const void *owner, uint64_t pc_first);
 void lata_sve_helper_release_tb(const void *owner);
 void lata_sve_helper_release_all(void);
+/* True when the code cache rewound past the position the live chunks came
+ * from, i.e. a flush happened without an explicit release call. */
+bool lata_sve_helper_codegen_rewound(uintptr_t recorded, uintptr_t current);
 void lata_sve_helper_stats(uint32_t *live_descs, uint32_t *live_chunks);
 
 /*

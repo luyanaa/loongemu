@@ -89,6 +89,19 @@ void lata_sve_helper_begin_tb(const void *owner, uint64_t pc_first)
      * the old (dead) descriptors' addresses valid until release_all/release_tb
      * drops the chunk.
      */
+    /*
+     * Multi-vCPU note: the code cache is shared, the chunk list is per-thread
+     * (LataContext is TLS) and every TB is translated by exactly one thread, so
+     * a thread only ever frees descriptors its own code embeds.  A flush by
+     * another thread rewinds the shared allocator; checking at every block start
+     * - not only at helper allocation - keeps the leak window to one block.
+     */
+    if (ctx->sve_helper_chunks != 0 &&
+        lata_sve_helper_codegen_rewound(ctx->sve_helper_codegen,
+                                        (uintptr_t)tcg_ctx->code_gen_ptr))
+    {
+        lata_sve_helper_release_all();
+    }
     ctx->sve_helper_owner = owner;
     ctx->sve_helper_pc = pc_first;
     ctx->sve_helper_active = NULL;
@@ -141,6 +154,18 @@ void lata_sve_helper_stats(uint32_t *live_descs, uint32_t *live_chunks)
     }
 }
 
+/*
+ * A code-cache flush rewinds the allocator to the start of the buffer without
+ * calling us (SMC, address-space change and cross-CPU invalidations all go
+ * through QEMU's tb_flush).  Observing a position earlier than the one recorded
+ * when the live chunks were handed out proves those chunks belong to dead code,
+ * so they are dropped here instead of waiting for the next explicit flush site.
+ */
+bool lata_sve_helper_codegen_rewound(uintptr_t recorded, uintptr_t current)
+{
+    return recorded != 0 && current < recorded;
+}
+
 const LataSVEHelperDesc *lata_sve_alloc_helper_desc(
     const DisasContext *s, const PvirInstruction *instruction,
     const A64SVEIR1Instruction *source)
@@ -161,8 +186,21 @@ const LataSVEHelperDesc *lata_sve_alloc_helper_desc(
      * (hand-built IR2, fixtures) gets the same treatment with owner == NULL
      * keyed by the current PC.
      */
-    owner = (s->base != NULL) ? (const void *)s->base->tb : NULL;
+    owner = (s->base != NULL && s->base->tb != NULL)
+                ? (const void *)s->base->tb->tc.ptr
+                : NULL;
     pc_first = (s->base != NULL) ? s->base->pc_first : s->pc_curr;
+    if (ctx->sve_helper_chunks != 0 &&
+        lata_sve_helper_codegen_rewound(ctx->sve_helper_codegen,
+                                        (uintptr_t)tcg_ctx->code_gen_ptr))
+    {
+        /* The cache was flushed behind our back: every chunk is dead. */
+        lata_sve_helper_release_all();
+    }
+    if (ctx->sve_helper_chunks == 0)
+    {
+        ctx->sve_helper_codegen = (uintptr_t)tcg_ctx->code_gen_ptr;
+    }
     if (ctx->sve_helper_owner != owner || ctx->sve_helper_pc != pc_first) {
         lata_sve_helper_begin_tb(owner, pc_first);
     }
@@ -851,6 +889,8 @@ static void exec_while(CPUARMState *env, size_t vl_bytes,
     }
     h_predtest(env, vl_bytes, (uint8_t)ebits, all_true, dst);
 }
+
+
 
 static uint64_t exec_fault_or_contiguous_mem(CPUARMState *env,
                                              const LataSVEHelperDesc *d)

@@ -16,7 +16,7 @@ LLD_PREFIX ?= $(shell brew --prefix lld 2>/dev/null)
 LD_LLD   ?= $(if $(LLD_PREFIX),$(LLD_PREFIX)/bin/ld.lld,ld.lld)
 QEMU_PREFIX ?= $(shell brew --prefix qemu 2>/dev/null)
 
-.PHONY: all test test-pvir test-riscv-sbi test-riscv-virtio test-riscv-acpi test-riscv-plic test-riscv-uart test-riscv-clint test-riscv-fw test-sve-decode test-sve-pvir test-sve-helper-support test-sve-helper-lifecycle test-vcache test-arm-state test-cpu test-lapaging test-pci-host test-hyperv test-tbc test-soft-ras test-p0 test-plv3-isolation tb-sys-run tb-sys-smp-run vmm-efi vmm-boot vmm-integrated vmm-integrated-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot test-latr latr-core latr-isa-image latr-isa-run latr-riscv-ref latr-check latr-boot-image latr-boot-run latr-sys-ref latr-sys-run latr-sys-diff latr-opensbi-image latr-opensbi-run latr-opensbi-trace latr-opensbi-trace-run latr-opensbi-test test-latm test-latm-decode latm-core latm-isa-image latm-isa-run latm-riscv-ref clean
+.PHONY: all test test-pvir test-fpsr test-riscv-sbi test-riscv-virtio test-riscv-acpi test-riscv-plic test-riscv-uart test-riscv-clint test-riscv-fw test-sve-decode test-sve-pvir test-sve-helper-support test-sve-helper-lifecycle test-vcache test-arm-state test-cpu test-lapaging test-pci-host test-hyperv test-tbc test-soft-ras test-p0 test-plv3-isolation tb-sys-run tb-sys-smp-run vmm-efi vmm-boot vmm-integrated vmm-integrated-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot test-latr latr-core latr-isa-image latr-isa-run latr-riscv-ref latr-check latr-boot-image latr-boot-run latr-sys-ref latr-sys-run latr-sys-diff latr-opensbi-image latr-opensbi-run latr-opensbi-trace latr-opensbi-trace-run latr-opensbi-test test-latm test-latm-decode latm-core latm-isa-image latm-isa-run latm-riscv-ref clean
 
 all: test
 
@@ -36,6 +36,15 @@ build/test_pvir: tests/test_pvir.c target/arm/lata/pvir.c \
 
 test-pvir: build/test_pvir
 	./build/test_pvir
+
+build/test_fpsr: tests/test_fpsr.c target/arm/lata/fpsr.c \
+                 target/arm/lata/include/lata-fpsr.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Itarget/arm/lata/include \
+	      target/arm/lata/fpsr.c tests/test_fpsr.c -o $@
+
+test-fpsr: build/test_fpsr
+	./build/test_fpsr
 
 test-pvir-rvv-shapes: build/test_pvir_rvv_shapes
 	./build/test_pvir_rvv_shapes
@@ -229,6 +238,7 @@ test-arm-state: build/test_arm_state
 
 build/test_lata_context: tests/test_lata_context.c lata/vcache.c \
                          target/arm/lata/mem.c \
+                         target/arm/lata/ftemp-snapshot.c \
                          target/arm/lata/include/lata.h \
                          target/arm/lata/include/lata-mem.h \
                          target/arm/lata/include/lata-vcache.h \
@@ -239,7 +249,9 @@ build/test_lata_context: tests/test_lata_context.c lata/vcache.c \
 	      -Wno-gnu-empty-struct -Wno-macro-redefined -Wno-unused-parameter \
 	      -Ilata/compat -Ilatx/compat -I. -Itarget/arm/lata/include \
 	      -Itarget/arm/lata -Ilatx/upstream/include \
-	      lata/vcache.c target/arm/lata/mem.c tests/test_lata_context.c -o $@
+	      lata/vcache.c target/arm/lata/mem.c \
+	      target/arm/lata/ftemp-snapshot.c \
+	      tests/test_lata_context.c -o $@
 
 test-lata-context: build/test_lata_context
 	./build/test_lata_context
@@ -257,6 +269,8 @@ test-soft-ras: build/test_soft_ras
 test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging build/test_x86_64_paging \
       build/test_pci_host build/test_hyperv build/test_tb_cache build/test_soft_ras build/test_pvir build/test_sve_decode build/test_sve_pvir build/test_vcache build/test_arm_state build/test_lata_context \
       build/test_latm_decode build/test_riscv_virtio_blk \
+      build/test_riscv_sbi build/test_riscv_acpi build/test_riscv_plic \
+      build/test_riscv_uart build/test_riscv_fw \
       build/test_sve_helper_support build/test_sve_helper_lifecycle
 	./build/test_loongbt
 	./build/test_loongbt_cpu
@@ -267,6 +281,7 @@ test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging buil
 	./build/test_soft_ras
 	./build/test_hyperv
 	./build/test_pvir
+	./build/test_fpsr
 	./build/test_riscv_sbi
 	./build/test_riscv_acpi
 	./build/test_riscv_plic

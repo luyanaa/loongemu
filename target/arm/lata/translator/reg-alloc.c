@@ -289,6 +289,18 @@ void lata_ftemp_set_base_pool(int pool)
     }
     ctx->ftemp_base = pool;
     ctx->ftemp_pool_entries = pool;
+    /*
+     * Rebuild the reverse map for every slot that stays in the pool.  Shrinking
+     * above cleared the entries for slots >= pool; without this, growing back
+     * hands out physical registers that no longer look like temps and the
+     * lowering aborts in ra_free_temp.
+     */
+    for (int slot = 0; slot < pool; ++slot) {
+        int phys = ctx->reg_ftemp_map[slot];
+        if (phys >= 0 && phys < 32) {
+            ctx->reg_ftemp_reverse_map[phys] = slot;
+        }
+    }
 }
 
 const int reg_scr_map[] = {

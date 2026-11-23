@@ -319,6 +319,15 @@ static bool trans_sve_unimplemented(DisasContext *s)
     return true;
 }
 
+/*
+ * Scalar/NEON accesses still bypass the guest-memory contract here: the probe
+ * is emitted only when a custom provider is installed or a fault region is
+ * configured, and even then the access itself is a raw host load/store rather
+ * than a provider-mediated transfer.  Gating this on
+ * `!lata_guest_mem_direct_available()` was tried and hangs the first scalar
+ * memory fixture ("ldr-str-aligned"), so the probe emission path needs its own
+ * bring-up before the contract can be enforced.  Kept as-is on purpose.
+ */
 static bool lata_guest_mem_needs_probe(void)
 {
     CPUARMState *cpu_env = (lsenv != NULL) ? (CPUARMState *)lsenv->cpu_state : NULL;
@@ -328,6 +337,24 @@ static bool lata_guest_mem_needs_probe(void)
 }
 
 extern uint32_t lata_vreg_published;
+
+/* Provider-mediated access emitters (defined below, used by the pair paths). */
+static void lata_emit_mem_call_prologue(IR2_OPND vaddr_opnd, IR2_OPND value_opnd,
+                                        bool have_value);
+static void lata_emit_mem_call_epilogue(void);
+static void lata_emit_mem_call_fault(DisasContext *s, IR2_OPND status);
+static bool lata_emit_guest_mem_load_call(DisasContext *s, IR2_OPND dst,
+                                          IR2_OPND addr_reg, int64_t offset,
+                                          size_t size, bool is_signed);
+static bool lata_emit_guest_mem_store_call(DisasContext *s, IR2_OPND value,
+                                           IR2_OPND addr_reg, int64_t offset,
+                                           size_t size);
+static bool lata_emit_guest_mem_load_bulk(DisasContext *s, IR2_OPND dst_vec,
+                                          IR2_OPND addr_reg, int64_t offset,
+                                          size_t size);
+static bool lata_emit_guest_mem_store_bulk(DisasContext *s, IR2_OPND src_vec,
+                                           IR2_OPND addr_reg, int64_t offset,
+                                           size_t size);
 
 static void lata_emit_guest_mem_probe(DisasContext *s, IR2_OPND addr_reg,
                                       int64_t offset, size_t size,
@@ -403,8 +430,10 @@ static void lata_clean_data_tbi(DisasContext *s, IR2_OPND *dst, IR2_OPND *src, i
     {
         /* Load unmodified address */
     } else {
-        /* lata only support user-mode, we don't need Sign-extend */
-        la_bstrpick_d(*dst, *src, 56, 0);
+        /* lata only support user-mode, we don't need Sign-extend.
+         * TBI drops bits 63:56, i.e. keep bits 55:0 (mem.c and the SVE
+         * helpers mask with 0x00ffffffffffffff); 56 here kept bit 56. */
+        la_bstrpick_d(*dst, *src, 55, 0);
     }
 }
 
@@ -2579,6 +2608,24 @@ static bool trans_STP(DisasContext *s)
     }
 
     lata_clean_data_tbi(s, &reg_n, &reg_n, s->tbid);
+    if (!lata_guest_mem_inline_host_access_ok())
+    {
+        int64_t disp = (!a->w || a->p) ? (int64_t)offset : 0;
+
+        lata_emit_guest_mem_store_call(s, reg_t, reg_n, disp, (size_t)dbytes);
+        lata_emit_guest_mem_store_call(s, reg_t2, reg_n, disp + dbytes,
+                                       (size_t)dbytes);
+        if (a->w)
+        {
+            la_addi_d(temp, reg_n, (int)offset);
+            store_gpr_dst(a->rn, temp);
+        }
+        free_alloc_gpr(reg_n);
+        free_alloc_gpr(reg_t);
+        free_alloc_gpr(reg_t2);
+        ra_free_temp(temp);
+        return true;
+    }
     lata_emit_guest_mem_probe(s, reg_n, (!a->w || !a->p) ? (int64_t)offset : 0,
                               (size_t)dbytes * 2u, true, NULL);
 
@@ -2664,6 +2711,27 @@ static bool trans_LDP(DisasContext *s)
     }
 
     lata_clean_data_tbi(s, &reg_n, &reg_n, s->tbid);
+    if (!lata_guest_mem_inline_host_access_ok())
+    {
+        int64_t disp = (!a->w || a->p) ? (int64_t)offset : 0;
+
+        lata_emit_guest_mem_load_call(s, reg_t, reg_n, disp, (size_t)dbytes,
+                                      false);
+        lata_emit_guest_mem_load_call(s, reg_t2, reg_n, disp + dbytes,
+                                      (size_t)dbytes, false);
+        if (a->w)
+        {
+            la_addi_d(temp, reg_n, (int)offset);
+            store_gpr_dst(a->rn, temp);
+        }
+        store_gpr_dst(a->rt, reg_t);
+        store_gpr_dst(a->rt2, reg_t2);
+        free_alloc_gpr(reg_n);
+        free_alloc_gpr(reg_t);
+        free_alloc_gpr(reg_t2);
+        ra_free_temp(temp);
+        return true;
+    }
     lata_emit_guest_mem_probe(s, reg_n, (!a->w || !a->p) ? (int64_t)offset : 0,
                               (size_t)dbytes * 2u, false, NULL);
 
@@ -2798,12 +2866,46 @@ static bool trans_STP_v(DisasContext *s)
     }
 
     lata_clean_data_tbi(s, &reg_n, &reg_n, s->tbid);
-    lata_emit_guest_mem_probe(s, reg_n, (!a->w || !a->p) ? (int64_t)offset : 0,
-                              (size_t)dbytes * 2u, true, NULL);
 
     IR2_OPND vreg_t = alloc_fpr_src(a->rt);
     IR2_OPND vreg_t2 = alloc_fpr_src(a->rt2);
     IR2_OPND temp = ra_alloc_itemp();
+
+    if (!lata_guest_mem_inline_host_access_ok())
+    {
+        int64_t disp = (!a->w || a->p) ? (int64_t)offset : 0;
+
+        if (dbytes == 16)
+        {
+            lata_emit_guest_mem_store_bulk(s, vreg_t, reg_n, disp, 16u);
+            lata_emit_guest_mem_store_bulk(s, vreg_t2, reg_n, disp + 16, 16u);
+        }
+        else
+        {
+            /* Narrow pairs store two scalar halves through the value hooks. */
+            for (int i = 0; i < 2; ++i)
+            {
+                IR2_OPND half = ra_alloc_itemp();
+                la_vpickve2gr_du(half, i == 0 ? vreg_t : vreg_t2, 0);
+                lata_emit_guest_mem_store_call(s, half, reg_n,
+                                               disp + (int64_t)i * dbytes,
+                                               (size_t)dbytes);
+                ra_free_temp(half);
+            }
+        }
+        if (a->w)
+        {
+            la_addi_d(temp, reg_n, (int)offset);
+            store_gpr_dst(a->rn, temp);
+        }
+        free_alloc_gpr(reg_n);
+        free_alloc_fpr(vreg_t);
+        free_alloc_fpr(vreg_t2);
+        ra_free_temp(temp);
+        return true;
+    }
+    lata_emit_guest_mem_probe(s, reg_n, (!a->w || !a->p) ? (int64_t)offset : 0,
+                              (size_t)dbytes * 2u, true, NULL);
 
     if (!a->w && offset)
     { // wback = false && offset!=0
@@ -2891,6 +2993,42 @@ static bool trans_LDP_v(DisasContext *s)
     }
 
     lata_clean_data_tbi(s, &reg_n, &reg_n, s->tbid);
+    IR2_OPND ltemp = temp;
+
+    if (!lata_guest_mem_inline_host_access_ok())
+    {
+        int64_t disp = (!a->w || a->p) ? (int64_t)offset : 0;
+
+        if (dbytes == 16)
+        {
+            lata_emit_guest_mem_load_bulk(s, vreg_t, reg_n, disp, 16u);
+            lata_emit_guest_mem_load_bulk(s, vreg_t2, reg_n, disp + 16, 16u);
+        }
+        else
+        {
+            for (int i = 0; i < 2; ++i)
+            {
+                IR2_OPND half = ra_alloc_itemp();
+                lata_emit_guest_mem_load_call(s, half, reg_n,
+                                              disp + (int64_t)i * dbytes,
+                                              (size_t)dbytes, false);
+                la_vinsgr2vr_d(i == 0 ? vreg_t : vreg_t2, half, 0);
+                ra_free_temp(half);
+            }
+        }
+        if (a->w)
+        {
+            la_addi_d(ltemp, reg_n, (int)offset);
+            store_gpr_dst(a->rn, ltemp);
+        }
+        store_fpr_dst(a->rt, vreg_t);
+        store_fpr_dst(a->rt2, vreg_t2);
+        free_alloc_gpr(reg_n);
+        free_alloc_fpr(vreg_t);
+        free_alloc_fpr(vreg_t2);
+        ra_free_temp(ltemp);
+        return true;
+    }
     lata_emit_guest_mem_probe(s, reg_n, (!a->w || !a->p) ? (int64_t)offset : 0,
                               (size_t)dbytes * 2u, false, NULL);
 
@@ -2997,8 +3135,243 @@ static bool trans_STGP(DisasContext *s)
     assert(0);
 }
 
+/*
+ * Provider-mediated scalar access.
+ *
+ * When the installed provider publishes no direct policy there is no proof that
+ * a guest VA is a host pointer (and no proof it stays one), so the value must
+ * come from the provider instead of a raw host load/store.  This is the only
+ * path that is correct for a custom provider whose VA != HPA.
+ */
+#define LATA_MEM_CALL_FRAME 112
+/* 16-byte-aligned data slot for vector transfers (sp is 16-byte aligned). */
+#define LATA_MEM_CALL_DATA 64
+
+static void lata_emit_mem_call_prologue(IR2_OPND vaddr_opnd, IR2_OPND value_opnd,
+                                        bool have_value)
+{
+    lata_zcache_flush_for_exit();
+    la_addi_d(sp_ir2_opnd, sp_ir2_opnd, -LATA_MEM_CALL_FRAME);
+    la_st_d(t0_ir2_opnd, sp_ir2_opnd, 0);
+    la_st_d(t1_ir2_opnd, sp_ir2_opnd, 8);
+    la_st_d(t2_ir2_opnd, sp_ir2_opnd, 16);
+    la_st_d(t3_ir2_opnd, sp_ir2_opnd, 24);
+    la_st_d(t4_ir2_opnd, sp_ir2_opnd, 32);
+    la_st_d(t5_ir2_opnd, sp_ir2_opnd, 40);
+    la_st_d(vaddr_opnd, sp_ir2_opnd, 48);
+    if (have_value) {
+        la_st_d(value_opnd, sp_ir2_opnd, 56);
+    }
+}
+
+static void lata_emit_mem_call_epilogue(void)
+{
+    la_ld_d(t0_ir2_opnd, sp_ir2_opnd, 0);
+    la_ld_d(t1_ir2_opnd, sp_ir2_opnd, 8);
+    la_ld_d(t2_ir2_opnd, sp_ir2_opnd, 16);
+    la_ld_d(t3_ir2_opnd, sp_ir2_opnd, 24);
+    la_ld_d(t4_ir2_opnd, sp_ir2_opnd, 32);
+    la_ld_d(t5_ir2_opnd, sp_ir2_opnd, 40);
+    la_addi_d(sp_ir2_opnd, sp_ir2_opnd, LATA_MEM_CALL_FRAME);
+}
+
+/* Publish the provider's status as a synchronous Data Abort and leave the TB. */
+static void lata_emit_mem_call_fault(DisasContext *s, IR2_OPND status)
+{
+    la_mov64(a4_ir2_opnd, status);
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    li_d(a1_ir2_opnd, (int64_t)s->pc_curr);
+    la_ld_d(a2_ir2_opnd, sp_ir2_opnd, 48);
+    li_d(a3_ir2_opnd, 1);
+    li_d(t0_ir2_opnd, (uint64_t)lata_guest_mem_raise_fault);
+    la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
+    lata_emit_mem_call_epilogue();
+    lata_gen_call_helper_epilogue(tcg_ctx);
+    li_d(t0_ir2_opnd, (int64_t)(uintptr_t)&lata_vreg_published);
+    li_d(t1_ir2_opnd, 1);
+    la_st_w(t1_ir2_opnd, t0_ir2_opnd, 0);
+    li_d(t0_ir2_opnd, (int64_t)context_switch_native_to_bt_ret_0);
+    la_jirl(zero_ir2_opnd, t0_ir2_opnd, 0);
+}
+
+static bool lata_emit_guest_mem_load_call(DisasContext *s, IR2_OPND dst,
+                                          IR2_OPND addr_reg, int64_t offset,
+                                          size_t size, bool is_signed)
+{
+    IR2_OPND vaddr = ra_alloc_itemp();
+    IR2_OPND ok_lbl = ir2_opnd_new_type(IR2_OPND_LABEL);
+
+    li_d(vaddr, offset);
+    la_add_d(vaddr, addr_reg, vaddr);
+    lata_emit_mem_call_prologue(vaddr, vaddr, false);
+    ra_free_temp(vaddr);
+
+    lata_gen_call_helper_prologue(tcg_ctx);
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    la_ld_d(a1_ir2_opnd, sp_ir2_opnd, 48);
+    li_d(a2_ir2_opnd, (int64_t)size);
+    li_d(a3_ir2_opnd, is_signed ? 1 : 0);
+    la_addi_d(a4_ir2_opnd, sp_ir2_opnd, 56);
+    li_d(t0_ir2_opnd, (uint64_t)lata_guest_mem_load);
+    la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
+    la_beqz(a0_ir2_opnd, ok_lbl);
+    lata_emit_mem_call_fault(s, a0_ir2_opnd);
+    la_label(ok_lbl);
+    lata_gen_call_helper_epilogue(tcg_ctx);
+    la_ld_d(dst, sp_ir2_opnd, 56);
+    lata_emit_mem_call_epilogue();
+    return true;
+}
+
+static bool lata_emit_guest_mem_store_call(DisasContext *s, IR2_OPND value,
+                                           IR2_OPND addr_reg, int64_t offset,
+                                           size_t size)
+{
+    IR2_OPND vaddr = ra_alloc_itemp();
+    IR2_OPND ok_lbl = ir2_opnd_new_type(IR2_OPND_LABEL);
+
+    li_d(vaddr, offset);
+    la_add_d(vaddr, addr_reg, vaddr);
+    lata_emit_mem_call_prologue(vaddr, value, true);
+    ra_free_temp(vaddr);
+
+    lata_gen_call_helper_prologue(tcg_ctx);
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    la_ld_d(a1_ir2_opnd, sp_ir2_opnd, 48);
+    li_d(a2_ir2_opnd, (int64_t)size);
+    la_ld_d(a3_ir2_opnd, sp_ir2_opnd, 56);
+    li_d(t0_ir2_opnd, (uint64_t)lata_guest_mem_store);
+    la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
+    la_beqz(a0_ir2_opnd, ok_lbl);
+    lata_emit_mem_call_fault(s, a0_ir2_opnd);
+    la_label(ok_lbl);
+    lata_gen_call_helper_epilogue(tcg_ctx);
+    lata_emit_mem_call_epilogue();
+    return true;
+}
+
+/*
+ * Provider-mediated 16-byte (SIMD/vector) access.
+ *
+ * The staged transfer moves data through two 64-bit halves rather than a 128-bit
+ * vld/vst: a vld/vst based staging landed the value 8 bytes high in the guest
+ * register view, so the halves are moved explicitly with vinsgr2vr_d /
+ * vpickve2gr_d, which are unambiguous 64-bit lane operations.
+ */
+static bool lata_emit_guest_mem_load_bulk(DisasContext *s, IR2_OPND dst_vec,
+                                          IR2_OPND addr_reg, int64_t offset,
+                                          size_t size)
+{
+    IR2_OPND vaddr = ra_alloc_itemp();
+    IR2_OPND lo = ra_alloc_itemp();
+    IR2_OPND hi = ra_alloc_itemp();
+    IR2_OPND ok_lbl = ir2_opnd_new_type(IR2_OPND_LABEL);
+    const LataGuestMemOps *ops = lata_get_guest_mem_ops();
+
+    li_d(vaddr, offset);
+    la_add_d(vaddr, addr_reg, vaddr);
+    lata_emit_mem_call_prologue(vaddr, vaddr, false);
+    ra_free_temp(vaddr);
+
+    lata_gen_call_helper_prologue(tcg_ctx);
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    la_ld_d(a1_ir2_opnd, sp_ir2_opnd, 48);
+    la_addi_d(a2_ir2_opnd, sp_ir2_opnd, LATA_MEM_CALL_DATA);
+    li_d(a3_ir2_opnd, (int64_t)size);
+    if (ops != NULL && ops->load_bytes != NULL) {
+        li_d(t0_ir2_opnd, (uint64_t)ops->load_bytes);
+        la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
+        la_beqz(a0_ir2_opnd, ok_lbl);
+        lata_emit_mem_call_fault(s, a0_ir2_opnd);
+    } else {
+        for (size_t off = 0; off < size; off += 8) {
+            la_mov64(a0_ir2_opnd, env_ir2_opnd);
+            la_ld_d(a1_ir2_opnd, sp_ir2_opnd, 48);
+            li_d(a2_ir2_opnd, 8);
+            li_d(a3_ir2_opnd, 0);
+            la_addi_d(a4_ir2_opnd, sp_ir2_opnd,
+                      (int)(LATA_MEM_CALL_DATA + off));
+            li_d(t0_ir2_opnd, (uint64_t)lata_guest_mem_load);
+            la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
+            la_beqz(a0_ir2_opnd, ok_lbl);
+            lata_emit_mem_call_fault(s, a0_ir2_opnd);
+            la_label(ok_lbl);
+            ok_lbl = ir2_opnd_new_type(IR2_OPND_LABEL);
+        }
+    }
+    la_label(ok_lbl);
+    lata_gen_call_helper_epilogue(tcg_ctx);
+    la_ld_d(lo, sp_ir2_opnd, LATA_MEM_CALL_DATA);
+    la_ld_d(hi, sp_ir2_opnd, LATA_MEM_CALL_DATA + 8);
+    la_vinsgr2vr_d(dst_vec, lo, 0);
+    la_vinsgr2vr_d(dst_vec, hi, 1);
+    ra_free_temp(lo);
+    ra_free_temp(hi);
+    lata_emit_mem_call_epilogue();
+    return true;
+}
+
+static bool lata_emit_guest_mem_store_bulk(DisasContext *s, IR2_OPND src_vec,
+                                           IR2_OPND addr_reg, int64_t offset,
+                                           size_t size)
+{
+    IR2_OPND vaddr = ra_alloc_itemp();
+    IR2_OPND ok_lbl = ir2_opnd_new_type(IR2_OPND_LABEL);
+    const LataGuestMemOps *ops = lata_get_guest_mem_ops();
+
+    li_d(vaddr, offset);
+    la_add_d(vaddr, addr_reg, vaddr);
+    lata_emit_mem_call_prologue(vaddr, vaddr, false);
+    ra_free_temp(vaddr);
+
+    IR2_OPND lo = ra_alloc_itemp();
+    IR2_OPND hi = ra_alloc_itemp();
+    la_vpickve2gr_d(lo, src_vec, 0);
+    la_vpickve2gr_d(hi, src_vec, 1);
+    la_st_d(lo, sp_ir2_opnd, LATA_MEM_CALL_DATA);
+    la_st_d(hi, sp_ir2_opnd, LATA_MEM_CALL_DATA + 8);
+    ra_free_temp(lo);
+    ra_free_temp(hi);
+
+    lata_gen_call_helper_prologue(tcg_ctx);
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    la_ld_d(a1_ir2_opnd, sp_ir2_opnd, 48);
+    la_addi_d(a2_ir2_opnd, sp_ir2_opnd, LATA_MEM_CALL_DATA);
+    li_d(a3_ir2_opnd, (int64_t)size);
+    if (ops != NULL && ops->store_bytes != NULL) {
+        li_d(t0_ir2_opnd, (uint64_t)ops->store_bytes);
+        la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
+        la_beqz(a0_ir2_opnd, ok_lbl);
+        lata_emit_mem_call_fault(s, a0_ir2_opnd);
+    } else {
+        for (size_t off = 0; off < size; off += 8) {
+            la_mov64(a0_ir2_opnd, env_ir2_opnd);
+            la_ld_d(a1_ir2_opnd, sp_ir2_opnd, 48);
+            li_d(a2_ir2_opnd, 8);
+            la_ld_d(a3_ir2_opnd, sp_ir2_opnd,
+                    (int)(LATA_MEM_CALL_DATA + off));
+            li_d(t0_ir2_opnd, (uint64_t)lata_guest_mem_store);
+            la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
+            la_beqz(a0_ir2_opnd, ok_lbl);
+            lata_emit_mem_call_fault(s, a0_ir2_opnd);
+            la_label(ok_lbl);
+            ok_lbl = ir2_opnd_new_type(IR2_OPND_LABEL);
+        }
+    }
+    la_label(ok_lbl);
+    lata_gen_call_helper_epilogue(tcg_ctx);
+    lata_emit_mem_call_epilogue();
+    return true;
+}
+
 static void assist_trans_STR_i(DisasContext *s, IR2_OPND *reg_t, IR2_OPND *reg_n, uint64_t offset, uint64_t sz)
 {
+    if (!lata_guest_mem_inline_host_access_ok())
+    {
+        lata_emit_guest_mem_store_call(s, *reg_t, *reg_n, (int64_t)offset,
+                                       (size_t)1u << sz);
+        return;
+    }
     lata_emit_guest_mem_probe(s, *reg_n, (int64_t)offset, (size_t)1u << sz, true, NULL);
     switch (sz)
     {
@@ -3101,6 +3474,12 @@ static bool trans_STR_i(DisasContext *s)
 
 static void assist_trans_LDR_i(DisasContext *s, IR2_OPND *reg_t, IR2_OPND *reg_n, uint64_t offset, uint64_t sz, uint64_t sign, bool iss_sf)
 {
+    if (!lata_guest_mem_inline_host_access_ok())
+    {
+        lata_emit_guest_mem_load_call(s, *reg_t, *reg_n, (int64_t)offset,
+                                      (size_t)1u << sz, sign != 0);
+        return;
+    }
     lata_emit_guest_mem_probe(s, *reg_n, (int64_t)offset, (size_t)1u << sz, false, NULL);
     switch (sz)
     {
@@ -3248,6 +3627,12 @@ static bool trans_LDR_i(DisasContext *s)
 
 static void assist_trans_STR_v_i(DisasContext *s, IR2_OPND *vreg_t, IR2_OPND *reg_n, uint64_t offset, uint64_t sz)
 {
+    if (!lata_guest_mem_inline_host_access_ok())
+    {
+        lata_emit_guest_mem_store_bulk(s, *vreg_t, *reg_n, (int64_t)offset,
+                                       (size_t)16u);
+        return;
+    }
     lata_emit_guest_mem_probe(s, *reg_n, (int64_t)offset, (size_t)1u << sz, true, vreg_t);
     IR2_OPND temp = ra_alloc_itemp();
     switch (sz)
@@ -3349,6 +3734,12 @@ static bool trans_STR_v_i(DisasContext *s)
 
 static void assist_trans_LDR_v_i(DisasContext *s, IR2_OPND *vreg_t, IR2_OPND *reg_n, uint64_t offset, uint64_t sz)
 {
+    if (!lata_guest_mem_inline_host_access_ok())
+    {
+        lata_emit_guest_mem_load_bulk(s, *vreg_t, *reg_n, (int64_t)offset,
+                                      (size_t)16u);
+        return;
+    }
     lata_emit_guest_mem_probe(s, *reg_n, (int64_t)offset, (size_t)1u << sz, false, NULL);
     IR2_OPND temp = ra_alloc_itemp();
     switch (sz)
@@ -19248,7 +19639,10 @@ bool tr_ir2_generate(struct TranslationBlock *tb)
     int start = 0;
     /* Announce this block's helper-descriptor group (see sve-lasx-lower.h:
      * announcing only switches groups; release happens at flush/teardown). */
-    lata_sve_helper_begin_tb((const void *)tb, (uint64_t)tb->pc);
+    /* Key the descriptor group by the code pointer: a reused TB struct gets a
+     * fresh code region, so it cannot alias a previous group (see the
+     * ownership note in sve-lasx-lower.h). */
+    lata_sve_helper_begin_tb((const void *)tb->tc.ptr, (uint64_t)tb->pc);
 #ifdef CONFIG_LATA_TU
     start = tu_data->curr_insns;
 #endif

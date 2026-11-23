@@ -3,6 +3,13 @@
 # it is done or the watchdog fires.  A bare QEMU launch is what leaves orphan
 # processes behind: the image ends its test and spins forever, so the child
 # outlives the shell that started it.
+#
+# Exit status is the verification result, not "qemu was launched":
+#   0  the expected DONE_TOKEN appeared in the serial log
+#   2  the watchdog fired before the token appeared
+#   3  QEMU exited on its own before the token appeared
+# Without this, a missing token, an early exit or a hang all looked like
+# success to CI.
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -23,17 +30,46 @@ rm -f "$LOG_FILE"
     -serial "file:$LOG_FILE" -no-reboot >/dev/null 2>&1 &
 QEMU_PID=$!
 
-# Watchdog: nothing here may leave a QEMU behind.
-( sleep "$TIMEOUT_SEC"; kill -KILL "$QEMU_PID" 2>/dev/null ) >/dev/null 2>&1 &
+# Watchdog: nothing here may leave a QEMU behind.  It records that it fired so a
+# watchdog kill is not reported as "qemu exited on its own".
+WATCHDOG_FLAG="$(mktemp)"
+( sleep "$TIMEOUT_SEC"; : > "$WATCHDOG_FLAG"; kill -KILL "$QEMU_PID" 2>/dev/null ) >/dev/null 2>&1 &
 WATCHDOG=$!
 
+token_seen=0
+qemu_exited=0
 for _ in $(seq 1 $((TIMEOUT_SEC * 5))); do
-    grep -qa "$DONE_TOKEN" "$LOG_FILE" 2>/dev/null && break
-    kill -0 "$QEMU_PID" 2>/dev/null || break
+    if grep -qa -- "$DONE_TOKEN" "$LOG_FILE" 2>/dev/null; then
+        token_seen=1
+        break
+    fi
+    if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+        qemu_exited=1
+        break
+    fi
     sleep 0.2
 done
 
 kill -KILL "$QEMU_PID" 2>/dev/null
 kill -KILL "$WATCHDOG" 2>/dev/null
 wait "$QEMU_PID" 2>/dev/null
-exit 0
+
+if [[ "$token_seen" -eq 1 ]]; then
+    exit 0
+fi
+
+if [[ -s "$WATCHDOG_FLAG" ]]; then
+    qemu_exited=0
+fi
+rm -f "$WATCHDOG_FLAG"
+
+if [[ "$qemu_exited" -eq 1 ]]; then
+    echo "run_qemu_lata: qemu exited before '$DONE_TOKEN' appeared" >&2
+    status=3
+else
+    echo "run_qemu_lata: timed out after ${TIMEOUT_SEC}s waiting for '$DONE_TOKEN'" >&2
+    status=2
+fi
+echo "run_qemu_lata: log tail ($LOG_FILE):" >&2
+tail -n 20 "$LOG_FILE" 2>/dev/null >&2
+exit "$status"

@@ -10,6 +10,8 @@
 #include "reg-alloc.h"
 #include "macro-inst.h"
 #include "lata-vcache.h"
+#include "lata-snapshot.h"
+#include "lata-fpsr.h"
 
 #include "tcg/tcg.h"
 //#include "env.h"
@@ -129,6 +131,12 @@ typedef struct LataContext {
     uint64_t sve_helper_pc;
     uint32_t sve_helper_descs;
     uint32_t sve_helper_chunks;
+    /*
+     * Code-cache position recorded when the live chunks were allocated.  A
+     * flush rewinds the cache, so seeing an earlier position later proves that
+     * no code from the old cache can run and every descriptor can be dropped.
+     */
+    uintptr_t sve_helper_codegen;
     struct TUControl *tu_data;
     void *tu_search_offsets;
     bool initialized;
@@ -208,6 +216,8 @@ uint32_t lata_vreg_spills(void);
 uint32_t lata_vreg_resident_count(void);
 /* Test/debug knob: shrink the temporary base pool to force spilling. */
 void lata_ftemp_set_base_pool(int pool);
+
+/* Guest FPSR helpers live in lata-fpsr.h (included above). */
 /* True when the physical register is currently handed out by the temp pool. */
 bool ra_ftemp_phys_in_pool(int phys);
 
@@ -246,30 +256,8 @@ IR2_OPND alloc_fpr_dst(int i);
 void store_fpr_dst(int i, IR2_OPND opnd);
 void free_alloc_fpr(IR2_OPND opnd);
 
-typedef struct LataIr2Snapshot {
-    int ir2_inst_num_current;
-    int real_ir2_inst_num;
-    int first_ir2_id;
-    int last_ir2_id;
-    int last_ir2_next;
-    int label_num;
-    uint32_t all_temp_status;
-    uint32_t vreg_resident_touched;
-    uint32_t vreg_resident_dirty;
-    uint32_t vreg_v_written_mask;
-    uint32_t vreg_tb_resident;
-    uint32_t w_write_flag;
-    bool ftemp_alloc_failed;
-    struct {
-        bool valid;
-        bool dirty;
-        int offset;
-    } zcache_slots[2];
-    unsigned zcache_victim;
-    LataVcacheSnapshot vcache_snap;
-} LataIr2Snapshot;
-
-void lata_ir2_snapshot_take(LataIr2Snapshot *snap);
+void lata_ftemp_pool_snapshot(LataContext *ctx, LataIr2Snapshot *snap);
+void lata_ftemp_pool_rollback(LataContext *ctx, const LataIr2Snapshot *snap);
 void lata_ir2_snapshot_rollback(const LataIr2Snapshot *snap);
 
 #endif

@@ -70,6 +70,21 @@ typedef struct LataGuestMemOps {
      * access is then lowered through probe/load/store.
      */
     const LataGuestMemDirectPolicy *direct;
+    /*
+     * Byte-buffer transfer for spans wider than 8 bytes (SIMD/vector). NULL
+     * means the lowering must split the span into 8-byte provider calls.
+     */
+    LataGuestMemStatus (*load_bytes)(CPUARMState *env, uint64_t vaddr,
+                                     void *dst, size_t size);
+    LataGuestMemStatus (*store_bytes)(CPUARMState *env, uint64_t vaddr,
+                                      const void *src, size_t size);
+    /*
+     * Declared environment property, not a probe result: the loader maps every
+     * guest VA at the same host address and applies no permission model of its
+     * own.  Only the bare-metal harness may claim this; a custom provider
+     * leaves it false and its accesses go through load/store instead.
+     */
+    bool va_is_hpa_identity;
 } LataGuestMemOps;
 
 extern const LataGuestMemOps lata_default_guest_mem_ops;
@@ -89,6 +104,10 @@ LataGuestMemStatus lata_guest_mem_store(CPUARMState *env, uint64_t vaddr,
 /* Direct-access contract. `available()` gates code generation: when it is
  * false the lowering must not emit an inline host access at all. */
 bool lata_guest_mem_direct_available(void);
+/* True when inline host access is justified (policy published, or the provider
+ * declares the identity environment).  Scalar/NEON lowering must consult this
+ * instead of comparing against a specific provider pointer. */
+bool lata_guest_mem_inline_host_access_ok(void);
 /* Epoch to embed in code generated now; 0 when no policy is installed. */
 uint64_t lata_guest_mem_direct_epoch(void);
 /* Runtime admission for one span. `translation_epoch` is the value observed

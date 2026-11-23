@@ -171,6 +171,7 @@ RA_ALLOC_FUNC_DEF(scr);
 /* allocate and free temp register */
 IR2_OPND ra_alloc_itemp(void);
 IR2_OPND ra_alloc_ftemp(void);
+
 #define ra_free_itemp(phy_id)   RA_FREE_CODE(itemp, phy_id)
 #define ra_free_ftemp(phy_id)   RA_FREE_FTEMP_CODE(phy_id)
 void ra_free_all(void);

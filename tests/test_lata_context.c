@@ -207,8 +207,50 @@ static void *worker_thread(void *arg_ptr)
     return NULL;
 }
 
+/* A lowering that spills resident vectors and then rolls back its IR2 must
+ * also roll back the temp pool: spill entries are permanent for the TB, so a
+ * stale phy<->slot map would outlive the instructions that created it. */
+static void test_ir2_snapshot_restores_ftemp_pool(void)
+{
+    LataContext *ctx = lata_context_current();
+    LataIr2Snapshot snap;
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->mem_ops = &lata_default_guest_mem_ops;
+    ctx->ftemp_base = 6;
+    ctx->ftemp_pool_entries = 6;
+    for (int i = 0; i < 32; ++i) {
+        ctx->reg_ftemp_map[i] = 100 + i;
+        ctx->reg_ftemp_reverse_map[i] = 200 + i;
+    }
+
+    lata_ftemp_pool_snapshot(ctx, &snap);
+
+    /* Simulate a spill: the pool grows and the maps are rewritten. */
+    ctx->ftemp_base = 5;
+    ctx->ftemp_pool_entries = 7;
+    ctx->reg_ftemp_map[0] = 42;
+    ctx->reg_ftemp_map[6] = 43;
+    ctx->reg_ftemp_reverse_map[0] = 9;
+
+    lata_ftemp_pool_rollback(ctx, &snap);
+
+    CHECK(ctx->ftemp_base == 6);
+    CHECK(ctx->ftemp_pool_entries == 6);
+    CHECK(ctx->reg_ftemp_map[0] == 100);
+    CHECK(ctx->reg_ftemp_map[6] == 106);
+    CHECK(ctx->reg_ftemp_reverse_map[0] == 200);
+    CHECK(ctx->reg_ftemp_reverse_map[31] == 231);
+
+    /* Rollback must be idempotent w.r.t. the snapshot, not the live maps. */
+    ctx->ftemp_pool_entries = 7;
+    lata_ftemp_pool_rollback(ctx, &snap);
+    CHECK(ctx->ftemp_pool_entries == 6);
+}
+
 int main(void)
 {
+    test_ir2_snapshot_restores_ftemp_pool();
     LataVcacheState main_vc;
     lata_vcache_state_init(&main_vc, true);
     lata_vcache_bind_state(&main_vc);

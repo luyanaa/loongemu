@@ -158,6 +158,11 @@ static inline int env_offset_PSTATE(void)
     return offsetof(CPUARMState,pstate);
 }
 
+static inline int env_offset_fpsr(void)
+{
+    return offsetof(CPUARMState, vfp.xregs[ARM_VFP_FPSR]);
+}
+
 static inline int env_offset_FPSCR(void)
 {
     return offsetof(CPUARMState, vfp.xregs[ARM_VFP_FPSCR]);

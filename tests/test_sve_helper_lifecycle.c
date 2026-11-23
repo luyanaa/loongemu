@@ -23,6 +23,11 @@
 #include "sve-lasx-lower.h"
 #include "target/arm/lata/include/lata.h"
 #include "target/arm/tcg/translate.h"
+#include "tcg/tcg.h"
+
+/* The allocator records the code-cache position; give the fixture one. */
+static TCGContext tcg_ctx_storage;
+TCGContext *tcg_ctx = &tcg_ctx_storage;
 
 #include <stdio.h>
 #include <string.h>
@@ -33,7 +38,7 @@ static unsigned failures;
 #define CHECK(condition) do { \
     ++checks; \
     if (!(condition)) { \
-        fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #condition); \
+        printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #condition); \
         ++failures; \
     } \
 } while (0)
@@ -42,6 +47,8 @@ static unsigned failures;
 static LATA_TLS LataContext tls_ctx;
 
 LATA_TLS ENV *lsenv = NULL;
+/* QEMU assert output goes here; keep it a real stream so a failing CHECK
+ * reports instead of dereferencing NULL. */
 FILE *stderr = NULL;
 
 void latx_bare_assert_fail(const char *expr, const char *file, int line)
@@ -95,6 +102,9 @@ int main(void)
     static uint8_t tb_b_mem[512];
     TranslationBlock *tb_a = (TranslationBlock *)tb_a_mem;
     TranslationBlock *tb_b = (TranslationBlock *)tb_b_mem;
+    /* Descriptor groups are keyed by the block's code pointer. */
+    tb_a->tc.ptr = (uint8_t *)(uintptr_t)0x40000;
+    tb_b->tc.ptr = (uint8_t *)(uintptr_t)0x40100;
     DisasContext s;
     DisasContextBase base;
     const LataSVEHelperDesc *d1;
@@ -134,7 +144,7 @@ int main(void)
     CHECK(chunks == 4);
 
     /* release_tb drops exactly one block's group. */
-    lata_sve_helper_release_tb((const void *)tb_a);
+    lata_sve_helper_release_tb((const void *)tb_a->tc.ptr);
     lata_sve_helper_stats(&descs, &chunks);
     CHECK(descs == 2);
     CHECK(chunks == 1);
@@ -167,6 +177,13 @@ int main(void)
     CHECK(d1 != NULL && d2 != NULL && d1 != d2);
     lata_sve_helper_stats(&descs, &chunks);
     CHECK(descs == 3);
+    /* A code-cache flush rewinds the allocator; the allocator must treat the
+     * live chunks as dead instead of leaking them across generations. */
+    CHECK(lata_sve_helper_codegen_rewound(0x2000, 0x1000));
+    CHECK(!lata_sve_helper_codegen_rewound(0x1000, 0x2000));
+    CHECK(!lata_sve_helper_codegen_rewound(0x1000, 0x1000));
+    CHECK(!lata_sve_helper_codegen_rewound(0, 0x1000));
+
     s.pc_curr = 0x4000;
     (void)lata_sve_alloc_helper_desc(&s, &insn, NULL);
     lata_sve_helper_stats(&descs, &chunks);
@@ -175,6 +192,30 @@ int main(void)
 
     /* NULL instruction must be refused, not crash. */
     CHECK(lata_sve_alloc_helper_desc(&s, NULL, NULL) == NULL);
+
+    /* A flush performed by another thread rewinds the shared code cache; the
+     * next block start in this thread must drop the stale chunks. */
+    {
+        uint32_t d0, c0, d1, c1;
+
+        tcg_ctx->code_gen_ptr = (void *)(uintptr_t)0x50000;
+        make_ctx(&s, &base, tb_a, 0x5000);
+        CHECK(lata_sve_alloc_helper_desc(&s, &insn, NULL) != NULL);
+        lata_sve_helper_stats(&d0, &c0);
+        CHECK(d0 == 1 && c0 == 1);
+
+        tcg_ctx->code_gen_ptr = (void *)(uintptr_t)0x10000; /* rewind */
+        lata_sve_helper_begin_tb((const void *)tb_b->tc.ptr, 0x6000);
+        lata_sve_helper_stats(&d1, &c1);
+        CHECK(d1 == 0 && c1 == 0);
+
+        /* Allocating again in the old group must not resurrect the dropped
+         * chunk (the group state has to be rebuilt). */
+        CHECK(lata_sve_alloc_helper_desc(&s, &insn, NULL) != NULL);
+        lata_sve_helper_stats(&d1, &c1);
+        CHECK(d1 == 1 && c1 == 1);
+        lata_sve_helper_release_all();
+    }
 
     printf("SVE helper lifecycle: %u checks passed", checks);
     if (failures != 0) {
