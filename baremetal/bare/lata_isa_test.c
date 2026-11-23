@@ -7285,7 +7285,7 @@ void kmain(void)
         m = ra_alloc_ftemp();
         lata_env_xvld(a, env_offset_zreg(0));
         lata_env_xvld(b, env_offset_zreg(1));
-        la_xvfcmp_cond_s(m, a, b, FCMP_COND_CUN);
+        la_xvfcmp_cond_s(m, a, a, FCMP_COND_CUN);
         lata_env_xvst(m, env_offset_zreg(2));
         /* temps are released with the translation below */
         sve_exec_direct();
@@ -7293,6 +7293,43 @@ void kmain(void)
               "xvfcmp CUN sets a mask bit in NaN lanes");
     }
 cun_probe_done:;
+
+    /* FPCR.DN on the inline binary path (lower_fp_binary). */
+    if (latx_cpu_has_lasx() != 0) {
+        DisasContext ds;
+        A64SVEPvirBuilder bs;
+
+        sve_init_direct(&ds, &bs, 256);
+        env.vfp.xregs[0] = UINT64_C(1) << 25; /* FPCR.DN */
+        arm_sve_preg(&env, 1)[0] = 0x11u;
+        arm_sve_preg(&env, 1)[1] = 0x11u;
+        arm_sve_preg(&env, 1)[2] = 0x11u;
+        arm_sve_preg(&env, 1)[3] = 0x11u;
+        for (size_t l = 0; l < 8; ++l) {
+            write_le32(arm_sve_zreg(&env, 0) + l * 4u, 0x3f800000u);
+            write_le32(arm_sve_zreg(&env, 2) + l * 4u, 0x7fc00001u);
+        }
+        check(sve_emit_decoded(&ds, 0x65808440u, "FADD z0.s with DN"),
+              1, "FADD with a NaN lowers under DN=1");
+        sve_exec_direct();
+        check(read_le32(arm_sve_zreg(&env, 0)), UINT32_C(0x7fc00000),
+              "DN=1 turns the NaN result into the default NaN");
+
+        /* DN=0 keeps the quieted NaN operand instead. */
+        sve_init_direct(&ds, &bs, 256);
+        arm_sve_preg(&env, 1)[0] = 0x11u;
+        arm_sve_preg(&env, 1)[1] = 0x11u;
+        arm_sve_preg(&env, 1)[2] = 0x11u;
+        arm_sve_preg(&env, 1)[3] = 0x11u;
+        for (size_t l = 0; l < 8; ++l) {
+            write_le32(arm_sve_zreg(&env, 0) + l * 4u, 0x3f800000u);
+            write_le32(arm_sve_zreg(&env, 2) + l * 4u, 0x7fc00001u);
+        }
+        (void)sve_emit_decoded(&ds, 0x65808440u, "FADD z0.s without DN");
+        sve_exec_direct();
+        check(read_le32(arm_sve_zreg(&env, 0)), UINT32_C(0x7fc00001),
+              "DN=0 keeps the NaN payload");
+    }
 
     latx_bare_uart_puts("lata-isa: checks=");
     putdec((uint64_t)checks);

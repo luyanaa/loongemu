@@ -1261,6 +1261,39 @@ static bool lower_integer_binary(
 }
 
 int lata_last_fp_route = 0;
+static void emit_xv_broadcast_u64(IR2_OPND dst, uint64_t value);
+
+/*
+ * FPCR.DN: when set, every produced NaN is the default quiet NaN.
+ * xvfcmp CUN writes 1 in NaN lanes (measured), and vbitsel(vd, vj, vk, va)
+ * selects vj where va is 1, so vj = default NaN and vk = the computed value.
+ */
+static void lata_emit_dn_fixup(IR2_OPND res, bool is64)
+{
+    IR2_OPND skip = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND tmp = ra_alloc_ftemp();
+    IR2_OPND mask = ra_alloc_ftemp();
+
+    li_d(t0_ir2_opnd, env_offset_FPCR());
+    la_ldx_wu(t0_ir2_opnd, env_ir2_opnd, t0_ir2_opnd);
+    li_d(t1_ir2_opnd, INT64_C(1) << 25);
+    la_and(t0_ir2_opnd, t0_ir2_opnd, t1_ir2_opnd);
+    la_beqz(t0_ir2_opnd, skip);
+
+    if (is64) {
+        la_xvfcmp_cond_d(mask, res, res, FCMP_COND_CUN);
+        emit_xv_broadcast_u64(tmp, UINT64_C(0x7ff8000000000000));
+    } else {
+        la_xvfcmp_cond_s(mask, res, res, FCMP_COND_CUN);
+        emit_xv_broadcast_u64(tmp, UINT64_C(0x7fc000007fc00000));
+    }
+    /* This backend documents vbitsel as "va ? vk : vj", so the default NaN goes
+     * in vk and the computed value in vj. */
+    la_xvbitsel_v(res, res, tmp, mask);
+    la_label(skip);
+    ra_free_temp(mask);
+    ra_free_temp(tmp);
+}
 
 static bool lower_fp_binary(DisasContext *s,
                             const A64SVEIR1Instruction *source,
@@ -1425,6 +1458,8 @@ static bool lower_fp_binary(DisasContext *s,
             }
         }
         if (ok) {
+            lata_emit_dn_fixup(result_value,
+                               operation->type.element_bits == 64);
             /* The chunk has not been stored yet, so env still holds old Zdn. */
             lata_env_xvld(old_value, destination_offset + (int)byte);
             la_xvbitsel_v(result, old_value, result_value, mask);
