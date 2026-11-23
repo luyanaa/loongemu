@@ -386,8 +386,8 @@ static bool trans_alu(DisasContext *s)
         return trans_ri(s);
     }
 
-    if (mips_la_map[s->ir1.rs] < 0 && s->ir1.rs != 0) ra_free_itemp(rs._reg_num);
-    if (mips_la_map[s->ir1.rt] < 0 && s->ir1.rt != 0) ra_free_itemp(rt._reg_num);
+    free_alloc_gpr(rs);
+    if (rt._reg_num != rs._reg_num) free_alloc_gpr(rt);
     return true;
 }
 
@@ -476,7 +476,7 @@ static bool trans_alu_imm(DisasContext *s)
         return trans_ri(s);
     }
 
-    if (mips_la_map[s->ir1.rs] < 0 && s->ir1.rs != 0) ra_free_itemp(rs._reg_num);
+    free_alloc_gpr(rs);
     return true;
 }
 
@@ -742,7 +742,7 @@ static void emit_addr(IR2_OPND addr, int base, int64_t imm)
         la_add_d(addr, b, t);
         ra_free_itemp(t._reg_num);
     }
-    if (mips_la_map[base] < 0 && base != 0) ra_free_itemp(b._reg_num);
+    if (mips_la_map[base] < 0 && base != 0) free_alloc_gpr(b);
 }
 
 static bool trans_load(DisasContext *s)
@@ -1362,7 +1362,7 @@ static bool trans_trap(DisasContext *s)
     latm_set_pc(s);
     hcall4((uintptr_t)latm_helper_trap, opv, a, b, code);
     if (s->ir1.insn >> 26 == 0x01) {
-        ra_free_itemp(b._reg_num);
+        free_alloc_gpr(b);
     } else {
         free_gpr_temp(b, s->ir1.rt);
     }
@@ -1413,7 +1413,7 @@ static bool trans_loongson_mem(DisasContext *s)
     latm_set_pc(s);
     hcall6((uintptr_t)latm_helper_loongson_mem, op, base, index, off, rt, rt2);
     if (index_reg && mips_la_map[index_reg] < 0) {
-        ra_free_itemp(index._reg_num);
+        free_alloc_gpr(index);
     }
     free_gpr_temp(base, s->ir1.rs);
     ra_free_itemp(off._reg_num);

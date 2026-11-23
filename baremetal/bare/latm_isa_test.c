@@ -443,19 +443,13 @@ static void run_block(uint32_t *guest, int insns, const char *name)
     latx_bare_uart_puts(" done\n");
 }
 
-/* daddiu $23,$0,0x11 — $23 is env-resident (mips_la_map == NOT_DEF), so
- * the store lands in the TB-local GPR cache and flushes to env as one
- * st.d on TB exit.
- *
- * KNOWN ISSUE: any TB with >=2 env-resident GPR operands (e.g. also
- * `daddu $8,$24,$24`) hangs inside tr_ir2_generate — the S3-LATM
- * regcache borrow/evict accounting deadlocks once itemps are pinned.
- * Single-operand cases work; this test pins the one proven path. */
+/* daddiu $23,$0,0x11; daddiu $23,$23,0x22;
+ * daddu $8,$24,$24; daddu $9,$24,$24.
+ * $23/$24 are env-resident (mips_la_map == NOT_DEF); $8/$9 are pinned
+ * to fixed LA regs. Two writes to $23 coalesce to one env st.d at the
+ * TB-end flush; two reads of $24 coalesce to one env ld.d. */
 static uint32_t regcache_code[] __attribute__((aligned(4096))) = {
-    /* daddiu $23,$0,0x11; jr $31; nop (delay slot). $23 is env-resident
-     * (mips_la_map == NOT_DEF); jr is a branch boundary so the regcache
-     * flush emits the deferred st.d $23 into the IR2 stream before it. */
-    0x64170011, 0x03e00008, 0x00000000,
+    0x64170011, 0x66f70022, 0x0318402d, 0x0318482d, 0x03e00008, 0x00000000,
 };
 
 extern const int mips_la_map[32];
@@ -488,7 +482,7 @@ static void run_regcache_ir2_test(void)
     tb.jmp_reset_offset[0] = 0xffff;
     tb.jmp_reset_offset[1] = 0xffff;
 
-    int max_insns = 3;
+    int max_insns = 6;
     target_disasm(&tb, &max_insns, &env);
     if (tb.icount == 0 || !tr_ir2_generate(&tb)) {
         fails++;
@@ -500,22 +494,28 @@ static void run_regcache_ir2_test(void)
 
     TRANSLATION_DATA *td = (TRANSLATION_DATA *)env.latm_tr_data;
     int env_reg = env_ir2_opnd._reg_num;
-    unsigned st23 = 0;
+    unsigned st23 = 0, ld24 = 0;
     for (IR2_INST *inst = td->first_ir2; inst != NULL;
          inst = ir2_next(inst)) {
         if (inst->op_count != 3 || inst->_opnd[1]._reg_num != env_reg) {
             continue;
         }
-        if (ir2_opcode(inst) == LISA_ST_D &&
-            inst->_opnd[2]._imm32 == env_offset_gpr(23)) {
+        int off = inst->_opnd[2]._imm32;
+        if (ir2_opcode(inst) == LISA_ST_D && off == env_offset_gpr(23)) {
             st23++;
+        }
+        if (ir2_opcode(inst) == LISA_LD_D && off == env_offset_gpr(24)) {
+            ld24++;
         }
     }
     tr_fini();
 
     check(st23, 1, "regcache-ir2 st.d $23 coalesced");
+    check(ld24, 1, "regcache-ir2 ld.d $24 coalesced");
     latx_bare_uart_puts("latm-isa: regcache-ir2 st.d=");
     puthex(st23);
+    latx_bare_uart_puts(" ld.d=");
+    puthex(ld24);
     latx_bare_uart_puts("\n");
 }
 

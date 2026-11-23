@@ -11,6 +11,11 @@ LATM_WEAK TCGContext *tcg_ctx = &latm_tcg_ctx;
 LATM_WEAK int option_fam_jmp_cache;
 
 LATM_WEAK void qemu_log(const char *fmt, ...) { (void)fmt; }
+LATM_WEAK void lata_ir2_debug(unsigned int opcode, unsigned int word)
+{
+    (void)opcode;
+    (void)word;
+}
 LATM_WEAK void *tcg_splitwx_to_rx(void *p) { return p; }
 
 LATM_WEAK void latm_platform_cpu_loop_exit(struct CPUState *cs)
