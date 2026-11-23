@@ -16,6 +16,7 @@
 #include "translate.h"
 #include "riscv-env.h"
 #include "qemu/cpu-features.h"
+#include "pvir-plan.h"
 
 void latr_env_vld(IR2_OPND vector, int offset)
 {
@@ -648,22 +649,31 @@ static void load_fp_one(IR2_OPND scratch, unsigned sew_shift, bool lasx)
     ra_free_temp(one);
 }
 
-static bool can_lasx_chunk(bool allow_lasx, const DirectMatch *m,
-                           unsigned byte, unsigned span_bytes, unsigned vd,
-                           unsigned a_reg, unsigned b_reg)
-{
-    unsigned reg_idx = byte / LATR_RVV_VLENB;
+typedef struct RvvChunkLegalCtx {
+    const DirectMatch *m;
+    unsigned vd;
+    unsigned a_reg;
+    unsigned b_reg;
+} RvvChunkLegalCtx;
 
-    if (!allow_lasx || (span_bytes - byte) < 32u || (byte & 31u) != 0) {
+/* Shared-planner legality: a `width`-byte chunk at `offset` may issue only when
+ * every register it touches keeps LMUL even-pair alignment. The planner itself
+ * checks has_lasx/32B-align/remaining; this supplies the RVV register rule. */
+static bool rvv_chunk_legal(void *opaque, unsigned offset, unsigned width)
+{
+    const RvvChunkLegalCtx *c = opaque;
+    unsigned reg_idx = offset / LATR_RVV_VLENB;
+
+    if (width < 32u) {
+        return true;
+    }
+    if (((c->vd + reg_idx) & 1u) != 0) {
         return false;
     }
-    if (((vd + reg_idx) & 1u) != 0) {
+    if (c->m->family != DIRECT_KIND_MOVE && ((c->a_reg + reg_idx) & 1u) != 0) {
         return false;
     }
-    if (m->family != DIRECT_KIND_MOVE && ((a_reg + reg_idx) & 1u) != 0) {
-        return false;
-    }
-    if (m->src_kind == DIRECT_SRC_VV && ((b_reg + reg_idx) & 1u) != 0) {
+    if (c->m->src_kind == DIRECT_SRC_VV && ((c->b_reg + reg_idx) & 1u) != 0) {
         return false;
     }
     return true;
@@ -684,10 +694,8 @@ bool latr_pvir_try_lower_lsx(const RiscvIR1 *ir1, IR2_OPND *fallback_label,
     unsigned a_reg;
     unsigned b_reg;
     unsigned span_bytes;
-    unsigned lasx_chunks = 0;
-    unsigned lsx_chunks = 0;
-    unsigned chunk_steps[8];
-    unsigned chunk_count = 0;
+    PvirPlan plan;
+    RvvChunkLegalCtx legal_ctx;
     bool has_lasx = latx_cpu_has_lasx() != 0;
     bool is_fp_arith;
     uint64_t packed;
@@ -725,17 +733,21 @@ bool latr_pvir_try_lower_lsx(const RiscvIR1 *ir1, IR2_OPND *fallback_label,
                 : ((unsigned)ir1->arg.rs2 & 31u);
     b_reg = (unsigned)ir1->arg.rs1 & 31u;
 
+    legal_ctx = (RvvChunkLegalCtx){&m, vd, a_reg, b_reg};
+    memset(&plan, 0, sizeof(plan));
+
     if (m.family == DIRECT_KIND_MASK_LOGIC) {
+        /* One 16B chunk regardless of LASX. */
         span_bytes = LATR_RVV_VLENB;
-        chunk_steps[0] = 16u;
-        chunk_count = 1u;
-        lsx_chunks = 1u;
+        if (pvir_plan_chunks(&plan, span_bytes, false, NULL, NULL) !=
+            PVIR_STATUS_OK) {
+            return false;
+        }
     } else {
         unsigned elem_bytes = 1u << sew_shift;
         unsigned active_bytes = vl * elem_bytes;
         unsigned vlmax_bytes = vlmax * elem_bytes;
         unsigned nregs;
-        unsigned byte;
 
         span_bytes = vta ? vlmax_bytes : ((active_bytes + 15u) & ~15u);
         span_bytes = (span_bytes + 15u) & ~15u;
@@ -754,17 +766,9 @@ bool latr_pvir_try_lower_lsx(const RiscvIR1 *ir1, IR2_OPND *fallback_label,
             return false;
         }
 
-        for (byte = 0; byte < span_bytes;) {
-            bool use_lasx = can_lasx_chunk(has_lasx, &m, byte, span_bytes, vd,
-                                           a_reg, b_reg);
-            unsigned step = use_lasx ? 32u : 16u;
-            chunk_steps[chunk_count++] = step;
-            if (use_lasx) {
-                lasx_chunks++;
-            } else {
-                lsx_chunks++;
-            }
-            byte += step;
+        if (pvir_plan_chunks(&plan, span_bytes, has_lasx, rvv_chunk_legal,
+                             &legal_ctx) != PVIR_STATUS_OK) {
+            return false;
         }
     }
 
@@ -779,8 +783,8 @@ bool latr_pvir_try_lower_lsx(const RiscvIR1 *ir1, IR2_OPND *fallback_label,
         m.unmasked ? 1u : 0u,
         (is_fp_arith || m.src_kind == DIRECT_SRC_VF) ? 1u : 0u,
         m.family == DIRECT_KIND_MASK_LOGIC ? 1u : 0u,
-        m.family == DIRECT_KIND_MERGE ? 1u : 0u, vta, vma, lasx_chunks,
-        lsx_chunks, vd,
+        m.family == DIRECT_KIND_MERGE ? 1u : 0u, vta, vma, plan.lasx_chunks,
+        plan.lsx_chunks, vd,
         ((ir1->pc & 0xffffu) ^ ((uint64_t)(unsigned)ir1->opcode << 16)));
 
     *fallback_label = ir2_opnd_new_type(IR2_OPND_LABEL);
@@ -815,11 +819,11 @@ bool latr_pvir_try_lower_lsx(const RiscvIR1 *ir1, IR2_OPND *fallback_label,
         }
         if (scalar_b) {
             emit_broadcast_scalar(b_vec, ir1, &m, sew_shift,
-                                  lasx_chunks > 0);
+                                  plan.lasx_chunks > 0);
         }
 
-        for (idx = 0; idx < chunk_count; idx++) {
-            bool lasx = chunk_steps[idx] == 32u;
+        for (idx = 0; idx < plan.chunk_count; idx++) {
+            bool lasx = plan.steps[idx].size == 32u;
             int mask_off = env_offset_v_expanded_mask((int)byte);
             int fill_off = env_offset_v_inactive_fill((int)byte);
             int out_off = span_bytes > LATR_RVV_VLENB
@@ -918,18 +922,18 @@ bool latr_pvir_try_lower_lsx(const RiscvIR1 *ir1, IR2_OPND *fallback_label,
                 (lasx ? la_xvbitsel_v : la_vbitsel_v)(res, scratch, res, mask);
             }
             (lasx ? latr_env_xvst : latr_env_vst)(res, out_off);
-            byte += chunk_steps[idx];
+            byte += plan.steps[idx].size;
         }
 
         if (span_bytes > LATR_RVV_VLENB) {
             byte = 0;
-            for (idx = 0; idx < chunk_count; idx++) {
-                bool lasx = chunk_steps[idx] == 32u;
+            for (idx = 0; idx < plan.chunk_count; idx++) {
+                bool lasx = plan.steps[idx].size == 32u;
                 (lasx ? latr_env_xvld : latr_env_vld)(
                     res, env_offset_v_staging((int)byte));
                 (lasx ? latr_env_xvst : latr_env_vst)(
                     res, env_offset_vreg((int)vd) + (int)byte);
-                byte += chunk_steps[idx];
+                byte += plan.steps[idx].size;
             }
         }
 
