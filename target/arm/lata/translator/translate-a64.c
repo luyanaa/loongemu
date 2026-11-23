@@ -3483,10 +3483,71 @@ static bool lata_emit_guest_mem_load_pair(DisasContext *s, IR2_OPND dst0,
     return true;
 }
 
+/*
+ * Translation-time decisions are not proofs: a published direct policy can only
+ * admit a span at execution time, against the current epoch.  Scalar/NEON lower
+ * the access twice - native when admitted, provider-mediated otherwise - so a
+ * policy change, a fault window or a permission change degrades gracefully.
+ */
+static void lata_emit_scalar_span_admission(IR2_OPND addr_reg, int64_t offset,
+                                            size_t size, bool is_write,
+                                            IR2_OPND admitted)
+{
+    IR2_OPND vaddr = ra_alloc_itemp();
+
+    li_d(vaddr, offset);
+    la_add_d(vaddr, addr_reg, vaddr);
+    /* The admission helper clobbers the caller-saved host registers that back
+     * guest GPRs, so publish them first and restore afterwards. */
+    for (int i = 0; i <= 31; ++i) {
+        if (arm_la_map[i] > 0) {
+            la_st_d(ir2_opnd_new(IR2_OPND_GPR, arm_la_map[i]), env_ir2_opnd,
+                    env_offset_gpr(i));
+        }
+    }
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    la_mov64(a1_ir2_opnd, vaddr);
+    li_d(a2_ir2_opnd, (int64_t)size);
+    li_d(a3_ir2_opnd, is_write ? 1 : 0);
+    li_d(a4_ir2_opnd, (int64_t)lata_guest_mem_direct_epoch());
+    li_d(t0_ir2_opnd, (int64_t)(uintptr_t)lata_guest_mem_direct_admit);
+    la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
+    la_mov64(t2_ir2_opnd, a0_ir2_opnd);
+    for (int i = 0; i <= 31; ++i) {
+        if (arm_la_map[i] > 0) {
+            la_ld_d(ir2_opnd_new(IR2_OPND_GPR, arm_la_map[i]), env_ir2_opnd,
+                    env_offset_gpr(i));
+        }
+    }
+    ra_free_temp(vaddr);
+    la_bnez(t2_ir2_opnd, admitted);
+}
+
 static void assist_trans_STR_i(DisasContext *s, IR2_OPND *reg_t, IR2_OPND *reg_n, uint64_t offset, uint64_t sz)
 {
     if (!lata_guest_mem_inline_host_access_ok())
     {
+        if (lata_guest_mem_direct_available())
+        {
+            IR2_OPND admitted = ir2_opnd_new_type(IR2_OPND_LABEL);
+            IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
+
+            lata_emit_scalar_span_admission(*reg_n, (int64_t)offset,
+                                            (size_t)1u << sz, true, admitted);
+            lata_emit_guest_mem_store_call(s, *reg_t, *reg_n, (int64_t)offset,
+                                           (size_t)1u << sz);
+            la_b(done);
+            la_label(admitted);
+            switch (sz)
+            {
+            case 0: la_st_b(*reg_t, *reg_n, offset); break;
+            case 1: la_st_h(*reg_t, *reg_n, offset); break;
+            case 2: la_st_w(*reg_t, *reg_n, offset); break;
+            default: la_st_d(*reg_t, *reg_n, offset); break;
+            }
+            la_label(done);
+            return;
+        }
         lata_emit_guest_mem_store_call(s, *reg_t, *reg_n, (int64_t)offset,
                                        (size_t)1u << sz);
         return;
@@ -3597,6 +3658,30 @@ static void assist_trans_LDR_i(DisasContext *s, IR2_OPND *reg_t, IR2_OPND *reg_n
 {
     if (!lata_guest_mem_inline_host_access_ok())
     {
+        if (lata_guest_mem_direct_available())
+        {
+            IR2_OPND admitted = ir2_opnd_new_type(IR2_OPND_LABEL);
+            IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
+
+            lata_emit_scalar_span_admission(*reg_n, (int64_t)offset,
+                                            (size_t)1u << sz, false, admitted);
+            lata_emit_guest_mem_load_call(s, *reg_t, *reg_n, (int64_t)offset,
+                                          (size_t)1u << sz, sign != 0);
+            la_b(done);
+            la_label(admitted);
+            switch (sz)
+            {
+            case 0: sign ? la_ld_b(*reg_t, *reg_n, offset)
+                         : la_ld_bu(*reg_t, *reg_n, offset); break;
+            case 1: sign ? la_ld_h(*reg_t, *reg_n, offset)
+                         : la_ld_hu(*reg_t, *reg_n, offset); break;
+            case 2: sign ? la_ld_w(*reg_t, *reg_n, offset)
+                         : la_ld_wu(*reg_t, *reg_n, offset); break;
+            default: la_ld_d(*reg_t, *reg_n, offset); break;
+            }
+            la_label(done);
+            return;
+        }
         lata_emit_guest_mem_load_call(s, *reg_t, *reg_n, (int64_t)offset,
                                       (size_t)1u << sz, sign != 0);
         return;

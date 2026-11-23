@@ -2451,6 +2451,38 @@ static const LataGuestMemOps prov_fault_ops = {
     .va_is_hpa_identity = false,
 };
 
+/* Policy provider: only [policy_base, +8) is admissible, epoch is constant. */
+static uint64_t policy_base;
+static unsigned policy_calls;
+
+static uint64_t prov_policy_epoch(CPUARMState *env)
+{
+    (void)env;
+    return 1;
+}
+
+static bool prov_policy_span(CPUARMState *env, uint64_t vaddr, uint64_t size,
+                             bool is_write)
+{
+    (void)env; (void)is_write;
+    policy_calls++;
+    return vaddr >= policy_base && vaddr + size <= policy_base + 8;
+}
+
+static const LataGuestMemDirectPolicy prov_policy = {
+    .name = "test-policy",
+    .epoch = prov_policy_epoch,
+    .span_admissible = prov_policy_span,
+};
+
+static const LataGuestMemOps prov_policy_ops = {
+    .probe = prov_probe,
+    .load = prov_load,
+    .store = prov_store,
+    .direct = &prov_policy,
+    .va_is_hpa_identity = false,
+};
+
 static const LataGuestMemOps prov_no_identity_ops = {
     .probe = prov_probe,
     .load = prov_load,
@@ -6878,6 +6910,43 @@ void kmain(void)
         check(sve_run_a64_tb(unimpl_sqshrn, 1, 128, 0x0fu, false,
                              "unimplemented NEON"),
               1, "unimplemented NEON instruction does not abort");
+    }
+
+    /* Scalar access under a published direct policy: the span is admitted at
+     * execution time, so the native path runs for an admitted address and the
+     * provider path for one outside the policy. */
+    {
+        static uint32_t ldr_x2[] __attribute__((aligned(16))) = {
+            0xf9400022u, /* ldr x2, [x1] */
+        };
+        static uint8_t pbuf[16] __attribute__((aligned(16)));
+
+        for (size_t i = 0; i < 16; ++i) pbuf[i] = (uint8_t)(0x80u + i);
+        policy_base = (uint64_t)(uintptr_t)pbuf;
+
+        /* Admitted span: policy is consulted and no provider load happens. */
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[1] = (uint64_t)(uintptr_t)pbuf;
+        prov_loads = 0;
+        policy_calls = 0;
+        lata_guest_mem_clear_fault_regions(&env);
+        lata_set_guest_mem_ops(&prov_policy_ops);
+        check(sve_run_a64_tb(ldr_x2, 1, 128, 0x0fu, false, "policy admitted"),
+              1, "admitted span runs");
+        check(env.xregs[2], UINT64_C(0x8786858483828180),
+              "admitted span loads through the native path");
+        check(policy_calls >= 1, 1, "the policy is consulted at run time");
+
+        /* Outside the policy: the provider must serve the access. */
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[1] = (uint64_t)(uintptr_t)(pbuf + 8);
+        prov_loads = 0;
+        check(sve_run_a64_tb(ldr_x2, 1, 128, 0x0fu, false, "policy denied"),
+              1, "denied span runs");
+        check(prov_loads >= 1, 1, "denied span falls back to the provider");
+        check(env.xregs[2], UINT64_C(0x8f8e8d8c8b8a8988),
+              "denied span still loads the right value");
+        lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
     }
 
     latx_bare_uart_puts("lata-isa: checks=");
