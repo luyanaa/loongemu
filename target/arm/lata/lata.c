@@ -1702,10 +1702,10 @@ void lata_ir2_snapshot_rollback(const LataIr2Snapshot *snap)
     t->ir2_inst_num_current = snap->ir2_inst_num_current;
     t->real_ir2_inst_num = snap->real_ir2_inst_num;
     t->first_ir2 = (snap->first_ir2_id >= 0 && t->ir2_inst_array != NULL)
-                       ? &t->ir2_inst_array[snap->first_ir2_id]
+                       ? ir2_inst_of((Ir2Id)snap->first_ir2_id)
                        : NULL;
     t->last_ir2 = (snap->last_ir2_id >= 0 && t->ir2_inst_array != NULL)
-                      ? &t->ir2_inst_array[snap->last_ir2_id]
+                      ? ir2_inst_of((Ir2Id)snap->last_ir2_id)
                       : NULL;
     if (t->last_ir2 != NULL) {
         t->last_ir2->_next = snap->last_ir2_next;

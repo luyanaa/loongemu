@@ -312,6 +312,22 @@ void ir2_set_id(IR2_INST *ir2, int id) { ir2->_id = id; }
 
 int ir2_get_id(const IR2_INST *ir2) { return ir2->_id; }
 
+Ir2Id ir2_id_of(const IR2_INST *ir2)
+{
+    if (ir2 == NULL) {
+        return IR2_ID_NONE;
+    }
+    return (Ir2Id)(ir2 - lsenv->tr_data->ir2_inst_array);
+}
+
+IR2_INST *ir2_inst_of(Ir2Id id)
+{
+    if (id == IR2_ID_NONE) {
+        return NULL;
+    }
+    return lsenv->tr_data->ir2_inst_array + id;
+}
+
 IR2_OPCODE ir2_opcode(const IR2_INST *ir2) { return (IR2_OPCODE)(ir2->_opcode); }
 
 void ir2_set_opcode(IR2_INST *ir2, IR2_OPCODE type) {
@@ -322,18 +338,16 @@ IR2_INST *ir2_prev(const IR2_INST *ir2)
 {
     if (ir2->_prev == -1) {
         return NULL;
-    } else {
-        return lsenv->tr_data->ir2_inst_array + ir2->_prev;
     }
+    return ir2_inst_of((Ir2Id)ir2->_prev);
 }
 
 IR2_INST *ir2_next(const IR2_INST *ir2)
 {
     if (ir2->_next == -1) {
         return NULL;
-    } else {
-        return lsenv->tr_data->ir2_inst_array + ir2->_next;
     }
+    return ir2_inst_of((Ir2Id)ir2->_next);
 }
 
 int ir2_to_string(IR2_INST *ir2, char *str)
@@ -513,30 +527,25 @@ IR2_INST *ir2_allocate(void)
         /* __LINE__); exit(-1); 1.1. current array size in bytes */
         int bytes = sizeof(IR2_INST) * t->ir2_inst_num_max;
 
-        /* 1.2. double the array */
+        /* 1.2. capture head/tail as stable IDs BEFORE the block can move. An
+         * Ir2Id is an array index, so it is immune to the relocation that
+         * follows; a raw IR2_INST* saved here would dangle. */
+        Ir2Id first_id = ir2_id_of(t->first_ir2);
+        Ir2Id last_id = ir2_id_of(t->last_ir2);
+
         t->ir2_inst_num_max *= 2;
-        IR2_INST *back_ir2_inst_array = t->ir2_inst_array;
         t->ir2_inst_array =
             (IR2_INST *)mm_realloc(t->ir2_inst_array, bytes << 1);
         /*
-         * realloc() may move the block. first_ir2/last_ir2 are rebased, but
-         * any IR2_INST * that the translator itself stashed across this call
-         * now dangles. That is why the capacity is normally grown at TB
-         * boundaries (see tr_init()) and this path is only a last resort.
-         * The rebase must not be applied to a NULL head/tail: NULL is encoded
-         * as -1 in the links, so a rebased NULL would turn into a bogus
-         * non-NULL pointer and ir2_append() would then walk into it.
+         * realloc() may move the block. first_ir2/last_ir2 are restored from
+         * their IDs, but any IR2_INST* the translator itself stashed across
+         * this call still dangles — that is why callers must hold an Ir2Id
+         * (see ir2.h). Capacity is normally grown at TB boundaries (tr_init())
+         * so this path is a last resort. A NULL head/tail stays IR2_ID_NONE
+         * through ir2_inst_of(), so it cannot become a bogus non-NULL link.
          */
-        if (t->first_ir2 != NULL) {
-            t->first_ir2 =
-                (IR2_INST *)((ADDR)t->first_ir2 - (ADDR)back_ir2_inst_array +
-                             (ADDR)t->ir2_inst_array);
-        }
-        if (t->last_ir2 != NULL) {
-            t->last_ir2 =
-                (IR2_INST *)((ADDR)t->last_ir2 - (ADDR)back_ir2_inst_array +
-                             (ADDR)t->ir2_inst_array);
-        }
+        t->first_ir2 = ir2_inst_of(first_id);
+        t->last_ir2 = ir2_inst_of(last_id);
     }
 
     /* 2. allocate one */
@@ -546,6 +555,61 @@ IR2_INST *ir2_allocate(void)
 
     /* 3. return it */
     return p;
+}
+
+/* ----- IR2-stream checkpoint/rollback -------------------------------------
+ * Captures only the stream: live-list endpoints, allocation counters, and the
+ * label counter. Operand pools, the temp register file, vreg/vcache residency
+ * and write flags are owned by the front-end and are NOT restored here; a port
+ * may register a dirty-flush hook to run them down on rollback.
+ * Endpoints are recorded as Ir2Id so a snapshot survives ir2_inst_array
+ * relocation inside ir2_allocate(). */
+
+static void (*ir2_dirty_flush_fn)(void *);
+static void *ir2_dirty_flush_opaque;
+
+void ir2_stream_set_dirty_flush(void (*fn)(void *opaque), void *opaque)
+{
+    ir2_dirty_flush_fn = fn;
+    ir2_dirty_flush_opaque = opaque;
+}
+
+void ir2_stream_snapshot(Ir2StreamSnap *snap)
+{
+    TRANSLATION_DATA *t;
+
+    if (snap == NULL || lsenv == NULL || lsenv->tr_data == NULL) {
+        return;
+    }
+    t = lsenv->tr_data;
+    snap->ir2_inst_num_current = t->ir2_inst_num_current;
+    snap->real_ir2_inst_num = t->real_ir2_inst_num;
+    snap->label_num = t->label_num;
+    snap->first_id = ir2_id_of(t->first_ir2);
+    snap->last_id = ir2_id_of(t->last_ir2);
+    snap->last_next = t->last_ir2 ? t->last_ir2->_next : -1;
+}
+
+void ir2_stream_rollback(const Ir2StreamSnap *snap)
+{
+    TRANSLATION_DATA *t;
+
+    if (snap == NULL || lsenv == NULL || lsenv->tr_data == NULL) {
+        return;
+    }
+    t = lsenv->tr_data;
+    t->ir2_inst_num_current = snap->ir2_inst_num_current;
+    t->real_ir2_inst_num = snap->real_ir2_inst_num;
+    t->label_num = snap->label_num;
+    t->first_ir2 = ir2_inst_of(snap->first_id);
+    t->last_ir2 = ir2_inst_of(snap->last_id);
+    if (t->last_ir2 != NULL) {
+        t->last_ir2->_next = snap->last_next;
+    }
+
+    if (ir2_dirty_flush_fn != NULL) {
+        ir2_dirty_flush_fn(ir2_dirty_flush_opaque);
+    }
 }
 
 /********************************************

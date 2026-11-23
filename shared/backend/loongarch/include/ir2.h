@@ -57,8 +57,18 @@ void ir2_opnd_convert_label_to_imm(IR2_OPND *, int imm);
 
 void ir2_build(IR2_INST *, IR2_OPCODE, IR2_OPND, IR2_OPND, IR2_OPND);
 
+/* An Ir2Id is a stable index into TRANSLATION_DATA::ir2_inst_array. Unlike an
+ * IR2_INST*, an Ir2Id survives ir2_allocate() growing (and relocating) the
+ * backing array. Links (_prev/_next) and the LATA snapshot already store IDs;
+ * callers that must hold a reference across an emission should keep an Ir2Id
+ * and re-materialise the pointer with ir2_inst_of() when needed. */
+typedef int32 Ir2Id;
+#define IR2_ID_NONE ((Ir2Id)-1)
+
 void ir2_set_id(IR2_INST *, int);
 int ir2_get_id(const IR2_INST *);
+Ir2Id ir2_id_of(const IR2_INST *);
+IR2_INST *ir2_inst_of(Ir2Id);
 IR2_OPCODE ir2_opcode(const IR2_INST *);
 void ir2_set_opcode(IR2_INST *ir2, IR2_OPCODE type);
 int ir2_dump(IR2_INST *);
@@ -73,6 +83,29 @@ void ir2_insert_after(IR2_INST *ir2, IR2_INST *prev);
 IR2_INST *ir2_allocate(void);
 
 uint32 ir2_assemble(IR2_INST *);
+/* IR2-stream checkpoint/rollback. Covers ONLY the instruction stream itself:
+ * the live list (head/tail + tail's successor), the allocation counters, and
+ * the label counter. It deliberately does NOT capture operand pools, the temp
+ * register file, vreg/vcache residency, or write flags — those are port-private
+ * and restored by the optional dirty-flush hook registered per front-end.
+ * IDs are stored, not pointers, so a snapshot stays valid across a realloc. */
+typedef struct Ir2StreamSnap {
+    int ir2_inst_num_current;
+    int real_ir2_inst_num;
+    int label_num;
+    Ir2Id first_id;
+    Ir2Id last_id;
+    int last_next;
+} Ir2StreamSnap;
+
+/* Optional per-port dirty-flush callback. Called from ir2_stream_rollback()
+ * after the stream itself is rewound; the front-end restores whatever it owns
+ * (temp pool, residency bitmaps, dirty flags). May be NULL. */
+void ir2_stream_set_dirty_flush(void (*fn)(void *opaque), void *opaque);
+
+void ir2_stream_snapshot(Ir2StreamSnap *snap);
+void ir2_stream_rollback(const Ir2StreamSnap *snap);
+
 bool ir2_op_check(IR2_INST *);
 
 bool ir2_opcode_is_branch(IR2_OPCODE);
