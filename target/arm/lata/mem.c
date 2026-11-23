@@ -159,21 +159,21 @@ static LataGuestMemStatus default_store(CPUARMState *env, uint64_t vaddr,
     return LATA_MEM_OK;
 }
 
-static bool default_direct_range_stable(CPUARMState *env, uint64_t vaddr,
-                                        size_t size, bool is_write)
-{
-    if (env != NULL && (env->sve_ctrl.fault_region_count > 0 ||
-                        env->sve_ctrl.fault_mem_limit != 0)) {
-        return false;
-    }
-    return default_probe(env, vaddr, size, is_write, false) == LATA_MEM_OK;
-}
-
+/*
+ * Default provider: no inline direct access.
+ *
+ * `default_probe()` is a byte-level address check, not a mapping proof: it
+ * cannot say whether host permission equals guest permission, and this build
+ * has no mapping-generation counter to invalidate a span that was accepted
+ * earlier. Publishing NULL here is the whole point of the contract - the SVE
+ * lowering then has no fast path to emit and every access goes through
+ * probe/load/store, which report an architectural status.
+ */
 const LataGuestMemOps lata_default_guest_mem_ops = {
     .probe = default_probe,
     .load = default_load,
     .store = default_store,
-    .direct_range_stable = default_direct_range_stable,
+    .direct = NULL,
 };
 
 void lata_set_guest_mem_ops(const LataGuestMemOps *ops)
@@ -216,16 +216,72 @@ LataGuestMemStatus lata_guest_mem_store(CPUARMState *env, uint64_t vaddr,
     return ops->store(env, vaddr, size, value);
 }
 
-bool lata_guest_mem_direct_range_stable(CPUARMState *env, uint64_t vaddr,
-                                        size_t size, bool is_write)
+static const LataGuestMemDirectPolicy *direct_policy(void)
 {
     const LataGuestMemOps *ops = lata_get_guest_mem_ops();
-    if (ops != &lata_default_guest_mem_ops) {
-        return ops->direct_range_stable
-                   ? ops->direct_range_stable(env, vaddr, size, is_write)
-                   : false;
+
+    if (ops == NULL || ops->direct == NULL) {
+        return NULL;
     }
-    return ops->direct_range_stable(env, vaddr, size, is_write);
+    if (ops->direct->epoch == NULL || ops->direct->span_admissible == NULL) {
+        /* A half-installed policy is a provider bug; treat it as "no proof". */
+        return NULL;
+    }
+    return ops->direct;
+}
+
+bool lata_guest_mem_direct_available(void)
+{
+    return direct_policy() != NULL;
+}
+
+static CPUARMState *mapping_env(void)
+{
+    LataContext *ctx = lata_context_current();
+
+    if (ctx != NULL && ctx->cpu_state != NULL) {
+        return (CPUARMState *)ctx->cpu_state;
+    }
+    return (lsenv != NULL) ? (CPUARMState *)lsenv->cpu_state : NULL;
+}
+
+uint64_t lata_guest_mem_direct_epoch(void)
+{
+    const LataGuestMemDirectPolicy *policy = direct_policy();
+
+    if (policy == NULL) {
+        return 0;
+    }
+    return policy->epoch(mapping_env());
+}
+
+bool lata_guest_mem_direct_admit(CPUARMState *env, uint64_t vaddr,
+                                 uint64_t size, bool is_write,
+                                 uint64_t translation_epoch)
+{
+    const LataGuestMemDirectPolicy *policy = direct_policy();
+
+    if (policy == NULL || size == 0) {
+        return false;
+    }
+    /*
+     * LATA's own fault-window instrumentation is part of the memory contract,
+     * not of the host mapping: a window can be installed after a block was
+     * translated, so it must veto the fast path at execution time.
+     */
+    if (env != NULL && (env->sve_ctrl.fault_region_count > 0 ||
+                        env->sve_ctrl.fault_mem_limit != 0)) {
+        return false;
+    }
+    /* A span that wraps the address space cannot be one mapping. */
+    if (vaddr + size < vaddr) {
+        return false;
+    }
+    /* Stale proof: any mapping/permission change since translation. */
+    if (policy->epoch(env) != translation_epoch) {
+        return false;
+    }
+    return policy->span_admissible(env, vaddr, size, is_write);
 }
 
 void lata_guest_mem_clear_fault_regions(CPUARMState *env)
@@ -267,11 +323,34 @@ uint64_t lata_guest_mem_store_checked(CPUARMState *env, uint64_t vaddr,
     return (uint64_t)lata_guest_mem_store(env, vaddr, size, val);
 }
 
+uint32_t lata_guest_mem_status_to_dfsc(uint32_t status)
+{
+    switch ((LataGuestMemStatus)status) {
+    case LATA_MEM_FAULT_TRANSLATION:
+    case LATA_MEM_FAULT_UNMAPPED:
+        /* "Unmapped" is architecturally a translation fault: the walk found no
+         * entry. Level 3 is the only level this interface can justify. */
+        return 0x07u; /* Translation fault, level 3 */
+    case LATA_MEM_FAULT_PERMISSION:
+        return 0x0fu; /* Permission fault, level 3 */
+    case LATA_MEM_FAULT_ALIGNMENT:
+        return 0x21u; /* Alignment fault */
+    case LATA_MEM_OK:
+    default:
+        /* LATA_MEM_OK has no DFSC. Reaching the abort path with it means the
+         * caller raised a fault without a fault status; a synchronous external
+         * abort is the only encoding that does not invent a page-table story. */
+        return 0x10u; /* Synchronous external abort, not on a translation walk */
+    }
+}
+
 void lata_guest_mem_raise_fault(CPUARMState *env, uint64_t fault_pc,
                                   uint64_t vaddr, uint32_t is_write,
                                   uint32_t status)
 {
-    uint32_t syn = syn_data_abort_curr_el(is_write != 0) | (status & 0x3fu);
+    uint32_t dfsc = lata_guest_mem_status_to_dfsc(status);
+    uint32_t syn = syn_data_abort_curr_el(is_write != 0) | dfsc;
+
     if (env != NULL) {
         env->pc = fault_pc;
         env->sve_ctrl.last_fault_va = vaddr;

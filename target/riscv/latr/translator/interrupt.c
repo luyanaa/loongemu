@@ -25,7 +25,10 @@
 #define CSR_MIP_ADDR     0x344
 #define CSR_STVEC_ADDR   0x105
 #define CSR_SEPC_ADDR    0x141
+#define CSR_STVAL_ADDR   0x143
+#define CSR_MTVAL_ADDR   0x343
 #define CSR_MIDELEG_ADDR 0x303
+#define CSR_MEDELEG_ADDR 0x302
 #define CSR_STIMECMP_ADDR LATR_RISCV_CSR_STIMECMP
 
 #define MSTATUS_SIE  (UINT64_C(1) << 1)
@@ -210,4 +213,65 @@ void latr_idle_advance(CPUArchState *env)
         next = now + UINT64_C(1000000); /* 1 ms slice */
     }
     loongemu_vclock_advance_ns(env->vclock, next - now);
+}
+
+/*
+ * Runtime synchronous-exception entry, mirroring exactly what the generated
+ * transfer_exception() emits for guest traps taken inside a block: M/S target
+ * selection by privilege + medeleg, mstatus.{MPIE|MPP|SPIE|SPP|SIE|MIE},
+ * {m,s}epc/cause/tval, the privilege change and the (non-vectored) trap-vector
+ * PC. The one caller that needs it outside generated code is the native-fault
+ * dispatcher: latr_machine_host_fault() resolves a host PC to the guest
+ * instruction that caused it and hands that instruction to the guest's own
+ * trap handler instead of silently resuming.
+ *
+ * Interrupt-form causes (bit 63) and vectored dispatch do not apply here:
+ * vectored mode offsets only interrupt targets.
+ */
+void latr_take_guest_trap(CPUArchState *env, uint64_t cause, uint64_t tval)
+{
+    uint64_t status;
+    uint64_t deleg;
+    unsigned privilege;
+    bool supervisor;
+
+    privilege = (unsigned)env->privilege;
+    deleg = env->csr[CSR_MEDELEG_ADDR];
+    supervisor = privilege != LATR_RISCV_PRIV_M &&
+                 (deleg & (UINT64_C(1) << (cause & 63))) != 0;
+
+    status = env->csr[CSR_MSTATUS_ADDR];
+    env->exception = cause;
+    env->badaddr = tval;
+    env->reservation_valid = 0;
+
+    if (supervisor) {
+        /* SPIE <- SIE, SIE <- 0, SPP <- previous privilege (bit 0). */
+        status &= ~(MSTATUS_SPIE | MSTATUS_SPP);
+        if ((status & MSTATUS_SIE) != 0) {
+            status |= MSTATUS_SPIE;
+        }
+        status |= (uint64_t)(privilege & 1) << 8;
+        status &= ~MSTATUS_SIE;
+        env->csr[CSR_MSTATUS_ADDR] = status;
+        env->csr[CSR_SEPC_ADDR] = env->pc & ~UINT64_C(1);
+        env->csr[CSR_SCAUSE_ADDR] = cause;
+        env->csr[CSR_STVAL_ADDR] = tval;
+        env->privilege = LATR_RISCV_PRIV_S;
+        env->pc = env->csr[CSR_STVEC_ADDR] & ~UINT64_C(3);
+    } else {
+        /* MPIE <- MIE, MIE <- 0, MPP <- previous privilege. */
+        status &= ~(MSTATUS_MPIE | MSTATUS_MPP);
+        if ((status & MSTATUS_MIE) != 0) {
+            status |= MSTATUS_MPIE;
+        }
+        status |= (uint64_t)(privilege & 3) << 11;
+        status &= ~MSTATUS_MIE;
+        env->csr[CSR_MSTATUS_ADDR] = status;
+        env->csr[CSR_MEPC_ADDR] = env->pc & ~UINT64_C(1);
+        env->csr[CSR_MCAUSE_ADDR] = cause;
+        env->csr[CSR_MTVAL_ADDR] = tval;
+        env->privilege = LATR_RISCV_PRIV_M;
+        env->pc = env->csr[CSR_MTVEC_ADDR] & ~UINT64_C(3);
+    }
 }

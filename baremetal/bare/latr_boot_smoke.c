@@ -581,18 +581,27 @@ static int run_machine_phase(void)
         return 0;
     }
     /* Host-fault dispatcher: attribute a native PC back to the guest TB that
-     * owns it, restore the guest PC/cause, and drop the stale native block. */
+     * owns it, then enter the guest's own trap handler at that instruction.
+     * medeleg was set to all-ones by the firmware and the hart runs in
+     * S-mode, so cause 13 (load page fault) targets S: sepc/scause/stval are
+     * written, privilege stays S, and the PC lands on the stvec base (the
+     * payload never programmed stvec, so that base is 0). */
     {
         LatrMachineFaultInfo fault;
         uint64_t expected_pc = machine.last_pc;
+        LatrMachineHart *hart = &machine.harts[0];
 
         if (!latr_machine_host_fault(&machine, 0,
                                      (uintptr_t)machine.harts[0].last_code,
                                      13, UINT64_C(0xdead), &fault) ||
             !fault.resolved || fault.guest_pc != expected_pc ||
-            machine.harts[0].env.pc != expected_pc ||
-            machine.harts[0].env.exception != 13 ||
-            machine.harts[0].env.badaddr != UINT64_C(0xdead)) {
+            hart->env.csr[0x141] != expected_pc ||          /* sepc */
+            hart->env.csr[0x142] != 13 ||                   /* scause */
+            hart->env.csr[0x143] != UINT64_C(0xdead) ||     /* stval */
+            hart->env.exception != 13 ||
+            hart->env.badaddr != UINT64_C(0xdead) ||
+            hart->env.privilege != LATR_RISCV_PRIV_S ||
+            hart->env.pc != (hart->env.csr[0x105] & ~UINT64_C(3))) {
             machine_fail("host-fault");
             return 0;
         }

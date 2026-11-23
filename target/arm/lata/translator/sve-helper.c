@@ -14,51 +14,193 @@
 void helper_exception_with_syndrome(CPUARMState *env, uint32_t excp,
                                     uint32_t syndrome);
 
-typedef struct LataSVEHelperNode {
-    struct LataSVEHelperNode *next;
-    LataSVEHelperDesc desc;
-} LataSVEHelperNode;
+/*
+ * Descriptors are allocated in chunks that belong to one translation block.
+ * A chunk is never split between blocks and never freed while its block can
+ * still run, which is exactly the lifetime the generated code assumes when it
+ * embeds `&chunk->descs[i]` as an immediate.
+ */
+#define LATA_SVE_HELPER_CHUNK_DESCS 8u
+
+typedef struct LataSVEHelperChunk {
+    struct LataSVEHelperChunk *next;
+    const void *owner;
+    uint64_t pc_first;
+    uint32_t used;
+} LataSVEHelperChunk;
+
+#define LATA_SVE_HELPER_CHUNK_BYTES                                        \
+    (sizeof(LataSVEHelperChunk) +                                          \
+     LATA_SVE_HELPER_CHUNK_DESCS * sizeof(LataSVEHelperDesc))
+
+static LataSVEHelperDesc *chunk_descs(LataSVEHelperChunk *chunk)
+{
+    return (LataSVEHelperDesc *)(chunk + 1);
+}
+
+static void chunk_free_chain(LataSVEHelperChunk *chunk)
+{
+    while (chunk != NULL) {
+        LataSVEHelperChunk *next = chunk->next;
+
+        mm_free(chunk);
+        chunk = next;
+    }
+}
+
+/*
+ * Drop every chunk. Callers must only do this at a boundary where no guest
+ * code can run again until retranslation - a code-cache flush, or context
+ * teardown - because generated code embeds chunk addresses as immediates.
+ */
+void lata_sve_helper_release_all(void)
+{
+    LataContext *ctx = lata_context_current();
+    LataSVEHelperChunk *chunk;
+
+    if (ctx == NULL) {
+        return;
+    }
+    chunk = (LataSVEHelperChunk *)ctx->sve_helper_list;
+    ctx->sve_helper_list = NULL;
+    ctx->sve_helper_active = NULL;
+    ctx->sve_helper_owner = NULL;
+    ctx->sve_helper_pc = 0;
+    ctx->sve_helper_descs = 0;
+    ctx->sve_helper_chunks = 0;
+    chunk_free_chain(chunk);
+}
+
+void lata_sve_helper_begin_tb(const void *owner, uint64_t pc_first)
+{
+    LataContext *ctx = lata_context_current();
+    LataSVEHelperChunk *chunk;
+
+    if (ctx == NULL) {
+        return;
+    }
+    /*
+     * Only announce the group; nothing is freed here. Blocks produced by one
+     * translation pass coexist (TU generation emits several before any of them
+     * runs), so chunks of other groups may still be referenced by live code.
+     * Reuse of a partial chunk of the *same* group is safe: it happens only
+     * when the very same block is retranslated, and retranslation implies the
+     * previous code for that block was invalidated or flushed. Appending keeps
+     * the old (dead) descriptors' addresses valid until release_all/release_tb
+     * drops the chunk.
+     */
+    ctx->sve_helper_owner = owner;
+    ctx->sve_helper_pc = pc_first;
+    ctx->sve_helper_active = NULL;
+    for (chunk = (LataSVEHelperChunk *)ctx->sve_helper_list; chunk != NULL;
+         chunk = chunk->next) {
+        if (chunk->owner == owner && chunk->pc_first == pc_first &&
+            chunk->used < LATA_SVE_HELPER_CHUNK_DESCS) {
+            ctx->sve_helper_active = chunk;
+            break;
+        }
+    }
+}
+
+void lata_sve_helper_release_tb(const void *owner)
+{
+    LataContext *ctx = lata_context_current();
+    LataSVEHelperChunk **link;
+
+    if (ctx == NULL) {
+        return;
+    }
+    link = (LataSVEHelperChunk **)&ctx->sve_helper_list;
+    while (*link != NULL) {
+        LataSVEHelperChunk *chunk = *link;
+
+        if (chunk->owner == owner) {
+            *link = chunk->next;
+            ctx->sve_helper_descs -= chunk->used;
+            ctx->sve_helper_chunks--;
+            if (ctx->sve_helper_active == chunk) {
+                ctx->sve_helper_active = NULL;
+            }
+            chunk->next = NULL;
+            chunk_free_chain(chunk);
+        } else {
+            link = &chunk->next;
+        }
+    }
+}
+
+void lata_sve_helper_stats(uint32_t *live_descs, uint32_t *live_chunks)
+{
+    LataContext *ctx = lata_context_current();
+
+    if (live_descs != NULL) {
+        *live_descs = (ctx != NULL) ? ctx->sve_helper_descs : 0;
+    }
+    if (live_chunks != NULL) {
+        *live_chunks = (ctx != NULL) ? ctx->sve_helper_chunks : 0;
+    }
+}
 
 const LataSVEHelperDesc *lata_sve_alloc_helper_desc(
     const DisasContext *s, const PvirInstruction *instruction,
     const A64SVEIR1Instruction *source)
 {
     LataContext *ctx = lata_context_current();
-    LataSVEHelperNode *node;
+    LataSVEHelperChunk *chunk;
+    LataSVEHelperDesc *desc;
+    const void *owner;
+    uint64_t pc_first;
 
     if (s == NULL || instruction == NULL || ctx == NULL) {
         return NULL;
     }
-    node = (LataSVEHelperNode *)mm_calloc(1, sizeof(LataSVEHelperNode));
-    node->desc.pvir = *instruction;
+    /*
+     * The group key is the TranslationBlock pointer, not the shared
+     * DisasContextBase: every live TB has its own group, so consecutive TU
+     * generations never collide. A caller that never announced a block
+     * (hand-built IR2, fixtures) gets the same treatment with owner == NULL
+     * keyed by the current PC.
+     */
+    owner = (s->base != NULL) ? (const void *)s->base->tb : NULL;
+    pc_first = (s->base != NULL) ? s->base->pc_first : s->pc_curr;
+    if (ctx->sve_helper_owner != owner || ctx->sve_helper_pc != pc_first) {
+        lata_sve_helper_begin_tb(owner, pc_first);
+    }
+    chunk = (LataSVEHelperChunk *)ctx->sve_helper_active;
+    if (chunk == NULL || chunk->used >= LATA_SVE_HELPER_CHUNK_DESCS) {
+        chunk = (LataSVEHelperChunk *)mm_calloc(1, LATA_SVE_HELPER_CHUNK_BYTES);
+        chunk->owner = owner;
+        chunk->pc_first = pc_first;
+        chunk->next = (LataSVEHelperChunk *)ctx->sve_helper_list;
+        ctx->sve_helper_list = chunk;
+        ctx->sve_helper_active = chunk;
+        ctx->sve_helper_chunks++;
+    }
+    desc = &chunk_descs(chunk)[chunk->used++];
+    ctx->sve_helper_descs++;
+    memset(desc, 0, sizeof(*desc));
+    desc->pvir = *instruction;
     if (source != NULL) {
-        node->desc.has_source = true;
-        node->desc.source = *source;
+        desc->has_source = true;
+        desc->source = *source;
     }
-    node->desc.vl_bytes = (uint16_t)s->vl;
-    node->desc.tbid = (uint8_t)s->tbid;
-    node->desc.pc_curr = s->pc_curr;
-    node->desc.pc_next = (s->base != NULL) ? s->base->pc_next : (s->pc_curr + 4u);
+    desc->vl_bytes = (uint16_t)s->vl;
+    desc->tbid = (uint8_t)s->tbid;
+    desc->pc_curr = s->pc_curr;
+    desc->pc_next = (s->base != NULL) ? s->base->pc_next : (s->pc_curr + 4u);
     if (s->sve_pvir_builder != NULL) {
-        memcpy(node->desc.z_values, s->sve_pvir_builder->z_values,
-               sizeof(node->desc.z_values));
-        memcpy(node->desc.p_values, s->sve_pvir_builder->p_values,
-               sizeof(node->desc.p_values));
-        node->desc.ffr_value = s->sve_pvir_builder->ffr_value;
+        memcpy(desc->z_values, s->sve_pvir_builder->z_values,
+               sizeof(desc->z_values));
+        memcpy(desc->p_values, s->sve_pvir_builder->p_values,
+               sizeof(desc->p_values));
+        desc->ffr_value = s->sve_pvir_builder->ffr_value;
     }
-    node->next = (LataSVEHelperNode *)ctx->sve_helper_list;
-    ctx->sve_helper_list = node;
-    return &node->desc;
+    return desc;
 }
 
 void lata_sve_helper_list_free(void *head)
 {
-    LataSVEHelperNode *cur = (LataSVEHelperNode *)head;
-    while (cur != NULL) {
-        LataSVEHelperNode *next = cur->next;
-        mm_free(cur);
-        cur = next;
-    }
+    chunk_free_chain((LataSVEHelperChunk *)head);
 }
 
 static int h_find_zreg(const LataSVEHelperDesc *d, PvirValueId id)

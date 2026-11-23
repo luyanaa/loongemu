@@ -11,6 +11,7 @@
 #include "ir1.h"
 #include "tcg/tcg.h"
 #include "target/arm/lata/include/translate-a64.h"
+#include "target/arm/lata/translator/sve-lasx-lower.h"
 #include "tu.h"
 #include "disas/disas.h"
 
@@ -97,6 +98,9 @@ static inline void tu_enough_space(CPUState *cpu)
 {
     if (unlikely(tcg_ctx->code_gen_ptr + MAX_TU_SIZE >= tcg_ctx->code_gen_highwater)) {
         tb_flush(cpu);
+        /* The flush killed every cached translation; nothing can reference a
+         * helper descriptor any more, so drop them all (see sve-lasx-lower.h). */
+        lata_sve_helper_release_all();
         mmap_unlock();
         /* Make the execution loop process the flush as soon as possible.  */
         cpu->exception_index = EXCP_INTERRUPT;
@@ -146,9 +150,10 @@ static TranslationBlock* tb_create(CPUState *cpu, uint64_t pc,
     tb = tcg_tb_alloc_full(tcg_ctx);
     if (unlikely(!tb)) {
         fprintf(stderr, "tb flush\n");
-        /* exit(-1); */
         /* flush must be done */
         tb_flush(cpu);
+        /* No cached code survives the flush; drop helper descriptors too. */
+        lata_sve_helper_release_all();
         mmap_unlock();
         /* Make the execution loop process the flush as soon as possible.  */
         cpu->exception_index = EXCP_INTERRUPT;

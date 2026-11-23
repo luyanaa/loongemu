@@ -296,6 +296,11 @@ void lata_context_destroy(LataContext *ctx)
         lata_sve_helper_list_free(ctx->sve_helper_list);
         ctx->sve_helper_list = NULL;
     }
+    ctx->sve_helper_active = NULL;
+    ctx->sve_helper_owner = NULL;
+    ctx->sve_helper_pc = 0;
+    ctx->sve_helper_descs = 0;
+    ctx->sve_helper_chunks = 0;
     if (bound_ctx == ctx) {
         bound_ctx = NULL;
         lata_vcache_bind_state(NULL);

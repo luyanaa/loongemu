@@ -19246,6 +19246,9 @@ bool tr_ir2_generate(struct TranslationBlock *tb)
 {
     int i;
     int start = 0;
+    /* Announce this block's helper-descriptor group (see sve-lasx-lower.h:
+     * announcing only switches groups; release happens at flush/teardown). */
+    lata_sve_helper_begin_tb((const void *)tb, (uint64_t)tb->pc);
 #ifdef CONFIG_LATA_TU
     start = tu_data->curr_insns;
 #endif

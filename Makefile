@@ -16,7 +16,7 @@ LLD_PREFIX ?= $(shell brew --prefix lld 2>/dev/null)
 LD_LLD   ?= $(if $(LLD_PREFIX),$(LLD_PREFIX)/bin/ld.lld,ld.lld)
 QEMU_PREFIX ?= $(shell brew --prefix qemu 2>/dev/null)
 
-.PHONY: all test test-pvir test-riscv-sbi test-riscv-virtio test-riscv-acpi test-riscv-plic test-riscv-uart test-riscv-clint test-riscv-fw test-sve-decode test-sve-pvir test-sve-helper-support test-vcache test-arm-state test-cpu test-lapaging test-pci-host test-hyperv test-tbc test-soft-ras test-p0 test-plv3-isolation tb-sys-run tb-sys-smp-run vmm-efi vmm-boot vmm-integrated vmm-integrated-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot test-latr latr-core latr-isa-image latr-isa-run latr-riscv-ref latr-check latr-boot-image latr-boot-run latr-sys-ref latr-sys-run latr-sys-diff latr-opensbi-image latr-opensbi-run latr-opensbi-trace latr-opensbi-trace-run latr-opensbi-test test-latm test-latm-decode latm-core latm-isa-image latm-isa-run latm-riscv-ref clean
+.PHONY: all test test-pvir test-riscv-sbi test-riscv-virtio test-riscv-acpi test-riscv-plic test-riscv-uart test-riscv-clint test-riscv-fw test-sve-decode test-sve-pvir test-sve-helper-support test-sve-helper-lifecycle test-vcache test-arm-state test-cpu test-lapaging test-pci-host test-hyperv test-tbc test-soft-ras test-p0 test-plv3-isolation tb-sys-run tb-sys-smp-run vmm-efi vmm-boot vmm-integrated vmm-integrated-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot test-latr latr-core latr-isa-image latr-isa-run latr-riscv-ref latr-check latr-boot-image latr-boot-run latr-sys-ref latr-sys-run latr-sys-diff latr-opensbi-image latr-opensbi-run latr-opensbi-trace latr-opensbi-trace-run latr-opensbi-test test-latm test-latm-decode latm-core latm-isa-image latm-isa-run latm-riscv-ref clean
 
 all: test
 
@@ -175,6 +175,35 @@ build/test_sve_helper_support: tests/test_sve_helper_support.c \
 	      target/arm/lata/translator/sve-helper-support.c \
 	      tests/test_sve_helper_support.c -o $@
 
+# Helper-descriptor lifetime: chunks keyed by TranslationBlock, released at
+# flush/teardown instead of growing until context destruction.
+build/test_sve_helper_lifecycle: tests/test_sve_helper_lifecycle.c \
+                                 target/arm/lata/translator/sve-helper.c \
+                                 target/arm/lata/translator/sve-helper-support.c \
+                                 target/arm/lata/ir1/sve-pvir.c \
+                                 target/arm/lata/ir1/sve-decode.c \
+                                 target/arm/lata/pvir.c \
+                                 target/arm/lata/mem.c \
+                                 target/arm/lata/translator/sve-lasx-lower.h \
+                                 target/arm/lata/include/lata.h \
+                                 lata/compat/target/arm/tcg/translate.h
+	@mkdir -p build
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -Wno-deprecated-non-prototype \
+	      -DLATA_ENABLE_TLS -pthread -DTARGET_AARCH64 -DCONFIG_LATA \
+	      -DCONFIG_LATA_STANDALONE -Wno-gnu-empty-struct -Wno-macro-redefined \
+	      -Wno-unused-parameter \
+	      -Ilata/compat -Ilatx/compat -I. -Itarget/arm/lata/include \
+	      -Itarget/arm/lata -Itarget/arm/lata/translator -Itarget/arm/lata/ir1 \
+	      -Ilatx/upstream/include \
+	      target/arm/lata/pvir.c target/arm/lata/ir1/sve-decode.c \
+	      target/arm/lata/ir1/sve-pvir.c latx/runtime/cpu_features.c \
+	      target/arm/lata/mem.c target/arm/lata/translator/sve-helper.c \
+	      target/arm/lata/translator/sve-helper-support.c \
+	      tests/test_sve_helper_lifecycle.c -o $@
+
+test-sve-helper-lifecycle: build/test_sve_helper_lifecycle
+	./build/test_sve_helper_lifecycle
+
 test-sve-helper-support: build/test_sve_helper_support
 	./build/test_sve_helper_support
 
@@ -228,7 +257,7 @@ test-soft-ras: build/test_soft_ras
 test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging build/test_x86_64_paging \
       build/test_pci_host build/test_hyperv build/test_tb_cache build/test_soft_ras build/test_pvir build/test_sve_decode build/test_sve_pvir build/test_vcache build/test_arm_state build/test_lata_context \
       build/test_latm_decode build/test_riscv_virtio_blk \
-      build/test_sve_helper_support
+      build/test_sve_helper_support build/test_sve_helper_lifecycle
 	./build/test_loongbt
 	./build/test_loongbt_cpu
 	./build/test_loongarch_paging
@@ -246,6 +275,7 @@ test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging buil
 	./build/test_sve_decode
 	./build/test_sve_pvir
 	./build/test_sve_helper_support
+	./build/test_sve_helper_lifecycle
 	./build/test_riscv_virtio_blk
 	./build/test_vcache
 	./build/test_arm_state

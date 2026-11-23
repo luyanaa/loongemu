@@ -131,10 +131,11 @@ int latr_machine_attach_disk(LatrMachine *m, uint8_t *image, uint64_t len);
 int latr_machine_set_bootargs(LatrMachine *m, const char *args);
 /*
  * Host-fault dispatcher closure: attributes a native fault PC to the guest
- * instruction that produced it, restores the guest PC to that instruction,
- * latches the guest exception/bad address, and drops the native blocks so the
- * next dispatch re-translates from the restored PC. Returns 0 when the host PC
- * is not inside any translated block of the hart.
+ * instruction that produced it and enters the guest's own trap handler at
+ * that instruction (the full mepc/mcause/mtval/mstatus/privilege/tvec entry,
+ * as the generated transfer_exception() would have performed), then drops the
+ * native blocks so the next dispatch re-translates from the trap vector.
+ * Returns 0 when the host PC is not inside any translated block of the hart.
  */
 int latr_machine_host_fault(LatrMachine *m, uint32_t hartid,
                             uintptr_t host_pc, uint32_t cause,

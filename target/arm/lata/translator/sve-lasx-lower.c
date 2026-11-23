@@ -1789,13 +1789,25 @@ static bool instruction_writes_nzcv_static(const PvirInstruction *ins,
     return false;
 }
 
-static bool sve_mem_needs_checked_path(void)
+/*
+ * Translation-time gate for the SVE inline memory fast path.
+ *
+ * There is no fast path unless the active provider publishes a
+ * LataGuestMemDirectPolicy, i.e. unless somebody can prove the mapping, the
+ * permission and the invalidation rule for the spans this instruction touches
+ * (see lata-mem.h). This function only decides whether it is worth emitting
+ * code at all; the actual entry condition is the per-span runtime admission in
+ * emit_direct_span_admission(), which re-checks the proof for the address the
+ * instruction really uses.
+ */
+static bool sve_mem_direct_fast_path_declined(void)
 {
-    const LataGuestMemOps *ops = lata_get_guest_mem_ops();
-    CPUARMState *env = (lsenv != NULL) ? (CPUARMState *)lsenv->cpu_state : NULL;
-    if (ops != &lata_default_guest_mem_ops) {
+    CPUARMState *env;
+
+    if (!lata_guest_mem_direct_available()) {
         return true;
     }
+    env = (lsenv != NULL) ? (CPUARMState *)lsenv->cpu_state : NULL;
     if (env != NULL && (env->sve_ctrl.fault_region_count > 0 ||
                         env->sve_ctrl.fault_mem_limit != 0)) {
         return true;
@@ -1823,6 +1835,30 @@ static void emit_restore_guest_gprs_from_env(void)
     }
 }
 
+/*
+ * Emit the runtime admission for one contiguous span: the guest GPRs are
+ * published to env (the call owns the ABI argument registers, several of which
+ * are guest GPR homes), the proof is queried for [span_start, +span_bytes) at
+ * the address computed by *this* execution, and control branches to `admitted`
+ * only when the provider still stands behind that span. Anything else falls
+ * through to the checked helper path the caller emits next.
+ */
+static void emit_direct_span_admission(IR2_OPND span_start, uint32_t span_bytes,
+                                       bool is_write, IR2_OPND admitted)
+{
+    emit_save_guest_gprs_to_env();
+    la_mov64(a1_ir2_opnd, span_start);
+    li_d(a2_ir2_opnd, (int64_t)span_bytes);
+    li_d(a3_ir2_opnd, is_write ? 1 : 0);
+    li_d(a4_ir2_opnd, (int64_t)lata_guest_mem_direct_epoch());
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    li_d(t0_ir2_opnd, (int64_t)(uintptr_t)lata_guest_mem_direct_admit);
+    la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
+    la_mov64(t2_ir2_opnd, a0_ir2_opnd);
+    emit_restore_guest_gprs_from_env();
+    la_bnez(t2_ir2_opnd, admitted);
+}
+
 static void emit_inline_mem_fault_abort(const DisasContext *s,
                                         IR2_OPND fault_addr_itemp,
                                         bool is_write, bool pop_stack)
@@ -1848,19 +1884,14 @@ static void emit_inline_mem_fault_abort(const DisasContext *s,
     }
 }
 
-static bool emit_sve_helper_call(DisasContext *s,
-                                 const PvirInstruction *instruction,
-                                 const A64SVEIR1Instruction *source)
+static bool emit_sve_helper_call_body(DisasContext *s,
+                                      const PvirInstruction *instruction,
+                                      const A64SVEIR1Instruction *source,
+                                      const LataSVEHelperDesc *desc)
 {
-    const LataSVEHelperDesc *desc;
     IR2_OPND no_fault = ir2_opnd_new_type(IR2_OPND_LABEL);
     IR2_OPND fault = ir2_opnd_new_type(IR2_OPND_LABEL);
     uint64_t next_pc = (s->base != NULL) ? s->base->pc_next : (s->pc_curr + 4u);
-
-    desc = lata_sve_alloc_helper_desc(s, instruction, source);
-    if (desc == NULL) {
-        return false;
-    }
 
     emit_save_guest_gprs_to_env();
     li_d(t0_ir2_opnd, (int64_t)next_pc);
@@ -1905,6 +1936,19 @@ static bool emit_sve_helper_call(DisasContext *s,
     return true;
 }
 
+static bool emit_sve_helper_call(DisasContext *s,
+                                 const PvirInstruction *instruction,
+                                 const A64SVEIR1Instruction *source)
+{
+    const LataSVEHelperDesc *desc =
+        lata_sve_alloc_helper_desc(s, instruction, source);
+
+    if (desc == NULL) {
+        return false;
+    }
+    return emit_sve_helper_call_body(s, instruction, source, desc);
+}
+
 static bool lower_contiguous_memory(
     DisasContext *s, const A64SVEIR1Instruction *source,
     const PvirInstruction *instruction)
@@ -1930,6 +1974,9 @@ static bool lower_contiguous_memory(
     IR2_OPND predicate_word;
     IR2_OPND active;
     IR2_OPND value;
+    IR2_OPND admitted;
+    IR2_OPND direct_done;
+    const LataSVEHelperDesc *fallback;
 
     if ((!is_load && source->insn_type != AARCH64_A64_SVE_ST1B &&
          source->insn_type != AARCH64_A64_SVE_ST1H &&
@@ -2000,8 +2047,17 @@ static bool lower_contiguous_memory(
         return false;
     }
 
-    if (sve_mem_needs_checked_path()) {
+    if (sve_mem_direct_fast_path_declined()) {
         return emit_sve_helper_call(s, instruction, source);
+    }
+    /*
+     * Allocate the checked-path descriptor before emitting anything: a
+     * descriptor failure has to reject the instruction as a whole instead of
+     * leaving half an admission sequence in the IR2 stream.
+     */
+    fallback = lata_sve_alloc_helper_desc(s, instruction, source);
+    if (fallback == NULL) {
+        return false;
     }
 
     guest_base = alloc_gpr_src_sp(memory->rn);
@@ -2014,6 +2070,23 @@ static bool lower_contiguous_memory(
     li_d(adjusted_base, displacement);
     la_add_d(adjusted_base, guest_base, adjusted_base);
     free_alloc_gpr(guest_base);
+
+    /*
+     * Fast-path entry condition. The span is one vector worth of bytes from the
+     * adjusted base; a lane whose memory element is narrower than its vector
+     * element touches a subset of it, so admitting the enclosing window is the
+     * conservative choice. If the provider no longer proves this address the
+     * instruction takes the checked path below with the same descriptor.
+     */
+    admitted = ir2_opnd_new_type(IR2_OPND_LABEL);
+    direct_done = ir2_opnd_new_type(IR2_OPND_LABEL);
+    emit_direct_span_admission(adjusted_base, (uint32_t)vl_bytes, !is_load,
+                               admitted);
+    if (!emit_sve_helper_call_body(s, instruction, source, fallback)) {
+        return false;
+    }
+    la_b(direct_done);
+    la_label(admitted);
 
     address = ra_alloc_itemp();
     predicate_word = ra_alloc_itemp();
@@ -2167,6 +2240,7 @@ static bool lower_contiguous_memory(
         ra_free_temp(staged);
         la_addi_d(sp_ir2_opnd, sp_ir2_opnd, ARM_SVE_MAX_VL_BYTES);
     }
+    la_label(direct_done);
     return true;
 }
 
@@ -2223,16 +2297,6 @@ static void emit_ldx_elem(IR2_OPND dst, IR2_OPND addr, uint8_t mem_bytes,
     default:
         la_ldx_d(dst, addr, zero_ir2_opnd);
         break;
-    }
-}
-
-static void emit_stx_elem(IR2_OPND val, IR2_OPND addr, uint8_t mem_bytes)
-{
-    switch (mem_bytes) {
-    case 1: la_stx_b(val, addr, zero_ir2_opnd); break;
-    case 2: la_stx_h(val, addr, zero_ir2_opnd); break;
-    case 4: la_stx_w(val, addr, zero_ir2_opnd); break;
-    default: la_stx_d(val, addr, zero_ir2_opnd); break;
     }
 }
 
@@ -2314,11 +2378,12 @@ static bool lower_fault_load(DisasContext *s,
     int rn = base_is_sp ? 31 : find_gpr_for_value(op->memory_address.base_value);
     int zt = find_zreg_for_value(s->sve_pvir_builder, op->destination);
     int pg = find_preg_for_value(s->sve_pvir_builder, op->predicate.source.id);
-    int rm = 31;
     bool has_index = false;
     int64_t disp = op->memory_address.displacement;
     int pg_off, zt_off, ffr_off;
-    IR2_OPND base, idx_reg, addr, state, lane_addr, tmp;
+    IR2_OPND base, addr, state, lane_addr, tmp;
+    IR2_OPND admitted, direct_done;
+    const LataSVEHelperDesc *fallback;
 
     if (source != NULL) {
         if (is_first) {
@@ -2326,8 +2391,7 @@ static bool lower_fault_load(DisasContext *s,
             zt = f->zt;
             pg = f->pg;
             rn = f->rn;
-            rm = f->rm;
-            has_index = f->has_index;
+            has_index = f->has_index && f->rm < 31;
             base_is_sp = f->base_is_sp;
         } else {
             const arg_sve_nonfault_load *nf = &source->arg.f_sve_nonfault_load;
@@ -2345,26 +2409,24 @@ static bool lower_fault_load(DisasContext *s,
         return false;
     }
 
-    if (sve_mem_needs_checked_path()) {
+    /*
+     * An indexed first-fault/non-fault load derives its addresses from a vector
+     * of indices, so no statically bounded span exists to prove; and without a
+     * mapping policy there is nothing to prove at all. Both cases belong to the
+     * checked path, which is the only one that can implement MemNF/FFR
+     * suppression exactly.
+     */
+    if (has_index || sve_mem_direct_fast_path_declined()) {
         return emit_sve_helper_call(s, instruction, source);
+    }
+    fallback = lata_sve_alloc_helper_desc(s, instruction, source);
+    if (fallback == NULL) {
+        return false;
     }
 
     base = base_is_sp ? alloc_gpr_src_sp(31) : alloc_gpr_src(rn);
     addr = ra_alloc_itemp();
-    if (has_index && rm < 31) {
-        unsigned msz_shift = (mem_bytes == 1) ? 0u
-                             : (mem_bytes == 2 ? 1u : (mem_bytes == 4 ? 2u : 3u));
-        idx_reg = alloc_gpr_src(rm);
-        if (msz_shift != 0) {
-            la_slli_d(addr, idx_reg, (int)msz_shift);
-            la_add_d(addr, base, addr);
-        } else {
-            la_add_d(addr, base, idx_reg);
-        }
-        free_alloc_gpr(idx_reg);
-    } else {
-        la_mov64(addr, base);
-    }
+    la_mov64(addr, base);
     free_alloc_gpr(base);
     if (disp != 0) {
         IR2_OPND d = ra_alloc_itemp();
@@ -2375,6 +2437,15 @@ static bool lower_fault_load(DisasContext *s,
     if (s->tbid != 0) {
         la_bstrpick_d(addr, addr, 56, 0);
     }
+
+    admitted = ir2_opnd_new_type(IR2_OPND_LABEL);
+    direct_done = ir2_opnd_new_type(IR2_OPND_LABEL);
+    emit_direct_span_admission(addr, (uint32_t)vl_bytes, false, admitted);
+    if (!emit_sve_helper_call_body(s, instruction, source, fallback)) {
+        return false;
+    }
+    la_b(direct_done);
+    la_label(admitted);
 
     la_addi_d(sp_ir2_opnd, sp_ir2_opnd, -ARM_SVE_MAX_VL_BYTES);
     emit_zero_stack_stage(vl_bytes);
@@ -2478,6 +2549,7 @@ static bool lower_fault_load(DisasContext *s,
 
     emit_commit_stack_to_zreg(zt_off, vl_bytes);
     la_addi_d(sp_ir2_opnd, sp_ir2_opnd, ARM_SVE_MAX_VL_BYTES);
+    la_label(direct_done);
     return true;
 }
 
@@ -3047,284 +3119,29 @@ static bool lower_last(DisasContext *s, const A64SVEIR1Instruction *source,
     return true;
 }
 
-/* Extended SVE memory: scalar+scalar, LD2/3/4 & ST2/3/4, LD1R, LD1RQ, gather/scatter, LDNT1/STNT1. */
+/*
+ * Extended SVE memory: scalar+scalar, LD2/3/4 & ST2/3/4, LD1R, LD1RQ,
+ * gather/scatter, LDNT1/STNT1.
+ *
+ * Every form in this family derives its addresses from a multi-register
+ * structure, a replicating load, or an index vector, so there is no statically
+ * bounded span a provider could prove stable for the whole access. The inline
+ * lowering that used to live here could not satisfy the direct-access contract
+ * (there was no per-address admission to make), so the checked helper path is
+ * the only lowering that does: exec_mem_ext() drives every lane through
+ * lata_guest_mem_load/store, and a guarded or unmapped lane raises the
+ * architectural Data Abort with the status that probe reported.
+ */
 static bool lower_mem_ext(DisasContext *s, const A64SVEIR1Instruction *source,
                           const PvirInstruction *instruction)
 {
-    size_t vl_bytes = (size_t)s->vl;
     if (source == NULL) {
-        (void)instruction;
         return false;
     }
-    const arg_sve_mem_ext *m = &source->arg.f_sve_mem_ext;
-    uint8_t elem_bytes = m->element_bits / 8u;
-    uint8_t mem_bytes = m->memory_bits / 8u;
-    size_t lanes = vl_bytes / elem_bytes;
-    int pg_off = env_offset_sve_preg(m->pg);
-    unsigned msz_shift = (mem_bytes == 1) ? 0u
-                         : (mem_bytes == 2 ? 1u : (mem_bytes == 4 ? 2u : 3u));
-
-    if (pg_off < 0) return false;
-
-    if (sve_mem_needs_checked_path()) {
-        return emit_sve_helper_call(s, instruction, source);
+    if (env_offset_sve_preg(source->arg.f_sve_mem_ext.pg) < 0) {
+        return false;
     }
-
-    if (m->kind == SVE_MEM_REP_IMM || m->kind == SVE_MEM_REP_QUAD) {
-        /* LD1R / LD1RQ: single or 16-byte block replicated across vector */
-        int zt_off = env_offset_zreg(m->zt);
-        if (zt_off < 0) return false;
-        IR2_OPND base = m->base_is_sp ? alloc_gpr_src_sp(31) : alloc_gpr_src(m->rn);
-        IR2_OPND addr = ra_alloc_itemp();
-        la_mov64(addr, base);
-        free_alloc_gpr(base);
-        if (m->imm != 0) {
-            IR2_OPND d = ra_alloc_itemp();
-            li_d(d, m->imm);
-            la_add_d(addr, addr, d);
-            ra_free_temp(d);
-        }
-        if (s->tbid != 0) la_bstrpick_d(addr, addr, 56, 0);
-
-        la_addi_d(sp_ir2_opnd, sp_ir2_opnd, -ARM_SVE_MAX_VL_BYTES);
-        emit_zero_stack_stage(vl_bytes);
-
-        IR2_OPND pw = ra_alloc_itemp();
-        IR2_OPND act = ra_alloc_itemp();
-        IR2_OPND val = ra_alloc_itemp();
-        if (m->kind == SVE_MEM_REP_IMM) {
-            IR2_OPND any_act = ra_alloc_itemp();
-            IR2_OPND skip_mem = ir2_opnd_new_type(IR2_OPND_LABEL);
-            li_d(any_act, 0);
-            for (size_t b = 0; b < vl_bytes / 8u; ++b) {
-                size_t wb = b & ~(size_t)3u;
-                unsigned wsh = (unsigned)((b - wb) * 8u);
-                lata_env_ld_wu(pw, pg_off + (int)wb);
-                la_bstrpick_d(pw, pw, wsh + 7u, wsh);
-                la_or(any_act, any_act, pw);
-            }
-            la_beqz(any_act, skip_mem);
-            emit_ldx_elem(val, addr, mem_bytes, m->sign_extend);
-            for (size_t lane = 0; lane < lanes; ++lane) {
-                size_t vb = lane * elem_bytes;
-                size_t wb = (vb / 32u) * 4u;
-                unsigned sh = (unsigned)(vb % 32u);
-                IR2_OPND sk = ir2_opnd_new_type(IR2_OPND_LABEL);
-                lata_env_ld_wu(pw, pg_off + (int)wb);
-                la_bstrpick_d(act, pw, sh, sh);
-                la_beqz(act, sk);
-                emit_store_elem_mem(val, sp_ir2_opnd, (int)vb, elem_bytes);
-                la_label(sk);
-            }
-            la_label(skip_mem);
-            ra_free_temp(any_act);
-        } else {
-            /* LD1RQ: load 16 bytes (active predicates within first 16 bytes) & replicate */
-            size_t quad_lanes = 16u / mem_bytes;
-            for (size_t ql = 0; ql < quad_lanes; ++ql) {
-                size_t vb = ql * elem_bytes;
-                size_t wb = (vb / 32u) * 4u;
-                unsigned sh = (unsigned)(vb % 32u);
-                IR2_OPND sk = ir2_opnd_new_type(IR2_OPND_LABEL);
-                IR2_OPND qa = ra_alloc_itemp();
-                lata_env_ld_wu(pw, pg_off + (int)wb);
-                la_bstrpick_d(act, pw, sh, sh);
-                la_beqz(act, sk);
-                if (vb == 0) la_mov64(qa, addr);
-                else la_addi_d(qa, addr, (int)vb);
-                emit_ldx_elem(val, qa, mem_bytes, false);
-                for (size_t qoff = 0; qoff < vl_bytes; qoff += 16u) {
-                    emit_store_elem_mem(val, sp_ir2_opnd, (int)(qoff + vb),
-                                        elem_bytes);
-                }
-                la_label(sk);
-                ra_free_temp(qa);
-            }
-        }
-        ra_free_temp(val);
-        ra_free_temp(act);
-        ra_free_temp(pw);
-        ra_free_temp(addr);
-        emit_commit_stack_to_zreg(zt_off, vl_bytes);
-        la_addi_d(sp_ir2_opnd, sp_ir2_opnd, ARM_SVE_MAX_VL_BYTES);
-        return true;
-    }
-
-    if (m->kind == SVE_MEM_GATHER_VEC_BASE ||
-        m->kind == SVE_MEM_GATHER_VEC_OFFSET) {
-        int zt_off = env_offset_zreg(m->zt);
-        int vec_idx_reg = (m->kind == SVE_MEM_GATHER_VEC_BASE) ? m->rn : m->rm;
-        int zoff_off = env_offset_zreg(vec_idx_reg);
-        if (zt_off < 0 || zoff_off < 0) return false;
-
-        IR2_OPND base = ra_alloc_itemp();
-        if (m->kind == SVE_MEM_GATHER_VEC_BASE) {
-            li_d(base, m->imm);
-        } else {
-            IR2_OPND sb = m->base_is_sp ? alloc_gpr_src_sp(31) : alloc_gpr_src(m->rn);
-            la_mov64(base, sb);
-            free_alloc_gpr(sb);
-        }
-        IR2_OPND zoff_base = ra_alloc_itemp();
-        li_d(zoff_base, zoff_off);
-        la_add_d(zoff_base, env_ir2_opnd, zoff_base);
-
-        if (m->is_load) {
-            la_addi_d(sp_ir2_opnd, sp_ir2_opnd, -ARM_SVE_MAX_VL_BYTES);
-            emit_zero_stack_stage(vl_bytes);
-        }
-
-        IR2_OPND pw = ra_alloc_itemp();
-        IR2_OPND laddr = ra_alloc_itemp();
-        IR2_OPND lval = ra_alloc_itemp();
-
-        for (size_t lane = 0; lane < lanes; ++lane) {
-            size_t vb = lane * elem_bytes;
-            size_t wb = (vb / 32u) * 4u;
-            unsigned sh = (unsigned)(vb % 32u);
-            IR2_OPND sk = ir2_opnd_new_type(IR2_OPND_LABEL);
-
-            lata_env_ld_wu(pw, pg_off + (int)wb);
-            la_bstrpick_d(pw, pw, sh, sh);
-            la_beqz(pw, sk);
-            if (m->kind == SVE_MEM_GATHER_VEC_BASE) {
-                emit_load_elem_mem(laddr, zoff_base, (int)vb, elem_bytes, false);
-                la_add_d(laddr, laddr, base);
-            } else {
-                uint8_t off_bytes = (elem_bytes == 4 || !m->offset_is_64) ? 4u : 8u;
-                emit_load_elem_mem(laddr, zoff_base, (int)vb, off_bytes,
-                                   m->offset_is_signed);
-                if (m->scaled && msz_shift != 0) {
-                    la_slli_d(laddr, laddr, (int)msz_shift);
-                }
-                la_add_d(laddr, laddr, base);
-            }
-            if (s->tbid != 0) la_bstrpick_d(laddr, laddr, 56, 0);
-            if (m->is_load) {
-                emit_ldx_elem(lval, laddr, mem_bytes, m->sign_extend);
-                emit_store_elem_mem(lval, sp_ir2_opnd, (int)vb, elem_bytes);
-            } else {
-                li_d(lval, zt_off + (int)vb);
-                la_add_d(lval, env_ir2_opnd, lval);
-                emit_load_elem_mem(lval, lval, 0, mem_bytes, false);
-                emit_stx_elem(lval, laddr, mem_bytes);
-            }
-            la_label(sk);
-        }
-        ra_free_temp(lval);
-        ra_free_temp(laddr);
-        ra_free_temp(pw);
-        ra_free_temp(zoff_base);
-        ra_free_temp(base);
-        if (m->is_load) {
-            emit_commit_stack_to_zreg(zt_off, vl_bytes);
-            la_addi_d(sp_ir2_opnd, sp_ir2_opnd, ARM_SVE_MAX_VL_BYTES);
-        }
-        return true;
-    }
-
-    /* Scalar+scalar / Scalar+imm / Multi-register LDN/STN / LDNT1/STNT1 */
-    IR2_OPND gbase = m->base_is_sp ? alloc_gpr_src_sp(31) : alloc_gpr_src(m->rn);
-    IR2_OPND base = ra_alloc_itemp();
-    la_mov64(base, gbase);
-    free_alloc_gpr(gbase);
-
-    if (m->rm < 31) {
-        IR2_OPND grem = alloc_gpr_src(m->rm);
-        if (m->scaled && msz_shift != 0) {
-            IR2_OPND off = ra_alloc_itemp();
-            la_slli_d(off, grem, (int)msz_shift);
-            la_add_d(base, base, off);
-            ra_free_temp(off);
-        } else {
-            la_add_d(base, base, grem);
-        }
-        free_alloc_gpr(grem);
-    } else if (m->imm != 0) {
-        IR2_OPND off = ra_alloc_itemp();
-        li_d(off, (int64_t)m->imm * (int64_t)m->nregs * (int64_t)vl_bytes);
-        la_add_d(base, base, off);
-        ra_free_temp(off);
-    }
-    if (s->tbid != 0) la_bstrpick_d(base, base, 56, 0);
-
-    size_t stage_bytes = (size_t)m->nregs * ARM_SVE_MAX_VL_BYTES;
-    if (m->is_load) {
-        IR2_OPND d = ra_alloc_itemp();
-        li_d(d, -(int64_t)stage_bytes);
-        la_add_d(sp_ir2_opnd, sp_ir2_opnd, d);
-        ra_free_temp(d);
-        for (uint8_t r = 0; r < m->nregs; ++r) {
-            IR2_OPND zero = ra_alloc_itemp();
-            li_d(zero, 0);
-            for (size_t b = 0; b < vl_bytes; b += 8u) {
-                la_st_d(zero, sp_ir2_opnd, (int)(r * ARM_SVE_MAX_VL_BYTES + b));
-            }
-            ra_free_temp(zero);
-        }
-    }
-
-    IR2_OPND pw = ra_alloc_itemp();
-    IR2_OPND laddr = ra_alloc_itemp();
-    IR2_OPND val = ra_alloc_itemp();
-
-    for (size_t lane = 0; lane < lanes; ++lane) {
-        size_t vb = lane * elem_bytes;
-        size_t wb = (vb / 32u) * 4u;
-        unsigned sh = (unsigned)(vb % 32u);
-        IR2_OPND sk = ir2_opnd_new_type(IR2_OPND_LABEL);
-
-        lata_env_ld_wu(pw, pg_off + (int)wb);
-        la_bstrpick_d(pw, pw, sh, sh);
-        la_beqz(pw, sk);
-        for (uint8_t r = 0; r < m->nregs; ++r) {
-            size_t mem_off = (lane * m->nregs + r) * mem_bytes;
-            if (mem_off == 0) la_mov64(laddr, base);
-            else la_addi_d(laddr, base, (int)mem_off);
-            if (m->is_load) {
-                emit_ldx_elem(val, laddr, mem_bytes, m->sign_extend);
-                emit_store_elem_mem(val, sp_ir2_opnd,
-                                    (int)(r * ARM_SVE_MAX_VL_BYTES + vb),
-                                    elem_bytes);
-            } else {
-                int zoff = env_offset_zreg((m->zt + r) & 31u);
-                li_d(pw, zoff + (int)vb);
-                la_add_d(pw, env_ir2_opnd, pw);
-                emit_load_elem_mem(val, pw, 0, mem_bytes, false);
-                emit_stx_elem(val, laddr, mem_bytes);
-            }
-        }
-        la_label(sk);
-    }
-
-    ra_free_temp(val);
-    ra_free_temp(laddr);
-    ra_free_temp(pw);
-    ra_free_temp(base);
-
-    if (m->is_load) {
-        for (uint8_t r = 0; r < m->nregs; ++r) {
-            int zoff = env_offset_zreg((m->zt + r) & 31u);
-            IR2_OPND staged = ra_alloc_ftemp();
-            for (size_t b = 0; b < vl_bytes; b += 32u) {
-                size_t rem = vl_bytes - b;
-                int soff = (int)(r * ARM_SVE_MAX_VL_BYTES + b);
-                if (rem >= 32u) {
-                    la_xvld(staged, sp_ir2_opnd, soff);
-                    lata_env_xvst(staged, zoff + (int)b);
-                } else {
-                    la_vld(staged, sp_ir2_opnd, soff);
-                    lata_env_vst(staged, zoff + (int)b);
-                }
-            }
-            ra_free_temp(staged);
-        }
-        IR2_OPND d = ra_alloc_itemp();
-        li_d(d, (int64_t)stage_bytes);
-        la_add_d(sp_ir2_opnd, sp_ir2_opnd, d);
-        ra_free_temp(d);
-    }
-    return true;
+    return emit_sve_helper_call(s, instruction, source);
 }
 
 static bool lower_fma_op(DisasContext *s, const A64SVEIR1Instruction *source,

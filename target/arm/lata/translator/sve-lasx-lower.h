@@ -62,6 +62,33 @@ const LataSVEHelperDesc *lata_sve_alloc_helper_desc(
     const A64SVEIR1Instruction *source);
 
 /*
+ * Descriptor lifetime.
+ *
+ * A descriptor is embedded in generated code as an immediate operand, so it
+ * must stay valid for as long as any cached translation can run - and it must
+ * be dropped once none can. Descriptors are grouped by TranslationBlock:
+ *
+ *  - tr_ir2_generate() announces the block with lata_sve_helper_begin_tb();
+ *    announcing only switches the active group, it never frees, because
+ *    several generated blocks coexist (TU emits a chain before running any of
+ *    it) and freeing another group's chunk would tear live code's data;
+ *  - lata_sve_helper_release_tb(tb) drops one block's descriptors, for a VMM
+ *    that invalidates a single translation;
+ *  - lata_sve_helper_release_all() drops everything, at a code-cache flush or
+ *    context teardown - the two points in the LATA layer where no cached code
+ *    survives (tu.c flush sites and the context destructor).
+ *
+ * Together these bound memory: descriptors can only accumulate while the code
+ * cache holds the blocks that reference them, and every flush in the layer
+ * releases them. Before this existed the list only shrank at context
+ * destruction, so a long-running guest grew it without limit.
+ */
+void lata_sve_helper_begin_tb(const void *owner, uint64_t pc_first);
+void lata_sve_helper_release_tb(const void *owner);
+void lata_sve_helper_release_all(void);
+void lata_sve_helper_stats(uint32_t *live_descs, uint32_t *live_chunks);
+
+/*
  * Translate-time query: can the scalar helper execute this instruction?
  *
  * A caller that is about to fall back to the helper must check this first and

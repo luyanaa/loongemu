@@ -567,14 +567,16 @@ int latr_machine_host_fault(LatrMachine *m, uint32_t hartid,
         info->guest_pc = guest_pc;
         info->resolved = true;
     }
-    /* Instructions before the faulting one already committed their effects;
-     * resume the guest at the faulting instruction itself with the guest
-     * exception latched. */
+    /*
+     * Instructions before the faulting one already committed their effects; the
+     * faulting instruction itself did not. Enter the guest's own trap handler
+     * at the faulting PC -- the same entry the generated transfer_exception()
+     * performs for guest-internal traps -- so the guest (firmware or kernel)
+     * decides what to do instead of the fault being silently dropped. The
+     * shootdown then makes the next dispatch re-translate from the vector.
+     */
     h->env.pc = guest_pc;
-    h->env.exception = cause;
-    h->env.badaddr = badaddr;
-    h->env.mem_fault_cause = 0;
-    h->env.fetch_faulted = 0;
+    latr_take_guest_trap(&h->env, cause, badaddr);
     latr_tb_shootdown_all(&h->tb_cache);
     latr_context_restore(saved);
     return 1;

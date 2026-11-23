@@ -181,6 +181,10 @@ void latr_update_interrupts(CPUArchState *env);
 bool latr_interrupt_pending(CPUArchState *env);
 bool latr_deliver_interrupt(CPUArchState *env);
 void latr_idle_advance(CPUArchState *env);
+/* Runtime synchronous-exception entry: the C mirror of the generated
+ * transfer_exception() (M/S target via medeleg, mstatus, epc/cause/tval,
+ * non-vectored trap-vector PC). Used by the native-fault dispatcher. */
+void latr_take_guest_trap(CPUArchState *env, uint64_t cause, uint64_t tval);
 void tr_init(void *tb);
 void tr_fini(void);
 int tr_ir2_assemble(const void *code_start_addr);

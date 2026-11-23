@@ -33,6 +33,10 @@ void latx_bare_assert_fail(const char *expr, const char *file, int line)
 
 static LATA_TLS LataContext tls_ctx;
 
+/* mem.c reads the bound event loop env through this TLS root, exactly like the
+ * translator does; the fixture has no event loop, so it stays NULL. */
+LATA_TLS ENV *lsenv = NULL;
+
 LataContext *lata_context_current(void)
 {
     return &tls_ctx;
@@ -93,7 +97,62 @@ static const LataGuestMemOps custom_ops = {
     .probe = custom_probe,
     .load = custom_load,
     .store = custom_store,
-    .direct_range_stable = NULL,
+    .direct = NULL,
+};
+
+/*
+ * A provider that claims the direct-access contract. `test_mapping_epoch` is
+ * the invalidation source: bumping it must invalidate every proof handed out
+ * to already-translated code.
+ */
+static uint64_t test_mapping_epoch = 7;
+
+static uint64_t test_epoch(CPUARMState *env)
+{
+    (void)env;
+    return test_mapping_epoch;
+}
+
+static bool test_span_admissible(CPUARMState *env, uint64_t vaddr,
+                                 uint64_t size, bool is_write)
+{
+    (void)env;
+    /* Unmapped guard page: [0x8000, 0x9000). */
+    if (vaddr < 0x9000 && vaddr + size > 0x8000) {
+        return false;
+    }
+    /* Read-only window: [0x10000, 0x11000). */
+    if (is_write && vaddr < 0x11000 && vaddr + size > 0x10000) {
+        return false;
+    }
+    return true;
+}
+
+static const LataGuestMemDirectPolicy test_policy = {
+    .name = "test",
+    .epoch = test_epoch,
+    .span_admissible = test_span_admissible,
+};
+
+static const LataGuestMemOps direct_ops = {
+    .probe = custom_probe,
+    .load = custom_load,
+    .store = custom_store,
+    .direct = &test_policy,
+};
+
+/* A policy that is missing its epoch callback is not a proof. */
+static const LataGuestMemDirectPolicy half_policy = {
+    .name = "half",
+    .epoch = NULL,
+    .span_admissible = test_span_admissible,
+};
+
+static const LataGuestMemOps half_direct_ops = {
+    .probe = custom_probe,
+    .load = custom_load,
+    .store = custom_store,
+    .direct = &half_policy,
 };
 
 static void *worker_thread(void *arg_ptr)
@@ -129,7 +188,9 @@ static void *worker_thread(void *arg_ptr)
         assert(lata_guest_mem_probe(&env, va, 4, false, false) == LATA_MEM_OK);
         assert(lata_guest_mem_probe(&env, va, 4, true, false) ==
                LATA_MEM_FAULT_PERMISSION);
-        assert(!lata_guest_mem_direct_range_stable(&env, va, 4, false));
+        /* No provider proof: nothing is admissible for inline host access. */
+        assert(!lata_guest_mem_direct_available());
+        assert(!lata_guest_mem_direct_admit(&env, va, 4, false, 0));
     }
 
     if (arg->id == 1) {
@@ -183,6 +244,84 @@ int main(void)
     CHECK(env.sve_ctrl.last_fault_va == 0xdeadbeefULL);
     CHECK(env.sve_ctrl.last_fault_is_write == true);
     CHECK(env.sve_ctrl.last_exception_index == EXCP_DATA_ABORT);
+
+    /*
+     * Data Abort syndrome: ESR.EC = 0x25 (Data Abort from a lower EL), IL = 1,
+     * WnR in bit 6, and DFSC in bits [5:0] must be the architectural Data
+     * Fault Status Code -- never the internal LataGuestMemStatus ordinal.
+     */
+    {
+        static const struct {
+            uint32_t status;
+            uint32_t dfsc;
+            const char *what;
+        } cases[] = {
+            { LATA_MEM_FAULT_TRANSLATION, 0x07, "translation l3" },
+            { LATA_MEM_FAULT_UNMAPPED, 0x07, "unmapped -> translation l3" },
+            { LATA_MEM_FAULT_PERMISSION, 0x0f, "permission l3" },
+            { LATA_MEM_FAULT_ALIGNMENT, 0x21, "alignment" },
+            { LATA_MEM_OK, 0x10, "no status -> external abort" },
+        };
+
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+            uint32_t syn;
+
+            lata_guest_mem_raise_fault(&env, 0x400200, 0x2000, 0, cases[i].status);
+            syn = env.sve_ctrl.last_exception_syndrome;
+            CHECK((syn >> 26) == 0x25u);
+            CHECK(((syn >> 25) & 1u) == 1u);
+            CHECK((syn & 0x3fu) == cases[i].dfsc);
+            CHECK(((syn >> 6) & 1u) == 0u);
+
+            lata_guest_mem_raise_fault(&env, 0x400200, 0x2000, 1, cases[i].status);
+            syn = env.sve_ctrl.last_exception_syndrome;
+            CHECK((syn & 0x3fu) == cases[i].dfsc);
+            CHECK(((syn >> 6) & 1u) == 1u);
+            CHECK(lata_guest_mem_status_to_dfsc(cases[i].status) == cases[i].dfsc);
+        }
+        /* The internal ordinal must not leak into DFSC. */
+        CHECK(lata_guest_mem_status_to_dfsc(LATA_MEM_FAULT_PERMISSION) !=
+              (uint32_t)LATA_MEM_FAULT_PERMISSION);
+    }
+
+    /*
+     * Direct-access contract. A provider that publishes no policy leaves the
+     * fast path unreachable, which is what the default provider does.
+     */
+    CHECK(!lata_guest_mem_direct_available());
+    CHECK(lata_guest_mem_direct_epoch() == 0);
+    CHECK(!lata_guest_mem_direct_admit(&env, 0x2000, 16, false, 0));
+
+    lata_set_guest_mem_ops(&half_direct_ops);
+    CHECK(!lata_guest_mem_direct_available());
+    CHECK(!lata_guest_mem_direct_admit(&env, 0x2000, 16, false, 7));
+
+    test_mapping_epoch = 7;
+    lata_set_guest_mem_ops(&direct_ops);
+    CHECK(lata_guest_mem_direct_available());
+    CHECK(lata_guest_mem_direct_epoch() == 7);
+    /* Matching epoch and an admissible span: the only combination that admits. */
+    CHECK(lata_guest_mem_direct_admit(&env, 0x2000, 16, false, 7));
+    CHECK(lata_guest_mem_direct_admit(&env, 0x2000, 16, true, 7));
+    /* Stale proof: anything translated before an epoch bump is re-routed. */
+    test_mapping_epoch = 8;
+    CHECK(!lata_guest_mem_direct_admit(&env, 0x2000, 16, false, 7));
+    CHECK(lata_guest_mem_direct_admit(&env, 0x2000, 16, false, 8));
+    /* Span proofs are per address, not per translation. */
+    CHECK(!lata_guest_mem_direct_admit(&env, 0x8ff0, 32, false, 8));
+    CHECK(lata_guest_mem_direct_admit(&env, 0x9000, 32, false, 8));
+    CHECK(!lata_guest_mem_direct_admit(&env, 0x10ff0, 32, true, 8));
+    CHECK(lata_guest_mem_direct_admit(&env, 0x10ff0, 32, false, 8));
+    /* Degenerate spans are never admitted. */
+    CHECK(!lata_guest_mem_direct_admit(&env, 0x2000, 0, false, 8));
+    CHECK(!lata_guest_mem_direct_admit(&env, UINT64_MAX - 7, 16, false, 8));
+    /* A fault window installed after translation vetoes the fast path. */
+    CHECK(lata_guest_mem_add_fault_region(&env, 0x2000, 16, LATA_MEM_PERM_READ));
+    CHECK(!lata_guest_mem_direct_admit(&env, 0x2000, 16, false, 8));
+    lata_guest_mem_clear_fault_regions(&env);
+    CHECK(lata_guest_mem_direct_admit(&env, 0x2000, 16, false, 8));
+    lata_set_guest_mem_ops(NULL);
+    CHECK(!lata_guest_mem_direct_available());
 
     if (failures != 0) {
         printf("LATA context: %u/%u checks failed\n", failures, checks);

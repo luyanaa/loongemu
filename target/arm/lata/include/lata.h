@@ -121,7 +121,14 @@ typedef struct LataContext {
     const struct LataGuestMemOps *mem_ops;
     void *ir1_list;
     void *db_rel;
+    /* SVE helper descriptor chunks; lifetime follows the owning TB, not the
+     * context. See lata-sve-lasx-lower.h. */
     void *sve_helper_list;
+    void *sve_helper_active;
+    const void *sve_helper_owner;
+    uint64_t sve_helper_pc;
+    uint32_t sve_helper_descs;
+    uint32_t sve_helper_chunks;
     struct TUControl *tu_data;
     void *tu_search_offsets;
     bool initialized;

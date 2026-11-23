@@ -22,9 +22,11 @@ DEFS := -DTARGET_RISCV64 -DCONFIG_LATR -DCONFIG_LATR_STANDALONE \
 BASE := --target=$(TARGET) -ffreestanding -nostdinc -fno-builtin \
         -fno-stack-protector -O2 -g -mno-lsx -mno-lasx -fno-vectorize \
         -fno-slp-vectorize -Wno-unused-parameter -Wno-unused-variable
+DEFS_HOST := $(DEFS) -D__thread=
 CFLAGS := $(BASE) $(INCS) -isystem $(RESINC) $(DEFS)
 HOST_CFLAGS ?= -std=gnu11 -O2 -Wall -Wextra -Werror -Wno-unused-parameter \
                -Wno-unused-function -I$(LATR)/include -I$(BUILD) \
+               -Icompat -I.. -I$(LATA)/include -I$(LATA) -I../include \
                -idirafter $(LATX)/compat -idirafter $(LATX)/compat/include \
                -idirafter $(LATX)/upstream/include
 
@@ -47,7 +49,7 @@ CORE_OBJS := $(BUILD)/ir2.o $(BUILD)/ir2-assemble.o $(BUILD)/la-append.o \
              $(BUILD)/runtime.o \
              $(BUILD)/vclock.o $(BUILD)/compiler-rt.o
 
-.PHONY: all test-decode test-legality test-elf test-tb-smp check probe clean
+.PHONY: all test-decode test-legality test-elf test-tb-smp test-machine-trap check probe clean
 all: $(BUILD)/liblatr_core.a
 
 test-decode: $(BUILD)/test-latr-decode
@@ -62,7 +64,10 @@ test-elf: $(BUILD)/test-latr-elf
 test-tb-smp: $(BUILD)/test-latr-tb-smp
 	./$(BUILD)/test-latr-tb-smp
 
-check: all test-legality test-elf test-tb-smp
+test-machine-trap: $(BUILD)/test-latr-machine-trap
+	./$(BUILD)/test-latr-machine-trap
+
+check: all test-legality test-elf test-tb-smp test-machine-trap
 	NM="$(NM)" sh ../tools/check_lata_symbols.sh $(BUILD)/liblatr_core.a $(CURDIR)/latr_externals.allowlist
 
 probe: $(CORE_OBJS)
@@ -296,6 +301,16 @@ $(BUILD)/test-latr-rvv-legality: ../tests/test_latr_rvv_legality.c \
 $(BUILD)/test-latr-tb-smp: ../tests/test_latr_tb_smp.c \
                            $(LATR)/tb-cache.c $(LATR)/include/latr-tb-cache.h | $(BUILD)
 	$(HOST_CC) $(HOST_CFLAGS) $(LATR)/tb-cache.c ../tests/test_latr_tb_smp.c -o $@
+
+# Runtime synchronous-exception entry (native fault -> guest trap handler).
+$(BUILD)/test-latr-machine-trap: ../tests/test_latr_machine_trap.c \
+                          $(LATR)/translator/interrupt.c \
+                          ../src/vclock.c ../src/riscv_plic.c ../src/mmio_bus.c \
+                          $(LATR)/include/latr.h $(LATR)/include/riscv-env.h | $(BUILD)
+	$(HOST_CC) $(HOST_CFLAGS) $(DEFS_HOST) \
+		$(LATR)/translator/interrupt.c ../src/vclock.c \
+		../src/riscv_plic.c ../src/mmio_bus.c \
+		../tests/test_latr_machine_trap.c -o $@
 
 $(BUILD)/test-latr-elf: ../tests/test_latr_elf.c $(LATR)/system/latr_elf.c \
                         $(LATR)/include/latr-elf.h | $(BUILD)
