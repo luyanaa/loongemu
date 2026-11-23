@@ -894,7 +894,8 @@ static void generate_context_switch_native_to_bt(void)
     la_add_d(t1_ir2_opnd, t1_ir2_opnd, t2_ir2_opnd);
     li_d(t2_ir2_opnd, env_offset_fpsr());
     la_ldx_wu(t0_ir2_opnd, env_ir2_opnd, t2_ir2_opnd);
-    la_add_d(t0_ir2_opnd, t0_ir2_opnd, t1_ir2_opnd);
+    /* Sticky flags: a repeated exception must not carry into the next bit. */
+    la_or(t0_ir2_opnd, t0_ir2_opnd, t1_ir2_opnd);
     la_stx_w(t0_ir2_opnd, env_ir2_opnd, t2_ir2_opnd);
     /* store fcsr(rouding mode) to vfp.xregs[ARM_VFP_FPSCR] */
     la_movfcsr2gr(t0_ir2_opnd, fcsr3_ir2_opnd);

@@ -342,7 +342,8 @@ extern uint32_t lata_vreg_published;
 static void lata_emit_mem_call_prologue(IR2_OPND vaddr_opnd, IR2_OPND value_opnd,
                                         bool have_value);
 static void lata_emit_mem_call_epilogue(void);
-static void lata_emit_mem_call_fault(DisasContext *s, IR2_OPND status);
+static void lata_emit_mem_call_fault(DisasContext *s, IR2_OPND status,
+                                     bool is_write);
 static bool lata_emit_guest_mem_load_call(DisasContext *s, IR2_OPND dst,
                                           IR2_OPND addr_reg, int64_t offset,
                                           size_t size, bool is_signed);
@@ -2715,10 +2716,11 @@ static bool trans_LDP(DisasContext *s)
     {
         int64_t disp = (!a->w || a->p) ? (int64_t)offset : 0;
 
+        /* LDPSW sign-extends both halves; LDP zero-extends. */
         lata_emit_guest_mem_load_call(s, reg_t, reg_n, disp, (size_t)dbytes,
-                                      false);
+                                      a->sign != 0);
         lata_emit_guest_mem_load_call(s, reg_t2, reg_n, disp + dbytes,
-                                      (size_t)dbytes, false);
+                                      (size_t)dbytes, a->sign != 0);
         if (a->w)
         {
             la_addi_d(temp, reg_n, (int)offset);
@@ -3176,13 +3178,16 @@ static void lata_emit_mem_call_epilogue(void)
 }
 
 /* Publish the provider's status as a synchronous Data Abort and leave the TB. */
-static void lata_emit_mem_call_fault(DisasContext *s, IR2_OPND status)
+static void lata_emit_mem_call_fault(DisasContext *s, IR2_OPND status,
+                                     bool is_write)
 {
     la_mov64(a4_ir2_opnd, status);
     la_mov64(a0_ir2_opnd, env_ir2_opnd);
     li_d(a1_ir2_opnd, (int64_t)s->pc_curr);
     la_ld_d(a2_ir2_opnd, sp_ir2_opnd, 48);
-    li_d(a3_ir2_opnd, 1);
+    /* ESR.WnR / last_fault_is_write follow the access direction, not the
+     * emitter that happened to notice the fault. */
+    li_d(a3_ir2_opnd, is_write ? 1 : 0);
     li_d(t0_ir2_opnd, (uint64_t)lata_guest_mem_raise_fault);
     la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
     lata_emit_mem_call_epilogue();
@@ -3215,7 +3220,7 @@ static bool lata_emit_guest_mem_load_call(DisasContext *s, IR2_OPND dst,
     li_d(t0_ir2_opnd, (uint64_t)lata_guest_mem_load);
     la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
     la_beqz(a0_ir2_opnd, ok_lbl);
-    lata_emit_mem_call_fault(s, a0_ir2_opnd);
+    lata_emit_mem_call_fault(s, a0_ir2_opnd, false);
     la_label(ok_lbl);
     lata_gen_call_helper_epilogue(tcg_ctx);
     la_ld_d(dst, sp_ir2_opnd, 56);
@@ -3243,7 +3248,7 @@ static bool lata_emit_guest_mem_store_call(DisasContext *s, IR2_OPND value,
     li_d(t0_ir2_opnd, (uint64_t)lata_guest_mem_store);
     la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
     la_beqz(a0_ir2_opnd, ok_lbl);
-    lata_emit_mem_call_fault(s, a0_ir2_opnd);
+    lata_emit_mem_call_fault(s, a0_ir2_opnd, true);
     la_label(ok_lbl);
     lata_gen_call_helper_epilogue(tcg_ctx);
     lata_emit_mem_call_epilogue();
@@ -3282,11 +3287,16 @@ static bool lata_emit_guest_mem_load_bulk(DisasContext *s, IR2_OPND dst_vec,
         li_d(t0_ir2_opnd, (uint64_t)ops->load_bytes);
         la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
         la_beqz(a0_ir2_opnd, ok_lbl);
-        lata_emit_mem_call_fault(s, a0_ir2_opnd);
+        lata_emit_mem_call_fault(s, a0_ir2_opnd, false);
     } else {
         for (size_t off = 0; off < size; off += 8) {
             la_mov64(a0_ir2_opnd, env_ir2_opnd);
             la_ld_d(a1_ir2_opnd, sp_ir2_opnd, 48);
+            if (off != 0) {
+                /* Each half must read its own address. */
+                li_d(t1_ir2_opnd, (int64_t)off);
+                la_add_d(a1_ir2_opnd, a1_ir2_opnd, t1_ir2_opnd);
+            }
             li_d(a2_ir2_opnd, 8);
             li_d(a3_ir2_opnd, 0);
             la_addi_d(a4_ir2_opnd, sp_ir2_opnd,
@@ -3294,7 +3304,7 @@ static bool lata_emit_guest_mem_load_bulk(DisasContext *s, IR2_OPND dst_vec,
             li_d(t0_ir2_opnd, (uint64_t)lata_guest_mem_load);
             la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
             la_beqz(a0_ir2_opnd, ok_lbl);
-            lata_emit_mem_call_fault(s, a0_ir2_opnd);
+            lata_emit_mem_call_fault(s, a0_ir2_opnd, false);
             la_label(ok_lbl);
             ok_lbl = ir2_opnd_new_type(IR2_OPND_LABEL);
         }
@@ -3342,18 +3352,22 @@ static bool lata_emit_guest_mem_store_bulk(DisasContext *s, IR2_OPND src_vec,
         li_d(t0_ir2_opnd, (uint64_t)ops->store_bytes);
         la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
         la_beqz(a0_ir2_opnd, ok_lbl);
-        lata_emit_mem_call_fault(s, a0_ir2_opnd);
+        lata_emit_mem_call_fault(s, a0_ir2_opnd, true);
     } else {
         for (size_t off = 0; off < size; off += 8) {
             la_mov64(a0_ir2_opnd, env_ir2_opnd);
             la_ld_d(a1_ir2_opnd, sp_ir2_opnd, 48);
+            if (off != 0) {
+                li_d(t1_ir2_opnd, (int64_t)off);
+                la_add_d(a1_ir2_opnd, a1_ir2_opnd, t1_ir2_opnd);
+            }
             li_d(a2_ir2_opnd, 8);
             la_ld_d(a3_ir2_opnd, sp_ir2_opnd,
                     (int)(LATA_MEM_CALL_DATA + off));
             li_d(t0_ir2_opnd, (uint64_t)lata_guest_mem_store);
             la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
             la_beqz(a0_ir2_opnd, ok_lbl);
-            lata_emit_mem_call_fault(s, a0_ir2_opnd);
+            lata_emit_mem_call_fault(s, a0_ir2_opnd, true);
             la_label(ok_lbl);
             ok_lbl = ir2_opnd_new_type(IR2_OPND_LABEL);
         }
@@ -3630,7 +3644,7 @@ static void assist_trans_STR_v_i(DisasContext *s, IR2_OPND *vreg_t, IR2_OPND *re
     if (!lata_guest_mem_inline_host_access_ok())
     {
         lata_emit_guest_mem_store_bulk(s, *vreg_t, *reg_n, (int64_t)offset,
-                                       (size_t)16u);
+                                       (size_t)1u << sz);
         return;
     }
     lata_emit_guest_mem_probe(s, *reg_n, (int64_t)offset, (size_t)1u << sz, true, vreg_t);
@@ -3737,7 +3751,7 @@ static void assist_trans_LDR_v_i(DisasContext *s, IR2_OPND *vreg_t, IR2_OPND *re
     if (!lata_guest_mem_inline_host_access_ok())
     {
         lata_emit_guest_mem_load_bulk(s, *vreg_t, *reg_n, (int64_t)offset,
-                                      (size_t)16u);
+                                      (size_t)1u << sz);
         return;
     }
     lata_emit_guest_mem_probe(s, *reg_n, (int64_t)offset, (size_t)1u << sz, false, NULL);

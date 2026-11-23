@@ -2402,6 +2402,43 @@ static LataGuestMemStatus prov_store_bytes(CPUARMState *env, uint64_t vaddr,
     return LATA_MEM_OK;
 }
 
+/* Same provider, but no byte-buffer hooks: the lowering must split a 128-bit
+ * access into two 8-byte transfers at the right addresses. */
+static const LataGuestMemOps prov_no_bulk_ops = {
+    .probe = prov_probe,
+    .load = prov_load,
+    .store = prov_store,
+    .direct = NULL,
+    .va_is_hpa_identity = false,
+};
+
+/* Always fails, to exercise the fault publication path. */
+static LataGuestMemStatus prov_fault_load(CPUARMState *env, uint64_t vaddr,
+                                          size_t size, bool is_signed,
+                                          uint64_t *out_value)
+{
+    (void)env; (void)vaddr; (void)size; (void)is_signed;
+    if (out_value != NULL) {
+        *out_value = 0;
+    }
+    return LATA_MEM_FAULT_UNMAPPED;
+}
+
+static LataGuestMemStatus prov_fault_store(CPUARMState *env, uint64_t vaddr,
+                                           size_t size, uint64_t value)
+{
+    (void)env; (void)vaddr; (void)size; (void)value;
+    return LATA_MEM_FAULT_UNMAPPED;
+}
+
+static const LataGuestMemOps prov_fault_ops = {
+    .probe = prov_probe,
+    .load = prov_fault_load,
+    .store = prov_fault_store,
+    .direct = NULL,
+    .va_is_hpa_identity = false,
+};
+
 static const LataGuestMemOps prov_no_identity_ops = {
     .probe = prov_probe,
     .load = prov_load,
@@ -6490,6 +6527,180 @@ void kmain(void)
         fpsr = env.vfp.xregs[8];
         check((fpsr & (1u << 1)) != 0, 1, "divide by zero sets FPSR.DZC");
         check((fpsr & (1u << 4)) != 0, 1, "FPSR flags are sticky");
+    }
+
+    /* Narrow SIMD through the checked path: only the instruction's width may be
+     * touched, and a narrow load must zero the rest of the destination. */
+    {
+        static uint32_t str_b[] __attribute__((aligned(16))) = {
+            0x3d000020u, /* str b0, [x1] */
+        };
+        static uint32_t str_s[] __attribute__((aligned(16))) = {
+            0xbd000020u, /* str s0, [x1] */
+        };
+        static uint32_t str_d[] __attribute__((aligned(16))) = {
+            0xfd000020u, /* str d0, [x1] */
+        };
+        static uint32_t ldr_b[] __attribute__((aligned(16))) = {
+            0x3d400020u, /* placeholder, replaced below */
+        };
+        static uint8_t narrow_buf[16] __attribute__((aligned(16)));
+
+        /* Widths: STR B0 = 1 byte, STR S0 = 4, STR D0 = 8. */
+        for (size_t i = 0; i < 16; ++i) narrow_buf[i] = 0xa5;
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        for (size_t i = 0; i < 16; ++i) {
+            arm_sve_zreg(&env, 0)[i] = (uint8_t)(0x10u + i);
+        }
+        env.xregs[1] = (uint64_t)(uintptr_t)narrow_buf;
+        lata_guest_mem_clear_fault_regions(&env);
+        lata_set_guest_mem_ops(&prov_no_identity_ops);
+        check(sve_run_a64_tb(str_b, 1, 128, 0x0fu, false, "STR B0 checked"),
+              1, "narrow STR B0 runs");
+        check(narrow_buf[0], 0x10u, "STR B0 writes the byte");
+        check(narrow_buf[1], 0xa5u, "STR B0 must not write byte 1");
+
+        for (size_t i = 0; i < 16; ++i) narrow_buf[i] = 0xa5;
+        check(sve_run_a64_tb(str_s, 1, 128, 0x0fu, false, "STR S0 checked"),
+              1, "narrow STR S0 runs");
+        check(read_le32(narrow_buf), UINT32_C(0x13121110), "STR S0 writes 4 bytes");
+        check(narrow_buf[4], 0xa5u, "STR S0 must not write byte 4");
+
+        for (size_t i = 0; i < 16; ++i) narrow_buf[i] = 0xa5;
+        check(sve_run_a64_tb(str_d, 1, 128, 0x0fu, false, "STR D0 checked"),
+              1, "narrow STR D0 runs");
+        check(read_le64(narrow_buf), UINT64_C(0x1716151413121110),
+              "STR D0 writes 8 bytes");
+        check(narrow_buf[8], 0xa5u, "STR D0 must not write byte 8");
+
+        /* LDR B0 from a buffer whose tail is non-zero: the vector must be zeroed
+         * above the loaded byte. */
+        for (size_t i = 0; i < 16; ++i) narrow_buf[i] = (uint8_t)(0x30u + i);
+        ldr_b[0] = 0x3d400020u; /* ldr b0, [x1] */
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        for (size_t i = 0; i < 16; ++i) arm_sve_zreg(&env, 0)[i] = 0xee;
+        env.xregs[1] = (uint64_t)(uintptr_t)narrow_buf;
+        lata_guest_mem_clear_fault_regions(&env);
+        lata_set_guest_mem_ops(&prov_no_identity_ops);
+        (void)sve_run_a64_tb(ldr_b, 1, 128, 0x0fu, false, "LDR B0 checked");
+        check(arm_sve_zreg(&env, 0)[0], 0x30u, "LDR B0 loads the byte");
+        check(arm_sve_zreg(&env, 0)[1], 0x00u,
+              "LDR B0 zeroes the destination above the loaded byte");
+        lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
+    }
+
+    /* Fallback without byte hooks: both 64-bit halves must use their own
+     * address (regression for the fixed split loop). */
+    {
+        static uint32_t q_pair[] __attribute__((aligned(16))) = {
+            0x3d800020u, /* str q0, [x1] */
+            0x3dc00022u, /* ldr q2, [x1] */
+        };
+        static uint8_t qbuf[16] __attribute__((aligned(16)));
+
+        for (size_t i = 0; i < 16; ++i) qbuf[i] = 0;
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        for (size_t i = 0; i < 16; ++i) {
+            arm_sve_zreg(&env, 0)[i] = (uint8_t)(0x50u + i);
+        }
+        env.xregs[1] = (uint64_t)(uintptr_t)qbuf;
+        lata_guest_mem_clear_fault_regions(&env);
+        lata_set_guest_mem_ops(&prov_no_bulk_ops);
+        check(sve_run_a64_tb(q_pair, 2, 128, 0x0fu, false, "128-bit split"),
+              1, "128-bit access through 8-byte provider calls runs");
+        lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
+        check(read_le64(qbuf), UINT64_C(0x5756555453525150),
+              "split STR writes the low half at the base address");
+        check(read_le64(qbuf + 8), UINT64_C(0x5f5e5d5c5b5a5958),
+              "split STR writes the high half at base+8");
+        check(read_le64(arm_sve_zreg(&env, 2)), UINT64_C(0x5756555453525150),
+              "split LDR reads the low half");
+        check(read_le64(arm_sve_zreg(&env, 2) + 8), UINT64_C(0x5f5e5d5c5b5a5958),
+              "split LDR reads the high half");
+    }
+
+    /* Fault direction: a provider load failure must report a read fault. */
+    {
+        static uint32_t ld_fix[] __attribute__((aligned(16))) = {
+            0xf9400022u, /* ldr x2, [x1] */
+        };
+        static uint32_t st_fix[] __attribute__((aligned(16))) = {
+            0xf9000022u, /* str x2, [x1] */
+        };
+
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[1] = (uint64_t)(uintptr_t)0x2000;
+        lata_guest_mem_clear_fault_regions(&env);
+        lata_set_guest_mem_ops(&prov_fault_ops);
+        check(sve_run_a64_tb(ld_fix, 1, 128, 0x0fu, false, "provider load fault"),
+              1, "provider load fault runs");
+        check(env.sve_ctrl.last_exception_index, EXCP_DATA_ABORT,
+              "provider load fault raises a Data Abort");
+        check(env.sve_ctrl.last_fault_is_write, 0,
+              "provider load fault reports WnR=0");
+
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[1] = (uint64_t)(uintptr_t)0x2000;
+        env.xregs[2] = 0x1234;
+        lata_guest_mem_clear_fault_regions(&env);
+        check(sve_run_a64_tb(st_fix, 1, 128, 0x0fu, false, "provider store fault"),
+              1, "provider store fault runs");
+        check(env.sve_ctrl.last_exception_index, EXCP_DATA_ABORT,
+              "provider store fault raises a Data Abort");
+        check(env.sve_ctrl.last_fault_is_write, 1,
+              "provider store fault reports WnR=1");
+        lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
+    }
+
+    /* Sticky flags must not carry: the same exception twice keeps one bit. */
+    {
+        static uint32_t fdiv_s[] __attribute__((aligned(16))) = {
+            0x1e221820u, /* fdiv s0, s1, s2 */
+        };
+
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        write_le32(arm_sve_zreg(&env, 1), 0x3f800000u); /* 1.0 */
+        write_le32(arm_sve_zreg(&env, 2), 0x40400000u); /* 3.0 -> inexact */
+        (void)sve_run_a64_tb(fdiv_s, 1, 128, 0x0fu, false, "FPSR inexact #1");
+        write_le32(arm_sve_zreg(&env, 1), 0x3f800000u);
+        write_le32(arm_sve_zreg(&env, 2), 0x40400000u);
+        (void)sve_run_a64_tb(fdiv_s, 1, 128, 0x0fu, false, "FPSR inexact #2");
+        check(env.vfp.xregs[8] & 0x1fu, 0x10u,
+              "repeated inexact keeps IXC only (no carry into DZC)");
+    }
+
+    /* LDPSW must sign-extend both halves through the provider path, while the
+     * plain LDP W-form zero-extends. */
+    {
+        static uint32_t ldpsw[] __attribute__((aligned(16))) = {
+            0x69400c22u, /* ldpsw x2, x3, [x1] */
+        };
+        static uint32_t ldpw[] __attribute__((aligned(16))) = {
+            0x29400c22u, /* ldp w2, w3, [x1] */
+        };
+        static uint8_t pair_buf[8] __attribute__((aligned(16)));
+
+        for (size_t i = 0; i < 8; ++i) pair_buf[i] = 0xff; /* both halves = -1 */
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[1] = (uint64_t)(uintptr_t)pair_buf;
+        lata_guest_mem_clear_fault_regions(&env);
+        lata_set_guest_mem_ops(&prov_no_identity_ops);
+        check(sve_run_a64_tb(ldpsw, 1, 128, 0x0fu, false, "LDPSW checked"),
+              1, "LDPSW through the provider runs");
+        check(env.xregs[2], UINT64_C(0xffffffffffffffff),
+              "LDPSW sign-extends the first half");
+        check(env.xregs[3], UINT64_C(0xffffffffffffffff),
+              "LDPSW sign-extends the second half");
+
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[1] = (uint64_t)(uintptr_t)pair_buf;
+        check(sve_run_a64_tb(ldpw, 1, 128, 0x0fu, false, "LDP W checked"),
+              1, "LDP W through the provider runs");
+        check(env.xregs[2], UINT64_C(0xffffffff),
+              "LDP W zero-extends the first half");
+        check(env.xregs[3], UINT64_C(0xffffffff),
+              "LDP W zero-extends the second half");
+        lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
     }
 
     latx_bare_uart_puts("lata-isa: checks=");

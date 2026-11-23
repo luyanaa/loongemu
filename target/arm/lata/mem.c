@@ -269,7 +269,14 @@ bool lata_guest_mem_direct_available(void)
     return direct_policy() != NULL;
 }
 
-/* Inline host access needs either a published policy or the identity claim. */
+/*
+ * Only the explicit identity claim justifies a raw host access at translation
+ * time.  A published `direct` policy is not enough: it proves spans only when
+ * `epoch()`/`span_admissible()` are consulted at run time for the actual range,
+ * which scalar/NEON lowering does not do yet (the SVE lowering does).  Such
+ * providers therefore take the checked (provider call) path until that
+ * admission is wired in.
+ */
 bool lata_guest_mem_inline_host_access_ok(void)
 {
     const LataGuestMemOps *ops = lata_get_guest_mem_ops();
@@ -277,7 +284,7 @@ bool lata_guest_mem_inline_host_access_ok(void)
     if (ops == NULL) {
         return false;
     }
-    return ops->direct != NULL || ops->va_is_hpa_identity;
+    return ops->va_is_hpa_identity;
 }
 
 static CPUARMState *mapping_env(void)
