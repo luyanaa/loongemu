@@ -266,9 +266,19 @@ build/test_soft_ras: tests/test_soft_ras.c src/soft_ras.c include/loongemu/soft_
 test-soft-ras: build/test_soft_ras
 	./build/test_soft_ras
 
+build/test_lata_dispatch: tests/test_lata_dispatch.c src/lata_dispatch.c \
+                          src/tb_cache.c include/loongemu/lata_dispatch.h \
+                          include/loongemu/tb_cache.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) src/lata_dispatch.c src/tb_cache.c tests/test_lata_dispatch.c -o $@
+
+test-lata-dispatch: build/test_lata_dispatch
+	./build/test_lata_dispatch
+
+
 test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging build/test_x86_64_paging \
       build/test_pci_host build/test_hyperv build/test_tb_cache build/test_soft_ras build/test_pvir build/test_sve_decode build/test_sve_pvir build/test_vcache build/test_arm_state build/test_lata_context \
-      build/test_latm_decode build/test_riscv_virtio_blk \
+      build/test_latm_decode build/test_riscv_virtio_blk build/test_lata_dispatch \
       build/test_riscv_sbi build/test_riscv_acpi build/test_riscv_plic \
       build/test_riscv_uart build/test_riscv_fw \
       build/test_sve_helper_support build/test_sve_helper_lifecycle
@@ -296,6 +306,7 @@ test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging buil
 	./build/test_arm_state
 	./build/test_lata_context
 	./build/test_latm_decode
+	./build/test_lata_dispatch
 
 # Back-end selection and the EFLAGS pack/unpack bridge.  Kept separate from
 # test_loongbt so a failure points at the glue rather than the semantics.
