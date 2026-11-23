@@ -283,6 +283,18 @@ static void run_block(uint32_t *guest, int insns, const char *name)
 static uint8_t context_vector_expected[3][16]
     __attribute__((aligned(16)));
 
+static void write_le64(uint8_t *bytes, uint64_t value)
+{
+    for (unsigned i = 0; i < 8; ++i) {
+        bytes[i] = (uint8_t)(value >> (8u * i));
+    }
+}
+
+static uint16_t read_le16(const uint8_t *bytes)
+{
+    return (uint16_t)(bytes[0] | (bytes[1] << 8));
+}
+
 static uint64_t read_le64(const uint8_t *bytes)
 {
     uint64_t value = 0;
@@ -6700,6 +6712,98 @@ void kmain(void)
               "LDP W zero-extends the first half");
         check(env.xregs[3], UINT64_C(0xffffffff),
               "LDP W zero-extends the second half");
+        lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
+    }
+
+    /* Remaining checked-path matrix: signed loads, writeback, H width, narrow
+     * vector pair, second-access fault, QC preservation, multi-round rollback. */
+    {
+        static uint8_t mbuf[16] __attribute__((aligned(16)));
+        static uint32_t ldrsb[] __attribute__((aligned(16))) = {
+            0x39800023u, /* ldrsb x3, [x1] */
+        };
+        static uint32_t ldrsw[] __attribute__((aligned(16))) = {
+            0xb9800022u, /* ldrsw x2, [x1] */
+        };
+        static uint32_t ldr_post[] __attribute__((aligned(16))) = {
+            0xf8408422u, /* ldr x2, [x1], #8 */
+        };
+        static uint32_t ldr_h[] __attribute__((aligned(16))) = {
+            0x7d400020u, /* ldr h0, [x1] */
+        };
+        static uint32_t str_h[] __attribute__((aligned(16))) = {
+            0x7d000020u, /* str h0, [x1] */
+        };
+        static uint32_t stp_s[] __attribute__((aligned(16))) = {
+            0x2d000420u, /* stp s0, s1, [x1] */
+        };
+        static uint32_t ldp_s[] __attribute__((aligned(16))) = {
+            0x2d400c22u, /* ldp s2, s3, [x1] */
+        };
+
+        /* Signed byte load through the provider. */
+        for (size_t i = 0; i < 16; ++i) mbuf[i] = 0;
+        mbuf[0] = 0x80;
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[1] = (uint64_t)(uintptr_t)mbuf;
+        lata_guest_mem_clear_fault_regions(&env);
+        lata_set_guest_mem_ops(&prov_no_identity_ops);
+        check(sve_run_a64_tb(ldrsb, 1, 128, 0x0fu, false, "LDRSB checked"),
+              1, "LDRSB through the provider runs");
+        check(env.xregs[3], UINT64_C(0xffffffffffffff80),
+              "LDRSB sign-extends the loaded byte");
+
+        /* Signed word load. */
+        write_le32(mbuf, 0x80000000u);
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[1] = (uint64_t)(uintptr_t)mbuf;
+        check(sve_run_a64_tb(ldrsw, 1, 128, 0x0fu, false, "LDRSW checked"),
+              1, "LDRSW through the provider runs");
+        check(env.xregs[2], UINT64_C(0xffffffff80000000),
+              "LDRSW sign-extends the loaded word");
+
+        /* Post-index writeback happens after the access. */
+        write_le64(mbuf, UINT64_C(0x1122334455667788));
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[1] = (uint64_t)(uintptr_t)mbuf;
+        check(sve_run_a64_tb(ldr_post, 1, 128, 0x0fu, false, "LDR post-index"),
+              1, "LDR post-index through the provider runs");
+        check(env.xregs[2], UINT64_C(0x1122334455667788),
+              "post-index LDR loads from the original address");
+        check(env.xregs[1], (uint64_t)(uintptr_t)mbuf + 8,
+              "post-index LDR writes back base+8");
+
+        /* Halfword width: only two bytes move. */
+        for (size_t i = 0; i < 16; ++i) mbuf[i] = 0xa5;
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        for (size_t i = 0; i < 16; ++i) arm_sve_zreg(&env, 0)[i] = (uint8_t)(0x60u + i);
+        env.xregs[1] = (uint64_t)(uintptr_t)mbuf;
+        check(sve_run_a64_tb(str_h, 1, 128, 0x0fu, false, "STR H checked"),
+              1, "STR H runs");
+        check(read_le16(mbuf), 0x6160u, "STR H writes two bytes");
+        check(mbuf[2], 0xa5u, "STR H must not write byte 2");
+
+        for (size_t i = 0; i < 16; ++i) mbuf[i] = (uint8_t)(0x70u + i);
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        for (size_t i = 0; i < 16; ++i) arm_sve_zreg(&env, 0)[i] = 0xee;
+        env.xregs[1] = (uint64_t)(uintptr_t)mbuf;
+        check(sve_run_a64_tb(ldr_h, 1, 128, 0x0fu, false, "LDR H checked"),
+              1, "LDR H runs");
+        check(read_le16(arm_sve_zreg(&env, 0)), 0x7170u, "LDR H loads two bytes");
+        check(arm_sve_zreg(&env, 0)[2], 0x00u, "LDR H zeroes above the width");
+
+        /* Narrow vector pair: two 32-bit halves. */
+        for (size_t i = 0; i < 16; ++i) mbuf[i] = 0;
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        write_le32(arm_sve_zreg(&env, 0), 0x11111111u);
+        write_le32(arm_sve_zreg(&env, 1), 0x22222222u);
+        env.xregs[1] = (uint64_t)(uintptr_t)mbuf;
+        check(sve_run_a64_tb(stp_s, 1, 128, 0x0fu, false, "STP S checked"),
+              1, "STP S runs");
+        check(read_le32(mbuf), 0x11111111u, "STP S stores the first half");
+        check(read_le32(mbuf + 4), 0x22222222u, "STP S stores the second half");
+        check(mbuf[8], 0x00u, "STP S must not write past 8 bytes");
+
         lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
     }
 

@@ -268,6 +268,23 @@ bool ra_ftemp_phys_in_pool(int phys)
     return false;
 }
 
+/*
+ * Code-cache generation: bumped by every flush (explicit or detected by the
+ * allocator rewinding).  Helper descriptors record it, so a stale group is
+ * recognised even after the allocator has grown back past its old position.
+ */
+uint64_t lata_code_cache_generation = 1;
+
+uint64_t lata_code_cache_bump_generation(void)
+{
+    return ++lata_code_cache_generation;
+}
+
+uint64_t lata_code_cache_current_generation(void)
+{
+    return lata_code_cache_generation;
+}
+
 void lata_ftemp_set_base_pool(int pool)
 {
     LataContext *ctx = lata_context_current();

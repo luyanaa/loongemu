@@ -356,6 +356,10 @@ static bool lata_emit_guest_mem_load_bulk(DisasContext *s, IR2_OPND dst_vec,
 static bool lata_emit_guest_mem_store_bulk(DisasContext *s, IR2_OPND src_vec,
                                            IR2_OPND addr_reg, int64_t offset,
                                            size_t size);
+static bool lata_emit_guest_mem_load_pair(DisasContext *s, IR2_OPND dst0,
+                                          IR2_OPND dst1, IR2_OPND addr_reg,
+                                          int64_t off0, int64_t off1,
+                                          size_t size, bool is_signed);
 
 static void lata_emit_guest_mem_probe(DisasContext *s, IR2_OPND addr_reg,
                                       int64_t offset, size_t size,
@@ -3008,15 +3012,16 @@ static bool trans_LDP_v(DisasContext *s)
         }
         else
         {
-            for (int i = 0; i < 2; ++i)
-            {
-                IR2_OPND half = ra_alloc_itemp();
-                lata_emit_guest_mem_load_call(s, half, reg_n,
-                                              disp + (int64_t)i * dbytes,
-                                              (size_t)dbytes, false);
-                la_vinsgr2vr_d(i == 0 ? vreg_t : vreg_t2, half, 0);
-                ra_free_temp(half);
-            }
+            IR2_OPND lo = ra_alloc_itemp();
+            IR2_OPND hi = ra_alloc_itemp();
+
+            lata_emit_guest_mem_load_pair(s, lo, hi, reg_n, disp,
+                                          disp + (int64_t)dbytes,
+                                          (size_t)dbytes, false);
+            la_vinsgr2vr_d(vreg_t, lo, 0);
+            la_vinsgr2vr_d(vreg_t2, hi, 0);
+            ra_free_temp(lo);
+            ra_free_temp(hi);
         }
         if (a->w)
         {
@@ -3374,6 +3379,51 @@ static bool lata_emit_guest_mem_store_bulk(DisasContext *s, IR2_OPND src_vec,
     }
     la_label(ok_lbl);
     lata_gen_call_helper_epilogue(tcg_ctx);
+    lata_emit_mem_call_epilogue();
+    return true;
+}
+
+/*
+ * Two provider loads inside one helper frame.
+ *
+ * Issuing the loads as two independent calls loses the first result: the
+ * helper ABI may clobber the caller-saved register it was returned in.  Both
+ * values are staged in the frame instead and read back after the last call.
+ */
+static bool lata_emit_guest_mem_load_pair(DisasContext *s, IR2_OPND dst0,
+                                          IR2_OPND dst1, IR2_OPND addr_reg,
+                                          int64_t off0, int64_t off1,
+                                          size_t size, bool is_signed)
+{
+    IR2_OPND vaddr = ra_alloc_itemp();
+    IR2_OPND ok_lbl = ir2_opnd_new_type(IR2_OPND_LABEL);
+
+    li_d(vaddr, off0);
+    la_add_d(vaddr, addr_reg, vaddr);
+    lata_emit_mem_call_prologue(vaddr, vaddr, false);
+    ra_free_temp(vaddr);
+
+    lata_gen_call_helper_prologue(tcg_ctx);
+    for (int i = 0; i < 2; ++i) {
+        la_mov64(a0_ir2_opnd, env_ir2_opnd);
+        la_ld_d(a1_ir2_opnd, sp_ir2_opnd, 48);
+        if (i != 0) {
+            li_d(t1_ir2_opnd, (int64_t)(off1 - off0));
+            la_add_d(a1_ir2_opnd, a1_ir2_opnd, t1_ir2_opnd);
+        }
+        li_d(a2_ir2_opnd, (int64_t)size);
+        li_d(a3_ir2_opnd, is_signed ? 1 : 0);
+        la_addi_d(a4_ir2_opnd, sp_ir2_opnd,
+                  (int)(LATA_MEM_CALL_DATA + i * 8));
+        li_d(t0_ir2_opnd, (uint64_t)lata_guest_mem_load);
+        la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
+        la_beqz(a0_ir2_opnd, ok_lbl);
+        lata_emit_mem_call_fault(s, a0_ir2_opnd, false);
+    }
+    la_label(ok_lbl);
+    lata_gen_call_helper_epilogue(tcg_ctx);
+    la_ld_d(dst0, sp_ir2_opnd, LATA_MEM_CALL_DATA);
+    la_ld_d(dst1, sp_ir2_opnd, LATA_MEM_CALL_DATA + 8);
     lata_emit_mem_call_epilogue();
     return true;
 }

@@ -26,6 +26,7 @@ typedef struct LataSVEHelperChunk {
     struct LataSVEHelperChunk *next;
     const void *owner;
     uint64_t pc_first;
+    uint64_t generation;
     uint32_t used;
 } LataSVEHelperChunk;
 
@@ -96,11 +97,19 @@ void lata_sve_helper_begin_tb(const void *owner, uint64_t pc_first)
      * another thread rewinds the shared allocator; checking at every block start
      * - not only at helper allocation - keeps the leak window to one block.
      */
-    if (ctx->sve_helper_chunks != 0 &&
-        lata_sve_helper_codegen_rewound(ctx->sve_helper_codegen,
-                                        (uintptr_t)tcg_ctx->code_gen_ptr))
-    {
-        lata_sve_helper_release_all();
+    /*
+     * A generation change is the authoritative signal: an explicit flush bumps
+     * it, and so does a detected rewind.  The position comparison alone cannot
+     * tell after the allocator has grown back past the old address.
+     */
+    if (ctx->sve_helper_chunks != 0) {
+        if (ctx->sve_helper_codegen_gen != lata_code_cache_current_generation()) {
+            lata_sve_helper_release_all();
+        } else if (lata_sve_helper_codegen_rewound(ctx->sve_helper_codegen,
+                                                   (uintptr_t)tcg_ctx->code_gen_ptr)) {
+            lata_code_cache_bump_generation();
+            lata_sve_helper_release_all();
+        }
     }
     ctx->sve_helper_owner = owner;
     ctx->sve_helper_pc = pc_first;
@@ -190,16 +199,18 @@ const LataSVEHelperDesc *lata_sve_alloc_helper_desc(
                 ? (const void *)s->base->tb->tc.ptr
                 : NULL;
     pc_first = (s->base != NULL) ? s->base->pc_first : s->pc_curr;
-    if (ctx->sve_helper_chunks != 0 &&
-        lata_sve_helper_codegen_rewound(ctx->sve_helper_codegen,
-                                        (uintptr_t)tcg_ctx->code_gen_ptr))
-    {
-        /* The cache was flushed behind our back: every chunk is dead. */
-        lata_sve_helper_release_all();
+    if (ctx->sve_helper_chunks != 0) {
+        if (ctx->sve_helper_codegen_gen != lata_code_cache_current_generation()) {
+            lata_sve_helper_release_all();
+        } else if (lata_sve_helper_codegen_rewound(ctx->sve_helper_codegen,
+                                                   (uintptr_t)tcg_ctx->code_gen_ptr)) {
+            lata_code_cache_bump_generation();
+            lata_sve_helper_release_all();
+        }
     }
-    if (ctx->sve_helper_chunks == 0)
-    {
+    if (ctx->sve_helper_chunks == 0) {
         ctx->sve_helper_codegen = (uintptr_t)tcg_ctx->code_gen_ptr;
+        ctx->sve_helper_codegen_gen = lata_code_cache_current_generation();
     }
     if (ctx->sve_helper_owner != owner || ctx->sve_helper_pc != pc_first) {
         lata_sve_helper_begin_tb(owner, pc_first);
@@ -209,6 +220,7 @@ const LataSVEHelperDesc *lata_sve_alloc_helper_desc(
         chunk = (LataSVEHelperChunk *)mm_calloc(1, LATA_SVE_HELPER_CHUNK_BYTES);
         chunk->owner = owner;
         chunk->pc_first = pc_first;
+        chunk->generation = lata_code_cache_current_generation();
         chunk->next = (LataSVEHelperChunk *)ctx->sve_helper_list;
         ctx->sve_helper_list = chunk;
         ctx->sve_helper_active = chunk;

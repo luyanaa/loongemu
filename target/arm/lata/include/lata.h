@@ -137,6 +137,8 @@ typedef struct LataContext {
      * no code from the old cache can run and every descriptor can be dropped.
      */
     uintptr_t sve_helper_codegen;
+    /* Code-cache generation the live chunks belong to. */
+    uint64_t sve_helper_codegen_gen;
     struct TUControl *tu_data;
     void *tu_search_offsets;
     bool initialized;
@@ -216,6 +218,16 @@ uint32_t lata_vreg_spills(void);
 uint32_t lata_vreg_resident_count(void);
 /* Test/debug knob: shrink the temporary base pool to force spilling. */
 void lata_ftemp_set_base_pool(int pool);
+
+/*
+ * Code-cache generation.  Every cache flush (explicit or detected by the
+ * allocator rewinding) bumps it; helper descriptors carry the generation they
+ * were created under, so a stale group is recognised even when the allocator
+ * has already grown back past the old position.
+ */
+extern uint64_t lata_code_cache_generation;
+uint64_t lata_code_cache_bump_generation(void);
+uint64_t lata_code_cache_current_generation(void);
 
 /* Guest FPSR helpers live in lata-fpsr.h (included above). */
 /* True when the physical register is currently handed out by the temp pool. */

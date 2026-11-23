@@ -99,7 +99,8 @@ static inline void tu_enough_space(CPUState *cpu)
     if (unlikely(tcg_ctx->code_gen_ptr + MAX_TU_SIZE >= tcg_ctx->code_gen_highwater)) {
         tb_flush(cpu);
         /* The flush killed every cached translation; nothing can reference a
-         * helper descriptor any more, so drop them all (see sve-lasx-lower.h). */
+         * helper descriptor any more, so bump the generation and drop them. */
+        lata_code_cache_bump_generation();
         lata_sve_helper_release_all();
         mmap_unlock();
         /* Make the execution loop process the flush as soon as possible.  */
@@ -152,7 +153,8 @@ static TranslationBlock* tb_create(CPUState *cpu, uint64_t pc,
         fprintf(stderr, "tb flush\n");
         /* flush must be done */
         tb_flush(cpu);
-        /* No cached code survives the flush; drop helper descriptors too. */
+        /* No cached code survives the flush; bump and drop descriptors. */
+        lata_code_cache_bump_generation();
         lata_sve_helper_release_all();
         mmap_unlock();
         /* Make the execution loop process the flush as soon as possible.  */

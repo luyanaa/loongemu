@@ -25,9 +25,19 @@
 #include "target/arm/tcg/translate.h"
 #include "tcg/tcg.h"
 
-/* The allocator records the code-cache position; give the fixture one. */
+/* The allocator records the code-cache position and generation. */
 static TCGContext tcg_ctx_storage;
 TCGContext *tcg_ctx = &tcg_ctx_storage;
+
+uint64_t lata_code_cache_generation = 1;
+uint64_t lata_code_cache_bump_generation(void)
+{
+    return ++lata_code_cache_generation;
+}
+uint64_t lata_code_cache_current_generation(void)
+{
+    return lata_code_cache_generation;
+}
 
 #include <stdio.h>
 #include <string.h>
@@ -211,6 +221,31 @@ int main(void)
 
         /* Allocating again in the old group must not resurrect the dropped
          * chunk (the group state has to be rebuilt). */
+        CHECK(lata_sve_alloc_helper_desc(&s, &insn, NULL) != NULL);
+        lata_sve_helper_stats(&d1, &c1);
+        CHECK(d1 == 1 && c1 == 1);
+        lata_sve_helper_release_all();
+    }
+
+    /* A generation bump invalidates every group, even when the allocator has
+     * already grown back past the recorded position. */
+    {
+        uint32_t d0, c0, d1, c1;
+
+        tcg_ctx->code_gen_ptr = (void *)(uintptr_t)0x60000;
+        make_ctx(&s, &base, tb_a, 0x7000);
+        CHECK(lata_sve_alloc_helper_desc(&s, &insn, NULL) != NULL);
+        lata_sve_helper_stats(&d0, &c0);
+        CHECK(d0 == 1 && c0 == 1);
+
+        /* Move forward, not back: the position heuristic cannot help here. */
+        tcg_ctx->code_gen_ptr = (void *)(uintptr_t)0x70000;
+        (void)lata_code_cache_bump_generation();
+        lata_sve_helper_begin_tb((const void *)tb_b->tc.ptr, 0x8000);
+        lata_sve_helper_stats(&d1, &c1);
+        CHECK(d1 == 0 && c1 == 0);
+
+        /* And the group rebuilds under the new generation. */
         CHECK(lata_sve_alloc_helper_desc(&s, &insn, NULL) != NULL);
         lata_sve_helper_stats(&d1, &c1);
         CHECK(d1 == 1 && c1 == 1);
