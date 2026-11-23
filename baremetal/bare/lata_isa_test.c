@@ -2453,6 +2453,7 @@ static const LataGuestMemOps prov_fault_ops = {
 
 /* Policy provider: only [policy_base, +8) is admissible, epoch is constant. */
 static uint64_t policy_base;
+static uint64_t policy_limit = 8; /* bytes admitted from policy_base */
 static unsigned policy_calls;
 
 static uint64_t prov_policy_epoch(CPUARMState *env)
@@ -2466,7 +2467,7 @@ static bool prov_policy_span(CPUARMState *env, uint64_t vaddr, uint64_t size,
 {
     (void)env; (void)is_write;
     policy_calls++;
-    return vaddr >= policy_base && vaddr + size <= policy_base + 8;
+    return vaddr >= policy_base && vaddr + size <= policy_base + policy_limit;
 }
 
 static const LataGuestMemDirectPolicy prov_policy = {
@@ -6994,6 +6995,49 @@ void kmain(void)
         (void)sve_run_a64_tb(str_q, 1, 128, 0x0fu, false, "policy SIMD store");
         check(read_le64(vbuf), UINT64_C(0xa7a6a5a4a3a2a1a0),
               "admitted SIMD store writes natively");
+        lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
+    }
+
+    /* GPR pair under the same policy: admitted span uses the native pair. */
+    {
+        static uint32_t stp_x[] __attribute__((aligned(16))) = {
+            0xa9000c22u, /* stp x2, x3, [x1] */
+        };
+        static uint32_t ldp_x[] __attribute__((aligned(16))) = {
+            0xa9401424u, /* ldp x4, x5, [x1] */
+        };
+        static uint8_t ppbuf[16] __attribute__((aligned(16)));
+
+        for (size_t i = 0; i < 16; ++i) ppbuf[i] = 0;
+        policy_base = (uint64_t)(uintptr_t)ppbuf;
+        policy_limit = 16;
+
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[1] = (uint64_t)(uintptr_t)ppbuf;
+        env.xregs[2] = UINT64_C(0x1122334455667788);
+        env.xregs[3] = UINT64_C(0x99aabbccddeeff00);
+        prov_stores = 0;
+        policy_calls = 0;
+        lata_guest_mem_clear_fault_regions(&env);
+        lata_set_guest_mem_ops(&prov_policy_ops);
+        check(sve_run_a64_tb(stp_x, 1, 128, 0x0fu, false, "policy STP admitted"),
+              1, "admitted STP runs");
+        check(prov_stores, 0, "admitted STP does not call the provider");
+        check(read_le64(ppbuf), UINT64_C(0x1122334455667788),
+              "admitted STP stores the first half natively");
+        check(read_le64(ppbuf + 8), UINT64_C(0x99aabbccddeeff00),
+              "admitted STP stores the second half natively");
+
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[1] = (uint64_t)(uintptr_t)ppbuf;
+        prov_loads = 0;
+        (void)sve_run_a64_tb(ldp_x, 1, 128, 0x0fu, false, "policy LDP admitted");
+        check(prov_loads, 0, "admitted LDP does not call the provider");
+        check(env.xregs[4], UINT64_C(0x1122334455667788),
+              "admitted LDP loads the first half natively");
+        check(env.xregs[5], UINT64_C(0x99aabbccddeeff00),
+              "admitted LDP loads the second half natively");
+        policy_limit = 8;
         lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
     }
 

@@ -360,6 +360,16 @@ static bool lata_emit_guest_mem_load_pair(DisasContext *s, IR2_OPND dst0,
                                           IR2_OPND dst1, IR2_OPND addr_reg,
                                           int64_t off0, int64_t off1,
                                           size_t size, bool is_signed);
+static void lata_emit_scalar_span_admission(IR2_OPND addr_reg, int64_t offset,
+                                            size_t size, bool is_write,
+                                            IR2_OPND admitted);
+static void lata_emit_native_pair_store(DisasContext *s, IR2_OPND lo,
+                                        IR2_OPND hi, IR2_OPND base,
+                                        int64_t disp, int dbytes);
+static void lata_emit_native_pair_load(DisasContext *s, IR2_OPND lo,
+                                       IR2_OPND hi, IR2_OPND base,
+                                       int64_t disp, int dbytes,
+                                       bool is_signed);
 
 static void lata_emit_guest_mem_probe(DisasContext *s, IR2_OPND addr_reg,
                                       int64_t offset, size_t size,
@@ -2662,9 +2672,28 @@ static bool trans_STP(DisasContext *s)
     {
         int64_t disp = (!a->w || a->p) ? (int64_t)offset : 0;
 
-        lata_emit_guest_mem_store_call(s, reg_t, reg_n, disp, (size_t)dbytes);
-        lata_emit_guest_mem_store_call(s, reg_t2, reg_n, disp + dbytes,
-                                       (size_t)dbytes);
+        if (lata_guest_mem_direct_available())
+        {
+            IR2_OPND admitted = ir2_opnd_new_type(IR2_OPND_LABEL);
+            IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
+
+            lata_emit_scalar_span_admission(reg_n, disp,
+                                            (size_t)dbytes * 2u, true,
+                                            admitted);
+            lata_emit_guest_mem_store_call(s, reg_t, reg_n, disp, (size_t)dbytes);
+            lata_emit_guest_mem_store_call(s, reg_t2, reg_n, disp + dbytes,
+                                           (size_t)dbytes);
+            la_b(done);
+            la_label(admitted);
+            lata_emit_native_pair_store(s, reg_t, reg_t2, reg_n, disp, dbytes);
+            la_label(done);
+        }
+        else
+        {
+            lata_emit_guest_mem_store_call(s, reg_t, reg_n, disp, (size_t)dbytes);
+            lata_emit_guest_mem_store_call(s, reg_t2, reg_n, disp + dbytes,
+                                           (size_t)dbytes);
+        }
         if (a->w)
         {
             la_addi_d(temp, reg_n, (int)offset);
@@ -2768,11 +2797,32 @@ static bool trans_LDP(DisasContext *s)
     {
         int64_t disp = (!a->w || a->p) ? (int64_t)offset : 0;
 
-        /* LDPSW sign-extends both halves; LDP zero-extends. */
-        lata_emit_guest_mem_load_call(s, reg_t, reg_n, disp, (size_t)dbytes,
-                                      a->sign != 0);
-        lata_emit_guest_mem_load_call(s, reg_t2, reg_n, disp + dbytes,
-                                      (size_t)dbytes, a->sign != 0);
+        if (lata_guest_mem_direct_available())
+        {
+            IR2_OPND admitted = ir2_opnd_new_type(IR2_OPND_LABEL);
+            IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
+
+            lata_emit_scalar_span_admission(reg_n, disp,
+                                            (size_t)dbytes * 2u, false,
+                                            admitted);
+            lata_emit_guest_mem_load_call(s, reg_t, reg_n, disp, (size_t)dbytes,
+                                          a->sign != 0);
+            lata_emit_guest_mem_load_call(s, reg_t2, reg_n, disp + dbytes,
+                                          (size_t)dbytes, a->sign != 0);
+            la_b(done);
+            la_label(admitted);
+            lata_emit_native_pair_load(s, reg_t, reg_t2, reg_n, disp, dbytes,
+                                       a->sign != 0);
+            la_label(done);
+        }
+        else
+        {
+            /* LDPSW sign-extends both halves; LDP zero-extends. */
+            lata_emit_guest_mem_load_call(s, reg_t, reg_n, disp, (size_t)dbytes,
+                                          a->sign != 0);
+            lata_emit_guest_mem_load_call(s, reg_t2, reg_n, disp + dbytes,
+                                          (size_t)dbytes, a->sign != 0);
+        }
         if (a->w)
         {
             la_addi_d(temp, reg_n, (int)offset);
@@ -3525,6 +3575,61 @@ static void lata_emit_scalar_span_admission(IR2_OPND addr_reg, int64_t offset,
 
 /* Native SIMD load/store forms, shared by the identity path and the
  * run-time admitted span of a direct policy. */
+/* Native pair forms for a run-time admitted span. */
+static void lata_emit_native_pair_store(DisasContext *s, IR2_OPND lo, IR2_OPND hi,
+                                        IR2_OPND base, int64_t disp, int dbytes)
+{
+    IR2_OPND addr = ra_alloc_itemp();
+
+    if (disp != 0) {
+        li_d(addr, disp);
+        la_add_d(addr, base, addr);
+    } else {
+        la_mov64(addr, base);
+    }
+    switch (dbytes) {
+    case 4:
+        la_st_w(lo, addr, 0);
+        la_st_w(hi, addr, dbytes);
+        break;
+    default:
+        la_st_d(lo, addr, 0);
+        la_st_d(hi, addr, dbytes);
+        break;
+    }
+    ra_free_temp(addr);
+}
+
+static void lata_emit_native_pair_load(DisasContext *s, IR2_OPND lo, IR2_OPND hi,
+                                       IR2_OPND base, int64_t disp, int dbytes,
+                                       bool is_signed)
+{
+    IR2_OPND addr = ra_alloc_itemp();
+
+    if (disp != 0) {
+        li_d(addr, disp);
+        la_add_d(addr, base, addr);
+    } else {
+        la_mov64(addr, base);
+    }
+    switch (dbytes) {
+    case 4:
+        if (is_signed) {
+            la_ld_w(lo, addr, 0);
+            la_ld_w(hi, addr, 4);
+        } else {
+            la_ld_wu(lo, addr, 0);
+            la_ld_wu(hi, addr, 4);
+        }
+        break;
+    default:
+        la_ld_d(lo, addr, 0);
+        la_ld_d(hi, addr, dbytes);
+        break;
+    }
+    ra_free_temp(addr);
+}
+
 static void lata_emit_vec_native_load(DisasContext *s, IR2_OPND vreg_t,
                                       IR2_OPND reg_n, uint64_t offset,
                                       uint64_t sz)
