@@ -7368,6 +7368,59 @@ cun_probe_done:;
               "DN=0 keeps the NaN payload");
     }
 
+    /* Does an sNaN input already raise FPSR.IOC through the host's own
+     * invalid-operation flag (which the exit stub accumulates)? */
+    if (latx_cpu_has_lasx() != 0) {
+        DisasContext ds;
+        A64SVEPvirBuilder bs;
+
+        sve_init_direct(&ds, &bs, 256);
+        arm_sve_preg(&env, 1)[0] = 0x11u;
+        arm_sve_preg(&env, 1)[1] = 0x11u;
+        arm_sve_preg(&env, 1)[2] = 0x11u;
+        arm_sve_preg(&env, 1)[3] = 0x11u;
+        for (size_t l = 0; l < 8; ++l) {
+            write_le32(arm_sve_zreg(&env, 0) + l * 4u, 0x3f800000u); /* 1.0f */
+            write_le32(arm_sve_zreg(&env, 2) + l * 4u, 0x7f800001u); /* sNaN */
+        }
+        (void)sve_emit_decoded(&ds, 0x65808440u, "FADD z0.s with sNaN");
+        sve_exec_direct();
+        check(env.vfp.xregs[8] & 1u, 1u,
+              "sNaN input sets FPSR.IOC");
+        check(read_le32(arm_sve_zreg(&env, 0)), UINT32_C(0x7fc00001),
+              "sNaN input yields the quieted NaN under DN=0");
+
+        sve_init_direct(&ds, &bs, 256);
+        arm_sve_preg(&env, 1)[0] = 0x11u;
+        arm_sve_preg(&env, 1)[1] = 0x11u;
+        arm_sve_preg(&env, 1)[2] = 0x11u;
+        arm_sve_preg(&env, 1)[3] = 0x11u;
+        for (size_t l = 0; l < 8; ++l) {
+            write_le32(arm_sve_zreg(&env, 0) + l * 4u, 0x3f800000u);
+            write_le32(arm_sve_zreg(&env, 2) + l * 4u, 0x7fc00001u); /* qNaN */
+        }
+        (void)sve_emit_decoded(&ds, 0x65808440u, "FADD z0.s with qNaN");
+        sve_exec_direct();
+        check(env.vfp.xregs[8] & 1u, 0u,
+              "quiet NaN input does not set FPSR.IOC");
+
+        sve_init_direct(&ds, &bs, 256);
+        env.vfp.xregs[0] = UINT64_C(1) << 25; /* FPCR.DN */
+        arm_sve_preg(&env, 1)[0] = 0x11u;
+        arm_sve_preg(&env, 1)[1] = 0x11u;
+        arm_sve_preg(&env, 1)[2] = 0x11u;
+        arm_sve_preg(&env, 1)[3] = 0x11u;
+        for (size_t l = 0; l < 8; ++l) {
+            write_le32(arm_sve_zreg(&env, 0) + l * 4u, 0x3f800000u);
+            write_le32(arm_sve_zreg(&env, 2) + l * 4u, 0x7f800001u);
+        }
+        (void)sve_emit_decoded(&ds, 0x65808440u, "FADD z0.s sNaN + DN");
+        sve_exec_direct();
+        check(read_le32(arm_sve_zreg(&env, 0)), UINT32_C(0x7fc00000),
+              "DN=1 turns the quieted sNaN into the default NaN");
+        check(env.vfp.xregs[8] & 1u, 1u, "IOC stays set under DN=1");
+    }
+
     latx_bare_uart_puts("lata-isa: checks=");
     putdec((uint64_t)checks);
     latx_bare_uart_puts(" fails=");
