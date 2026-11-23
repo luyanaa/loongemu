@@ -270,21 +270,16 @@ bool lata_guest_mem_direct_available(void)
 }
 
 /*
- * Only the explicit identity claim justifies a raw host access at translation
- * time.  A published `direct` policy is not enough: it proves spans only when
- * `epoch()`/`span_admissible()` are consulted at run time for the actual range,
- * which scalar/NEON lowering does not do yet (the SVE lowering does).  Such
- * providers therefore take the checked (provider call) path until that
- * admission is wired in.
+ * Inline host access is justified either by the explicit identity claim or by
+ * a complete direct policy. Policy-backed accesses still require a runtime
+ * per-span admission before the native load/store is reached.
  */
 bool lata_guest_mem_inline_host_access_ok(void)
 {
     const LataGuestMemOps *ops = lata_get_guest_mem_ops();
 
-    if (ops == NULL) {
-        return false;
-    }
-    return ops->va_is_hpa_identity;
+    return ops != NULL &&
+           (ops->va_is_hpa_identity || direct_policy() != NULL);
 }
 
 static CPUARMState *mapping_env(void)
@@ -334,6 +329,27 @@ bool lata_guest_mem_direct_admit(CPUARMState *env, uint64_t vaddr,
         return false;
     }
     return policy->span_admissible(env, vaddr, size, is_write);
+}
+
+bool lata_guest_mem_direct_span_admit(CPUARMState *env, uint64_t vaddr,
+                                      uint64_t size, bool is_write,
+                                      uint64_t translation_epoch,
+                                      uint64_t fault_pc, DirectSpan *span)
+{
+    bool admitted = lata_guest_mem_direct_admit(env, vaddr, size, is_write,
+                                                 translation_epoch);
+
+    if (span != NULL) {
+        span->host_address = admitted ? vaddr : 0;
+        span->span_size = size;
+        span->mapping_epoch = translation_epoch;
+        span->permissions = is_write ? LATA_MEM_PERM_WRITE
+                                     : LATA_MEM_PERM_READ;
+        span->fault_pc = fault_pc;
+        span->status = admitted ? LATA_DIRECT_SPAN_ADMITTED
+                                : LATA_DIRECT_SPAN_REJECTED;
+    }
+    return admitted;
 }
 
 void lata_guest_mem_clear_fault_regions(CPUARMState *env)

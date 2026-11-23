@@ -3,11 +3,15 @@
 #include "qemu/osdep.h"
 #include "exec/exec-all.h"
 
-/* Translation-block internals used by the TU optimiser. The bare runtime
- * supplies weak defaults in lata/runtime.c. */
+/* Translation-block bookkeeping and invalidation hooks used by the TU
+ * optimiser; runtime.c owns page membership and direct-jump lifecycle. */
 TranslationBlock *tb_htable_lookup(CPUState *cpu, uint64_t pc, uint64_t cs_base,
                                    uint32_t flags, uint32_t cflags);
 void tb_link_page(TranslationBlock *tb);
+/* Invalidate every TB registered against the containing guest page. */
+void tb_invalidate_page(tb_page_addr_t addr);
+/* Mark invalid and unlink incoming/outgoing direct jumps before retirement. */
+void tb_invalidate_tb(TranslationBlock *tb);
 void tb_lock_page0(tb_page_addr_t addr);
 void tb_lock_page1(tb_page_addr_t addr);
 void tb_set_page_addr0(TranslationBlock *tb, tb_page_addr_t addr);

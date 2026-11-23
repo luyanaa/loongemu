@@ -1,5 +1,6 @@
 #include "sve-lasx-lower.h"
 #include "target/arm/lata/include/translate.h"
+#include "target/arm/lata/include/translate-a64.h"
 
 #include "target/arm/lata/ir1/sve-pvir.h"
 #include "target/arm/lata/include/env.h"
@@ -1864,7 +1865,7 @@ static bool instruction_writes_nzcv_static(const PvirInstruction *ins,
  * permission and the invalidation rule for the spans this instruction touches
  * (see lata-mem.h). This function only decides whether it is worth emitting
  * code at all; the actual entry condition is the per-span runtime admission in
- * emit_direct_span_admission(), which re-checks the proof for the address the
+ * lata_emit_direct_span_admission(), which re-checks the proof for the address the
  * instruction really uses.
  */
 static bool sve_mem_direct_fast_path_declined(void)
@@ -1902,30 +1903,6 @@ static void emit_restore_guest_gprs_from_env(void)
     }
 }
 
-/*
- * Emit the runtime admission for one contiguous span: the guest GPRs are
- * published to env (the call owns the ABI argument registers, several of which
- * are guest GPR homes), the proof is queried for [span_start, +span_bytes) at
- * the address computed by *this* execution, and control branches to `admitted`
- * only when the provider still stands behind that span. Anything else falls
- * through to the checked helper path the caller emits next.
- */
-static void emit_direct_span_admission(IR2_OPND span_start, uint32_t span_bytes,
-                                       bool is_write, IR2_OPND admitted)
-{
-    lata_regcache_flush();
-    emit_save_guest_gprs_to_env();
-    la_mov64(a1_ir2_opnd, span_start);
-    li_d(a2_ir2_opnd, (int64_t)span_bytes);
-    li_d(a3_ir2_opnd, is_write ? 1 : 0);
-    li_d(a4_ir2_opnd, (int64_t)lata_guest_mem_direct_epoch());
-    la_mov64(a0_ir2_opnd, env_ir2_opnd);
-    li_d(t0_ir2_opnd, (int64_t)(uintptr_t)lata_guest_mem_direct_admit);
-    la_jirl(ra_ir2_opnd, t0_ir2_opnd, 0);
-    la_mov64(t2_ir2_opnd, a0_ir2_opnd);
-    emit_restore_guest_gprs_from_env();
-    la_bnez(t2_ir2_opnd, admitted);
-}
 
 static void emit_inline_mem_fault_abort(const DisasContext *s,
                                         IR2_OPND fault_addr_itemp,
@@ -2219,8 +2196,8 @@ static bool lower_contiguous_memory(
      */
     admitted = ir2_opnd_new_type(IR2_OPND_LABEL);
     direct_done = ir2_opnd_new_type(IR2_OPND_LABEL);
-    emit_direct_span_admission(adjusted_base, (uint32_t)vl_bytes, !is_load,
-                               admitted);
+    lata_emit_direct_span_admission(adjusted_base, 0, (size_t)vl_bytes,
+                                    !is_load, admitted);
     if (!emit_sve_helper_call_body(s, instruction, source, fallback)) {
         return false;
     }
@@ -2584,7 +2561,8 @@ static bool lower_fault_load(DisasContext *s,
 
     admitted = ir2_opnd_new_type(IR2_OPND_LABEL);
     direct_done = ir2_opnd_new_type(IR2_OPND_LABEL);
-    emit_direct_span_admission(addr, (uint32_t)vl_bytes, false, admitted);
+    lata_emit_direct_span_admission(addr, 0, (size_t)vl_bytes, false,
+                                    admitted);
     if (!emit_sve_helper_call_body(s, instruction, source, fallback)) {
         return false;
     }

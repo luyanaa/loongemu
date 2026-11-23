@@ -19,9 +19,8 @@
  * [vaddr, vaddr+size) may be lowered to raw host loads/stores only when the
  * provider publishes a `LataGuestMemDirectPolicy` that can prove all three of:
  *
- *   mapping      every accepted span is backed by a host-accessible mapping,
- *                not a device/MMIO window, and the host bytes are the guest
- *                bytes for that span;
+ *   mapping      the entire range is one contiguous host-accessible mapping at
+ *                `vaddr` (not device/MMIO), with guest bytes at that address;
  *   permission   a write span is only accepted when the guest may write it,
  *                and the proof is against the *current* translation regime;
  *   invalidation `epoch()` changes whenever any mapping or permission change
@@ -39,8 +38,9 @@ typedef struct LataGuestMemDirectPolicy {
     const char *name;
     /* Monotonic mapping/permission generation. */
     uint64_t (*epoch)(CPUARMState *env);
-    /* Per-span proof of mapping + permission; must be cheap and side-effect
-     * free (it runs on the hot path when a policy is installed). */
+    /* Per-span proof that the whole range is one directly accessible,
+     * correctly aligned mapping with the requested guest permission. It must
+     * be cheap and side-effect free (it runs on the hot path). */
     bool (*span_admissible)(CPUARMState *env, uint64_t vaddr, uint64_t size,
                             bool is_write);
 } LataGuestMemDirectPolicy;
@@ -56,6 +56,21 @@ typedef enum {
 #define LATA_MEM_PERM_READ (1u << 0)
 #define LATA_MEM_PERM_WRITE (1u << 1)
 #define LATA_MEM_PERM_RW (LATA_MEM_PERM_READ | LATA_MEM_PERM_WRITE)
+typedef enum DirectSpanStatus {
+    LATA_DIRECT_SPAN_REJECTED = 0,
+    LATA_DIRECT_SPAN_ADMITTED = 1,
+} DirectSpanStatus;
+
+/* Runtime evidence for one direct span. host_address is vaddr and is valid
+ * only when status is ADMITTED; otherwise use the checked path. */
+typedef struct DirectSpan {
+    uint64_t host_address;
+    uint64_t span_size;
+    uint64_t mapping_epoch;
+    uint32_t permissions; /* Required LATA_MEM_PERM_* for this access. */
+    uint64_t fault_pc;
+    DirectSpanStatus status;
+} DirectSpan;
 
 typedef struct LataGuestMemOps {
     LataGuestMemStatus (*probe)(CPUARMState *env, uint64_t vaddr,
@@ -104,9 +119,9 @@ LataGuestMemStatus lata_guest_mem_store(CPUARMState *env, uint64_t vaddr,
 /* Direct-access contract. `available()` gates code generation: when it is
  * false the lowering must not emit an inline host access at all. */
 bool lata_guest_mem_direct_available(void);
-/* True when inline host access is justified (policy published, or the provider
- * declares the identity environment).  Scalar/NEON lowering must consult this
- * instead of comparing against a specific provider pointer. */
+/* True when inline host access is justified (a direct policy is published, or
+ * the provider declares the identity environment). Scalar/NEON lowering uses
+ * direct admission for policies and the identity path otherwise. */
 bool lata_guest_mem_inline_host_access_ok(void);
 /* Epoch to embed in code generated now; 0 when no policy is installed. */
 uint64_t lata_guest_mem_direct_epoch(void);
@@ -116,6 +131,14 @@ uint64_t lata_guest_mem_direct_epoch(void);
 bool lata_guest_mem_direct_admit(CPUARMState *env, uint64_t vaddr,
                                  uint64_t size, bool is_write,
                                  uint64_t translation_epoch);
+
+/* Apply runtime admission and record its result. A rejected span is not itself
+ * an architectural fault; the caller must execute the checked access using
+ * fault_pc if that path reports an error. */
+bool lata_guest_mem_direct_span_admit(CPUARMState *env, uint64_t vaddr,
+                                      uint64_t size, bool is_write,
+                                      uint64_t translation_epoch,
+                                      uint64_t fault_pc, DirectSpan *span);
 
 /* Configure test/MMU fault windows on env->sve_ctrl. */
 void lata_guest_mem_clear_fault_regions(CPUARMState *env);

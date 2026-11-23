@@ -321,13 +321,10 @@ static bool trans_sve_unimplemented(DisasContext *s)
 }
 
 /*
- * Scalar/NEON accesses still bypass the guest-memory contract here: the probe
- * is emitted only when a custom provider is installed or a fault region is
- * configured, and even then the access itself is a raw host load/store rather
- * than a provider-mediated transfer.  Gating this on
- * `!lata_guest_mem_direct_available()` was tried and hangs the first scalar
- * memory fixture ("ldr-str-aligned"), so the probe emission path needs its own
- * bring-up before the contract can be enforced.  Kept as-is on purpose.
+ * The probe is used by the identity-inline path: custom providers and fault
+ * windows need a checked validation before raw host access. Policy-backed
+ * scalar/NEON loads instead use runtime span admission and provider-mediated
+ * accesses when admission fails.
  */
 static bool lata_guest_mem_needs_probe(void)
 {
@@ -361,9 +358,9 @@ static bool lata_emit_guest_mem_load_pair(DisasContext *s, int rt0, int rt1,
                                           IR2_OPND addr_reg, int64_t off0,
                                           int64_t off1, size_t size,
                                           bool is_signed);
-static void lata_emit_scalar_span_admission(IR2_OPND addr_reg, int64_t offset,
-                                            size_t size, bool is_write,
-                                            IR2_OPND admitted);
+void lata_emit_direct_span_admission(IR2_OPND addr_reg, int64_t offset,
+                                     size_t size, bool is_write,
+                                     IR2_OPND admitted);
 static void lata_emit_native_pair_store(DisasContext *s, IR2_OPND lo,
                                         IR2_OPND hi, IR2_OPND base,
                                         int64_t disp, int dbytes);
@@ -2789,7 +2786,8 @@ static bool trans_STP(DisasContext *s)
     }
 
     lata_clean_data_tbi(s, &reg_n, &reg_n, s->tbid);
-    if (!lata_guest_mem_inline_host_access_ok())
+    if (!lata_guest_mem_inline_host_access_ok() ||
+        lata_guest_mem_direct_available())
     {
         int64_t disp = (!a->w || a->p) ? (int64_t)offset : 0;
 
@@ -2798,7 +2796,7 @@ static bool trans_STP(DisasContext *s)
             IR2_OPND admitted = ir2_opnd_new_type(IR2_OPND_LABEL);
             IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
 
-            lata_emit_scalar_span_admission(reg_n, disp,
+            lata_emit_direct_span_admission(reg_n, disp,
                                             (size_t)dbytes * 2u, true,
                                             admitted);
             lata_emit_guest_mem_store_call(s, reg_t, reg_n, disp, (size_t)dbytes);
@@ -2914,7 +2912,8 @@ static bool trans_LDP(DisasContext *s)
     }
 
     lata_clean_data_tbi(s, &reg_n, &reg_n, s->tbid);
-    if (!lata_guest_mem_inline_host_access_ok())
+    if (!lata_guest_mem_inline_host_access_ok() ||
+        lata_guest_mem_direct_available())
     {
         int64_t disp = (!a->w || a->p) ? (int64_t)offset : 0;
 
@@ -2923,7 +2922,7 @@ static bool trans_LDP(DisasContext *s)
             IR2_OPND admitted = ir2_opnd_new_type(IR2_OPND_LABEL);
             IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
 
-            lata_emit_scalar_span_admission(reg_n, disp,
+            lata_emit_direct_span_admission(reg_n, disp,
                                             (size_t)dbytes * 2u, false,
                                             admitted);
             lata_emit_guest_mem_load_call(s, reg_t, reg_n, disp, (size_t)dbytes,
@@ -3098,7 +3097,8 @@ static bool trans_STP_v(DisasContext *s)
     IR2_OPND vreg_t2 = alloc_fpr_src(a->rt2);
     IR2_OPND temp = ra_alloc_itemp();
 
-    if (!lata_guest_mem_inline_host_access_ok())
+    if (!lata_guest_mem_inline_host_access_ok() ||
+        lata_guest_mem_direct_available())
     {
         int64_t disp = (!a->w || a->p) ? (int64_t)offset : 0;
         bool admitted_path = false;
@@ -3108,7 +3108,7 @@ static bool trans_STP_v(DisasContext *s)
             IR2_OPND admitted = ir2_opnd_new_type(IR2_OPND_LABEL);
             IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
 
-            lata_emit_scalar_span_admission(reg_n, disp,
+            lata_emit_direct_span_admission(reg_n, disp,
                                             (size_t)dbytes * 2u, true,
                                             admitted);
             admitted_path = true;
@@ -3259,7 +3259,8 @@ static bool trans_LDP_v(DisasContext *s)
     lata_clean_data_tbi(s, &reg_n, &reg_n, s->tbid);
     IR2_OPND ltemp = temp;
 
-    if (!lata_guest_mem_inline_host_access_ok())
+    if (!lata_guest_mem_inline_host_access_ok() ||
+        lata_guest_mem_direct_available())
     {
         int64_t disp = (!a->w || a->p) ? (int64_t)offset : 0;
 
@@ -3270,7 +3271,7 @@ static bool trans_LDP_v(DisasContext *s)
             IR2_OPND admitted = ir2_opnd_new_type(IR2_OPND_LABEL);
             IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
 
-            lata_emit_scalar_span_admission(reg_n, disp,
+            lata_emit_direct_span_admission(reg_n, disp,
                                             (size_t)dbytes * 2u, false,
                                             admitted);
             admitted_path = true;
@@ -3727,14 +3728,14 @@ static bool lata_emit_guest_mem_load_pair(DisasContext *s, int rt0, int rt1,
 }
 
 /*
- * Translation-time decisions are not proofs: a published direct policy can only
- * admit a span at execution time, against the current epoch.  Scalar/NEON lower
- * the access twice - native when admitted, provider-mediated otherwise - so a
- * policy change, a fault window or a permission change degrades gracefully.
+ * Translation-time decisions are not proofs: a published direct policy can
+ * admit a span only at execution time, against the current epoch. Scalar,
+ * NEON, and SVE lowering share this emitter and use provider-mediated
+ * accesses when admission fails.
  */
-static void lata_emit_scalar_span_admission(IR2_OPND addr_reg, int64_t offset,
-                                            size_t size, bool is_write,
-                                            IR2_OPND admitted)
+void lata_emit_direct_span_admission(IR2_OPND addr_reg, int64_t offset,
+                                     size_t size, bool is_write,
+                                     IR2_OPND admitted)
 {
     lata_regcache_flush();
     IR2_OPND vaddr = ra_alloc_itemp();
@@ -3965,14 +3966,15 @@ static void lata_emit_vec_native_store(DisasContext *s, IR2_OPND vreg_t,
 
 static void assist_trans_STR_i(DisasContext *s, IR2_OPND *reg_t, IR2_OPND *reg_n, uint64_t offset, uint64_t sz)
 {
-    if (!lata_guest_mem_inline_host_access_ok())
+    if (!lata_guest_mem_inline_host_access_ok() ||
+        lata_guest_mem_direct_available())
     {
         if (lata_guest_mem_direct_available())
         {
             IR2_OPND admitted = ir2_opnd_new_type(IR2_OPND_LABEL);
             IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
 
-            lata_emit_scalar_span_admission(*reg_n, (int64_t)offset,
+            lata_emit_direct_span_admission(*reg_n, (int64_t)offset,
                                             (size_t)1u << sz, true, admitted);
             lata_emit_guest_mem_store_call(s, *reg_t, *reg_n, (int64_t)offset,
                                            (size_t)1u << sz);
@@ -4096,14 +4098,15 @@ static bool trans_STR_i(DisasContext *s)
 
 static void assist_trans_LDR_i(DisasContext *s, IR2_OPND *reg_t, IR2_OPND *reg_n, uint64_t offset, uint64_t sz, uint64_t sign, bool iss_sf)
 {
-    if (!lata_guest_mem_inline_host_access_ok())
+    if (!lata_guest_mem_inline_host_access_ok() ||
+        lata_guest_mem_direct_available())
     {
         if (lata_guest_mem_direct_available())
         {
             IR2_OPND admitted = ir2_opnd_new_type(IR2_OPND_LABEL);
             IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
 
-            lata_emit_scalar_span_admission(*reg_n, (int64_t)offset,
+            lata_emit_direct_span_admission(*reg_n, (int64_t)offset,
                                             (size_t)1u << sz, false, admitted);
             lata_emit_guest_mem_load_call(s, *reg_t, *reg_n, (int64_t)offset,
                                           (size_t)1u << sz, sign != 0);
@@ -4275,14 +4278,15 @@ static bool trans_LDR_i(DisasContext *s)
 
 static void assist_trans_STR_v_i(DisasContext *s, IR2_OPND *vreg_t, IR2_OPND *reg_n, uint64_t offset, uint64_t sz)
 {
-    if (!lata_guest_mem_inline_host_access_ok())
+    if (!lata_guest_mem_inline_host_access_ok() ||
+        lata_guest_mem_direct_available())
     {
         if (lata_guest_mem_direct_available())
         {
             IR2_OPND admitted = ir2_opnd_new_type(IR2_OPND_LABEL);
             IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
 
-            lata_emit_scalar_span_admission(*reg_n, (int64_t)offset,
+            lata_emit_direct_span_admission(*reg_n, (int64_t)offset,
                                             (size_t)1u << sz, true, admitted);
             lata_emit_guest_mem_store_bulk(s, *vreg_t, *reg_n, (int64_t)offset,
                                            (size_t)1u << sz);
@@ -4360,14 +4364,15 @@ static bool trans_STR_v_i(DisasContext *s)
 
 static void assist_trans_LDR_v_i(DisasContext *s, IR2_OPND *vreg_t, IR2_OPND *reg_n, uint64_t offset, uint64_t sz)
 {
-    if (!lata_guest_mem_inline_host_access_ok())
+    if (!lata_guest_mem_inline_host_access_ok() ||
+        lata_guest_mem_direct_available())
     {
         if (lata_guest_mem_direct_available())
         {
             IR2_OPND admitted = ir2_opnd_new_type(IR2_OPND_LABEL);
             IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
 
-            lata_emit_scalar_span_admission(*reg_n, (int64_t)offset,
+            lata_emit_direct_span_admission(*reg_n, (int64_t)offset,
                                             (size_t)1u << sz, false, admitted);
             lata_emit_guest_mem_load_bulk(s, *vreg_t, *reg_n, (int64_t)offset,
                                           (size_t)1u << sz);

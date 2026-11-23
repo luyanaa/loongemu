@@ -6,10 +6,9 @@
  * below keeps a keyed cache (pc + address space + exception level) of
  * already-emitted host code and only re-translates on a miss.
  *
- * The key reuses the shared tb_cache contract: pc in `pc`, the AArch64
- * translation-table root (TTBR) in the `cr3` slot, and the exception level
- * in the `cpl` slot. A hit therefore cannot confuse the same guest PC
- * translated for a different address space or a different EL.
+ * translation-table root (TTBR) in the `cr3` slot, and the mapping epoch in
+ * the otherwise-unused `cs_base` slot (AArch64 has no segment base). A hit
+ * therefore cannot confuse different address spaces, ELs, or direct mappings.
  *
  * The caller owns the code arena, the cache storage, and the LATA plumbing
  * (tr_init/tr_ir2_generate/tr_ir2_assemble/lata_enter_tb). The loop itself
@@ -39,8 +38,11 @@ typedef struct LataDispatchOps {
     /* Read the next guest PC after a TB exits. */
     uint64_t (*next_pc)(void *opaque);
     /* Translation-table root + exception level that qualify a cached TB.
-     * Map to cr3/cpl so equal keys never alias across regimes. */
+     * Map TTBR to cr3 so equal keys never alias across address spaces. */
     uint64_t (*address_space)(void *opaque);
+    /* Current direct-memory mapping epoch; return 0 when no direct policy is
+     * installed. It is keyed in cs_base without truncation. */
+    uint64_t (*mapping_epoch)(void *opaque);
     uint8_t (*exception_level)(void *opaque);
     /* Stop condition: return true to end the loop (e.g. env.pc==halt, or a
      * budget of dispatched TBs exhausted). */

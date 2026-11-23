@@ -25,9 +25,12 @@ typedef struct FakeCpu {
     /* Counts of how often each distinct pc got translated/entered. */
     uint64_t asid;
     uint8_t el;
-    /* After this many enters, switch to asid_new (0 = never). */
+    /* After this many enters, change the key's current memory regime. */
     int asid_flip_at;
     uint64_t asid_new;
+    int mapping_epoch_flip_at;
+    uint64_t mapping_epoch;
+    uint64_t mapping_epoch_new;
     int translate_calls;
     int enter_calls;
     uint64_t translated_pcs[64];
@@ -62,10 +65,18 @@ static void fake_enter(void *o, uint64_t pc, void *code_addr)
     if (c->asid_flip_at != 0 && c->enter_calls == c->asid_flip_at) {
         c->asid = c->asid_new;
     }
+    if (c->mapping_epoch_flip_at != 0 &&
+        c->enter_calls == c->mapping_epoch_flip_at) {
+        c->mapping_epoch = c->mapping_epoch_new;
+    }
 }
 
 static uint64_t fake_next_pc(void *o) { return ((FakeCpu *)o)->pc; }
 static uint64_t fake_asid(void *o) { return ((FakeCpu *)o)->asid; }
+static uint64_t fake_mapping_epoch(void *o)
+{
+    return ((FakeCpu *)o)->mapping_epoch;
+}
 static uint8_t fake_el(void *o) { return ((FakeCpu *)o)->el; }
 static bool fake_halt(void *o)
 {
@@ -78,6 +89,7 @@ static const LataDispatchOps OPS = {
     .enter = fake_enter,
     .next_pc = fake_next_pc,
     .address_space = fake_asid,
+    .mapping_epoch = fake_mapping_epoch,
     .exception_level = fake_el,
     .halt = fake_halt,
 };
@@ -151,11 +163,39 @@ static void test_asid_isolation(void)
     CHECK(d.cache_hits == 0, "no cross-asid cache hit");
 }
 
+/* A remap at the same PC/TTBR must miss the old TB even before per-span
+ * admission is reached. */
+static void test_mapping_epoch_isolation(void)
+{
+    zero_storage();
+    static const uint64_t A = 0x1000;
+    const uint64_t stream[] = { A, 0 };
+    FakeCpu c = {0};
+    c.pc_stream = stream;
+    c.stream_len = (int)(sizeof(stream) / sizeof(stream[0]));
+    c.pc = A;
+    c.asid = 0x11;
+    c.el = 1;
+    c.mapping_epoch = 7;
+    c.mapping_epoch_flip_at = 1;
+    c.mapping_epoch_new = 8;
+
+    LataDispatch d;
+    CHECK(lata_dispatch_init(&d, &OPS, &c, g_entries, g_buckets, CAP,
+                             g_arena, sizeof(g_arena)),
+          "mapping-epoch dispatch_init");
+    lata_dispatch_run(&d);
+    CHECK(d.executed == 2, "same PC executes under both mapping epochs");
+    CHECK(d.translated == 2, "mapping epoch change forces re-translation");
+    CHECK(d.cache_hits == 0, "stale mapping-epoch TB is not reused");
+}
+
 /* init rejects non-power-of-two capacity and NULL ops. */
 static void test_bad_geometry(void)
 {
     LataDispatch d;
     FakeCpu c = {0};
+    LataDispatchOps no_epoch_ops = OPS;
     CHECK(!lata_dispatch_init(&d, &OPS, &c, g_entries, g_buckets, 3,
                               g_arena, sizeof(g_arena)),
           "rejects capacity 3");
@@ -165,12 +205,17 @@ static void test_bad_geometry(void)
     CHECK(!lata_dispatch_init(&d, &OPS, &c, g_entries, g_buckets, CAP,
                               NULL, 0),
           "rejects null arena");
+    no_epoch_ops.mapping_epoch = NULL;
+    CHECK(!lata_dispatch_init(&d, &no_epoch_ops, &c, g_entries, g_buckets,
+                              CAP, g_arena, sizeof(g_arena)),
+          "rejects missing mapping-epoch callback");
 }
 
 int main(void)
 {
     test_revisits_translate_once();
     test_asid_isolation();
+    test_mapping_epoch_isolation();
     test_bad_geometry();
     if (fails == 0) {
         printf("lata-dispatch: all checks passed\n");

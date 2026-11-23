@@ -8,7 +8,7 @@ LATA    := ../target/arm/lata
 LATX    := ../latx
 
 SHARED_BE := ../shared/backend/loongarch
-INCS := -Icompat -I.. -I$(LATA)/include -I$(LATA) -I../shared/pvir/include -I$(SHARED_BE)/include -I$(LATX)/compat -I$(LATX)/upstream/include \
+INCS := -Icompat -I.. -I$(LATX)/compat -I../include -I$(LATA)/include -I$(LATA) -I../shared/pvir/include -I$(SHARED_BE)/include -I$(LATX)/include -I$(LATX)/upstream/include \
          -isystem $(RESINC)
 LATA_ENABLE_TLS ?= 0
 TLS_DEFS := $(if $(filter 1,$(LATA_ENABLE_TLS)),-DLATA_ENABLE_TLS,-D__thread=)

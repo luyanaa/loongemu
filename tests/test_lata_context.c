@@ -57,6 +57,7 @@ typedef struct {
     uint32_t expected_misses;
 } ThreadArg;
 
+static unsigned custom_load_calls;
 static LataGuestMemStatus custom_probe(CPUARMState *env, uint64_t vaddr,
                                        size_t size, bool is_write,
                                        bool clean_tbi)
@@ -77,6 +78,7 @@ static LataGuestMemStatus custom_load(CPUARMState *env, uint64_t vaddr,
     (void)env;
     (void)size;
     (void)is_signed;
+    custom_load_calls++;
     if (vaddr == 0x6000) {
         return LATA_MEM_FAULT_TRANSLATION;
     }
@@ -90,7 +92,9 @@ static LataGuestMemStatus custom_store(CPUARMState *env, uint64_t vaddr,
     (void)env;
     (void)size;
     (void)value;
-    return (vaddr == 0x5000) ? LATA_MEM_FAULT_PERMISSION : LATA_MEM_OK;
+    return (vaddr == 0x5000 || vaddr == 0x10000)
+               ? LATA_MEM_FAULT_PERMISSION
+               : LATA_MEM_OK;
 }
 
 static const LataGuestMemOps custom_ops = {
@@ -117,6 +121,11 @@ static bool test_span_admissible(CPUARMState *env, uint64_t vaddr,
                                  uint64_t size, bool is_write)
 {
     (void)env;
+    /* Provider-managed and faulting spans cannot use raw host access. */
+    if (vaddr == 0x7000 || vaddr == 0x6000 ||
+        (size > 1 && (vaddr & 1u) != 0)) {
+        return false;
+    }
     /* Unmapped guard page: [0x8000, 0x9000). */
     if (vaddr < 0x9000 && vaddr + size > 0x8000) {
         return false;
@@ -133,6 +142,40 @@ static const LataGuestMemDirectPolicy test_policy = {
     .epoch = test_epoch,
     .span_admissible = test_span_admissible,
 };
+
+static bool run_direct_load_with_checked_fallback(
+    CPUARMState *env, uint64_t vaddr, uint64_t size,
+    uint64_t translation_epoch, uint64_t fault_pc, DirectSpan *span,
+    LataGuestMemStatus *status, uint64_t *value)
+{
+    if (lata_guest_mem_direct_span_admit(env, vaddr, size, false,
+                                         translation_epoch, fault_pc, span)) {
+        return false;
+    }
+    *status = (LataGuestMemStatus)lata_guest_mem_load_checked(
+        env, vaddr, (uint32_t)size, value);
+    if (*status != LATA_MEM_OK) {
+        lata_guest_mem_raise_fault(env, span->fault_pc, vaddr, 0, *status);
+    }
+    return true;
+}
+
+static bool run_direct_store_with_checked_fallback(
+    CPUARMState *env, uint64_t vaddr, uint64_t size,
+    uint64_t translation_epoch, uint64_t fault_pc, DirectSpan *span,
+    LataGuestMemStatus *status)
+{
+    if (lata_guest_mem_direct_span_admit(env, vaddr, size, true,
+                                         translation_epoch, fault_pc, span)) {
+        return false;
+    }
+    *status = (LataGuestMemStatus)lata_guest_mem_store_checked(
+        env, vaddr, (uint32_t)size, 0);
+    if (*status != LATA_MEM_OK) {
+        lata_guest_mem_raise_fault(env, span->fault_pc, vaddr, 1, *status);
+    }
+    return true;
+}
 
 static const LataGuestMemOps direct_ops = {
     .probe = custom_probe,
@@ -337,18 +380,89 @@ int main(void)
     lata_set_guest_mem_ops(&half_direct_ops);
     CHECK(!lata_guest_mem_direct_available());
     CHECK(!lata_guest_mem_direct_admit(&env, 0x2000, 16, false, 7));
+    CHECK(!lata_guest_mem_inline_host_access_ok());
 
     test_mapping_epoch = 7;
     lata_set_guest_mem_ops(&direct_ops);
     CHECK(lata_guest_mem_direct_available());
+    DirectSpan span;
+    const uint64_t direct_fault_pc = UINT64_C(0x400300);
+
     CHECK(lata_guest_mem_direct_epoch() == 7);
     /* Matching epoch and an admissible span: the only combination that admits. */
     CHECK(lata_guest_mem_direct_admit(&env, 0x2000, 16, false, 7));
+    CHECK(lata_guest_mem_inline_host_access_ok());
+    CHECK(lata_guest_mem_direct_span_admit(&env, 0x2000, 16, false, 7,
+                                           direct_fault_pc, &span));
+    CHECK(span.host_address == 0x2000);
+    CHECK(span.span_size == 16);
+    CHECK(span.mapping_epoch == 7);
+    CHECK(span.permissions == LATA_MEM_PERM_READ);
+    CHECK(span.fault_pc == direct_fault_pc);
+    CHECK(span.status == LATA_DIRECT_SPAN_ADMITTED);
     CHECK(lata_guest_mem_direct_admit(&env, 0x2000, 16, true, 7));
     /* Stale proof: anything translated before an epoch bump is re-routed. */
     test_mapping_epoch = 8;
     CHECK(!lata_guest_mem_direct_admit(&env, 0x2000, 16, false, 7));
     CHECK(lata_guest_mem_direct_admit(&env, 0x2000, 16, false, 8));
+    {
+        unsigned before = custom_load_calls;
+        LataGuestMemStatus status = LATA_MEM_OK;
+        uint64_t value = 0;
+
+        /* Epoch captured at translation no longer admits; use checked load. */
+        CHECK(run_direct_load_with_checked_fallback(
+            &env, 0x2000, 4, 7, direct_fault_pc, &span, &status, &value));
+        CHECK(span.status == LATA_DIRECT_SPAN_REJECTED);
+        CHECK(span.host_address == 0);
+        CHECK(span.mapping_epoch == 7);
+        CHECK(span.fault_pc == direct_fault_pc);
+        CHECK(status == LATA_MEM_OK);
+        CHECK(value == 0x12347678ULL);
+        CHECK(custom_load_calls == before + 1);
+    }
+    {
+        unsigned before = custom_load_calls;
+        LataGuestMemStatus status = LATA_MEM_FAULT_TRANSLATION;
+        uint64_t value = 0;
+
+        /* Provider refusal (including an unaligned span) is checked, not a
+         * guest fault inferred from the admission result. */
+        CHECK(run_direct_load_with_checked_fallback(
+            &env, 0x7000, 4, 8, direct_fault_pc, &span, &status, &value));
+        CHECK(span.status == LATA_DIRECT_SPAN_REJECTED);
+        CHECK(status == LATA_MEM_OK);
+        CHECK(custom_load_calls == before + 1);
+        CHECK(run_direct_load_with_checked_fallback(
+            &env, 0x2001, 4, 8, direct_fault_pc, &span, &status, &value));
+        CHECK(span.status == LATA_DIRECT_SPAN_REJECTED);
+        CHECK(status == LATA_MEM_OK);
+    }
+    {
+        LataGuestMemStatus status = LATA_MEM_OK;
+        const uint64_t fault_pc = UINT64_C(0x400308);
+
+        /* Permission denial takes the checked path and preserves its PC. */
+        CHECK(run_direct_store_with_checked_fallback(
+            &env, 0x10000, 4, 8, fault_pc, &span, &status));
+        CHECK(span.permissions == LATA_MEM_PERM_WRITE);
+        CHECK(span.status == LATA_DIRECT_SPAN_REJECTED);
+        CHECK(status == LATA_MEM_FAULT_PERMISSION);
+        CHECK(env.pc == fault_pc);
+        CHECK(env.sve_ctrl.last_fault_is_write);
+    }
+    {
+        LataGuestMemStatus status = LATA_MEM_OK;
+        uint64_t value = 0;
+        const uint64_t fault_pc = UINT64_C(0x400304);
+
+        /* A checked fault still records the exact translated guest PC. */
+        CHECK(run_direct_load_with_checked_fallback(
+            &env, 0x6000, 4, 8, fault_pc, &span, &status, &value));
+        CHECK(status == LATA_MEM_FAULT_TRANSLATION);
+        CHECK(env.pc == fault_pc);
+        CHECK(env.sve_ctrl.last_fault_va == 0x6000);
+    }
     /* Span proofs are per address, not per translation. */
     CHECK(!lata_guest_mem_direct_admit(&env, 0x8ff0, 32, false, 8));
     CHECK(lata_guest_mem_direct_admit(&env, 0x9000, 32, false, 8));

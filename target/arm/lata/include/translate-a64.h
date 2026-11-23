@@ -14,6 +14,11 @@ void translate_aarch64_insn(DisasContext *s, CPUState *cpu);
 void get_last_info(TranslationBlock *tb, DisasContext *s);
 #endif
 
+/* Shared runtime direct-span admission used by scalar, NEON, and SVE lowering. */
+void lata_emit_direct_span_admission(IR2_OPND addr_reg, int64_t offset,
+                                     size_t size, bool is_write,
+                                     IR2_OPND admitted);
+
 static inline void assert_fp_access_checked(DisasContext *s)
 {
 #ifdef CONFIG_DEBUG_TCG
