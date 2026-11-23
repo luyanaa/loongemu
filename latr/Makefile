@@ -14,7 +14,7 @@ LATX        := ../latx
 BUILD       := build
 
 INCS := -I$(LATR)/include -I$(BUILD) -Icompat -I.. \
-        -I$(LATA)/include -I$(LATA) -I../shared/pvir/include -I$(LATX)/compat -I$(LATX)/compat/include \
+        -I$(LATA)/include -I$(LATA) -I../shared/pvir/include -I../shared/backend/loongarch/include -I$(LATX)/compat -I$(LATX)/compat/include \
         -I$(LATX)/upstream/include -I../include
 RESINC := $(shell $(CLANG) -print-resource-dir)/include
 DEFS := -DTARGET_RISCV64 -DCONFIG_LATR -DCONFIG_LATR_STANDALONE \
@@ -26,7 +26,7 @@ DEFS_HOST := $(DEFS) -D__thread=
 CFLAGS := $(BASE) $(INCS) -isystem $(RESINC) $(DEFS)
 HOST_CFLAGS ?= -std=gnu11 -O2 -Wall -Wextra -Werror -Wno-unused-parameter \
                -Wno-unused-function -I$(LATR)/include -I$(BUILD) \
-               -Icompat -I.. -I$(LATA)/include -I$(LATA) -I../shared/pvir/include -I../include \
+               -Icompat -I.. -I$(LATA)/include -I$(LATA) -I../shared/pvir/include -I../shared/backend/loongarch/include -I../include \
                -idirafter $(LATX)/compat -idirafter $(LATX)/compat/include \
                -idirafter $(LATX)/upstream/include
 
@@ -89,13 +89,13 @@ $(TRANS_STUBS): $(DECODE32) $(DECODE16) $(LATR)/ir1/rv64gc-opcodes.def \
 	$(PYTHON) $(LATR)/ir1/gen_decode_stubs.py $(DECODE32) $(DECODE16) \
 		$(LATR)/ir1/rv64gc-opcodes.def $@
 
-$(BUILD)/ir2.o: $(LATA)/ir2/ir2.c | $(BUILD)
+$(BUILD)/ir2.o: ../shared/backend/loongarch/ir2.c | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/ir2-assemble.o: $(LATA)/ir2/ir2-assemble.c | $(BUILD)
+$(BUILD)/ir2-assemble.o: ../shared/backend/loongarch/ir2-assemble.c | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/la-append.o: $(LATA)/ir2/la-append.c | $(BUILD)
+$(BUILD)/la-append.o: ../shared/backend/loongarch/la-append.c | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/mem.o: mem-latr.c | $(BUILD)
@@ -134,8 +134,8 @@ $(BUILD)/translate-riscv-fp.o: $(LATR)/translator/translate-riscv-fp.c \
                                $(LATR)/include/latr.h \
                                $(LATR)/include/ir1.h \
                                $(LATR)/include/riscv-env.h \
-                               $(LATA)/include/la-ir2.h \
-                               $(LATA)/include/la-append.h \
+                               ../shared/backend/loongarch/include/la-ir2.h \
+                               ../shared/backend/loongarch/include/la-append.h \
                                $(LATR)/ir1/rv64gc-opcodes.def | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 

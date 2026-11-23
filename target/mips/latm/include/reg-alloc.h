@@ -71,6 +71,21 @@ extern IR2_OPND scr3_ir2_opnd;
         }                                                               \
     } while (0)
 
+/*
+ * The shared `shared/backend/loongarch/ir2.c` classifies FPR operands
+ * through this helper. LATA resolves it against its per-context reverse map;
+ * LATM only has the static map below, and this header shadows the ARM
+ * `reg-alloc.h`, so the same contract is provided here. `-1` is INVALID_TEMP
+ * on both sides. Mirrors target/riscv/latr/include/reg-alloc.h.
+ */
+static inline int lata_ftemp_slot_for_phys(int phys)
+{
+    if (phys < 0 || phys >= 32) {
+        return -1;
+    }
+    return reg_ftemp_reverse_map[phys];
+}
+
 #define ra_free_temp_auto(opnd)                                         \
     do {                                                                \
         if (ir2_opnd_is_itemp(&opnd)) {                                 \

@@ -7,7 +7,8 @@ RESINC  := $(shell $(CLANG) -print-resource-dir)/include
 LATA    := ../target/arm/lata
 LATX    := ../latx
 
-INCS := -Icompat -I.. -I$(LATA)/include -I$(LATA) -I../shared/pvir/include -I$(LATX)/compat -I$(LATX)/upstream/include \
+SHARED_BE := ../shared/backend/loongarch
+INCS := -Icompat -I.. -I$(LATA)/include -I$(LATA) -I../shared/pvir/include -I$(SHARED_BE)/include -I$(LATX)/compat -I$(LATX)/upstream/include \
          -isystem $(RESINC)
 LATA_ENABLE_TLS ?= 0
 TLS_DEFS := $(if $(filter 1,$(LATA_ENABLE_TLS)),-DLATA_ENABLE_TLS,-D__thread=)
@@ -18,7 +19,7 @@ BASE := --target=$(TARGET) -ffreestanding -nostdinc -fno-builtin \
         -fno-slp-vectorize -Wno-unused-parameter -Wno-unused-variable -ferror-limit=0
 CFLAGS := $(BASE) $(INCS) $(DEFS)
 
-SRCS := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \
+SRCS := $(SHARED_BE)/ir2.c $(SHARED_BE)/ir2-assemble.c $(SHARED_BE)/la-append.c \
         $(LATA)/mem.c ../shared/pvir/src/pvir.c $(LATA)/lata.c \
         $(LATA)/ftemp-snapshot.c $(LATA)/fpsr.c runtime.c \
         $(LATA)/optimization/clear-high.c $(LATA)/optimization/insts-pattern.c \

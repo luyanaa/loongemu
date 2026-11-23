@@ -58,6 +58,16 @@ bool lata_dump;
 bool latm_system_memory;
 static uint8_t latm_translation_lock_flag;
 
+/* The shared target-independent IR2 dump path asks for a LataContext it can
+ * tag lines with. LATM has no ARM translation context, so hand it a single
+ * process-wide counter; mirrors the shim in target/riscv/latr/latr.c. */
+static LataContext latm_dump_context;
+
+LataContext *lata_context_current(void)
+{
+    return &latm_dump_context;
+}
+
 void latm_set_system_memory(bool on)
 {
     latm_system_memory = on;

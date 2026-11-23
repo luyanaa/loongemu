@@ -9,7 +9,7 @@ LATA    := ../target/arm/lata
 LATX    := ../latx
 
 INCS := -I$(LATM)/include -I$(LATM)/compat -I$(LATM) -I../target/mips \
-        -I$(LATA)/include -I$(LATA) -Icompat -I.. -I$(LATX)/compat \
+        -I$(LATA)/include -I$(LATA) -I../shared/backend/loongarch/include -Icompat -I.. -I$(LATX)/compat \
         -I$(LATX)/include -I$(LATX)/upstream/include -isystem $(RESINC)
 DEFS := -DTARGET_MIPS64 -DCONFIG_LATM -DCONFIG_LATM_STANDALONE \
         -D__WORDSIZE=64 -DCONFIG_LATX -D__thread= -DNO_MSA
@@ -23,8 +23,8 @@ DEFS += -DCONFIG_LATM_TRANSLATE_TLS
 endif
 CFLAGS := $(BASE) $(INCS) $(DEFS)
 
-SHARED := $(LATA)/ir2/ir2.c $(LATA)/ir2/ir2-assemble.c $(LATA)/ir2/la-append.c \
-          $(LATA)/mem.c $(LATA)/translator/macro-helper.c
+SHARED := ../shared/backend/loongarch/ir2.c ../shared/backend/loongarch/ir2-assemble.c ../shared/backend/loongarch/la-append.c \
+          mem-latm.c $(LATA)/translator/macro-helper.c
 CORE   := $(LATM)/latm.c $(LATM)/tb_insn_map.c $(LATM)/cpu/loongson-profile.c $(LATM)/runtime.c $(LATM)/translator/reg-alloc.c \
           $(LATM)/ir1/decode-mips.c $(LATM)/translator/translate-mips.c \
           ../target/mips/fpu.c

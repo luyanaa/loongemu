@@ -76,6 +76,16 @@ typedef struct ENV {
     TRANSLATION_DATA *tr_data;
 } ENV;
 
+/* The shared IR2 backend (shared/backend/loongarch/ir2.c) tags its dump
+ * lines through a LataContext. LATM has no ARM translation context, so the
+ * shim below carries only the field the dump path reads. See the matching
+ * shim in target/riscv/latr/latr.c. */
+typedef struct LataContext {
+    int ir2_dump_ir1_id;
+} LataContext;
+
+LataContext *lata_context_current(void);
+
 #define LATM_JMP_CACHE_WAYS 2
 #define LATM_JMP_CACHE_SETS 512
 #define LATM_JMP_CACHE_SIZE (LATM_JMP_CACHE_SETS * LATM_JMP_CACHE_WAYS)
