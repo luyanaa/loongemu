@@ -7088,6 +7088,48 @@ void kmain(void)
         lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
     }
 
+    /* Narrow vector pair through a provider with no policy: both halves must
+     * land in their destination registers. */
+    {
+        static uint32_t ldp_s_np[] __attribute__((aligned(16))) = {
+            0x2d400c22u, /* ldp s2, s3, [x1] */
+        };
+        static uint32_t stp_s_np[] __attribute__((aligned(16))) = {
+            0x2d000420u, /* stp s0, s1, [x1] */
+        };
+        static uint8_t npbuf[16] __attribute__((aligned(16)));
+
+        write_le32(npbuf, 0x11111111u);
+        write_le32(npbuf + 4, 0x22222222u);
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[1] = (uint64_t)(uintptr_t)npbuf;
+        prov_loads = 0;
+        lata_guest_mem_clear_fault_regions(&env);
+        lata_set_guest_mem_ops(&prov_no_identity_ops);
+        check(sve_run_a64_tb(ldp_s_np, 1, 128, 0x0fu, false, "LDP S provider"),
+              1, "narrow LDP through the provider runs");
+        lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
+        check(prov_loads, 2, "narrow LDP issues two provider loads");
+        check(read_le32(arm_sve_zreg(&env, 2)), 0x11111111u,
+              "narrow LDP loads the first half");
+        check(read_le32(arm_sve_zreg(&env, 3)), 0x22222222u,
+              "narrow LDP loads the second half");
+
+        for (size_t i = 0; i < 16; ++i) npbuf[i] = 0;
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        write_le32(arm_sve_zreg(&env, 0), 0x33333333u);
+        write_le32(arm_sve_zreg(&env, 1), 0x44444444u);
+        env.xregs[1] = (uint64_t)(uintptr_t)npbuf;
+        prov_stores = 0;
+        lata_set_guest_mem_ops(&prov_no_identity_ops);
+        check(sve_run_a64_tb(stp_s_np, 1, 128, 0x0fu, false, "STP S provider"),
+              1, "narrow STP through the provider runs");
+        lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
+        check(prov_stores, 2, "narrow STP issues two provider stores");
+        check(read_le32(npbuf), 0x33333333u, "narrow STP stores the first half");
+        check(read_le32(npbuf + 4), 0x44444444u, "narrow STP stores the second half");
+    }
+
     latx_bare_uart_puts("lata-isa: checks=");
     putdec((uint64_t)checks);
     latx_bare_uart_puts(" fails=");
