@@ -24,7 +24,18 @@
 #endif
 #endif
 
-#define B_STUB_SIZE 4
+typedef struct LataRegCacheEntry {
+    int8_t temp;
+    uint8_t valid;
+    uint8_t dirty;
+    uint64_t age;
+} LataRegCacheEntry;
+
+typedef struct LataRegCache {
+    LataRegCacheEntry gpr[32];
+    uint8_t itemp_borrows[IR2_ITEMP_MAX];
+    uint64_t clock;
+} LataRegCache;
 
 typedef struct TRANSLATION_DATA {
 
@@ -62,6 +73,7 @@ typedef struct TRANSLATION_DATA {
             uint16 ftemp_status;
         };
     };
+    LataRegCache regcache;
 
     /*
      * Guest V registers the current TB actually loaded into their resident
@@ -261,6 +273,96 @@ IR2_OPND alloc_gpr_dst(int i);
 IR2_OPND alloc_gpr_dst_sp(int i);
 void store_gpr_dst(int i, IR2_OPND opnd);
 void store_gpr_zero(int i);
+
+/* TB-local scalar GPR cache hooks. */
+void lata_regcache_reset(void);
+void lata_regcache_flush(void);
+bool lata_regcache_evict_itemp(void);
+bool lata_regcache_free_itemp(int temp);
+
+/*
+ * Keep cache state coherent on both control-flow edges: a branch may bypass
+ * the fallthrough flush immediately before its target label.
+ */
+static inline IR2_INST *lata_regcache_label(IR2_OPND label)
+{
+    lata_regcache_flush();
+    return (la_label)(label);
+}
+
+static inline IR2_INST *lata_regcache_jirl(IR2_OPND rd, IR2_OPND rj,
+                                            int offset)
+{
+    lata_regcache_flush();
+    return (la_jirl)(rd, rj, offset);
+}
+
+static inline IR2_INST *lata_regcache_b(IR2_OPND label)
+{
+    lata_regcache_flush();
+    return (la_b)(label);
+}
+
+static inline IR2_INST *lata_regcache_beqz(IR2_OPND reg, IR2_OPND label)
+{
+    lata_regcache_flush();
+    return (la_beqz)(reg, label);
+}
+
+static inline IR2_INST *lata_regcache_bnez(IR2_OPND reg, IR2_OPND label)
+{
+    lata_regcache_flush();
+    return (la_bnez)(reg, label);
+}
+
+static inline IR2_INST *lata_regcache_beq(IR2_OPND lhs, IR2_OPND rhs,
+                                           IR2_OPND label)
+{
+    lata_regcache_flush();
+    return (la_beq)(lhs, rhs, label);
+}
+
+static inline IR2_INST *lata_regcache_bne(IR2_OPND lhs, IR2_OPND rhs,
+                                           IR2_OPND label)
+{
+    lata_regcache_flush();
+    return (la_bne)(lhs, rhs, label);
+}
+
+static inline IR2_INST *lata_regcache_blt(IR2_OPND lhs, IR2_OPND rhs,
+                                           IR2_OPND label)
+{
+    lata_regcache_flush();
+    return (la_blt)(lhs, rhs, label);
+}
+
+static inline IR2_INST *lata_regcache_bge(IR2_OPND lhs, IR2_OPND rhs,
+                                           IR2_OPND label)
+{
+    lata_regcache_flush();
+    return (la_bge)(lhs, rhs, label);
+}
+
+static inline IR2_INST *lata_regcache_bltu(IR2_OPND lhs, IR2_OPND rhs,
+                                            IR2_OPND label)
+{
+    lata_regcache_flush();
+    return (la_bltu)(lhs, rhs, label);
+}
+
+static inline IR2_INST *lata_regcache_bgeu(IR2_OPND lhs, IR2_OPND rhs,
+                                            IR2_OPND label)
+{
+    lata_regcache_flush();
+    return (la_bgeu)(lhs, rhs, label);
+}
+
+static inline IR2_INST *lata_regcache_bcnez(IR2_OPND cond, IR2_OPND label)
+{
+    lata_regcache_flush();
+    return (la_bcnez)(cond, label);
+}
+
 void free_alloc_gpr(IR2_OPND opnd);
 
 IR2_OPND alloc_fpr_src(int i);

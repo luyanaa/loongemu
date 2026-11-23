@@ -18,7 +18,7 @@
 #include "target/arm/cpu.h"
 #include "target/arm/tcg/translate.h"
 #include "target/arm/lata/include/env.h"
-#include "target/arm/lata/include/la-append.h"
+#include "shared/backend/loongarch/include/la-append.h"
 #include "target/arm/lata/include/macro-inst.h"
 #include "target/arm/lata/ir1/sve-pvir.h"
 #include "target/arm/lata/translator/sve-lasx-lower.h"
@@ -158,6 +158,12 @@ extern void tr_init(void *tb);
 extern void tr_fini(void);
 extern uint64_t context_switch_native_to_bt;
 extern uint64_t context_switch_native_to_bt_ret_0;
+extern IR2_OPND env_ir2_opnd;
+extern IR2_OPND alloc_gpr_src(int reg);
+extern IR2_OPND alloc_gpr_dst(int reg);
+extern void store_gpr_dst(int reg, IR2_OPND value);
+extern void free_alloc_gpr(IR2_OPND value);
+extern void lata_regcache_flush(void);
 
 void lata_enter_tb(void *envp, void *code);
 
@@ -459,6 +465,73 @@ static void run_context_vector_save_restore(void)
           read_le64(context_vector_expected[2] + 8), "context save V31 high");
     check(env.xregs[0], context_switch_native_to_bt,
           "V31 upper half must not overwrite xregs[0]");
+}
+
+static void run_scalar_gpr_regcache_ir2_test(void)
+{
+    unsigned stores = 0;
+    unsigned loads = 0;
+
+    for (size_t i = 0; i < sizeof(env); ++i) {
+        ((uint8_t *)&env)[i] = 0;
+    }
+    for (size_t i = 0; i < sizeof(cpu); ++i) {
+        ((uint8_t *)&cpu)[i] = 0;
+    }
+    for (size_t i = 0; i < sizeof(tb); ++i) {
+        ((uint8_t *)&tb)[i] = 0;
+    }
+    cpu.env_ptr = &env;
+    lata_tr_data_init(&env);
+    tr_init(&tb);
+
+    IR2_OPND dst = alloc_gpr_dst(11);
+    li_d(dst, 1);
+    store_gpr_dst(11, dst);
+    free_alloc_gpr(dst);
+    dst = alloc_gpr_dst(11);
+    li_d(dst, 2);
+    store_gpr_dst(11, dst);
+    free_alloc_gpr(dst);
+
+    IR2_OPND src = alloc_gpr_src(12);
+    free_alloc_gpr(src);
+    src = alloc_gpr_src(12);
+    free_alloc_gpr(src);
+    lata_regcache_flush();
+
+    for (IR2_INST *inst = lata_first_ir2(); inst != NULL;
+         inst = ir2_next(inst)) {
+        if (inst->op_count != 3 ||
+            inst->_opnd[1]._reg_num != env_ir2_opnd._reg_num ||
+            inst->_opnd[2]._imm32 != env_offset_gpr(11)) {
+            continue;
+        }
+        if (ir2_opcode(inst) == LISA_ST_D) {
+            stores++;
+        }
+    }
+    for (IR2_INST *inst = lata_first_ir2(); inst != NULL;
+         inst = ir2_next(inst)) {
+        if (inst->op_count != 3 ||
+            inst->_opnd[1]._reg_num != env_ir2_opnd._reg_num ||
+            inst->_opnd[2]._imm32 != env_offset_gpr(12)) {
+            continue;
+        }
+        if (ir2_opcode(inst) == LISA_LD_D) {
+            loads++;
+        }
+    }
+
+    latx_bare_uart_puts("lata-isa: regcache-ir2 st.d x11=");
+    putdec(stores);
+    latx_bare_uart_puts(" ld.d x12=");
+    putdec(loads);
+    latx_bare_uart_puts("\n");
+    if (stores != 1 || loads != 1) {
+        fails++;
+    }
+    tr_fini();
 }
 
 static void run_integer_nzcv_matrix(void)
@@ -5013,6 +5086,7 @@ static __attribute__((noinline)) void run_sve_p0_p1_gap_regression_runtime(void)
 void kmain(void)
 {
     latx_bare_uart_puts("lata-isa: start\n");
+    run_scalar_gpr_regcache_ir2_test();
 
     /*
      * Every block ends with its result in x2.

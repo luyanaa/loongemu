@@ -4,6 +4,7 @@
 #include "target/arm/lata/ir1/sve-pvir.h"
 #include "target/arm/lata/include/env.h"
 #include "target/arm/lata/include/lata.h"
+#include "target/arm/lata/include/lata-regcache-wrap.h"
 #include "target/arm/lata/include/lata-mem.h"
 
 #include <limits.h>
@@ -1912,6 +1913,7 @@ static void emit_restore_guest_gprs_from_env(void)
 static void emit_direct_span_admission(IR2_OPND span_start, uint32_t span_bytes,
                                        bool is_write, IR2_OPND admitted)
 {
+    lata_regcache_flush();
     emit_save_guest_gprs_to_env();
     la_mov64(a1_ir2_opnd, span_start);
     li_d(a2_ir2_opnd, (int64_t)span_bytes);
@@ -1929,6 +1931,7 @@ static void emit_inline_mem_fault_abort(const DisasContext *s,
                                         IR2_OPND fault_addr_itemp,
                                         bool is_write, bool pop_stack)
 {
+    lata_regcache_flush();
     if (pop_stack) {
         la_addi_d(sp_ir2_opnd, sp_ir2_opnd, ARM_SVE_MAX_VL_BYTES);
     }
@@ -1989,6 +1992,7 @@ static bool emit_sve_helper_call_body(DisasContext *s,
                                       const A64SVEIR1Instruction *source,
                                       const LataSVEHelperDesc *desc)
 {
+    lata_regcache_flush();
     IR2_OPND no_fault = ir2_opnd_new_type(IR2_OPND_LABEL);
     IR2_OPND fault = ir2_opnd_new_type(IR2_OPND_LABEL);
     uint64_t next_pc = (s->base != NULL) ? s->base->pc_next : (s->pc_curr + 4u);

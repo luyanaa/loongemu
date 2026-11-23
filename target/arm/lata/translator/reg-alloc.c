@@ -350,7 +350,24 @@ RA_ALLOC_FUNC(trace, IR2_OPND_GPR)
 /* ra_alloc_src */
 RA_ALLOC_FUNC(scr, IR2_OPND_SCR);
 /* ra_alloc_itemp_num() */
-RA_ALLOC_TEMP_NUM_FUNC(itemp)
+static int ra_alloc_itemp_num(void)
+{
+    int itemp_num, cto_num;
+    uint16_t full = (uint16_t)((1u << itemp_status_num) - 1u);
+
+    if ((lsenv->tr_data->itemp_status & full) == full) {
+        lata_regcache_evict_itemp();
+    }
+    __asm("cto.w %0, %1\n\t"
+          : "=r"(cto_num)
+          : "r"(lsenv->tr_data->itemp_status));
+    lsassertm(cto_num < itemp_status_num,
+              "\n%s:%d alloc itemp failed, cto_num %d\n",
+              __func__, __LINE__, cto_num);
+    itemp_num = reg_itemp_map[cto_num];
+    BITS_SET(lsenv->tr_data->itemp_status, 1 << cto_num);
+    return itemp_num;
+}
 /* ra_alloc_ftemp_num(): spill a cold guest register when the pool is dry. */
 /*
  * Allocation failures must be deterministic: the old code fell through with an
@@ -472,6 +489,14 @@ IR2_OPND ra_alloc_itemp(void)
     ir2_opnd_build(&ir2_opnd, IR2_OPND_GPR, itemp_num);
 
     return ir2_opnd;
+}
+
+void ra_free_itemp(int phy_id)
+{
+    if (lata_regcache_free_itemp(phy_id)) {
+        return;
+    }
+    RA_FREE_CODE(itemp, phy_id);
 }
 
 IR2_OPND ra_alloc_ftemp(void)

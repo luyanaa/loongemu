@@ -205,6 +205,7 @@ build/test_sve_helper_lifecycle: tests/test_sve_helper_lifecycle.c \
 	      -DCONFIG_LATA_STANDALONE -Wno-gnu-empty-struct -Wno-macro-redefined \
 	      -Wno-unused-parameter \
 	      -Ilata/compat -Ilatx/compat -I. -Itarget/arm/lata/include -Ishared/pvir/include \
+	      -Ishared/backend/loongarch/include \
 	      -Itarget/arm/lata -Itarget/arm/lata/translator -Itarget/arm/lata/ir1 \
 	      -Ilatx/upstream/include \
 	      shared/pvir/src/pvir.c target/arm/lata/ir1/sve-decode.c \
@@ -251,6 +252,7 @@ build/test_lata_context: tests/test_lata_context.c lata/vcache.c \
 	      -DTARGET_AARCH64 -DCONFIG_LATA -DCONFIG_LATA_STANDALONE \
 	      -Wno-gnu-empty-struct -Wno-macro-redefined -Wno-unused-parameter \
 	      -Ilata/compat -Ilatx/compat -I. -Itarget/arm/lata/include -Ishared/pvir/include \
+	      -Ishared/backend/loongarch/include \
 	      -Itarget/arm/lata -Ilatx/upstream/include \
 	      lata/vcache.c target/arm/lata/mem.c \
 	      target/arm/lata/ftemp-snapshot.c \

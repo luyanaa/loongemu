@@ -7,6 +7,7 @@
 #include "ir2.h"
 #include "env.h"
 #include "clear-high.h"
+#include "target/arm/lata/include/lata-regcache-wrap.h"
 
 #ifdef CONFIG_LATA_INSTS_PATTERN
 

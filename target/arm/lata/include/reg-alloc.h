@@ -172,7 +172,7 @@ RA_ALLOC_FUNC_DEF(scr);
 IR2_OPND ra_alloc_itemp(void);
 IR2_OPND ra_alloc_ftemp(void);
 
-#define ra_free_itemp(phy_id)   RA_FREE_CODE(itemp, phy_id)
+void ra_free_itemp(int phy_id);
 #define ra_free_ftemp(phy_id)   RA_FREE_FTEMP_CODE(phy_id)
 void ra_free_all(void);
 IR2_OPND ra_alloc_num_4095(void);

@@ -19,6 +19,7 @@
 #include "qemu/osdep.h"
 
 #ifdef CONFIG_LATA
+#include "target/arm/lata/include/lata-regcache-wrap.h"
 #include "target/arm/lata/include/translate.h"
 #include "target/arm/lata/include/arm_ldst.h"
 #include "target/arm/lata/include/insts-pattern.h"
@@ -2370,6 +2371,7 @@ static void lata_store_exclusive(DisasContext *s, int rs, int rt, int rt2,
 static bool trans_STXR(DisasContext *s)
 {
     arg_stxr *a = &(s->arg.f_stxr);
+    lata_regcache_flush();
     if (a->rn == 31)
     {
         gen_check_sp_alignment(s);
@@ -2385,6 +2387,7 @@ static bool trans_STXR(DisasContext *s)
 static bool trans_LDXR(DisasContext *s)
 {
     arg_stxr *a = &(s->arg.f_stxr);
+    lata_regcache_flush();
     if (a->rn == 31)
     {
         gen_check_sp_alignment(s);
@@ -2410,6 +2413,7 @@ static bool trans_STLR(DisasContext *s)
     {
         return false;
     }
+    lata_regcache_flush();
     /* Generate ISS for non-exclusive accesses including LASR.  */
     if (a->rn == 31)
     {
@@ -2493,6 +2497,7 @@ static bool trans_LDAR(DisasContext *s)
     {
         return false;
     }
+    lata_regcache_flush();
     /* Generate ISS for non-exclusive accesses including LASR.  */
     if (a->rn == 31)
     {
@@ -2555,6 +2560,7 @@ static bool trans_CAS(DisasContext *s)
     {
         return false;
     }
+    lata_regcache_flush();
 
     arg_CAS *a = &(s->arg.f_decode_insn3221);
     IR2_OPND reg_s = alloc_gpr_src(a->rs);
@@ -3730,6 +3736,7 @@ static void lata_emit_scalar_span_admission(IR2_OPND addr_reg, int64_t offset,
                                             size_t size, bool is_write,
                                             IR2_OPND admitted)
 {
+    lata_regcache_flush();
     IR2_OPND vaddr = ra_alloc_itemp();
 
     li_d(vaddr, offset);
@@ -5082,6 +5089,7 @@ static bool trans_LDADD(DisasContext *s)
     {
         return false;
     }
+    lata_regcache_flush();
     int acquire = extract32(s->insn, 23, 1);
     int release = extract32(s->insn, 22, 1);
 
@@ -5238,6 +5246,7 @@ static bool trans_LDADD(DisasContext *s)
 
 static bool trans_LDCLR(DisasContext *s)
 {
+    lata_regcache_flush();
     int acquire = extract32(s->insn, 23, 1);
     int release = extract32(s->insn, 22, 1);
 
@@ -5402,6 +5411,7 @@ static bool trans_LDEOR(DisasContext *s)
 
 static bool trans_LDSET(DisasContext *s)
 {
+    lata_regcache_flush();
     int acquire = extract32(s->insn, 23, 1);
     int release = extract32(s->insn, 22, 1);
 
