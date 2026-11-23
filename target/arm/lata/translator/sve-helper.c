@@ -39,6 +39,59 @@ static LataSVEHelperDesc *chunk_descs(LataSVEHelperChunk *chunk)
     return (LataSVEHelperDesc *)(chunk + 1);
 }
 
+/*
+ * Multi-vCPU reclamation.
+ *
+ * Chunks are freed only when no vCPU can still be running code that embeds their
+ * addresses.  Every vCPU publishes the generation it has reached at a safe point
+ * (block start); a chunk from an older generation is only released once *every*
+ * registered vCPU has moved past that generation.
+ */
+#define LATA_MAX_VCPUS 64
+static uint64_t vcpu_seen_generation[LATA_MAX_VCPUS];
+static unsigned vcpu_seen_count;
+static uint64_t vcpu_min_generation = UINT64_MAX;
+
+void lata_code_cache_vcpu_reset(void)
+{
+    vcpu_seen_count = 0;
+    vcpu_min_generation = UINT64_MAX;
+}
+
+int lata_code_cache_vcpu_register(uint64_t generation)
+{
+    if (vcpu_seen_count >= LATA_MAX_VCPUS) {
+        return -1;
+    }
+    vcpu_seen_generation[vcpu_seen_count] = generation;
+    if (generation < vcpu_min_generation) {
+        vcpu_min_generation = generation;
+    }
+    return (int)vcpu_seen_count++;
+}
+
+void lata_code_cache_vcpu_seen(int slot, uint64_t generation)
+{
+    if (slot < 0 || (unsigned)slot >= vcpu_seen_count) {
+        return;
+    }
+    vcpu_seen_generation[slot] = generation;
+    vcpu_min_generation = generation;
+    for (unsigned i = 0; i < vcpu_seen_count; ++i) {
+        if (vcpu_seen_generation[i] < vcpu_min_generation) {
+            vcpu_min_generation = vcpu_seen_generation[i];
+        }
+    }
+}
+
+/* A chunk from `generation` may be freed once every vCPU has passed it. */
+bool lata_code_cache_generation_retired(uint64_t generation)
+{
+    /* No registered vCPU means a single-threaded host (or the harness): there is
+     * nobody else to wait for. */
+    return vcpu_seen_count == 0 || vcpu_min_generation > generation;
+}
+
 static void chunk_free_chain(LataSVEHelperChunk *chunk)
 {
     while (chunk != NULL) {
@@ -103,12 +156,24 @@ void lata_sve_helper_begin_tb(const void *owner, uint64_t pc_first)
      * tell after the allocator has grown back past the old address.
      */
     if (ctx->sve_helper_chunks != 0) {
-        if (ctx->sve_helper_codegen_gen != lata_code_cache_current_generation()) {
-            lata_sve_helper_release_all();
-        } else if (lata_sve_helper_codegen_rewound(ctx->sve_helper_codegen,
-                                                   (uintptr_t)tcg_ctx->code_gen_ptr)) {
+        uint64_t current = lata_code_cache_current_generation();
+        bool stale = ctx->sve_helper_codegen_gen != current;
+
+        if (!stale &&
+            lata_sve_helper_codegen_rewound(ctx->sve_helper_codegen,
+                                            (uintptr_t)tcg_ctx->code_gen_ptr)) {
             lata_code_cache_bump_generation();
-            lata_sve_helper_release_all();
+            current = lata_code_cache_current_generation();
+            stale = true;
+        }
+        if (stale) {
+            if (lata_code_cache_generation_retired(ctx->sve_helper_codegen_gen)) {
+                lata_sve_helper_release_all();
+            } else {
+                /* Another vCPU may still execute this generation: keep the
+                 * chunks and retry at a later safe point. */
+                return;
+            }
         }
     }
     ctx->sve_helper_owner = owner;

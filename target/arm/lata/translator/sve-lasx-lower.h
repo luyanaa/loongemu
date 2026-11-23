@@ -97,6 +97,12 @@ void lata_sve_helper_release_all(void);
 /* True when the code cache rewound past the position the live chunks came
  * from, i.e. a flush happened without an explicit release call. */
 bool lata_sve_helper_codegen_rewound(uintptr_t recorded, uintptr_t current);
+
+/* Multi-vCPU quiescent-state tracking for descriptor reclamation. */
+void lata_code_cache_vcpu_reset(void);
+int lata_code_cache_vcpu_register(uint64_t generation);
+void lata_code_cache_vcpu_seen(int slot, uint64_t generation);
+bool lata_code_cache_generation_retired(uint64_t generation);
 void lata_sve_helper_stats(uint32_t *live_descs, uint32_t *live_chunks);
 
 /*

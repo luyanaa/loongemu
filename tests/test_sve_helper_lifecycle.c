@@ -252,6 +252,40 @@ int main(void)
         lata_sve_helper_release_all();
     }
 
+    /* Multi-vCPU reclamation: a chunk from an old generation survives until
+     * every registered vCPU has passed that generation. */
+    {
+        uint32_t d0, c0;
+        uint64_t gen = lata_code_cache_current_generation();
+
+        lata_code_cache_vcpu_reset();
+        CHECK(lata_code_cache_vcpu_register(gen) == 0);
+        CHECK(lata_code_cache_vcpu_register(gen) == 1);
+        CHECK(!lata_code_cache_generation_retired(gen));
+
+        lata_sve_helper_begin_tb((const void *)tb_a->tc.ptr, 0x9000);
+        CHECK(lata_sve_alloc_helper_desc(&s, &insn, NULL) != NULL);
+        lata_sve_helper_stats(&d0, &c0);
+        CHECK(d0 == 1 && c0 == 1);
+
+        /* One vCPU moves on, the other has not: the chunk must stay. */
+        (void)lata_code_cache_bump_generation();
+        lata_code_cache_vcpu_seen(0, gen + 1);
+        CHECK(!lata_code_cache_generation_retired(gen));
+        lata_sve_helper_begin_tb((const void *)tb_b->tc.ptr, 0xa000);
+        lata_sve_helper_stats(&d0, &c0);
+        CHECK(d0 == 1 && c0 == 1);
+
+        /* Once the second vCPU arrives the old generation is reclaimable. */
+        lata_code_cache_vcpu_seen(1, gen + 1);
+        CHECK(lata_code_cache_generation_retired(gen));
+        lata_sve_helper_begin_tb((const void *)tb_b->tc.ptr, 0xa000);
+        lata_sve_helper_stats(&d0, &c0);
+        CHECK(d0 == 0 && c0 == 0);
+        lata_sve_helper_release_all();
+        lata_code_cache_vcpu_reset();
+    }
+
     printf("SVE helper lifecycle: %u checks passed", checks);
     if (failures != 0) {
         printf(", %u FAILED\n", failures);
