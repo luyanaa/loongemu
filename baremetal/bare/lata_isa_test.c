@@ -6864,6 +6864,22 @@ void kmain(void)
 
     }
 
+    /* A legal encoding whose lowering is missing must reach the guest as an
+     * undefined instruction instead of aborting the translator. */
+    {
+        static uint32_t unimpl_sqshrn[] __attribute__((aligned(16))) = {
+            0x0f0c9420u, /* sqshrn v0.8b, v1.8h, #4 */
+        };
+
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        for (size_t i = 0; i < 8; ++i) {
+            arm_sve_zreg(&env, 1)[i * 2] = 0x34;
+        }
+        check(sve_run_a64_tb(unimpl_sqshrn, 1, 128, 0x0fu, false,
+                             "unimplemented NEON"),
+              1, "unimplemented NEON instruction does not abort");
+    }
+
     latx_bare_uart_puts("lata-isa: checks=");
     putdec((uint64_t)checks);
     latx_bare_uart_puts(" fails=");

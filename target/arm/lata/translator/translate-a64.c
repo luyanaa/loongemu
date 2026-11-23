@@ -897,7 +897,8 @@ static bool fp_access_check_only(DisasContext *s)
         assert(!s->fp_access_checked);
         s->fp_access_checked = true;
 
-        assert(0);
+        lata_unallocated_encoding(s);
+        return true;
         return false;
     }
     s->fp_access_checked = true;
@@ -912,7 +913,8 @@ static bool fp_access_check(DisasContext *s)
     }
     if (s->sme_trap_nonstreaming && s->is_nonstreaming)
     {
-        assert(0);
+        lata_unallocated_encoding(s);
+        return true;
         return false;
     }
     return true;
@@ -927,7 +929,8 @@ static bool sme_access_check(DisasContext *s)
 {
     if (s->sme_excp_el)
     {
-        assert(0);
+        lata_unallocated_encoding(s);
+        return true;
         return false;
     }
     return true;
@@ -1254,37 +1257,44 @@ static bool trans_RET(DisasContext *s)
 
 static bool trans_BRAZ(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_BLRAZ(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_RETA(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_BRA(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_BLRA(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_ERET(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_ERETA(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_NOP(DisasContext *s)
@@ -1420,7 +1430,8 @@ static bool trans_DSB_DMB(DisasContext *s)
 
 static bool trans_ISB(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_SB(DisasContext *s)
@@ -1440,62 +1451,74 @@ static bool trans_SB(DisasContext *s)
 
 static bool trans_CFINV(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_XAFLAG(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_AXFLAG(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_MSR_i_UAO(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_MSR_i_PAN(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_MSR_i_SPSEL(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_MSR_i_SBSS(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_MSR_i_DIT(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_MSR_i_TCO(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_MSR_i_DAIFSET(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_MSR_i_DAIFCLEAR(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_MSR_i_SVCR(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static void lata_helper_access_check_sysReg(DisasContext *ctx, void *la_ri, uint32_t key, uint32_t syndrome, uint32_t isread)
@@ -1606,7 +1629,8 @@ static void lata_helper_dc_zva(DisasContext *s, int rt)
 
     if (s->mte_active[0])
     {
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
     else
     {
@@ -1671,7 +1695,8 @@ static void handle_sys(DisasContext *s, bool isread,
     /* Check access permissions */
     if (!cp_access_ok(s->current_el, ri, isread))
     {
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 
     if (ri->accessfn || (ri->fgt && s->fgt_active))
@@ -1690,7 +1715,8 @@ static void handle_sys(DisasContext *s, bool isread,
          * The readfn or writefn might raise an exception;
          * synchronize the CPU state in case it does.
          */
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 
     IR2_OPND reg_t;
@@ -1723,7 +1749,8 @@ static void handle_sys(DisasContext *s, bool isread,
         free_alloc_gpr(reg_t);
         return;
     case ARM_CP_CURRENTEL:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         /* Reads as current EL value from pstate, which is
          * guaranteed to be constant by the tb flags.
          */
@@ -1733,12 +1760,14 @@ static void handle_sys(DisasContext *s, bool isread,
         return;
     case ARM_CP_DC_GVA:
     {
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
         return;
     case ARM_CP_DC_GZVA:
     {
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
         return;
     default:
@@ -1746,26 +1775,30 @@ static void handle_sys(DisasContext *s, bool isread,
     }
     if ((ri->type & ARM_CP_FPU) && !fp_access_check_only(s))
     {
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         return;
     }
     else if ((ri->type & ARM_CP_SVE) && !sve_access_check(s))
     {
         if (s->base->is_jmp != DISAS_NORETURN)
         {
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
         return;
     }
     else if ((ri->type & ARM_CP_SME) && !sme_access_check(s))
     {
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         return;
     }
 
     if (ri->type & ARM_CP_IO)
     {
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         /* I/O operations must end the TB here (whether read or write) */
     }
 
@@ -1905,12 +1938,14 @@ static bool trans_SVC(DisasContext *s)
 
 static bool trans_HVC(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_SMC(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_BRK(DisasContext *s)
@@ -1927,7 +1962,8 @@ static bool trans_HLT(DisasContext *s)
      * it is required for halting debug disabled: it will UNDEF.
      * Secondly, "HLT 0xf000" is the A64 semihosting syscall instruction.
      */
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 /*
  * Compute the ISS.SF bit for syndrome information if an exception
@@ -1989,7 +2025,8 @@ static void lata_load_exclusive(DisasContext *s, int rt, int rt2, int rn,
         }
         else
         {
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
             /* FIX ME: LL-SC粒度是针对缓存行的，连续的两个SC，前者一定会造成后者失效？ */
             if (s->be_data == MO_LE)
             {
@@ -2102,7 +2139,8 @@ static void lata_store_exclusive(DisasContext *s, int rs, int rt, int rt2,
         }
         else
         {
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
             /* FIX ME: LL-SC粒度是针对缓存行的，连续的两个SC，前者一定会造成后者失效？ */
             if (s->be_data == MO_LE)
             {
@@ -2294,7 +2332,8 @@ static bool trans_STLR(DisasContext *s)
     }
     else
     { /* pre-index */
-        assert(0);
+        lata_unallocated_encoding(s);
+        return true;
         offset = -(1 << a->sz);
         la_addi_d(reg_n, reg_n, offset);
         if (iss_sf)
@@ -2366,17 +2405,20 @@ static bool trans_LDAR(DisasContext *s)
 
 static bool trans_STXP(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_LDXP(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_CASP(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_CAS(DisasContext *s)
@@ -2552,7 +2594,8 @@ static bool trans_LD_lit(DisasContext *s)
 
         break;
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return true;
         break;
     }
 
@@ -2569,7 +2612,8 @@ static bool trans_LD_lit(DisasContext *s)
 static bool trans_LD_lit_v(DisasContext *s)
 {
     /* Load register (literal), vector version */
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
     return true;
 }
 
@@ -2588,7 +2632,8 @@ static bool trans_STP(DisasContext *s)
     int dbytes = (8 << a->sz) / 8;
     if (a->w && (a->rt == a->rn || a->rt2 == a->rn) && a->rn != 31)
     {
-        assert(0);
+        lata_unallocated_encoding(s);
+        return true;
         return true;
     }
 
@@ -2648,7 +2693,8 @@ static bool trans_STP(DisasContext *s)
             la_st_d(reg_t2, temp, dbytes);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return true;
         }
     }
     else
@@ -2669,7 +2715,8 @@ static bool trans_STP(DisasContext *s)
             la_st_d(reg_t2, reg_n, dbytes);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return true;
         }
 
         if (a->p && offset)
@@ -2702,7 +2749,8 @@ static bool trans_LDP(DisasContext *s)
     int dbytes = (8 << a->sz) / 8; // dbytes = datasize / 8;
     if (a->w && (a->rt == a->rn || a->rt2 == a->rn) && a->rn != 31)
     {
-        assert(0);
+        lata_unallocated_encoding(s);
+        return true;
         return true;
     }
 
@@ -2763,7 +2811,8 @@ static bool trans_LDP(DisasContext *s)
             la_ld_d(reg_t2, temp, dbytes);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return true;
         }
     }
     else
@@ -2819,7 +2868,8 @@ static bool trans_LDP(DisasContext *s)
             }
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return true;
         }
 
         if (a->p && offset)
@@ -2931,7 +2981,8 @@ static bool trans_STP_v(DisasContext *s)
             la_vst(vreg_t2, temp, dbytes);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return true;
         }
     }
     else
@@ -2956,7 +3007,8 @@ static bool trans_STP_v(DisasContext *s)
             la_vst(vreg_t2, reg_n, dbytes);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return true;
         }
 
         if (a->p && offset)
@@ -3061,7 +3113,8 @@ static bool trans_LDP_v(DisasContext *s)
             la_vld(vreg_t2, temp, dbytes);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return true;
         }
     }
     else
@@ -3117,7 +3170,8 @@ static bool trans_LDP_v(DisasContext *s)
             }
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return true;
         }
 
         if (a->p && offset)
@@ -3139,7 +3193,8 @@ static bool trans_LDP_v(DisasContext *s)
 
 static bool trans_STGP(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 /*
@@ -3452,7 +3507,8 @@ static void assist_trans_STR_i(DisasContext *s, IR2_OPND *reg_t, IR2_OPND *reg_n
         la_st_d(*reg_t, *reg_n, offset);
         break;
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 }
 
@@ -3469,7 +3525,8 @@ static bool trans_STR_i(DisasContext *s)
     int64_t offset = a->imm;
     if (a->w && a->rt == a->rn && a->rn != 31)
     {
-        assert(0);
+        lata_unallocated_encoding(s);
+        return true;
         return true;
     }
 
@@ -3581,7 +3638,8 @@ static void assist_trans_LDR_i(DisasContext *s, IR2_OPND *reg_t, IR2_OPND *reg_n
         la_ld_d(*reg_t, *reg_n, offset);
         break;
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 }
 
@@ -3600,7 +3658,8 @@ static bool trans_LDR_i(DisasContext *s)
     bool iss_sf = ldst_iss_sf(a->sz, a->sign, a->ext);
     if (a->w && a->rt == a->rn && a->rn != 31)
     {
-        assert(0);
+        lata_unallocated_encoding(s);
+        return true;
         return true;
     }
 
@@ -3733,7 +3792,8 @@ static void assist_trans_STR_v_i(DisasContext *s, IR2_OPND *vreg_t, IR2_OPND *re
         la_vst(*vreg_t, *reg_n, offset);
         break;
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
     free_alloc_gpr(temp);
 }
@@ -3831,7 +3891,8 @@ static void assist_trans_LDR_v_i(DisasContext *s, IR2_OPND *vreg_t, IR2_OPND *re
         la_vld(*vreg_t, *reg_n, offset);
         break;
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
     free_alloc_gpr(temp);
 }
@@ -4854,7 +4915,8 @@ static bool trans_LDCLR(DisasContext *s)
 
 static bool trans_LDEOR(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_LDSET(DisasContext *s)
@@ -5015,22 +5077,26 @@ static bool trans_LDSET(DisasContext *s)
 
 static bool trans_LDSMAX(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_LDSMIN(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_LDUMAX(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_LDUMIN(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_SWP(DisasContext *s)
@@ -5183,22 +5249,26 @@ static bool trans_SWP(DisasContext *s)
 
 static bool trans_LDAPR(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_LDRA(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_LDAPR_i(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_STLR_i(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_LD_mult(DisasContext *s)
@@ -5658,7 +5728,8 @@ static bool trans_LD_single_repl(DisasContext *s)
             la_vldrepl_d(vreg_d, reg_n, xs);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return true;
         }
         if (!a->q) {
             /* 高64位清零 */
@@ -5695,27 +5766,32 @@ static bool trans_LD_single_repl(DisasContext *s)
 
 static bool trans_STZGM(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_STGM(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_LDGM(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_LDG(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool do_STG(DisasContext *s, arg_ldst_tag *a, bool is_zero, bool is_pair)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 TRANS_FEAT_LDST_TAG(STG, aa64_mte_insn_reg, do_STG, false, false)
@@ -5819,7 +5895,8 @@ static bool trans_ADD_i(DisasContext *s)
         }
         break;
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return true;
         break;
     }
 
@@ -5894,7 +5971,8 @@ static bool trans_SUB_i(DisasContext *s)
         }
         break;
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return true;
         break;
     }
 
@@ -5938,7 +6016,8 @@ static bool trans_ADDS_i(DisasContext *s)
         la_lu12i_w(temp, a->imm >> 12);
         break;
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return true;
         break;
     }
 
@@ -5986,7 +6065,8 @@ static bool trans_SUBS_i(DisasContext *s)
         la_lu12i_w(temp, a->imm >> 12);
         break;
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return true;
         break;
     }
 
@@ -6017,12 +6097,14 @@ static bool trans_SUBS_i(DisasContext *s)
  */
 static bool trans_ADDG_i(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 static bool trans_SUBG_i(DisasContext *s)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return true;
 }
 
 /* The input should be a value in the bottom e bits (with higher
@@ -7404,7 +7486,8 @@ static void disas_data_proc_3src(DisasContext *s, uint32_t insn)
         la_mulh_du(reg_d, reg_n, reg_m);
         break;
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 
     if (rd != 31 && arm_la_map[rd] >= 0 && clearGprHigh)
@@ -7530,7 +7613,8 @@ static void disas_adc_sbc(DisasContext *s, uint32_t insn)
  */
 static void disas_rotate_right_into_flags(DisasContext *s, uint32_t insn)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 /*
@@ -7542,7 +7626,8 @@ static void disas_rotate_right_into_flags(DisasContext *s, uint32_t insn)
  */
 static void disas_evaluate_into_flags(DisasContext *s, uint32_t insn)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 /* Conditional compare (immediate / register)
@@ -8021,7 +8106,8 @@ static void disas_data_proc_1src(DisasContext *s, uint32_t insn)
     case MAP(1, 0x01, 0x0f): /* AUTDZB */
     case MAP(1, 0x01, 0x10): /* XPACI */
     case MAP(1, 0x01, 0x11): /* XPACD */
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         break;
     default:
         lata_unallocated_encoding(s);
@@ -8214,7 +8300,8 @@ static void handle_crc32(DisasContext *s,
             la_crcc_w_d_w(reg_d, reg_n, reg_m);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
     }
     else
@@ -8234,7 +8321,8 @@ static void handle_crc32(DisasContext *s,
             la_crc_w_d_w(reg_d, reg_n, reg_m);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
     }
 
@@ -8284,7 +8372,8 @@ static void disas_data_proc_2src(DisasContext *s, uint32_t insn)
         }
         else
         {
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
         break;
     case 2: /* UDIV */
@@ -8294,10 +8383,12 @@ static void disas_data_proc_2src(DisasContext *s, uint32_t insn)
         handle_div(s, true, sf, rm, rn, rd);
         break;
     case 4: /* IRG */
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         break;
     case 5: /* GMI */
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         break;
     case 8: /* LSLV */
         handle_shift_reg(s, A64_SHIFT_TYPE_LSL, sf, rm, rn, rd);
@@ -8312,7 +8403,8 @@ static void disas_data_proc_2src(DisasContext *s, uint32_t insn)
         handle_shift_reg(s, A64_SHIFT_TYPE_ROR, sf, rm, rn, rd);
         break;
     case 12: /* PACGA */
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         break;
     case 16:
     case 17:
@@ -8384,7 +8476,8 @@ static bool disas_data_proc_reg(DisasContext *s)
 
         case 0x01: /* Rotate right into flags */
         case 0x21:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return true;
             disas_rotate_right_into_flags(s, insn);
             break;
 
@@ -8392,7 +8485,8 @@ static bool disas_data_proc_reg(DisasContext *s)
         case 0x12:
         case 0x22:
         case 0x32:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return true;
             disas_evaluate_into_flags(s, insn);
             break;
 
@@ -8519,7 +8613,8 @@ static void handle_fp_compare(DisasContext *s, int size,
     }
     else
     {
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 
     free_alloc_fpr(vreg_m);
@@ -8568,7 +8663,8 @@ static void disas_fp_compare(DisasContext *s, uint32_t insn)
         }
         /* fallthru */
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 
     if (!fp_access_check(s))
@@ -8620,7 +8716,8 @@ static void disas_fp_ccomp(DisasContext *s, uint32_t insn)
         }
         /* fallthru */
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 
     if (!fp_access_check(s))
@@ -8704,14 +8801,16 @@ static void disas_fp_csel(DisasContext *s, uint32_t insn)
         la_fmov_d(vreg_d, vreg_n);
         break;
     case 3:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         if (dc_isar_feature(aa64_fp16, s))
         {
             break;
         }
         /* fallthru */
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
     la_b(l_end);
 
@@ -8727,14 +8826,16 @@ static void disas_fp_csel(DisasContext *s, uint32_t insn)
         la_fmov_d(vreg_d, vreg_m);
         break;
     case 3:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         if (dc_isar_feature(aa64_fp16, s))
         {
             break;
         }
         /* fallthru */
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 
     la_label(l_end);
@@ -8751,7 +8852,8 @@ static void disas_fp_csel(DisasContext *s, uint32_t insn)
 /* Floating-point data-processing (1 source) - half precision */
 static void handle_fp_1src_half(DisasContext *s, int opcode, int rd, int rn)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 /* Floating-point data-processing (1 source) - single precision */
@@ -8831,7 +8933,8 @@ static void handle_fp_1src_single(DisasContext *s, int opcode, int rd, int rn)
         g_assert_not_reached();
     }
 
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 
 done:
     la_vand_v(vreg_d, vreg_d, fsmask_ir2_opnd);
@@ -8918,7 +9021,8 @@ static void handle_fp_1src_double(DisasContext *s, int opcode, int rd, int rn)
         g_assert_not_reached();
     }
 
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 
 done:
     /* 高64位清零 */
@@ -8949,7 +9053,8 @@ static void handle_fp_fcvt(DisasContext *s, int opcode,
         }
         else
         {
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
             /* Single to half */
         }
         break;
@@ -8963,7 +9068,8 @@ static void handle_fp_fcvt(DisasContext *s, int opcode,
         }
         else
         {
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
             /* Double to half */
         }
         break;
@@ -8974,7 +9080,8 @@ static void handle_fp_fcvt(DisasContext *s, int opcode,
             la_vand_v(vreg_d, vreg_d, fsmask_ir2_opnd);
             /* Half to single */
         } else {
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
             /* Half to double */
         }
         break;
@@ -9220,7 +9327,8 @@ static void handle_fp_2src_double(DisasContext *s, int opcode,
 static void handle_fp_2src_half(DisasContext *s, int opcode,
                                 int rd, int rn, int rm)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 /* Floating point data-processing (2 source)
@@ -9393,7 +9501,8 @@ static void handle_fp_3src_double(DisasContext *s, bool o0, bool o1,
 static void handle_fp_3src_half(DisasContext *s, bool o0, bool o1,
                                 int rd, int rn, int rm, int ra)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 /* Floating point data-processing (3 source)
@@ -9490,7 +9599,8 @@ static void disas_fp_imm(DisasContext *s, uint32_t insn)
         }
         /* fallthru */
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 
     if (!fp_access_check(s))
@@ -9586,7 +9696,8 @@ static void handle_fpfpcvt(DisasContext *s, int rd, int rn, int opcode,
             break;
 
         case 3: /* float16 */
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
 
         default:
             g_assert_not_reached();
@@ -9644,7 +9755,8 @@ static void handle_fpfpcvt(DisasContext *s, int rd, int rn, int opcode,
                     }
                     break;
                 case 3: /* float16 */
-                    assert(0);
+                    lata_unallocated_encoding(s);
+                    return;
                     break;
                 default:
                     g_assert_not_reached();
@@ -9678,7 +9790,8 @@ static void handle_fpfpcvt(DisasContext *s, int rd, int rn, int opcode,
                     }
                     break;
                 case 3: /* float16 */
-                    assert(0);
+                    lata_unallocated_encoding(s);
+                    return;
                     break;
                 default:
                     g_assert_not_reached();
@@ -9712,7 +9825,8 @@ static void handle_fpfpcvt(DisasContext *s, int rd, int rn, int opcode,
                     }
                     break;
                 case 3: /* float16 */
-                    assert(0);
+                    lata_unallocated_encoding(s);
+                    return;
                     break;
                 default:
                     g_assert_not_reached();
@@ -9746,7 +9860,8 @@ static void handle_fpfpcvt(DisasContext *s, int rd, int rn, int opcode,
                     }
                     break;
                 case 3: /* float16 */
-                    assert(0);
+                    lata_unallocated_encoding(s);
+                    return;
                     break;
                 default:
                     g_assert_not_reached();
@@ -9851,7 +9966,8 @@ static void handle_fpfpcvt(DisasContext *s, int rd, int rn, int opcode,
                 }
                 break;
             case 3: /* float16 */
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
                 break;
 
             default:
@@ -9923,7 +10039,8 @@ static void disas_fp_fixed_conv(DisasContext *s, uint32_t insn)
         }
         /* fallthru */
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 
     switch ((rmode << 3) | opcode)
@@ -9937,7 +10054,8 @@ static void disas_fp_fixed_conv(DisasContext *s, uint32_t insn)
         itof = false;
         break;
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 
     if (!fp_access_check(s))
@@ -10052,7 +10170,8 @@ static void handle_fmov(DisasContext *s, int rd, int rn, int type, bool itof)
 
 static void handle_fjcvtzs(DisasContext *s, int rd, int rn)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 /* Floating point <-> integer conversions
@@ -10920,7 +11039,8 @@ static void disas_simd_across_lanes(DisasContext *s, uint32_t insn)
                 la_vadd_w(vtemp2, vtemp2, vtemp);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
 
@@ -11010,7 +11130,8 @@ static void disas_simd_across_lanes(DisasContext *s, uint32_t insn)
                     }
                     break;
                 default:
-                    assert(0);
+                    lata_unallocated_encoding(s);
+                    return;
                 }
             }
             /* SMAXV, UMAXV */
@@ -11049,7 +11170,8 @@ static void disas_simd_across_lanes(DisasContext *s, uint32_t insn)
                     }
                     break;
                 default:
-                    assert(0);
+                    lata_unallocated_encoding(s);
+                    return;
                 }
             }
         }
@@ -11121,7 +11243,8 @@ static void disas_simd_across_lanes(DisasContext *s, uint32_t insn)
         la_vand_v(vreg_d, vreg_d, fsmask_ir2_opnd);
         break;
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 
     store_fpr_dst(rd, vreg_d);
@@ -11177,7 +11300,8 @@ static void handle_simd_dupe(DisasContext *s, int is_q, int rd, int rn,
         la_vreplvei_d(vreg_d, vreg_n, index);
         break;
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         break;
     }
 
@@ -11239,7 +11363,8 @@ static void handle_simd_dupes(DisasContext *s, int rd, int rn,
             la_vextrins_d(vreg_d, vreg_n, index);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
             break;
         }
     }
@@ -11264,7 +11389,8 @@ static void handle_simd_dupes(DisasContext *s, int rd, int rn,
             la_vextrins_d(vreg_d, vtemp, index);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
             break;
         }
     }
@@ -11795,7 +11921,8 @@ static void disas_simd_scalar_pairwise(DisasContext *s, uint32_t insn)
 
         break;
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 
     IR2_OPND vreg_d = alloc_fpr_dst(rd);
@@ -11817,20 +11944,23 @@ static void disas_simd_scalar_pairwise(DisasContext *s, uint32_t insn)
             la_vfadd_d(vreg_d, vtemp, vreg_n);
             break;
         case 0xf: /* FMAXP */
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
             break;
         case 0x2c: /* FMINNMP */
             la_vfmin_d(vreg_d, vreg_n, vtemp);
             break;
         case 0x2f: /* FMINP */
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
             break;
         default:
             g_assert_not_reached();
         }
     } else {
         if (size == MO_16) {
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
             switch (opcode) {
             case 0xc: /* FMAXNMP */
                 break;
@@ -11856,12 +11986,14 @@ static void disas_simd_scalar_pairwise(DisasContext *s, uint32_t insn)
                 la_vfadd_s(vreg_d, vtemp, vreg_n);
                 break;
             case 0xf: /* FMAXP */
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             case 0x2c: /* FMINNMP */
                 la_vfmin_s(vreg_d, vreg_n, vtemp);
                 break;
             case 0x2f: /* FMINP */
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             default:
                 g_assert_not_reached();
             }
@@ -11902,11 +12034,13 @@ static void handle_scalar_simd_shri(DisasContext *s,
     switch (opcode)
     {
     case 0x02: /* SSRA / USRA (accumulate) */
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         break;
 
     case 0x08: /* SRI */
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         break;
 
     case 0x00: /* SSHR / USHR */
@@ -12057,7 +12191,8 @@ static void handle_vec_simd_sqshrn(DisasContext *s, bool is_scalar, bool is_q,
                 la_vssrlrni_wu_d(vreg, vreg_n, shift);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         } else {
             if (!is_u_narrow) {
@@ -12072,10 +12207,12 @@ static void handle_vec_simd_sqshrn(DisasContext *s, bool is_scalar, bool is_q,
                     la_vssrarni_w_d(vreg, vreg_n, shift);
                     break;
                 default:
-                    assert(0);
+                    lata_unallocated_encoding(s);
+                    return;
                 }
             } else {
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
                 switch (size) {
                 case 0:
                     la_vssrarni_bu_h(vreg, vreg_n, shift);
@@ -12087,7 +12224,8 @@ static void handle_vec_simd_sqshrn(DisasContext *s, bool is_scalar, bool is_q,
                     la_vssrarni_wu_d(vreg, vreg_n, shift);
                     break;
                 default:
-                    assert(0);
+                    lata_unallocated_encoding(s);
+                    return;
                 }
             }
         }
@@ -12104,7 +12242,8 @@ static void handle_vec_simd_sqshrn(DisasContext *s, bool is_scalar, bool is_q,
                 la_vssrlni_wu_d(vreg, vreg_n, shift);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         } else {
             if (!is_u_narrow) {
@@ -12119,10 +12258,12 @@ static void handle_vec_simd_sqshrn(DisasContext *s, bool is_scalar, bool is_q,
                     la_vssrani_w_d(vreg, vreg_n, shift);
                     break;
                 default:
-                    assert(0);
+                    lata_unallocated_encoding(s);
+                    return;
                 }
             } else {
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
                 switch (size) {
                 case 0:
                     la_vssrani_bu_h(vreg, vreg_n, shift);
@@ -12134,7 +12275,8 @@ static void handle_vec_simd_sqshrn(DisasContext *s, bool is_scalar, bool is_q,
                     la_vssrani_wu_d(vreg, vreg_n, shift);
                     break;
                 default:
-                    assert(0);
+                    lata_unallocated_encoding(s);
+                    return;
                 }
             }
         }
@@ -12270,7 +12412,8 @@ static void handle_simd_intfp_conv(DisasContext *s, int rd, int rn,
             }
             break;
         case MO_16:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
             break;
         default:
             g_assert_not_reached();
@@ -12349,7 +12492,8 @@ static void handle_simd_shift_fpint_conv(DisasContext *s, bool is_scalar,
                                          bool is_q, bool is_u,
                                          int immh, int immb, int rn, int rd)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 /* AdvSIMD scalar shift by immediate
@@ -12440,7 +12584,8 @@ static void disas_simd_scalar_shift_imm(DisasContext *s, uint32_t insn)
  */
 static void disas_simd_scalar_three_reg_diff(DisasContext *s, uint32_t insn)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 static void handle_3same_64(DisasContext *s, int opcode, bool u,
@@ -12548,13 +12693,16 @@ static void handle_3same_64(DisasContext *s, int opcode, bool u,
         la_vinsgr2vr_d(vreg_d, zero_ir2_opnd, 1);
         break;
     case 0x9: /* SQSHL, UQSHL */
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         break;
     case 0xa: /* SRSHL, URSHL */
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         break;
     case 0xb: /* SQRSHL, UQRSHL */
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         break;
     case 0xf: /* SABA, UABA */
         /*
@@ -13225,7 +13373,8 @@ static void disas_simd_scalar_three_reg_same(DisasContext *s, uint32_t insn)
         }
         break;
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 
     if (!fp_access_check(s))
@@ -13239,7 +13388,8 @@ static void disas_simd_scalar_three_reg_same(DisasContext *s, uint32_t insn)
     }
     else
     {
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 }
 
@@ -13254,7 +13404,8 @@ static void disas_simd_scalar_three_reg_same(DisasContext *s, uint32_t insn)
 static void disas_simd_scalar_three_reg_same_fp16(DisasContext *s,
                                                   uint32_t insn)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 /* AdvSIMD scalar three same extra
@@ -13266,7 +13417,8 @@ static void disas_simd_scalar_three_reg_same_fp16(DisasContext *s,
 static void disas_simd_scalar_three_reg_same_extra(DisasContext *s,
                                                    uint32_t insn)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 static void handle_2misc_64(DisasContext *s, int opcode, bool u,
@@ -13313,7 +13465,8 @@ static void handle_2misc_64(DisasContext *s, int opcode, bool u,
         la_vftintrm_l_d(*vreg_d, *vreg_n);
         break;
     case 0x1c: /* FCVTAS */
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         break;
     case 0x3a: /* FCVTPS */
         la_vftintrp_l_d(*vreg_d, *vreg_n);
@@ -13406,7 +13559,8 @@ static void handle_2misc_fcmp_zero(DisasContext *s, int opcode,
 
         if (size == MO_16)
         {
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
             switch (opcode)
             {
             case 0x2e: /* FCMLT (zero) */
@@ -13572,7 +13726,8 @@ static void handle_2misc_narrow(DisasContext *s, bool scalar, int opcode,
                 la_vpickev_w(vreg_d, vtemp, vtemp1);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         } else {
             if (!is_q) {
@@ -13590,7 +13745,8 @@ static void handle_2misc_narrow(DisasContext *s, bool scalar, int opcode,
                     la_vpickev_d(vreg_d, vtemp, vreg_n);
                     break;
                 default:
-                    assert(0);
+                    lata_unallocated_encoding(s);
+                    return;
                 }
             } else {
                 switch (size) {
@@ -13611,7 +13767,8 @@ static void handle_2misc_narrow(DisasContext *s, bool scalar, int opcode,
                     la_vpickev_d(vreg_d, vtemp, vreg_d);
                     break;
                 default:
-                    assert(0);
+                    lata_unallocated_encoding(s);
+                    return;
                 }
             }
         }
@@ -13635,7 +13792,8 @@ static void handle_2misc_narrow(DisasContext *s, bool scalar, int opcode,
                 la_vpickev_w(narrow, vtemp, vtemp1);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         } else {
             switch (size) {
@@ -13652,7 +13810,8 @@ static void handle_2misc_narrow(DisasContext *s, bool scalar, int opcode,
                 la_vpickev_w(narrow, vtemp, vtemp1);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         if (is_q) {
@@ -13695,14 +13854,16 @@ static void handle_2misc_narrow(DisasContext *s, bool scalar, int opcode,
         break;
     case 0x36: /* BFCVTN, BFCVTN2 */
     {
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
     break;
     case 0x56: /* FCVTXN, FCVTXN2 */
         /* 64 bit to 32 bit float conversion
          * with von Neumann rounding (round to odd)
          */
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         break;
     default:
         g_assert_not_reached();
@@ -13981,7 +14142,8 @@ static void disas_simd_scalar_two_reg_misc(DisasContext *s, uint32_t insn)
         }
         break;
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 
     if (!fp_access_check(s))
@@ -14046,7 +14208,8 @@ static void handle_vec_simd_shri(DisasContext *s, bool is_q, bool is_u,
                 la_vadd_d(vreg_d, vtemp1, vreg_d);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         } else {
             /* Shift count the same size as element size produces all sign.  */
@@ -14071,13 +14234,15 @@ static void handle_vec_simd_shri(DisasContext *s, bool is_q, bool is_u,
                 la_vadd_d(vreg_d, vtemp1, vreg_d);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         break;
 
     case 0x08: /* SRI */
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         break;
 
     case 0x00: /* SSHR / USHR */
@@ -14104,7 +14269,8 @@ static void handle_vec_simd_shri(DisasContext *s, bool is_q, bool is_u,
                 la_vsrli_d(vreg_d, vtemp, shift);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         else
@@ -14129,7 +14295,8 @@ static void handle_vec_simd_shri(DisasContext *s, bool is_q, bool is_u,
                 la_vsrai_d(vreg_d, vtemp, shift);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         break;
@@ -14155,7 +14322,8 @@ static void handle_vec_simd_shri(DisasContext *s, bool is_q, bool is_u,
                 la_vsrlri_d(vreg_d, vtemp, shift);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         } else {
             /* Shift count the same size as element size produces all sign.  */
@@ -14176,13 +14344,15 @@ static void handle_vec_simd_shri(DisasContext *s, bool is_q, bool is_u,
                 la_vsrari_d(vreg_d, vtemp, shift);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         break;
 
     case 0x06: /* SRSRA / URSRA (accum + rounding) */
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         break;
 
     default:
@@ -14323,7 +14493,8 @@ static void handle_vec_simd_wshli(DisasContext *s, bool is_q, bool is_u,
             la_vsllwil_du_wu(vreg_d, vtemp, shift);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
     }
     else
@@ -14340,7 +14511,8 @@ static void handle_vec_simd_wshli(DisasContext *s, bool is_q, bool is_u,
             la_vsllwil_d_w(vreg_d, vtemp, shift);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
     }
 
@@ -14415,7 +14587,8 @@ static void handle_vec_simd_shrn(DisasContext *s, bool is_q,
             la_vsrln_w_d(vtemp, vtemp, vtemp2);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
         la_vpickev_d(vreg_d, vtemp, vreg_d);
     }
@@ -14457,7 +14630,8 @@ static void handle_vec_simd_shrn(DisasContext *s, bool is_q,
             la_vsrln_w_d(vreg_d, vtemp, vtemp2);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
     }
 
@@ -14544,7 +14718,8 @@ static void disas_simd_shift_imm(DisasContext *s, uint32_t insn)
         handle_simd_shift_fpint_conv(s, false, is_q, is_u, immh, immb, rn, rd);
         return;
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 }
 
@@ -14701,7 +14876,8 @@ static void handle_3rd_widening(DisasContext *s, int is_q, int is_u, int size,
                     la_vmaddwev_q_d(vreg_d, vtemp, vtemp1);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         } else {
             /* 高位统一移至偶数位后做偶数位的相乘并拓2倍宽 */
@@ -14743,7 +14919,8 @@ static void handle_3rd_widening(DisasContext *s, int is_q, int is_u, int size,
                     la_vmaddwev_q_d(vreg_d, vtemp, vtemp1);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         break;
@@ -14775,7 +14952,8 @@ static void handle_3rd_widening(DisasContext *s, int is_q, int is_u, int size,
                 la_vmulwev_q_d(vreg_d, vtemp, vtemp1);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         else
@@ -14804,7 +14982,8 @@ static void handle_3rd_widening(DisasContext *s, int is_q, int is_u, int size,
                 la_vmulwev_q_d(vreg_d, vtemp, vtemp1);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         break;
@@ -14956,7 +15135,8 @@ static void handle_3rd_widening(DisasContext *s, int is_q, int is_u, int size,
                     la_vadd_q(vreg_d, vtemp, vtemp1);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         else
@@ -14997,7 +15177,8 @@ static void handle_3rd_widening(DisasContext *s, int is_q, int is_u, int size,
                     la_vadd_q(vreg_d, vtemp, vtemp1);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
 
@@ -15103,7 +15284,8 @@ static void handle_3rd_widening(DisasContext *s, int is_q, int is_u, int size,
                     la_vmaddwev_q_du(vreg_d, vtemp, vtemp1);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         else
@@ -15156,7 +15338,8 @@ static void handle_3rd_widening(DisasContext *s, int is_q, int is_u, int size,
                     la_vmaddwev_q_du(vreg_d, vtemp, vtemp1);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
 
@@ -15189,7 +15372,8 @@ static void handle_3rd_widening(DisasContext *s, int is_q, int is_u, int size,
                 la_vmulwev_q_du(vreg_d, vtemp, vtemp1);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         else
@@ -15218,7 +15402,8 @@ static void handle_3rd_widening(DisasContext *s, int is_q, int is_u, int size,
                 la_vmulwev_q_du(vreg_d, vtemp, vtemp1);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
 
@@ -15291,7 +15476,8 @@ static void handle_3rd_wide(DisasContext *s, int is_q, int is_u, int size,
                 la_vadd_q(vreg_d, vreg_n, vtemp);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
     }
     /* USUBW/USUBW2 */
@@ -15329,7 +15515,8 @@ static void handle_3rd_wide(DisasContext *s, int is_q, int is_u, int size,
                 la_vadd_q(vreg_d, vreg_n, vtemp);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
     }
 
@@ -15371,7 +15558,8 @@ static void handle_3rd_narrowing(DisasContext *s, int is_q, int is_u, int size,
             la_vadd_d(vtemp, vreg_n, vreg_m);
         break;
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 
     if(is_u) {/* RADDHN, RADDHN2, RSUBHN, RSUBHN2 */
@@ -15419,7 +15607,8 @@ static void handle_3rd_narrowing(DisasContext *s, int is_q, int is_u, int size,
             la_vpickev_w(vtemp, vtemp, vtemp);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
         la_vpickev_d(vreg_d, vtemp, vreg_d);
     } else {
@@ -15435,7 +15624,8 @@ static void handle_3rd_narrowing(DisasContext *s, int is_q, int is_u, int size,
             la_vpickev_w(vreg_d, vtemp, vtemp);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }        
     }
 
@@ -15519,7 +15709,8 @@ static void disas_simd_three_reg_diff(DisasContext *s, uint32_t insn)
             {
                 return;
             }
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
             break;
 
         case 3: /* PMULL.P64 */
@@ -15532,7 +15723,8 @@ static void disas_simd_three_reg_diff(DisasContext *s, uint32_t insn)
             {
                 return;
             }
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
             break;
 
         default:
@@ -15702,7 +15894,8 @@ static void handle_simd_3same_pair(DisasContext *s, int is_q, int u, int opcode,
             la_vadd_d(vreg_d, vtemp, vtemp1);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
 
         if (!is_q)
@@ -15758,7 +15951,8 @@ static void handle_simd_3same_pair(DisasContext *s, int is_q, int u, int opcode,
             }
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
 
         /* move vector to the lower*/
@@ -15814,7 +16008,8 @@ static void handle_simd_3same_pair(DisasContext *s, int is_q, int u, int opcode,
             }
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
 
         /* move vector to the lower*/
@@ -15890,7 +16085,8 @@ static void handle_simd_3same_pair(DisasContext *s, int is_q, int u, int opcode,
             la_vfadd_d(vreg_d, vtemp, vtemp1);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
 
         if (!is_q)
@@ -15993,12 +16189,14 @@ static void disas_simd_3same_float(DisasContext *s, uint32_t insn)
         }
         if (fp_access_check(s))
         {
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
         return;
 
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 }
 
@@ -16148,7 +16346,8 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
                 la_vsub_d(vtemp, vreg_n, vreg_m);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         } else {
             switch (size) {
@@ -16169,7 +16368,8 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
                 la_vsub_d(vtemp, vreg_n, vreg_m);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         la_vseq_d(vtemp, vtemp1, vtemp);
@@ -16361,7 +16561,8 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
 
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
 
         goto do_gvec_end;
@@ -16399,7 +16600,8 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
             }
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
         goto do_gvec_end;
     case 0x0d: /* SMIN, UMIN */
@@ -16436,7 +16638,8 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
             }
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
         goto do_gvec_end;
     case 0xe: /* SABD, UABD */
@@ -16577,7 +16780,8 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
             }
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
         goto do_gvec_end;
     case 0x13: /* MUL, PMUL */
@@ -16598,12 +16802,14 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
                 la_vmul_d(vreg_d, vreg_n, vreg_m);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         else
         { /* PMUL */
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
         goto do_gvec_end;
     case 0x12: /* MLA, MLS */
@@ -16651,7 +16857,8 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
             }
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
         goto do_gvec_end;
     case 0x16: /* SQDMULH, SQRDMULH */
@@ -16673,7 +16880,8 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
                 la_vssrarni_w_d(vreg_d, vreg_d, 32);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         } else {
             switch (size) {
@@ -16692,7 +16900,8 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
                 la_vssrani_w_d(vreg_d, vreg_d, 32);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         goto do_gvec_end;
@@ -16714,7 +16923,8 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
                 la_vseq_d(vreg_d, vreg_n, vreg_m);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         else
@@ -16735,7 +16945,8 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
                 la_vseqi_d(vreg_d, vreg_d, 0);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
             la_vnori_b(vreg_d, vreg_d, 0);
         }
@@ -16758,7 +16969,8 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
                 la_vslt_du(vreg_d, vreg_m, vreg_n);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         else
@@ -16778,7 +16990,8 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
                 la_vslt_d(vreg_d, vreg_m, vreg_n);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         goto do_gvec_end;
@@ -16800,7 +17013,8 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
                 la_vsle_du(vreg_d, vreg_m, vreg_n);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         else
@@ -16820,7 +17034,8 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
                 la_vsle_d(vreg_d, vreg_m, vreg_n);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
     do_gvec_end:
@@ -17021,7 +17236,8 @@ static void disas_simd_three_reg_same(DisasContext *s, uint32_t insn)
  */
 static void disas_simd_three_reg_same_fp16(DisasContext *s, uint32_t insn)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 /* AdvSIMD three same extra
@@ -17032,7 +17248,8 @@ static void disas_simd_three_reg_same_fp16(DisasContext *s, uint32_t insn)
  */
 static void disas_simd_three_reg_same_extra(DisasContext *s, uint32_t insn)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 static void handle_2misc_widening(DisasContext *s, int opcode, bool is_q,
@@ -17059,7 +17276,8 @@ static void handle_2misc_widening(DisasContext *s, int opcode, bool is_q,
     else
     {
         /* 16 -> 32 bit fp conversion */
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 
     store_fpr_dst(rd, vreg_d);
@@ -17133,7 +17351,8 @@ static void handle_rev(DisasContext *s, int opcode, bool u,
         }
         break;
     case 2: /* REV16 */
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         break;
     }
 
@@ -17180,7 +17399,8 @@ static void handle_2misc_pairwise(DisasContext *s, int opcode, bool u,
                 la_vadd_d(vreg_d, vreg_d, vtemp);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         else
@@ -17200,7 +17420,8 @@ static void handle_2misc_pairwise(DisasContext *s, int opcode, bool u,
                 la_vadd_d(vreg_d, vreg_d, vtemp);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         free_alloc_gpr(vtemp);
@@ -17222,7 +17443,8 @@ static void handle_2misc_pairwise(DisasContext *s, int opcode, bool u,
                 la_vhaddw_du_wu(vreg_d, vreg_n, vreg_n);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
         else
@@ -17239,7 +17461,8 @@ static void handle_2misc_pairwise(DisasContext *s, int opcode, bool u,
                 la_vhaddw_d_w(vreg_d, vreg_n, vreg_n);
                 break;
             default:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             }
         }
     }
@@ -17273,7 +17496,8 @@ static void handle_shll(DisasContext *s, bool is_q, int size, int rn, int rd)
             la_vilvl_w(vreg_d, vreg_n, vtemp);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
     } else {
         switch (size) {
@@ -17287,7 +17511,8 @@ static void handle_shll(DisasContext *s, bool is_q, int size, int rn, int rd)
             la_vilvh_w(vreg_d, vreg_n, vtemp);
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
     }
 
@@ -17605,7 +17830,8 @@ static void disas_simd_two_reg_misc(DisasContext *s, uint32_t insn)
         break;
     }
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 
     if (!fp_access_check(s))
@@ -17904,7 +18130,8 @@ static void disas_simd_two_reg_misc(DisasContext *s, uint32_t insn)
                 la_vftintrm_w_s(vreg_d, vreg_n);
                 break;
             case 0x1c: /* FCVTAS */
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
                 break;
             case 0x3a: /* FCVTPS */
                 la_vftintrp_w_s(vreg_d, vreg_n);
@@ -17964,7 +18191,8 @@ static void disas_simd_two_reg_misc(DisasContext *s, uint32_t insn)
             case 0x5: /* CNT, RBIT */
                 if (u)
                 { // RBIT
-                    assert(0);
+                    lata_unallocated_encoding(s);
+                    return;
                 }
                 else
                 { // CNT
@@ -18017,7 +18245,8 @@ static void disas_simd_two_reg_misc(DisasContext *s, uint32_t insn)
                 break;
             }
             case 0x4: /* CLS, CLZ */
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
             default:
                 g_assert_not_reached();
             }
@@ -18050,7 +18279,8 @@ static void disas_simd_two_reg_misc(DisasContext *s, uint32_t insn)
  */
 static void disas_simd_two_reg_misc_fp16(DisasContext *s, uint32_t insn)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 /* AdvSIMD scalar x indexed element
@@ -18202,7 +18432,8 @@ static void disas_simd_indexed(DisasContext *s, uint32_t insn)
         /* is_fp, but we pass cpu_env not fp_status.  */
         break;
     default:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
 
     switch (is_fp)
@@ -18351,7 +18582,8 @@ static void disas_simd_indexed(DisasContext *s, uint32_t insn)
         return;
     }
     case 0x0f:
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
         switch (extract32(insn, 22, 2))
         {
         case 0: /* SUDOT */
@@ -18369,7 +18601,8 @@ static void disas_simd_indexed(DisasContext *s, uint32_t insn)
     case 0x15: /* FCMLA #180 */
     case 0x17: /* FCMLA #270 */
     {
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
         return;
 
@@ -18378,7 +18611,8 @@ static void disas_simd_indexed(DisasContext *s, uint32_t insn)
     case 0x18: /* FMLAL2 */
     case 0x1c: /* FMLSL2 */
     {
-        assert(0);
+        lata_unallocated_encoding(s);
+        return;
     }
         return;
 
@@ -18508,7 +18742,8 @@ static void disas_simd_indexed(DisasContext *s, uint32_t insn)
             switch (size)
             {
             case 1:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
                 break;
             case 2:
                 vreg_d = alloc_fpr_src(rd);
@@ -18525,7 +18760,8 @@ static void disas_simd_indexed(DisasContext *s, uint32_t insn)
             switch (size)
             {
             case 1:
-                assert(0);
+                lata_unallocated_encoding(s);
+                return;
                 break;
             case 2:
                 vreg_d = alloc_fpr_src(rd);
@@ -18714,7 +18950,8 @@ static void disas_simd_indexed(DisasContext *s, uint32_t insn)
                             la_vmaddwev_d_wu(vreg_d, vtemp1, vtemp);
                         break;
                     default:
-                        assert(0);
+                        lata_unallocated_encoding(s);
+                        return;
                     }
                 } else {
                     switch (size) {
@@ -18739,7 +18976,8 @@ static void disas_simd_indexed(DisasContext *s, uint32_t insn)
                             la_vmaddwev_d_wu(vreg_d, vtemp1, vtemp);
                         break;
                     default:
-                        assert(0);
+                        lata_unallocated_encoding(s);
+                        return;
                     }
                 }
             } else {
@@ -18766,7 +19004,8 @@ static void disas_simd_indexed(DisasContext *s, uint32_t insn)
                             la_vmaddwev_d_w(vreg_d, vtemp1, vtemp);
                         break;
                     default:
-                        assert(0);
+                        lata_unallocated_encoding(s);
+                        return;
                     }
                 } else {
                     switch (size) {
@@ -18791,7 +19030,8 @@ static void disas_simd_indexed(DisasContext *s, uint32_t insn)
                             la_vmaddwev_d_w(vreg_d, vtemp1, vtemp);
                         break;
                     default:
-                        assert(0);
+                        lata_unallocated_encoding(s);
+                        return;
                     }
                 }
             }
@@ -18840,7 +19080,8 @@ static void disas_simd_indexed(DisasContext *s, uint32_t insn)
             }
             break;
         default:
-            assert(0);
+            lata_unallocated_encoding(s);
+            return;
         }
     }
 do_gvec_end:
@@ -18869,7 +19110,8 @@ do_gvec_end:
  */
 static void disas_crypto_aes(DisasContext *s, uint32_t insn)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 /* Crypto three-reg SHA
@@ -18880,7 +19122,8 @@ static void disas_crypto_aes(DisasContext *s, uint32_t insn)
  */
 static void disas_crypto_three_reg_sha(DisasContext *s, uint32_t insn)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 /* Crypto two-reg SHA
@@ -18891,7 +19134,8 @@ static void disas_crypto_three_reg_sha(DisasContext *s, uint32_t insn)
  */
 static void disas_crypto_two_reg_sha(DisasContext *s, uint32_t insn)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 /* Crypto three-reg SHA512
@@ -18902,7 +19146,8 @@ static void disas_crypto_two_reg_sha(DisasContext *s, uint32_t insn)
  */
 static void disas_crypto_three_reg_sha512(DisasContext *s, uint32_t insn)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 /* Crypto two-reg SHA512
@@ -18913,7 +19158,8 @@ static void disas_crypto_three_reg_sha512(DisasContext *s, uint32_t insn)
  */
 static void disas_crypto_two_reg_sha512(DisasContext *s, uint32_t insn)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 /* Crypto four-register
@@ -18924,7 +19170,8 @@ static void disas_crypto_two_reg_sha512(DisasContext *s, uint32_t insn)
  */
 static void disas_crypto_four_reg(DisasContext *s, uint32_t insn)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 /* Crypto XAR
@@ -18935,7 +19182,8 @@ static void disas_crypto_four_reg(DisasContext *s, uint32_t insn)
  */
 static void disas_crypto_xar(DisasContext *s, uint32_t insn)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 /* Crypto three-reg imm2
@@ -18946,7 +19194,8 @@ static void disas_crypto_xar(DisasContext *s, uint32_t insn)
  */
 static void disas_crypto_three_reg_imm2(DisasContext *s, uint32_t insn)
 {
-    assert(0);
+    lata_unallocated_encoding(s);
+    return;
 }
 
 /* C3.6 Data processing - SIMD, inc Crypto
