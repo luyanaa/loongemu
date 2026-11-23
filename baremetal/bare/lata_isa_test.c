@@ -7537,6 +7537,54 @@ cun_probe_done:;
         lata_guest_mem_clear_fault_regions(&env);
     }
 
+    /* The FP trap check lives in the shared exit stub, so scalar and NEON FP
+     * operations take it too. */
+    {
+        static uint32_t fdiv_ss[] __attribute__((aligned(16))) = {
+            0x1e221820u, /* fdiv s0, s1, s2 */
+        };
+        static uint32_t fadd_v[] __attribute__((aligned(16))) = {
+            0x4e22d420u, /* fadd v0.4s, v1.4s, v2.4s */
+        };
+
+        /* Scalar 0/0 is invalid; with IOE set it must trap. */
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.vfp.xregs[0] = UINT64_C(1) << 8; /* FPCR.IOE */
+        write_le32(arm_sve_zreg(&env, 1), 0x00000000u);
+        write_le32(arm_sve_zreg(&env, 2), 0x00000000u);
+        check(sve_run_a64_tb(fdiv_ss, 1, 128, 0x0fu, false, "scalar 0/0 + IOE"),
+              1, "scalar 0/0 runs");
+        check(env.sve_ctrl.last_exception_index, EXCP_AA64_FPTRAP,
+              "scalar FP trap is recorded");
+        check(env.sve_ctrl.last_exception_syndrome, (uint32_t)(0x2C << 26) | 1u,
+              "scalar FP trap carries FSC=invalid");
+
+        /* NEON sNaN with IOE set traps as well. */
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.vfp.xregs[0] = UINT64_C(1) << 8;
+        for (size_t l = 0; l < 4; ++l) {
+            write_le32(arm_sve_zreg(&env, 1) + l * 4u, 0x3f800000u);
+            write_le32(arm_sve_zreg(&env, 2) + l * 4u, 0x7f800001u); /* sNaN */
+        }
+        check(sve_run_a64_tb(fadd_v, 1, 128, 0x0fu, false, "NEON sNaN + IOE"),
+              1, "NEON sNaN runs");
+        check(env.sve_ctrl.last_exception_index, EXCP_AA64_FPTRAP,
+              "NEON FP trap is recorded");
+        check(env.sve_ctrl.last_exception_syndrome, (uint32_t)(0x2C << 26) | 1u,
+              "NEON FP trap carries FSC=invalid");
+
+        /* And without IOE nothing is recorded. */
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.vfp.xregs[0] = 0;
+        for (size_t l = 0; l < 4; ++l) {
+            write_le32(arm_sve_zreg(&env, 1) + l * 4u, 0x3f800000u);
+            write_le32(arm_sve_zreg(&env, 2) + l * 4u, 0x7f800001u);
+        }
+        (void)sve_run_a64_tb(fadd_v, 1, 128, 0x0fu, false, "NEON sNaN no IOE");
+        check(env.sve_ctrl.last_exception_index, 0,
+              "NEON without IOE does not trap");
+    }
+
     latx_bare_uart_puts("lata-isa: checks=");
     putdec((uint64_t)checks);
     latx_bare_uart_puts(" fails=");
