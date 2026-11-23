@@ -6949,6 +6949,54 @@ void kmain(void)
         lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
     }
 
+    /* SIMD access under the same policy: admitted spans use the native vector
+     * form, denied ones fall back to the provider. */
+    {
+        static uint32_t ldr_q[] __attribute__((aligned(16))) = {
+            0x3dc00022u, /* ldr q2, [x1] */
+        };
+        static uint32_t str_q[] __attribute__((aligned(16))) = {
+            0x3d800020u, /* str q0, [x1] */
+        };
+        static uint8_t vbuf[16] __attribute__((aligned(16)));
+
+        for (size_t i = 0; i < 16; ++i) vbuf[i] = (uint8_t)(0x90u + i);
+        policy_base = (uint64_t)(uintptr_t)vbuf;
+
+        /* Admitted 16-byte span. */
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[1] = (uint64_t)(uintptr_t)vbuf;
+        prov_loads = 0;
+        policy_calls = 0;
+        lata_guest_mem_clear_fault_regions(&env);
+        lata_set_guest_mem_ops(&prov_policy_ops);
+        check(sve_run_a64_tb(ldr_q, 1, 128, 0x0fu, false, "policy SIMD admitted"),
+              1, "admitted SIMD span runs");
+        check(read_le64(arm_sve_zreg(&env, 2)), UINT64_C(0x9796959493929190),
+              "admitted SIMD span loads natively");
+        check(policy_calls >= 1, 1, "SIMD admission consults the policy");
+
+        /* Denied: address outside the policy span. */
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[1] = (uint64_t)(uintptr_t)(vbuf + 8);
+        prov_loads = 0;
+        (void)sve_run_a64_tb(ldr_q, 1, 128, 0x0fu, false, "policy SIMD denied");
+        check(prov_loads >= 1, 1, "denied SIMD span uses the provider");
+        check(read_le64(arm_sve_zreg(&env, 2)), UINT64_C(0x9f9e9d9c9b9a9998),
+              "denied SIMD span still loads the right bytes");
+
+        /* Store side. */
+        for (size_t i = 0; i < 16; ++i) vbuf[i] = 0;
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        for (size_t i = 0; i < 16; ++i) arm_sve_zreg(&env, 0)[i] = (uint8_t)(0xa0u + i);
+        env.xregs[1] = (uint64_t)(uintptr_t)vbuf;
+        prov_stores = 0;
+        (void)sve_run_a64_tb(str_q, 1, 128, 0x0fu, false, "policy SIMD store");
+        check(read_le64(vbuf), UINT64_C(0xa7a6a5a4a3a2a1a0),
+              "admitted SIMD store writes natively");
+        lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
+    }
+
     latx_bare_uart_puts("lata-isa: checks=");
     putdec((uint64_t)checks);
     latx_bare_uart_puts(" fails=");

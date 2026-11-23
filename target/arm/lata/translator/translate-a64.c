@@ -3523,6 +3523,84 @@ static void lata_emit_scalar_span_admission(IR2_OPND addr_reg, int64_t offset,
     la_bnez(t2_ir2_opnd, admitted);
 }
 
+/* Native SIMD load/store forms, shared by the identity path and the
+ * run-time admitted span of a direct policy. */
+static void lata_emit_vec_native_load(DisasContext *s, IR2_OPND vreg_t,
+                                      IR2_OPND reg_n, uint64_t offset,
+                                      uint64_t sz)
+{
+    IR2_OPND temp = ra_alloc_itemp();
+
+    switch (sz)
+    {
+    case 0:
+        la_vxor_v(vreg_t, vreg_t, vreg_t);
+        la_ld_bu(temp, reg_n, offset);
+        la_vinsgr2vr_b(vreg_t, temp, 0);
+        break;
+    case 1:
+        la_vxor_v(vreg_t, vreg_t, vreg_t);
+        la_ld_hu(temp, reg_n, offset);
+        la_vinsgr2vr_h(vreg_t, temp, 0);
+        break;
+    case 2:
+        la_fld_s(vreg_t, reg_n, offset);
+        la_vand_v(vreg_t, vreg_t, fsmask_ir2_opnd);
+        break;
+    case 3:
+        la_fld_d(vreg_t, reg_n, offset);
+        la_vinsgr2vr_d(vreg_t, zero_ir2_opnd, 1);
+        break;
+    case 4:
+        la_vld(vreg_t, reg_n, offset);
+        break;
+    default:
+        lata_unallocated_encoding(s);
+        break;
+    }
+    free_alloc_gpr(temp);
+}
+
+static void lata_emit_vec_native_store(DisasContext *s, IR2_OPND vreg_t,
+                                       IR2_OPND reg_n, uint64_t offset,
+                                       uint64_t sz)
+{
+    IR2_OPND temp = ra_alloc_itemp();
+
+    switch (sz)
+    {
+    case 0:
+        if (offset) {
+            la_addi_d(temp, reg_n, offset);
+            la_vstelm_b(vreg_t, temp, 0, 0);
+        } else {
+            la_vstelm_b(vreg_t, reg_n, 0, 0);
+        }
+        break;
+    case 1:
+        if (offset) {
+            la_addi_d(temp, reg_n, offset);
+            la_vstelm_h(vreg_t, temp, 0, 0);
+        } else {
+            la_vstelm_h(vreg_t, reg_n, 0, 0);
+        }
+        break;
+    case 2:
+        la_fst_s(vreg_t, reg_n, offset);
+        break;
+    case 3:
+        la_fst_d(vreg_t, reg_n, offset);
+        break;
+    case 4:
+        la_vst(vreg_t, reg_n, offset);
+        break;
+    default:
+        lata_unallocated_encoding(s);
+        break;
+    }
+    free_alloc_gpr(temp);
+}
+
 static void assist_trans_STR_i(DisasContext *s, IR2_OPND *reg_t, IR2_OPND *reg_n, uint64_t offset, uint64_t sz)
 {
     if (!lata_guest_mem_inline_host_access_ok())
@@ -3837,50 +3915,27 @@ static void assist_trans_STR_v_i(DisasContext *s, IR2_OPND *vreg_t, IR2_OPND *re
 {
     if (!lata_guest_mem_inline_host_access_ok())
     {
+        if (lata_guest_mem_direct_available())
+        {
+            IR2_OPND admitted = ir2_opnd_new_type(IR2_OPND_LABEL);
+            IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
+
+            lata_emit_scalar_span_admission(*reg_n, (int64_t)offset,
+                                            (size_t)1u << sz, true, admitted);
+            lata_emit_guest_mem_store_bulk(s, *vreg_t, *reg_n, (int64_t)offset,
+                                           (size_t)1u << sz);
+            la_b(done);
+            la_label(admitted);
+            lata_emit_vec_native_store(s, *vreg_t, *reg_n, offset, sz);
+            la_label(done);
+            return;
+        }
         lata_emit_guest_mem_store_bulk(s, *vreg_t, *reg_n, (int64_t)offset,
                                        (size_t)1u << sz);
         return;
     }
     lata_emit_guest_mem_probe(s, *reg_n, (int64_t)offset, (size_t)1u << sz, true, vreg_t);
-    IR2_OPND temp = ra_alloc_itemp();
-    switch (sz)
-    {
-    case 0:
-        if (offset)
-        {
-            la_addi_d(temp, *reg_n, offset);
-            la_vstelm_b(*vreg_t, temp, 0, 0);
-        }
-        else
-        {
-            la_vstelm_b(*vreg_t, *reg_n, 0, 0);
-        }
-        break;
-    case 1:
-        if (offset)
-        {
-            la_addi_d(temp, *reg_n, offset);
-            la_vstelm_h(*vreg_t, temp, 0, 0);
-        }
-        else
-        {
-            la_vstelm_h(*vreg_t, *reg_n, 0, 0);
-        }
-        break;
-    case 2:
-        la_fst_s(*vreg_t, *reg_n, offset);
-        break;
-    case 3:
-        la_fst_d(*vreg_t, *reg_n, offset);
-        break;
-    case 4:
-        la_vst(*vreg_t, *reg_n, offset);
-        break;
-    default:
-        lata_unallocated_encoding(s);
-        return;
-    }
-    free_alloc_gpr(temp);
+    lata_emit_vec_native_store(s, *vreg_t, *reg_n, offset, sz);
 }
 
 static bool trans_STR_v_i(DisasContext *s)
@@ -3945,41 +4000,27 @@ static void assist_trans_LDR_v_i(DisasContext *s, IR2_OPND *vreg_t, IR2_OPND *re
 {
     if (!lata_guest_mem_inline_host_access_ok())
     {
+        if (lata_guest_mem_direct_available())
+        {
+            IR2_OPND admitted = ir2_opnd_new_type(IR2_OPND_LABEL);
+            IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
+
+            lata_emit_scalar_span_admission(*reg_n, (int64_t)offset,
+                                            (size_t)1u << sz, false, admitted);
+            lata_emit_guest_mem_load_bulk(s, *vreg_t, *reg_n, (int64_t)offset,
+                                          (size_t)1u << sz);
+            la_b(done);
+            la_label(admitted);
+            lata_emit_vec_native_load(s, *vreg_t, *reg_n, offset, sz);
+            la_label(done);
+            return;
+        }
         lata_emit_guest_mem_load_bulk(s, *vreg_t, *reg_n, (int64_t)offset,
                                       (size_t)1u << sz);
         return;
     }
     lata_emit_guest_mem_probe(s, *reg_n, (int64_t)offset, (size_t)1u << sz, false, NULL);
-    IR2_OPND temp = ra_alloc_itemp();
-    switch (sz)
-    {
-    case 0:
-        la_vxor_v(*vreg_t, *vreg_t, *vreg_t);
-        la_ld_bu(temp, *reg_n, offset);
-        la_vinsgr2vr_b(*vreg_t, temp, 0);
-        break;
-    case 1:
-        la_vxor_v(*vreg_t, *vreg_t, *vreg_t);
-        la_ld_hu(temp, *reg_n, offset);
-        la_vinsgr2vr_h(*vreg_t, temp, 0);
-        break;
-    case 2:
-        la_fld_s(*vreg_t, *reg_n, offset);
-        la_vand_v(*vreg_t, *vreg_t, fsmask_ir2_opnd);
-        break;
-    case 3:
-        la_fld_d(*vreg_t, *reg_n, offset);
-        /* 高64位清零 */
-        la_vinsgr2vr_d(*vreg_t, zero_ir2_opnd, 1);
-        break;
-    case 4:
-        la_vld(*vreg_t, *reg_n, offset);
-        break;
-    default:
-        lata_unallocated_encoding(s);
-        return;
-    }
-    free_alloc_gpr(temp);
+    lata_emit_vec_native_load(s, *vreg_t, *reg_n, offset, sz);
 }
 
 static bool trans_LDR_v_i(DisasContext *s)
