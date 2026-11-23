@@ -7,6 +7,7 @@
 #include "qemu/osdep.h"
 #include "translate.h"
 #include "ir1.h"
+#define LATM_REGCACHE_WRAP
 #include "latm.h"
 #include "reg-alloc.h"
 #include "env.h"

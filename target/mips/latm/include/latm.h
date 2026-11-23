@@ -37,6 +37,19 @@ struct LatmTbInsnMap {
     LatmTbInsnSpan spans[LATM_TB_MAP_MAX];
 };
 
+typedef struct LatmRegCacheEntry {
+    int8_t temp;
+    uint8_t valid;
+    uint8_t dirty;
+    uint64_t age;
+} LatmRegCacheEntry;
+
+typedef struct LatmRegCache {
+    LatmRegCacheEntry gpr[32];
+    uint8_t itemp_borrows[3];
+    uint64_t clock;
+} LatmRegCache;
+
 typedef struct TRANSLATION_DATA {
     void *curr_tb;
 
@@ -69,6 +82,7 @@ typedef struct TRANSLATION_DATA {
             uint16 ftemp_status;
         };
     };
+    LatmRegCache regcache;
 } TRANSLATION_DATA;
 
 typedef struct ENV {
@@ -181,5 +195,101 @@ IR2_OPND alloc_fpr_src(int i);
 IR2_OPND alloc_fpr_dst(int i);
 void store_fpr_dst(int i, IR2_OPND opnd);
 void free_alloc_fpr(IR2_OPND opnd);
+
+/* TB-local cache for env-resident MIPS GPRs. */
+void latm_regcache_reset(void);
+void latm_regcache_flush(void);
+bool latm_regcache_evict_itemp(void);
+
+/* Commit cached GPRs across control-flow edges and indirect exits. */
+static inline IR2_INST *latm_regcache_label(IR2_OPND label)
+{
+    latm_regcache_flush();
+    return (la_label)(label);
+}
+
+static inline IR2_INST *latm_regcache_jirl(IR2_OPND rd, IR2_OPND rj,
+                                            int offset)
+{
+    latm_regcache_flush();
+    return (la_jirl)(rd, rj, offset);
+}
+
+static inline IR2_INST *latm_regcache_b(IR2_OPND label)
+{
+    latm_regcache_flush();
+    return (la_b)(label);
+}
+
+static inline IR2_INST *latm_regcache_beqz(IR2_OPND reg, IR2_OPND label)
+{
+    latm_regcache_flush();
+    return (la_beqz)(reg, label);
+}
+
+static inline IR2_INST *latm_regcache_bnez(IR2_OPND reg, IR2_OPND label)
+{
+    latm_regcache_flush();
+    return (la_bnez)(reg, label);
+}
+
+static inline IR2_INST *latm_regcache_beq(IR2_OPND lhs, IR2_OPND rhs,
+                                           IR2_OPND label)
+{
+    latm_regcache_flush();
+    return (la_beq)(lhs, rhs, label);
+}
+
+static inline IR2_INST *latm_regcache_bne(IR2_OPND lhs, IR2_OPND rhs,
+                                           IR2_OPND label)
+{
+    latm_regcache_flush();
+    return (la_bne)(lhs, rhs, label);
+}
+
+static inline IR2_INST *latm_regcache_blt(IR2_OPND lhs, IR2_OPND rhs,
+                                           IR2_OPND label)
+{
+    latm_regcache_flush();
+    return (la_blt)(lhs, rhs, label);
+}
+
+static inline IR2_INST *latm_regcache_bge(IR2_OPND lhs, IR2_OPND rhs,
+                                           IR2_OPND label)
+{
+    latm_regcache_flush();
+    return (la_bge)(lhs, rhs, label);
+}
+
+static inline IR2_INST *latm_regcache_bltu(IR2_OPND lhs, IR2_OPND rhs,
+                                            IR2_OPND label)
+{
+    latm_regcache_flush();
+    return (la_bltu)(lhs, rhs, label);
+}
+
+static inline IR2_INST *latm_regcache_bgeu(IR2_OPND lhs, IR2_OPND rhs,
+                                            IR2_OPND label)
+{
+    latm_regcache_flush();
+    return (la_bgeu)(lhs, rhs, label);
+}
+
+#if defined(LATM_REGCACHE_WRAP)
+/* Opt-in macro shadow: only translator TUs that #define LATM_REGCACHE_WRAP
+ * before including this header get the flushing wrappers.  Shared emitter TUs
+ * (la-append.c via reg-alloc.h) must see the real la_* declarations. */
+#define la_label(label) latm_regcache_label(label)
+#define la_jirl(rd, rj, offset) latm_regcache_jirl(rd, rj, offset)
+#define la_b(label) latm_regcache_b(label)
+#define la_beqz(reg, label) latm_regcache_beqz(reg, label)
+#define la_bnez(reg, label) latm_regcache_bnez(reg, label)
+#define la_beq(lhs, rhs, label) latm_regcache_beq(lhs, rhs, label)
+#define la_bne(lhs, rhs, label) latm_regcache_bne(lhs, rhs, label)
+#define la_blt(lhs, rhs, label) latm_regcache_blt(lhs, rhs, label)
+#define la_bge(lhs, rhs, label) latm_regcache_bge(lhs, rhs, label)
+#define la_bltu(lhs, rhs, label) latm_regcache_bltu(lhs, rhs, label)
+#define la_bgeu(lhs, rhs, label) latm_regcache_bgeu(lhs, rhs, label)
+#endif
 
 #endif

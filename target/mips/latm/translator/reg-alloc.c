@@ -156,6 +156,10 @@ static int ra_alloc_temp_idx(uint16_t status, int max)
 
 IR2_OPND ra_alloc_itemp(void)
 {
+    uint16_t full = (uint16_t)((1u << itemp_status_num) - 1);
+    if ((lsenv->tr_data->itemp_status & full) == full) {
+        latm_regcache_evict_itemp();
+    }
     int idx = ra_alloc_temp_idx(lsenv->tr_data->itemp_status, 16);
     lsassertm(idx < (int)(sizeof(reg_itemp_map) / sizeof(int)),
               "out of IR2 itemps");
