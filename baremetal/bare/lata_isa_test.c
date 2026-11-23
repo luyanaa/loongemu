@@ -7585,6 +7585,39 @@ cun_probe_done:;
               "NEON without IOE does not trap");
     }
 
+    /* Trap delivery: the synchronous vector is VBAR_EL1 + 0x400. */
+    if (latx_cpu_has_lasx() != 0) {
+        static uint32_t msr_vbar[] __attribute__((aligned(16))) = {
+            0xd518c000u, /* msr VBAR_EL1, x0 */
+        };
+        DisasContext ds;
+        A64SVEPvirBuilder bs;
+
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[0] = UINT64_C(0x40000000);
+        check(sve_run_a64_tb(msr_vbar, 1, 128, 0x0fu, false, "MSR VBAR_EL1"),
+              1, "MSR VBAR_EL1 runs");
+        check(env.vbar_el1, UINT64_C(0x40000000), "VBAR_EL1 stores the vector");
+
+        sve_init_direct(&ds, &bs, 256);
+        env.vbar_el1 = UINT64_C(0x40000000);
+        env.vfp.xregs[0] = UINT64_C(1) << 8; /* FPCR.IOE */
+        arm_sve_preg(&env, 1)[0] = 0x11u;
+        arm_sve_preg(&env, 1)[1] = 0x11u;
+        arm_sve_preg(&env, 1)[2] = 0x11u;
+        arm_sve_preg(&env, 1)[3] = 0x11u;
+        for (size_t l = 0; l < 8; ++l) {
+            write_le32(arm_sve_zreg(&env, 0) + l * 4u, 0x3f800000u);
+            write_le32(arm_sve_zreg(&env, 2) + l * 4u, 0x7f800001u);
+        }
+        (void)sve_emit_decoded(&ds, 0x65808440u, "FADD z0.s trap delivery");
+        sve_exec_direct();
+        check(env.pc, UINT64_C(0x40000400),
+              "the trapped block resumes at VBAR_EL1 + 0x400");
+        check(env.sve_ctrl.last_exception_index, EXCP_AA64_FPTRAP,
+              "the trap is still recorded");
+    }
+
     latx_bare_uart_puts("lata-isa: checks=");
     putdec((uint64_t)checks);
     latx_bare_uart_puts(" fails=");

@@ -938,6 +938,16 @@ static void generate_context_switch_native_to_bt(void)
         la_or(t0_ir2_opnd, t0_ir2_opnd, t3_ir2_opnd);
         li_d(t1_ir2_opnd, env_offset(sve_ctrl.last_exception_syndrome));
         la_stx_w(t0_ir2_opnd, env_ir2_opnd, t1_ir2_opnd);
+        /*
+         * Delivery: resume at the synchronous exception vector
+         * (VBAR_EL1 + 0x400, lower-EL synchronous entry).  SPSR/PSTATE and the
+         * vector-group selection by EL are not modelled yet.
+         */
+        li_d(t1_ir2_opnd, env_offset(vbar_el1));
+        la_ldx_d(t0_ir2_opnd, env_ir2_opnd, t1_ir2_opnd);
+        la_addi_d(t0_ir2_opnd, t0_ir2_opnd, 0x400);
+        li_d(t1_ir2_opnd, env_offset_pc());
+        la_stx_d(t0_ir2_opnd, env_ir2_opnd, t1_ir2_opnd);
         la_label(no_trap);
     }
     /* store fcsr(rouding mode) to vfp.xregs[ARM_VFP_FPSCR] */

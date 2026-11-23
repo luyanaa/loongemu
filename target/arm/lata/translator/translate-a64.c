@@ -1713,6 +1713,12 @@ static const ARMCPRegInfo lata_fpcr_reginfo = {
     .fieldoffset = offsetof(CPUARMState, vfp.xregs[ARM_VFP_FPCR]),
 };
 
+static const ARMCPRegInfo lata_vbar_reginfo = {
+    .name = "VBAR_EL1",
+    .type = 0,
+    .fieldoffset = offsetof(CPUARMState, vbar_el1),
+};
+
 static const ARMCPRegInfo lata_fpsr_reginfo = {
     .name = "FPSR",
     .type = 0,
@@ -1731,6 +1737,9 @@ static const ARMCPRegInfo *lata_local_sysreg(uint32_t key)
     }
     if (key == fpsr_key) {
         return &lata_fpsr_reginfo;
+    }
+    if (key == ENCODE_AA64_CP_REG(CP_REG_ARM64_SYSREG_CP, 12, 0, 3, 0, 0)) {
+        return &lata_vbar_reginfo;
     }
     return NULL;
 }

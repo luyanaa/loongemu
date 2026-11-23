@@ -100,6 +100,8 @@ typedef struct CPUARMState {
         uint64_t last_fault_va;
         bool last_fault_is_write;
     } sve_ctrl;
+    /* Synchronous exception vector base (AArch64 VBAR_EL1). */
+    uint64_t vbar_el1;
 } CPUARMState;
 
 static inline void arm_sve_set_cpacr_el1_zen(CPUARMState *env, unsigned zen)
