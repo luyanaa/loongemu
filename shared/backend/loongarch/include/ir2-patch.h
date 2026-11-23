@@ -36,8 +36,13 @@ static inline bool loongarch_patch_b(uint32_t *insn_site, uintptr_t target)
                      (original & UINT32_C(0xfc000000)) |
                          ((uint32_t)words & UINT32_C(0x03ffffff)),
                      __ATOMIC_RELEASE);
+    /* Freestanding LATA has no libgcc __clear_cache implementation. */
+#if defined(__loongarch__)
+    __asm__ volatile("dbar 0\n ibar 0" ::: "memory");
+#else
     __builtin___clear_cache((char *)insn_site,
                             (char *)(insn_site + 1));
+#endif
     return true;
 }
 

@@ -225,6 +225,12 @@ static void test_direct_branch_chain_and_unlink(void)
     CHECK(decode_b_target(site) == (uintptr_t)b.tc.ptr);
     CHECK(a.jmp_dest[0] == (uintptr_t)b.tc.ptr);
     CHECK(b.jmp_list_head == (uintptr_t)&a);
+    fake_reset_jump(&a, 0);
+    CHECK(decode_b_target(site) == (uintptr_t)&code_a[1]);
+    CHECK(a.jmp_dest[0] == 0);
+    CHECK(b.jmp_list_head == 0);
+    CHECK(fake_set_jump(&a, 0, (uintptr_t)b.tc.ptr));
+    CHECK(b.jmp_list_head == (uintptr_t)&a);
 
     fake_invalidate_tb(&b);
     CHECK(decode_b_target(site) == (uintptr_t)&code_a[1]);
