@@ -1193,6 +1193,7 @@ LATM_BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdl
                -D__WORDSIZE=64 -D__thread= \
                -I target/mips/latm/include -I target/mips/latm/compat -I target/mips \
                -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
+               -I shared/backend/loongarch/include -I shared/perf/include \
                -I latx/compat -I latx/include -I latx/upstream/include -I . \
                -isystem $(shell $(CLANG) -print-resource-dir)/include
 

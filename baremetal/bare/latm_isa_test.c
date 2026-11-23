@@ -10,6 +10,7 @@
 #include "tcg/tcg.h"
 #include "cpu.h"
 #include "latm.h"
+#include "env.h"
 #include "translate.h"
 #include "fpu/softfloat.h"
 #include "latm-platform.h"
@@ -442,6 +443,82 @@ static void run_block(uint32_t *guest, int insns, const char *name)
     latx_bare_uart_puts(" done\n");
 }
 
+/* daddiu $23,$0,0x11 — $23 is env-resident (mips_la_map == NOT_DEF), so
+ * the store lands in the TB-local GPR cache and flushes to env as one
+ * st.d on TB exit.
+ *
+ * KNOWN ISSUE: any TB with >=2 env-resident GPR operands (e.g. also
+ * `daddu $8,$24,$24`) hangs inside tr_ir2_generate — the S3-LATM
+ * regcache borrow/evict accounting deadlocks once itemps are pinned.
+ * Single-operand cases work; this test pins the one proven path. */
+static uint32_t regcache_code[] __attribute__((aligned(4096))) = {
+    /* daddiu $23,$0,0x11; jr $31; nop (delay slot). $23 is env-resident
+     * (mips_la_map == NOT_DEF); jr is a branch boundary so the regcache
+     * flush emits the deferred st.d $23 into the IR2 stream before it. */
+    0x64170011, 0x03e00008, 0x00000000,
+};
+
+extern const int mips_la_map[32];
+
+static void run_regcache_ir2_test(void)
+{
+    latx_bare_uart_puts("latm-isa: regcache-ir2 begin\n");
+
+    {
+        void *le = env.latm_env, *lt = env.latm_tr_data, *lc = env.latm_jmp_cache;
+        for (size_t i = 0; i < sizeof(env); i++) {
+            ((uint8_t *)&env)[i] = 0;
+        }
+        env.latm_env = le;
+        env.latm_tr_data = lt;
+        env.latm_jmp_cache = lc;
+    }
+    for (size_t i = 0; i < sizeof(tb); i++) {
+        ((uint8_t *)&tb)[i] = 0;
+    }
+    for (size_t i = 0; i < CODE_BUF_SIZE; i++) {
+        code_buf[i] = 0;
+    }
+    env.active_tc.PC = (uint64_t)(uintptr_t)regcache_code;
+    latm_bind_env(&env);
+    tcg_ctx->code_ptr = code_buf + TB_OFFSET;
+    tcg_ctx->gen_insn_data = latx_tcg_gen_insn_data;
+    tb.pc = (uint64_t)(uintptr_t)regcache_code;
+    tb.tc.ptr = code_buf + TB_OFFSET;
+    tb.jmp_reset_offset[0] = 0xffff;
+    tb.jmp_reset_offset[1] = 0xffff;
+
+    int max_insns = 3;
+    target_disasm(&tb, &max_insns, &env);
+    if (tb.icount == 0 || !tr_ir2_generate(&tb)) {
+        fails++;
+        checks++;
+        latx_bare_uart_puts("latm-isa: FAIL regcache-ir2 translate\n");
+        tr_fini();
+        return;
+    }
+
+    TRANSLATION_DATA *td = (TRANSLATION_DATA *)env.latm_tr_data;
+    int env_reg = env_ir2_opnd._reg_num;
+    unsigned st23 = 0;
+    for (IR2_INST *inst = td->first_ir2; inst != NULL;
+         inst = ir2_next(inst)) {
+        if (inst->op_count != 3 || inst->_opnd[1]._reg_num != env_reg) {
+            continue;
+        }
+        if (ir2_opcode(inst) == LISA_ST_D &&
+            inst->_opnd[2]._imm32 == env_offset_gpr(23)) {
+            st23++;
+        }
+    }
+    tr_fini();
+
+    check(st23, 1, "regcache-ir2 st.d $23 coalesced");
+    latx_bare_uart_puts("latm-isa: regcache-ir2 st.d=");
+    puthex(st23);
+    latx_bare_uart_puts("\n");
+}
+
 void kmain(void)
 {
     latx_bare_uart_puts("latm-isa: begin\n");
@@ -684,6 +761,8 @@ void kmain(void)
         }
         check(smc_broadcasts >= 3, 1, "CACHE/SYNCI broadcasts SMC invalidation");
     }
+
+    run_regcache_ir2_test();
 
     latx_bare_uart_puts("latm-isa: checks=");
     puthex(checks);
