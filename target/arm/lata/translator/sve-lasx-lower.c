@@ -787,66 +787,14 @@ static bool expanded_mask_cache_key_from_operation(
     const PvirVectorOperation *operation,
     A64SVEPredicateMaskCacheKey *key)
 {
-    const PvirPredicate *predicate = &operation->predicate;
-
-    *key = (A64SVEPredicateMaskCacheKey){0};
-    key->source = predicate->source;
-    key->form = predicate->form;
-    key->first_lane = predicate->first_lane;
-    key->lanes = predicate->lanes;
-    key->element_bits = operation->type.element_bits;
-    key->vector_bits = operation->type.vector_bits;
-    switch (predicate->form) {
-    case PVIR_PREDICATE_PREFIX:
-    case PVIR_PREDICATE_SUFFIX:
-        key->active_lanes = predicate->value.active_lanes;
-        break;
-    case PVIR_PREDICATE_BITSET:
-        if (predicate->value.bitset.word_count >
-                A64_SVE_PVIR_MAX_MASK_KEY_WORDS ||
-            (predicate->value.bitset.word_count != 0 &&
-             predicate->value.bitset.words == NULL)) {
-            return false;
-        }
-        key->bitset_word_count = predicate->value.bitset.word_count;
-        for (size_t i = 0; i < key->bitset_word_count; ++i) {
-            key->bitset_words[i] = predicate->value.bitset.words[i];
-        }
-        break;
-    case PVIR_PREDICATE_ALL_TRUE:
-    case PVIR_PREDICATE_ALL_FALSE:
-    case PVIR_PREDICATE_VECTOR_MASK:
-        break;
-    default:
-        return false;
-    }
-    key->valid = true;
-    return true;
+    return pvir_plan_mask_key_from_operation(operation, key);
 }
 
 static bool expanded_mask_cache_keys_equal(
     const A64SVEPredicateMaskCacheKey *left,
     const A64SVEPredicateMaskCacheKey *right)
 {
-    if (!left->valid || !right->valid ||
-        left->source.kind != right->source.kind ||
-        left->source.id != right->source.id ||
-        left->source.version != right->source.version ||
-        left->form != right->form ||
-        left->active_lanes != right->active_lanes ||
-        left->bitset_word_count != right->bitset_word_count ||
-        left->first_lane != right->first_lane ||
-        left->lanes != right->lanes ||
-        left->element_bits != right->element_bits ||
-        left->vector_bits != right->vector_bits) {
-        return false;
-    }
-    for (size_t i = 0; i < A64_SVE_PVIR_MAX_MASK_KEY_WORDS; ++i) {
-        if (left->bitset_words[i] != right->bitset_words[i]) {
-            return false;
-        }
-    }
-    return true;
+    return pvir_plan_mask_keys_equal(left, right);
 }
 
 

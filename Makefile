@@ -29,10 +29,13 @@ build/test_tb_cache: tests/test_tb_cache.c src/tb_cache.c include/loongemu/tb_ca
 	$(CC) $(CFLAGS) src/tb_cache.c tests/test_tb_cache.c -o $@
 
 build/test_pvir: tests/test_pvir.c shared/pvir/src/pvir.c \
-                 shared/pvir/include/la-pvir.h
+                 shared/pvir/src/pvir-plan.c \
+                 shared/pvir/include/la-pvir.h \
+                 shared/pvir/include/pvir-plan.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Itarget/arm/lata/include -Ishared/pvir/include \
-	      shared/pvir/src/pvir.c tests/test_pvir.c -o $@
+	      shared/pvir/src/pvir.c shared/pvir/src/pvir-plan.c \
+	      tests/test_pvir.c -o $@
 
 test-pvir: build/test_pvir
 	./build/test_pvir

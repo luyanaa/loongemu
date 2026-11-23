@@ -81,9 +81,9 @@ typedef struct TRANSLATION_DATA {
             uint16_t itemp_status;
             uint16_t ftemp_status;
         };
+    };
     LatrRegCache regcache;
     uint8_t curr_ir1_skipped_eflags;
-
     /* Filled by tr_ir2_generate(), consumed by tr_ir2_assemble(). */
     int tb_insn_count;
     uint64_t tb_insn_pc[LATR_TB_MAP_SPANS];

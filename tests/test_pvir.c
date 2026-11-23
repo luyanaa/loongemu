@@ -1,6 +1,8 @@
 #include "la-pvir.h"
+#include "pvir-plan.h"
 
 #include <stdio.h>
+#include <string.h>
 
 static int checks;
 static int failures;
@@ -845,6 +847,93 @@ static void test_typed_operands_and_compare(void)
     CHECK(pvir_instruction_validate(&compare) == PVIR_STATUS_INVALID_ARGUMENT);
 }
 
+/* --- shared PvirPlan chunk scheduler --- */
+
+typedef struct {
+    unsigned vd;
+    unsigned a;
+    unsigned b;
+    bool vv;
+    bool move;
+} EvenPairCtx;
+
+/* Mirrors LATR can_lasx_chunk register-pair legality. */
+static bool even_pair_legal(void *opaque, unsigned offset, unsigned width)
+{
+    EvenPairCtx *c = opaque;
+    unsigned reg_idx;
+    if (width < 32) {
+        return true; /* 16B steps always legal */
+    }
+    reg_idx = offset / 16;
+    if (((c->vd + reg_idx) & 1u) != 0) {
+        return false;
+    }
+    if (!c->move && ((c->a + reg_idx) & 1u) != 0) {
+        return false;
+    }
+    if (c->vv && ((c->b + reg_idx) & 1u) != 0) {
+        return false;
+    }
+    return true;
+}
+
+static void test_plan_chunks(void)
+{
+    PvirPlan plan;
+    EvenPairCtx ctx;
+
+    memset(&plan, 0, sizeof(plan));
+    CHECK(pvir_plan_chunks(&plan, 96, false, NULL, NULL) == PVIR_STATUS_OK);
+    CHECK(plan.chunk_count == 6);
+    CHECK(plan.lasx_chunks == 0);
+    CHECK(plan.lsx_chunks == 6);
+
+    memset(&plan, 0, sizeof(plan));
+    ctx = (EvenPairCtx){0, 0, 0, true, false};
+    CHECK(pvir_plan_chunks(&plan, 64, true, even_pair_legal, &ctx) ==
+          PVIR_STATUS_OK);
+    CHECK(plan.chunk_count == 2);
+    CHECK(plan.steps[0].size == 32 && plan.steps[1].size == 32);
+    CHECK(plan.lasx_chunks == 2);
+
+    memset(&plan, 0, sizeof(plan));
+    ctx = (EvenPairCtx){1, 0, 0, false, false};
+    CHECK(pvir_plan_chunks(&plan, 64, true, even_pair_legal, &ctx) ==
+          PVIR_STATUS_OK);
+    CHECK(plan.lasx_chunks == 0);
+    CHECK(plan.lsx_chunks == 4);
+
+    CHECK(pvir_plan_chunks(&plan, 20, true, NULL, NULL) ==
+          PVIR_STATUS_INVALID_ARGUMENT);
+}
+
+static void test_plan_mask_keys(void)
+{
+    PvirVectorOperation op;
+    PvirPredicateMaskKey ka, kb;
+    PvirPredicateSource src =
+        source(PVIR_PREDICATE_SOURCE_PREDICATE, 5, 7);
+
+    memset(&op, 0, sizeof(op));
+    op.type.element_bits = 32;
+    op.type.vector_bits = 256;
+    op.predicate = pvir_predicate_prefix(src, 64, 40);
+
+    CHECK(pvir_plan_mask_key_from_operation(&op, &ka));
+    CHECK(pvir_plan_mask_key_from_operation(&op, &kb));
+    CHECK(pvir_plan_mask_keys_equal(&ka, &kb));
+
+    op.predicate = pvir_predicate_prefix(src, 64, 32);
+    CHECK(pvir_plan_mask_key_from_operation(&op, &kb));
+    CHECK(!pvir_plan_mask_keys_equal(&ka, &kb));
+
+    memset(&kb, 0, sizeof(kb));
+    CHECK(!pvir_plan_mask_keys_equal(&ka, &kb));
+    CHECK(!pvir_plan_mask_keys_equal(&kb, &kb));
+}
+
+
 int main(void)
 {
     test_shape_and_canonical_forms();
@@ -855,6 +944,8 @@ int main(void)
     test_expanded_mask_cache();
     test_cache_init_rejects_bad_storage_ranges();
     test_instruction_effects_and_inactive_policy();
+    test_plan_chunks();
+    test_plan_mask_keys();
 
     if (failures != 0) {
         printf("PVIR: %d/%d checks failed\n", failures, checks);

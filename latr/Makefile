@@ -44,7 +44,7 @@ CORE_OBJS := $(BUILD)/ir2.o $(BUILD)/ir2-assemble.o $(BUILD)/la-append.o \
              $(BUILD)/reg-alloc.o $(BUILD)/translate-riscv.o \
              $(BUILD)/translate-riscv-csr.o $(BUILD)/translate-riscv-fp.o \
              $(BUILD)/translate-riscv-fp-helper.o $(BUILD)/softfloat.o \
-             $(BUILD)/decode-riscv.o $(BUILD)/pvir.o $(BUILD)/pvir-exec.o $(BUILD)/pvir-lower-lsx.o $(BUILD)/cpu_features.o $(BUILD)/mmu.o $(BUILD)/interrupt.o $(BUILD)/mmio.o $(BUILD)/rvv.o $(BUILD)/rvv-legality.o $(BUILD)/translate-riscv-rvv.o $(BUILD)/tb-cache.o $(BUILD)/tb-insn-map.o \
+             $(BUILD)/decode-riscv.o $(BUILD)/pvir.o $(BUILD)/pvir-plan.o $(BUILD)/pvir-exec.o $(BUILD)/pvir-lower-lsx.o $(BUILD)/cpu_features.o $(BUILD)/mmu.o $(BUILD)/interrupt.o $(BUILD)/mmio.o $(BUILD)/rvv.o $(BUILD)/rvv-legality.o $(BUILD)/translate-riscv-rvv.o $(BUILD)/tb-cache.o $(BUILD)/tb-insn-map.o \
              $(BUILD)/phys_mem.o $(BUILD)/mmio_bus.o $(BUILD)/guest_dma.o $(BUILD)/riscv_virtio_blk.o $(BUILD)/latr_system.o $(BUILD)/latr_elf.o $(BUILD)/latr_fdt.o $(BUILD)/latr_machine.o $(BUILD)/uart16550.o $(BUILD)/riscv_clint.o $(BUILD)/riscv_plic.o $(BUILD)/riscv_acpi.o $(BUILD)/riscv_fw.o $(BUILD)/ovmf_board.o $(BUILD)/riscv_sbi.o \
              $(BUILD)/runtime.o \
              $(BUILD)/vclock.o $(BUILD)/compiler-rt.o
@@ -216,6 +216,10 @@ $(BUILD)/rvv.o: $(LATR)/translator/rvv.c $(LATR)/include/latr.h \
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/pvir.o: ../shared/pvir/src/pvir.c ../shared/pvir/include/la-pvir.h | $(BUILD)
+	$(CLANG) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/pvir-plan.o: ../shared/pvir/src/pvir-plan.c \
+                ../shared/pvir/include/pvir-plan.h ../shared/pvir/include/la-pvir.h | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/pvir-exec.o: $(LATR)/translator/pvir-exec.c $(LATR)/include/latr.h \

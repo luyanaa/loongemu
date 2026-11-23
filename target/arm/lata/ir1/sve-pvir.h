@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "sve-decode.h"
+#include "pvir-plan.h"
 
 
 enum {
@@ -27,18 +28,10 @@ enum {
 
 /* Entry-state IDs are Z0-31, P0-15, then X0-31; X31 denotes the zero value. */
 
-typedef struct {
-    bool valid;
-    PvirPredicateSource source;
-    PvirPredicateForm form;
-    size_t active_lanes;
-    size_t bitset_word_count;
-    uint64_t bitset_words[A64_SVE_PVIR_MAX_MASK_KEY_WORDS];
-    size_t first_lane;
-    size_t lanes;
-    uint16_t element_bits;
-    uint32_t vector_bits;
-} A64SVEPredicateMaskCacheKey;
+/* Shared lowering plan supplies the mask-key type; keep the LATA name as an
+ * alias so existing translator code and A64_SVE_PVIR_MAX_MASK_KEY_WORDS users
+ * are untouched. */
+typedef PvirPredicateMaskKey A64SVEPredicateMaskCacheKey;
 
 typedef struct A64SVEPvirBuilder {
     bool initialized;
