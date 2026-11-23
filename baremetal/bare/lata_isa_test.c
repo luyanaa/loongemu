@@ -7185,6 +7185,50 @@ void kmain(void)
               "FPCR.RMode=RZ truncates the quotient");
     }
 
+    /* FPSR.QC: saturating NEON must set bit 27, a clean operation must not. */
+    {
+        static uint32_t sqsub_v[] __attribute__((aligned(16))) = {
+            0x4ea22c20u, /* sqsub v0.4s, v1.4s, v2.4s */
+        };
+        static uint32_t uqsub_v[] __attribute__((aligned(16))) = {
+            0x6ea22c20u, /* uqsub v0.4s, v1.4s, v2.4s */
+        };
+
+        /* Saturation: INT32_MIN - 1 must clamp to INT32_MIN and set QC. */
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        for (size_t l = 0; l < 4; ++l) {
+            write_le32(arm_sve_zreg(&env, 1) + l * 4u, 0x80000000u);
+            write_le32(arm_sve_zreg(&env, 2) + l * 4u, 0x00000001u);
+        }
+        check(sve_run_a64_tb(sqsub_v, 1, 128, 0x0fu, false, "SQSUB saturates"),
+              1, "saturating SQSUB runs");
+        check(env.vfp.xregs[8] & (UINT64_C(1) << 27), UINT64_C(1) << 27,
+              "SQSUB saturation sets FPSR.QC");
+
+        /* No saturation: QC stays clear. */
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        for (size_t l = 0; l < 4; ++l) {
+            write_le32(arm_sve_zreg(&env, 1) + l * 4u, 5u);
+            write_le32(arm_sve_zreg(&env, 2) + l * 4u, 3u);
+        }
+        check(sve_run_a64_tb(sqsub_v, 1, 128, 0x0fu, false, "SQSUB clean"),
+              1, "clean SQSUB runs");
+        check(env.vfp.xregs[8] & (UINT64_C(1) << 27), 0,
+              "clean SQSUB leaves FPSR.QC clear");
+
+        /* Unsigned saturation below zero clamps to 0 and sets QC. */
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        for (size_t l = 0; l < 4; ++l) {
+            write_le32(arm_sve_zreg(&env, 1) + l * 4u, 1u);
+            write_le32(arm_sve_zreg(&env, 2) + l * 4u, 2u);
+        }
+        check(sve_run_a64_tb(uqsub_v, 1, 128, 0x0fu, false, "UQSUB saturates"),
+              1, "saturating UQSUB runs");
+        check(env.vfp.xregs[8] & (UINT64_C(1) << 27), UINT64_C(1) << 27,
+              "UQSUB saturation sets FPSR.QC");
+        check(read_le32(arm_sve_zreg(&env, 0)), 0u, "UQSUB clamps to zero");
+    }
+
     latx_bare_uart_puts("lata-isa: checks=");
     putdec((uint64_t)checks);
     latx_bare_uart_puts(" fails=");

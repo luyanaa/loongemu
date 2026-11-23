@@ -460,6 +460,21 @@ static void lata_clean_data_tbi(DisasContext *s, IR2_OPND *dst, IR2_OPND *src, i
 
 
 // check saturate
+/* Set FPSR.QC (bit 27): the AArch64 home of the cumulative saturation flag. */
+static void lata_emit_set_qc(void)
+{
+    IR2_OPND off = ra_alloc_itemp();
+    IR2_OPND val = ra_alloc_itemp();
+
+    li_d(off, env_offset_fpsr());
+    la_ldx_wu(val, env_ir2_opnd, off);
+    li_d(t0_ir2_opnd, 1 << 27);
+    la_or(val, val, t0_ir2_opnd);
+    la_stx_w(val, env_ir2_opnd, off);
+    ra_free_temp(val);
+    ra_free_temp(off);
+}
+
 static inline void gen_sat_q(IR2_OPND vreg, int size, int is_u)
 {
     IR2_OPND vtemp = ra_alloc_ftemp();
@@ -540,8 +555,7 @@ static inline void gen_sat_q(IR2_OPND vreg, int size, int is_u)
 
     la_label(set_qc);
 
-    li_d(temp, 1);
-    la_st_w(temp, env_ir2_opnd, env_offset_QC());
+    lata_emit_set_qc();
 
     la_label(exit);
 
@@ -13062,7 +13076,7 @@ static void handle_3same_64(DisasContext *s, int opcode, bool u,
 
         la_label(label);
         li_d(temp, 1);
-        la_st_w(temp, env_ir2_opnd, env_offset_QC());
+        lata_emit_set_qc();
 
         la_label(exit);
 
@@ -16750,7 +16764,7 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
 
         la_label(set_qc);
         li_d(temp, 1);
-        la_st_w(temp, env_ir2_opnd, env_offset_QC());
+        lata_emit_set_qc();
 
         la_label(exit);
 
@@ -16809,7 +16823,7 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
 
         la_label(set_qc);
         li_d(temp, 1);
-        la_st_w(temp, env_ir2_opnd, env_offset_QC());
+        lata_emit_set_qc();
 
         la_label(exit);
 
