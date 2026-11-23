@@ -1,14 +1,14 @@
 #include <assert.h>
 #include <string.h>
 
-#include "lata.h"
 #include "ir2.h"
 #include "loongemu-perf.h"
 
-LATA_TLS ENV *lsenv;
-
-static LataContext context;
 static IR2_INST insts[32];
+static int inst_count;
+static int real_ir2_inst_num;
+static IR2_INST *first;
+static IR2_INST *last;
 
 static IR2_OPND reg_opnd(int reg)
 {
@@ -36,37 +36,51 @@ static IR2_OPND label_opnd(int label)
 
 static void reset_stream(void)
 {
-    memset(&context, 0, sizeof(context));
     memset(insts, 0, sizeof(insts));
-    context.tr_data.ir2_inst_array = insts;
-    context.tr_data.ir2_inst_num_max = sizeof(insts) / sizeof(insts[0]);
-    context.env.tr_data = &context.tr_data;
-    lsenv = &context.env;
+    inst_count = 0;
+    real_ir2_inst_num = 0;
+    first = NULL;
+    last = NULL;
 }
 
 static IR2_INST *emit(IR2_OPCODE opcode, int op_count,
                       IR2_OPND op0, IR2_OPND op1, IR2_OPND op2)
 {
-    TRANSLATION_DATA *data = lsenv->tr_data;
-    int id = data->ir2_inst_num_current++;
-    IR2_INST *inst = &data->ir2_inst_array[id];
-
-    memset(inst, 0, sizeof(*inst));
-    ir2_set_id(inst, id);
-    ir2_build(inst, opcode, op0, op1, op2);
+    assert(inst_count < (int)(sizeof(insts) / sizeof(insts[0])));
+    IR2_INST *inst = &insts[inst_count];
+    inst->_id = inst_count;
+    inst->_opcode = (int16)opcode;
     inst->op_count = op_count;
-    ir2_append(inst);
+    inst->_opnd[0] = op0;
+    inst->_opnd[1] = op1;
+    inst->_opnd[2] = op2;
+    inst->_prev = last != NULL ? last->_id : -1;
+    inst->_next = -1;
+    if (last != NULL) {
+        last->_next = inst->_id;
+    } else {
+        first = inst;
+    }
+    last = inst;
+    if (opcode >= LISA_GR2SCR) {
+        real_ir2_inst_num++;
+    }
+    inst_count++;
     return inst;
+}
+
+static IR2_INST *next_inst(const IR2_INST *inst)
+{
+    return inst->_next < 0 ? NULL : &insts[inst->_next];
 }
 
 static unsigned count_opcode(IR2_OPCODE opcode, int first_gpr)
 {
     unsigned count = 0;
 
-    for (IR2_INST *inst = lsenv->tr_data->first_ir2;
-         inst != NULL; inst = ir2_next(inst)) {
-        if (ir2_opcode(inst) == opcode &&
-            (first_gpr < 0 || ir2_opnd_base_reg_num(&inst->_opnd[0]) == first_gpr)) {
+    for (IR2_INST *inst = first; inst != NULL; inst = next_inst(inst)) {
+        if (inst->_opcode == (int16)opcode &&
+            (first_gpr < 0 || inst->_opnd[0]._reg_num == first_gpr)) {
             count++;
         }
     }
@@ -119,7 +133,8 @@ static void test_peephole(void)
     emit(LISA_ST_D, 3, reg_opnd(11), env, imm_opnd(24));
     emit(LISA_ST_D, 3, reg_opnd(11), env, imm_opnd(24));
 
-    assert(ir2_peephole_optimize(env) == 6);
+    assert(ir2_peephole_optimize(insts, &first, &last,
+                                 &real_ir2_inst_num, env) == 6);
     assert(count_opcode(LISA_OR, -1) == 0);
     assert(count_opcode(LISA_MOV64, -1) == 0);
     assert(count_opcode(LISA_ADDI_D, 6) == 1);
@@ -130,11 +145,10 @@ static void test_peephole(void)
     assert(count_opcode(LISA_B, -1) == 0);
     assert(count_opcode(LISA_BL, -1) == 1);
 
-    for (IR2_INST *inst = lsenv->tr_data->first_ir2;
-         inst != NULL; inst = ir2_next(inst)) {
-        if (ir2_opcode(inst) == LISA_ADDI_D &&
-            ir2_opnd_base_reg_num(&inst->_opnd[0]) == 6) {
-            assert(ir2_opnd_imm(&inst->_opnd[2]) == 300);
+    for (IR2_INST *inst = first; inst != NULL; inst = next_inst(inst)) {
+        if (inst->_opcode == LISA_ADDI_D &&
+            inst->_opnd[0]._reg_num == 6) {
+            assert(inst->_opnd[2]._imm32 == 300);
         }
     }
 }

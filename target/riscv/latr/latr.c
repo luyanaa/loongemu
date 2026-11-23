@@ -946,7 +946,10 @@ void label_dispose(void)
     latr_ir2_list_check();
 #endif
 #if defined(LOONGEMU_IR2_PEEPHOLE) && LOONGEMU_IR2_PEEPHOLE
-    (void)ir2_peephole_optimize(env_ir2_opnd);
+    (void)ir2_peephole_optimize(
+        lsenv->tr_data->ir2_inst_array, &lsenv->tr_data->first_ir2,
+        &lsenv->tr_data->last_ir2, &lsenv->tr_data->real_ir2_inst_num,
+        env_ir2_opnd);
 #endif
     int label_count = lsenv->tr_data->label_num;
     int positions[label_count + 1];

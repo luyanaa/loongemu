@@ -629,7 +629,10 @@ void lata_gen_call_helper_epilogue(TCGContext *tcg_ctx)
 void label_dispose(void)
 {
 #if defined(LOONGEMU_IR2_PEEPHOLE) && LOONGEMU_IR2_PEEPHOLE
-    (void)ir2_peephole_optimize(env_ir2_opnd);
+    (void)ir2_peephole_optimize(
+        lsenv->tr_data->ir2_inst_array, &lsenv->tr_data->first_ir2,
+        &lsenv->tr_data->last_ir2, &lsenv->tr_data->real_ir2_inst_num,
+        env_ir2_opnd);
 #endif
     int *label_num_to_ir2_num =
         (int *)alloca(lsenv->tr_data->label_num * sizeof(int) + 20);

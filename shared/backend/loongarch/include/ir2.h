@@ -116,7 +116,9 @@ bool ir2_opcode_is_f_branch(IR2_OPCODE opcode);
 bool ir2_opcode_is_fcmp(IR2_OPCODE opcode);
 bool ir2_opcode_is_convert(IR2_OPCODE opcode);
 #if defined(LOONGEMU_IR2_PEEPHOLE) && LOONGEMU_IR2_PEEPHOLE
-int ir2_peephole_optimize(IR2_OPND env_base);
+int ir2_peephole_optimize(IR2_INST *inst_array, IR2_INST **first,
+                          IR2_INST **last, int *real_ir2_inst_num,
+                          IR2_OPND env_base);
 #endif
 
 IR2_OPND create_immh_opnd(int val);

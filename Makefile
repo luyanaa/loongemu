@@ -281,32 +281,20 @@ test-lata-dispatch: build/test_lata_dispatch
 	./build/test_lata_dispatch
 
 
-ifeq ($(shell uname -s),Darwin)
-IR2_GC_LDFLAGS := -Wl,-dead_strip
-else
-IR2_GC_LDFLAGS := -Wl,--gc-sections
-endif
 
 build/test_ir2_peephole: tests/test_ir2_peephole.c \
-                        shared/backend/loongarch/ir2.c \
+                        shared/backend/loongarch/ir2-peephole.c \
                         shared/backend/loongarch/include/ir2.h \
                         shared/backend/loongarch/include/la-ir2.h \
                         shared/backend/loongarch/include/ir2-sideeffect.h \
                         shared/perf/src/perf.c \
                         shared/perf/include/loongemu-perf.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -Wno-gnu-empty-struct -Wno-macro-redefined \
-	      -Wno-unused-parameter -Wno-unused-function \
-	      -ffunction-sections -fdata-sections \
-	      -DTARGET_AARCH64 -DCONFIG_LATA -DCONFIG_LATA_STANDALONE \
-	      -DCONFIG_LATX -D__WORDSIZE=64 -DLOONGEMU_PERF \
-	      -DLOONGEMU_IR2_PEEPHOLE=1 \
-	      -Ilata/compat -Ilatx/compat -I. \
-	      -Itarget/arm/lata/include -Itarget/arm/lata \
-	      -Itarget/arm/lata/translator -Ishared/backend/loongarch/include \
-	      -Ishared/perf/include -Ishared/pvir/include -Ilatx/upstream/include \
-	      shared/backend/loongarch/ir2.c shared/perf/src/perf.c \
-	      tests/test_ir2_peephole.c $(IR2_GC_LDFLAGS) -o $@
+	$(CC) $(CFLAGS) -Wno-unused-parameter -Wno-unused-function \
+	      -DLOONGEMU_PERF -DLOONGEMU_IR2_PEEPHOLE=1 \
+	      -Ishared/backend/loongarch/include -Ishared/perf/include \
+	      shared/backend/loongarch/ir2-peephole.c shared/perf/src/perf.c \
+	      tests/test_ir2_peephole.c -o $@
 
 
 test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging build/test_x86_64_paging \

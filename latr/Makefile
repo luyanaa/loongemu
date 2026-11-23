@@ -39,7 +39,7 @@ DECODE32 := $(BUILD)/decode-insn32.c.inc
 DECODE16 := $(BUILD)/decode-insn16.c.inc
 TRANS_STUBS := $(BUILD)/decode-trans-stubs.inc
 
-CORE_OBJS := $(BUILD)/ir2.o $(BUILD)/ir2-assemble.o $(BUILD)/la-append.o $(BUILD)/perf.o \
+CORE_OBJS := $(BUILD)/ir2.o $(BUILD)/ir2-peephole.o $(BUILD)/ir2-assemble.o $(BUILD)/la-append.o $(BUILD)/perf.o \
              $(BUILD)/mem.o $(BUILD)/macro-helper.o $(BUILD)/latr.o \
              $(BUILD)/reg-alloc.o $(BUILD)/translate-riscv.o \
              $(BUILD)/translate-riscv-csr.o $(BUILD)/translate-riscv-fp.o \
@@ -90,6 +90,11 @@ $(TRANS_STUBS): $(DECODE32) $(DECODE16) $(LATR)/ir1/rv64gc-opcodes.def \
 		$(LATR)/ir1/rv64gc-opcodes.def $@
 
 $(BUILD)/ir2.o: ../shared/backend/loongarch/ir2.c | $(BUILD)
+	$(CLANG) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/ir2-peephole.o: ../shared/backend/loongarch/ir2-peephole.c \
+                         ../shared/backend/loongarch/include/ir2.h \
+                         ../shared/backend/loongarch/include/ir2-sideeffect.h | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/ir2-assemble.o: ../shared/backend/loongarch/ir2-assemble.c | $(BUILD)
