@@ -7459,6 +7459,84 @@ cun_probe_done:;
               "IOE=0 leaves the exception untrapped");
     }
 
+    /* LDNF1 / LDFF1 across element widths (H, W, D, and the sign-extending
+     * SW form), all with FFR primed by SETFFR. */
+    {
+        static uint8_t hbuf[32] __attribute__((aligned(16)));
+        static uint32_t ldnf1h[] __attribute__((aligned(16))) = {
+            0x252c9000u, /* setffr */
+            0x2518e3e0u, /* ptrue p0.b, all */
+            0xa4b0a000u, /* ldnf1h { z0.h }, p0/z, [x0] */
+        };
+        static uint32_t ldff1w[] __attribute__((aligned(16))) = {
+            0x252c9000u, /* setffr */
+            0x2518e3e0u, /* ptrue p0.b, all */
+            0xa55f6000u, /* ldff1w { z0.s }, p0/z, [x0] */
+        };
+        static uint32_t ldnf1d[] __attribute__((aligned(16))) = {
+            0x252c9000u, /* setffr */
+            0x2518e3e0u, /* ptrue p0.b, all */
+            0xa5f0a000u, /* ldnf1d { z0.d }, p0/z, [x0] */
+        };
+        static uint32_t ldff1sw[] __attribute__((aligned(16))) = {
+            0x252c9000u, /* setffr */
+            0x2518e3e0u, /* ptrue p0.b, all */
+            0xa49f6000u, /* ldff1sw { z0.d }, p0/z, [x0] */
+        };
+
+        for (size_t i = 0; i < 32; ++i) hbuf[i] = (uint8_t)(0x10u + i);
+
+        /* Halfword, clean. */
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[0] = (uint64_t)(uintptr_t)hbuf;
+        lata_guest_mem_clear_fault_regions(&env);
+        check(sve_run_a64_tb(ldnf1h, 3, 128, 0x0fu, false, "LDNF1H clean"),
+              1, "LDNF1H clean runs");
+        check(read_le16(arm_sve_zreg(&env, 0)), 0x1110u, "LDNF1H loads lane 0");
+        check(read_le16(arm_sve_zreg(&env, 0) + 14), 0x1f1eu,
+              "LDNF1H loads the last halfword");
+        check(arm_sve_ffr(&env)[0], 0xffu, "LDNF1H sets FFR");
+        check(env.sve_ctrl.last_exception_index, 0,
+              "LDNF1H clean raises no exception");
+
+        /* Word, first-fault on a later lane: FFR stops there. */
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[0] = (uint64_t)(uintptr_t)hbuf;
+        lata_guest_mem_clear_fault_regions(&env);
+        lata_guest_mem_add_fault_region(&env, (uint64_t)(uintptr_t)&hbuf[8],
+                                        24, 0);
+        check(sve_run_a64_tb(ldff1w, 3, 128, 0x0fu, false, "LDFF1W fault"),
+              1, "LDFF1W with a faulting lane runs");
+        check(read_le32(arm_sve_zreg(&env, 0)), UINT32_C(0x13121110),
+              "LDFF1W commits the lanes before the fault");
+        /* FFR is one bit per vector byte: lanes 0..1 cover bytes 0..7. */
+        check(arm_sve_ffr(&env)[0], 0xffu, "LDFF1W FFR keeps the lanes before the fault");
+        check(arm_sve_ffr(&env)[1], 0x00u, "LDFF1W FFR clears from the faulting lane");
+        check(env.sve_ctrl.last_exception_index, 0,
+              "LDFF1W reports the fault through FFR");
+
+        /* Doubleword, clean. */
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[0] = (uint64_t)(uintptr_t)hbuf;
+        lata_guest_mem_clear_fault_regions(&env);
+        check(sve_run_a64_tb(ldnf1d, 3, 128, 0x0fu, false, "LDNF1D clean"),
+              1, "LDNF1D clean runs");
+        check(read_le64(arm_sve_zreg(&env, 0)), UINT64_C(0x1716151413121110),
+              "LDNF1D loads lane 0");
+
+        /* Signed word into doubleword: 0x80000000 must sign-extend. */
+        write_le32(hbuf, 0x80000000u);
+        write_le32(hbuf + 4, 0x00000001u);
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[0] = (uint64_t)(uintptr_t)hbuf;
+        lata_guest_mem_clear_fault_regions(&env);
+        check(sve_run_a64_tb(ldff1sw, 3, 128, 0x0fu, false, "LDFF1SW"),
+              1, "LDFF1SW runs");
+        check(read_le64(arm_sve_zreg(&env, 0)), UINT64_C(0xffffffff80000000),
+              "LDFF1SW sign-extends the loaded word");
+        lata_guest_mem_clear_fault_regions(&env);
+    }
+
     latx_bare_uart_puts("lata-isa: checks=");
     putdec((uint64_t)checks);
     latx_bare_uart_puts(" fails=");
