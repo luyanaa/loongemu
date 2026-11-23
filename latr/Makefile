@@ -14,7 +14,7 @@ LATX        := ../latx
 BUILD       := build
 
 INCS := -I$(LATR)/include -I$(BUILD) -Icompat -I.. \
-        -I$(LATA)/include -I$(LATA) -I../shared/pvir/include -I../shared/backend/loongarch/include -I$(LATX)/compat -I$(LATX)/compat/include \
+        -I$(LATA)/include -I$(LATA) -I../shared/pvir/include -I../shared/backend/loongarch/include -I../shared/perf/include -I$(LATX)/compat -I$(LATX)/compat/include \
         -I$(LATX)/upstream/include -I../include
 RESINC := $(shell $(CLANG) -print-resource-dir)/include
 DEFS := -DTARGET_RISCV64 -DCONFIG_LATR -DCONFIG_LATR_STANDALONE \
@@ -26,7 +26,7 @@ DEFS_HOST := $(DEFS) -D__thread=
 CFLAGS := $(BASE) $(INCS) -isystem $(RESINC) $(DEFS)
 HOST_CFLAGS ?= -std=gnu11 -O2 -Wall -Wextra -Werror -Wno-unused-parameter \
                -Wno-unused-function -I$(LATR)/include -I$(BUILD) \
-               -Icompat -I.. -I$(LATA)/include -I$(LATA) -I../shared/pvir/include -I../shared/backend/loongarch/include -I../include \
+               -Icompat -I.. -I$(LATA)/include -I$(LATA) -I../shared/pvir/include -I../shared/backend/loongarch/include -I../shared/perf/include -I../include \
                -idirafter $(LATX)/compat -idirafter $(LATX)/compat/include \
                -idirafter $(LATX)/upstream/include
 
@@ -39,7 +39,7 @@ DECODE32 := $(BUILD)/decode-insn32.c.inc
 DECODE16 := $(BUILD)/decode-insn16.c.inc
 TRANS_STUBS := $(BUILD)/decode-trans-stubs.inc
 
-CORE_OBJS := $(BUILD)/ir2.o $(BUILD)/ir2-assemble.o $(BUILD)/la-append.o \
+CORE_OBJS := $(BUILD)/ir2.o $(BUILD)/ir2-assemble.o $(BUILD)/la-append.o $(BUILD)/perf.o \
              $(BUILD)/mem.o $(BUILD)/macro-helper.o $(BUILD)/latr.o \
              $(BUILD)/reg-alloc.o $(BUILD)/translate-riscv.o \
              $(BUILD)/translate-riscv-csr.o $(BUILD)/translate-riscv-fp.o \
@@ -98,6 +98,8 @@ $(BUILD)/ir2-assemble.o: ../shared/backend/loongarch/ir2-assemble.c | $(BUILD)
 $(BUILD)/la-append.o: ../shared/backend/loongarch/la-append.c | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
+$(BUILD)/perf.o: ../shared/perf/src/perf.c ../shared/perf/include/loongemu-perf.h | $(BUILD)
+	$(CLANG) $(CFLAGS) -c $< -o $@
 $(BUILD)/mem.o: mem-latr.c | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
@@ -107,6 +109,7 @@ $(BUILD)/macro-helper.o: $(LATA)/translator/macro-helper.c | $(BUILD)
 $(BUILD)/latr.o: $(LATR)/latr.c $(LATR)/include/latr.h \
                 $(LATR)/include/translate.h $(LATR)/include/ir1.h \
                 $(LATR)/include/riscv-env.h \
+                ../shared/perf/include/loongemu-perf.h \
                 $(LATR)/ir1/rv64gc-opcodes.def | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 

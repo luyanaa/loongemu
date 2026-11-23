@@ -15,6 +15,7 @@
 #include "env.h"
 #include "internal.h"
 #include "macro-inst.h"
+#include "loongemu-perf.h"
 
 /* MIPS guest -> LoongArch GPR map.  $0 is virtual; $31 uses $ra and is
  * saved/restored around helper calls. */
@@ -209,6 +210,7 @@ void lata_tr_data_init(void *envp)
 void tr_init(void *tb)
 {
     TRANSLATION_DATA *t = lsenv->tr_data;
+    t->curr_tb = tb;
 
     latm_regcache_reset();
     ra_free_all();
@@ -626,6 +628,9 @@ void lata_gen_call_helper_epilogue(TCGContext *tcg_ctx)
 
 void label_dispose(void)
 {
+#if defined(LOONGEMU_IR2_PEEPHOLE) && LOONGEMU_IR2_PEEPHOLE
+    (void)ir2_peephole_optimize(env_ir2_opnd);
+#endif
     int *label_num_to_ir2_num =
         (int *)alloca(lsenv->tr_data->label_num * sizeof(int) + 20);
     memset(label_num_to_ir2_num, -1, lsenv->tr_data->label_num * sizeof(int) + 20);
@@ -690,11 +695,40 @@ void label_dispose(void)
     }
 }
 
+#if defined(LOONGEMU_IR2_PEEPHOLE) && LOONGEMU_IR2_PEEPHOLE
+static uint32_t latm_rebase_ir2_offset(const TRANSLATION_DATA *data,
+                                       uint32_t old_offset)
+{
+    uint32_t new_offset = 0;
+
+    for (IR2_INST *inst = data->first_ir2; inst != NULL; inst = ir2_next(inst)) {
+        IR2_OPCODE opcode = ir2_opcode(inst);
+        if (opcode != LISA_LABEL && opcode != LISA_X86_INST &&
+            inst->_addr < old_offset) {
+            new_offset += 4;
+        }
+    }
+    return new_offset;
+}
+#endif
 int tr_ir2_assemble(const void *code_start_addr)
 {
     label_dispose();
+    TRANSLATION_DATA *data = lsenv->tr_data;
+#if defined(LOONGEMU_IR2_PEEPHOLE) && LOONGEMU_IR2_PEEPHOLE
+    LatmTbInsnMap *map = data->active_insn_map;
+    if (map != NULL) {
+        for (unsigned i = 0; i < map->count; i++) {
+            LatmTbInsnSpan *span = &map->spans[i];
+            uint32_t old_start = span->native_start;
+            uint32_t old_end = span->native_end;
+            span->native_start = latm_rebase_ir2_offset(data, old_start);
+            span->native_end = latm_rebase_ir2_offset(data, old_end);
+        }
+    }
+#endif
 
-    IR2_INST *pir2 = lsenv->tr_data->first_ir2;
+    IR2_INST *pir2 = data->first_ir2;
     void *code_addr = (void *)code_start_addr;
     int code_nr = 0;
 
@@ -707,6 +741,9 @@ int tr_ir2_assemble(const void *code_start_addr)
         }
         pir2 = ir2_next(pir2);
     }
+    TranslationBlock *tb = data->curr_tb;
+    loongemu_perf_record_tb((uint64_t)code_nr,
+                            tb != NULL ? (uint64_t)tb->icount : 0);
     return code_nr;
 }
 

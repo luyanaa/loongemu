@@ -8,6 +8,9 @@
 #include "target/arm/tcg/translate.h"
 #include "target/arm/lata/translator/sve-lasx-lower.h"
 #include "lata-regcache-wrap.h"
+#if defined(LOONGEMU_PERF) && LOONGEMU_PERF
+#include "../../../shared/perf/include/loongemu-perf.h"
+#endif
 
 #include "exec/exec-all.h"
 #include "qemu/log.h"
@@ -1390,6 +1393,10 @@ int tr_ir2_assemble(const void *code_start_addr)
         pir2 = ir2_next(pir2);
     }
 
+#if defined(LOONGEMU_PERF) && LOONGEMU_PERF
+    TranslationBlock *tb = lsenv->tr_data->curr_tb;
+    loongemu_perf_record_tb(code_nr, tb ? tb->icount : 0);
+#endif
     return code_nr;
 }
 

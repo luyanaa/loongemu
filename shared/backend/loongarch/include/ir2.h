@@ -3,6 +3,7 @@
 
 #include "latx-types.h"
 #include "la-ir2.h"
+#include "ir2-sideeffect.h"
 #include "error_la.h"
 
 
@@ -112,8 +113,11 @@ bool ir2_opcode_is_branch(IR2_OPCODE);
 bool ir2_opcode_is_branch_with_3opnds(IR2_OPCODE);
 bool ir2_opcode_is_branch_with_2opnds(IR2_OPCODE);
 bool ir2_opcode_is_f_branch(IR2_OPCODE opcode);
-bool ir2_opcode_is_convert(IR2_OPCODE opcode);
 bool ir2_opcode_is_fcmp(IR2_OPCODE opcode);
+bool ir2_opcode_is_convert(IR2_OPCODE opcode);
+#if defined(LOONGEMU_IR2_PEEPHOLE) && LOONGEMU_IR2_PEEPHOLE
+int ir2_peephole_optimize(IR2_OPND env_base);
+#endif
 
 IR2_OPND create_immh_opnd(int val);
 IR2_INST *la_append_ir2_opnd0(IR2_OPCODE type);

@@ -4,6 +4,7 @@
 #include "mmu.h"
 #include "loongemu/riscv_sbi.h"
 #include "loongemu/mmio_bus.h"
+#include "loongemu-perf.h"
 
 /* One context per vCPU. With LATR_ENABLE_TLS each host thread sees its own
  * bootstrap; without it (freestanding build) a single hart is bound at a
@@ -944,6 +945,9 @@ void label_dispose(void)
 #if LATR_IR2_LIST_CHECK
     latr_ir2_list_check();
 #endif
+#if defined(LOONGEMU_IR2_PEEPHOLE) && LOONGEMU_IR2_PEEPHOLE
+    (void)ir2_peephole_optimize(env_ir2_opnd);
+#endif
     int label_count = lsenv->tr_data->label_num;
     int positions[label_count + 1];
     for (int i = 0; i <= label_count; i++) {
@@ -1014,5 +1018,7 @@ int tr_ir2_assemble(const void *code_start_addr)
         latr_tb_insn_map_add(data->tb_insn_pc[i], span_off[i],
                              span_off[i + 1], data->tb_insn_len[i]);
     }
+    loongemu_perf_record_tb((uint64_t)count,
+                            (uint64_t)data->tb_insn_count);
     return count;
 }
