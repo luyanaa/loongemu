@@ -28,11 +28,11 @@ build/test_tb_cache: tests/test_tb_cache.c src/tb_cache.c include/loongemu/tb_ca
 	@mkdir -p build
 	$(CC) $(CFLAGS) src/tb_cache.c tests/test_tb_cache.c -o $@
 
-build/test_pvir: tests/test_pvir.c target/arm/lata/pvir.c \
-                 target/arm/lata/include/la-pvir.h
+build/test_pvir: tests/test_pvir.c shared/pvir/src/pvir.c \
+                 shared/pvir/include/la-pvir.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -Itarget/arm/lata/include \
-	      target/arm/lata/pvir.c tests/test_pvir.c -o $@
+	$(CC) $(CFLAGS) -Itarget/arm/lata/include -Ishared/pvir/include \
+	      shared/pvir/src/pvir.c tests/test_pvir.c -o $@
 
 test-pvir: build/test_pvir
 	./build/test_pvir
@@ -40,7 +40,7 @@ test-pvir: build/test_pvir
 build/test_fpsr: tests/test_fpsr.c target/arm/lata/fpsr.c \
                  target/arm/lata/include/lata-fpsr.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -Itarget/arm/lata/include \
+	$(CC) $(CFLAGS) -Itarget/arm/lata/include -Ishared/pvir/include \
 	      target/arm/lata/fpsr.c tests/test_fpsr.c -o $@
 
 test-fpsr: build/test_fpsr
@@ -49,11 +49,11 @@ test-fpsr: build/test_fpsr
 test-pvir-rvv-shapes: build/test_pvir_rvv_shapes
 	./build/test_pvir_rvv_shapes
 
-build/test_pvir_rvv_shapes: tests/test_pvir_rvv_shapes.c target/arm/lata/pvir.c \
-                           target/arm/lata/include/la-pvir.h
+build/test_pvir_rvv_shapes: tests/test_pvir_rvv_shapes.c shared/pvir/src/pvir.c \
+                           shared/pvir/include/la-pvir.h
 	@mkdir -p build
-	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I target/arm/lata/include \
-	      target/arm/lata/pvir.c tests/test_pvir_rvv_shapes.c -o $@
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I target/arm/lata/include -I shared/pvir/include \
+	      shared/pvir/src/pvir.c tests/test_pvir_rvv_shapes.c -o $@
 
 test-riscv-sbi: build/test_riscv_sbi
 	./build/test_riscv_sbi
@@ -130,24 +130,24 @@ build/test_sve_decode: tests/test_sve_decode.c \
                        target/arm/lata/ir1/sve-decode.h \
                        target/arm/lata/include/ir1.h \
                        target/arm/lata/include/ir1-arg.h \
-                       target/arm/lata/include/la-pvir.h \
+                       shared/pvir/include/la-pvir.h \
                        lata/compat/target/arm/cpu.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Wno-gnu-empty-struct \
 	      -Ilata/compat -iquote latx/compat \
-	      -Itarget/arm/lata/include -Itarget/arm/lata/ir1 \
+	      -Itarget/arm/lata/include -Ishared/pvir/include -Itarget/arm/lata/ir1 \
 	      target/arm/lata/ir1/sve-decode.c tests/test_sve_decode.c -o $@
 
 test-sve-decode: build/test_sve_decode
 	./build/test_sve_decode
 
 build/test_sve_pvir: tests/test_sve_pvir.c target/arm/lata/ir1/sve-pvir.c \
-                     target/arm/lata/ir1/sve-decode.c target/arm/lata/pvir.c \
+                     target/arm/lata/ir1/sve-decode.c shared/pvir/src/pvir.c \
                      target/arm/lata/ir1/sve-pvir.h \
                      target/arm/lata/ir1/sve-decode.h \
                      target/arm/lata/include/ir1.h \
                      target/arm/lata/include/ir1-arg.h \
-                     target/arm/lata/include/la-pvir.h \
+                     shared/pvir/include/la-pvir.h \
                      target/arm/lata/include/env.h \
                      lata/compat/target/arm/cpu.h \
                      latx/runtime/cpu_features.c \
@@ -155,8 +155,8 @@ build/test_sve_pvir: tests/test_sve_pvir.c target/arm/lata/ir1/sve-pvir.c \
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Wno-gnu-empty-struct -I. \
 	      -Ilata/compat -iquote latx/compat \
-	      -Itarget/arm/lata/include -Itarget/arm/lata/ir1 \
-	      target/arm/lata/pvir.c target/arm/lata/ir1/sve-decode.c \
+	      -Itarget/arm/lata/include -Ishared/pvir/include -Itarget/arm/lata/ir1 \
+	      shared/pvir/src/pvir.c target/arm/lata/ir1/sve-decode.c \
 	      target/arm/lata/ir1/sve-pvir.c latx/runtime/cpu_features.c \
 	      tests/test_sve_pvir.c -o $@
 
@@ -169,17 +169,17 @@ build/test_sve_helper_support: tests/test_sve_helper_support.c \
                                target/arm/lata/translator/sve-helper-support.c \
                                target/arm/lata/ir1/sve-pvir.c \
                                target/arm/lata/ir1/sve-decode.c \
-                               target/arm/lata/pvir.c \
+                               shared/pvir/src/pvir.c \
                                target/arm/lata/translator/sve-lasx-lower.h \
                                target/arm/lata/ir1/sve-pvir.h \
                                target/arm/lata/ir1/sve-decode.h \
-                               target/arm/lata/include/la-pvir.h
+                               shared/pvir/include/la-pvir.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Wno-gnu-empty-struct -I. \
 	      -Ilata/compat -iquote latx/compat \
-	      -Itarget/arm/lata/include -Itarget/arm/lata/ir1 \
+	      -Itarget/arm/lata/include -Ishared/pvir/include -Itarget/arm/lata/ir1 \
 	      -Itarget/arm/lata/translator \
-	      target/arm/lata/pvir.c target/arm/lata/ir1/sve-decode.c \
+	      shared/pvir/src/pvir.c target/arm/lata/ir1/sve-decode.c \
 	      target/arm/lata/ir1/sve-pvir.c latx/runtime/cpu_features.c \
 	      target/arm/lata/translator/sve-helper-support.c \
 	      tests/test_sve_helper_support.c -o $@
@@ -191,7 +191,7 @@ build/test_sve_helper_lifecycle: tests/test_sve_helper_lifecycle.c \
                                  target/arm/lata/translator/sve-helper-support.c \
                                  target/arm/lata/ir1/sve-pvir.c \
                                  target/arm/lata/ir1/sve-decode.c \
-                                 target/arm/lata/pvir.c \
+                                 shared/pvir/src/pvir.c \
                                  target/arm/lata/mem.c \
                                  target/arm/lata/translator/sve-lasx-lower.h \
                                  target/arm/lata/include/lata.h \
@@ -201,10 +201,10 @@ build/test_sve_helper_lifecycle: tests/test_sve_helper_lifecycle.c \
 	      -DLATA_ENABLE_TLS -pthread -DTARGET_AARCH64 -DCONFIG_LATA \
 	      -DCONFIG_LATA_STANDALONE -Wno-gnu-empty-struct -Wno-macro-redefined \
 	      -Wno-unused-parameter \
-	      -Ilata/compat -Ilatx/compat -I. -Itarget/arm/lata/include \
+	      -Ilata/compat -Ilatx/compat -I. -Itarget/arm/lata/include -Ishared/pvir/include \
 	      -Itarget/arm/lata -Itarget/arm/lata/translator -Itarget/arm/lata/ir1 \
 	      -Ilatx/upstream/include \
-	      target/arm/lata/pvir.c target/arm/lata/ir1/sve-decode.c \
+	      shared/pvir/src/pvir.c target/arm/lata/ir1/sve-decode.c \
 	      target/arm/lata/ir1/sve-pvir.c latx/runtime/cpu_features.c \
 	      target/arm/lata/mem.c target/arm/lata/translator/sve-helper.c \
 	      target/arm/lata/translator/sve-helper-support.c \
@@ -220,7 +220,7 @@ build/test_vcache: tests/test_vcache.c lata/vcache.c \
                    target/arm/lata/include/lata-vcache.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Wno-gnu-empty-struct \
-	      -Itarget/arm/lata/include \
+	      -Itarget/arm/lata/include -Ishared/pvir/include \
 	      lata/vcache.c tests/test_vcache.c -o $@
 
 test-vcache: build/test_vcache
@@ -231,7 +231,7 @@ build/test_arm_state: tests/test_arm_state.c \
                       lata/compat/target/arm/cpu.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Ilata/compat -Ilatx/compat \
-	      -Itarget/arm/lata/include tests/test_arm_state.c -o $@
+	      -Itarget/arm/lata/include -Ishared/pvir/include tests/test_arm_state.c -o $@
 
 test-arm-state: build/test_arm_state
 	./build/test_arm_state
@@ -247,7 +247,7 @@ build/test_lata_context: tests/test_lata_context.c lata/vcache.c \
 	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -DLATA_ENABLE_TLS -pthread \
 	      -DTARGET_AARCH64 -DCONFIG_LATA -DCONFIG_LATA_STANDALONE \
 	      -Wno-gnu-empty-struct -Wno-macro-redefined -Wno-unused-parameter \
-	      -Ilata/compat -Ilatx/compat -I. -Itarget/arm/lata/include \
+	      -Ilata/compat -Ilatx/compat -I. -Itarget/arm/lata/include -Ishared/pvir/include \
 	      -Itarget/arm/lata -Ilatx/upstream/include \
 	      lata/vcache.c target/arm/lata/mem.c \
 	      target/arm/lata/ftemp-snapshot.c \
@@ -610,7 +610,7 @@ LATA_BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdl
                -fno-builtin -O2 -mno-lsx -mno-lasx -fno-vectorize -fno-slp-vectorize \
                -DTARGET_AARCH64 -DCONFIG_LATA -DCONFIG_LATA_TU -DCONFIG_LATA_STANDALONE \
                -D__WORDSIZE=64 -D__thread= \
-               -I lata/compat -I . -I target/arm/lata/include -I target/arm/lata \
+               -I lata/compat -I . -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
                -I latx/compat -I latx/include -I latx/upstream/include \
                -isystem $(shell $(CLANG) -print-resource-dir)/include
 
@@ -620,7 +620,7 @@ LATR_BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdl
                -DTARGET_RISCV64 -DCONFIG_LATR -DCONFIG_LATR_STANDALONE \
                -DCONFIG_LATX -D__WORDSIZE=64 -D__thread= \
                -I latr/compat -I target/riscv/latr/include -I . \
-               -I target/arm/lata/include -I target/arm/lata \
+               -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
                -I latx/compat -I latx/compat/include -I latx/upstream/include \
                -I include \
                -isystem $(shell $(CLANG) -print-resource-dir)/include
@@ -997,7 +997,7 @@ build/test_latm_loongson: tests/test_latm_loongson.c \
                           target/mips/latm/helpers/loongson.c
 	@mkdir -p build
 	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
-	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
+	      -I target/mips -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
 	      -I latx/compat -I latx/upstream/include -I . \
 	      $(CFLAGS) -Wno-gnu-empty-struct \
 	      tests/test_latm_loongson.c target/mips/latm/helpers/loongson.c -o $@
@@ -1018,7 +1018,7 @@ build/test_latm_unaligned: tests/test_latm_unaligned.c \
                            target/mips/latm/helpers/memory.c
 	@mkdir -p build
 	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
-	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
+	      -I target/mips -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
 	      -I latx/compat -I latx/upstream/include -I . \
 	      $(CFLAGS) -Wno-gnu-empty-struct \
 	      tests/test_latm_unaligned.c target/mips/latm/helpers/memory.c -o $@
@@ -1027,7 +1027,7 @@ build/test_latm_llsc: tests/test_latm_llsc.c \
                       target/mips/latm/helpers/int.c
 	@mkdir -p build
 	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
-	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
+	      -I target/mips -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
 	      -I latx/compat -I latx/upstream/include -I . \
 	      $(CFLAGS) -Wno-gnu-empty-struct \
 	      tests/test_latm_llsc.c target/mips/latm/helpers/int.c -o $@
@@ -1049,7 +1049,7 @@ build/test_latm_board_system: tests/test_latm_board_system.c \
                               src/pci_host.c src/phys_mem.c src/acpi_tables.c
 	@mkdir -p build
 	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
-	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
+	      -I target/mips -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
 	      -I latx/compat -I latx/upstream/include -I . -Iinclude \
 	      $(CFLAGS) -Wno-gnu-empty-struct \
 	      tests/test_latm_board_system.c \
@@ -1068,7 +1068,7 @@ build/test_latm_pci: tests/test_latm_pci.c \
                      src/pci_host.c src/phys_mem.c src/acpi_tables.c
 	@mkdir -p build
 	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
-	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
+	      -I target/mips -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
 	      -I latx/compat -I latx/upstream/include -I . -Iinclude \
 	      $(CFLAGS) -Wno-gnu-empty-struct \
 	      tests/test_latm_pci.c target/mips/latm/system/latm_pci.c \
@@ -1079,7 +1079,7 @@ build/test_latm_uncore: tests/test_latm_uncore.c \
                         target/mips/latm/uncore/latm_uncore.c
 	@mkdir -p build
 	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
-	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
+	      -I target/mips -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
 	      -I latx/compat -I latx/upstream/include -I . \
 	      $(CFLAGS) -Wno-gnu-empty-struct \
 	      tests/test_latm_uncore.c target/mips/latm/uncore/latm_uncore.c -o $@
@@ -1090,7 +1090,7 @@ build/test_latm_system: tests/test_latm_system.c \
                         target/mips/latm/system/latm_dtb.c
 	@mkdir -p build
 	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
-	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
+	      -I target/mips -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
 	      -I latx/compat -I latx/upstream/include -I . \
 	      $(CFLAGS) -Wno-gnu-empty-struct \
 	      tests/test_latm_system.c target/mips/latm/system/latm_mmio.c \
@@ -1102,7 +1102,7 @@ build/test_latm_cpu: tests/test_latm_cpu.c \
                     target/mips/latm/helpers/cp0.c
 	@mkdir -p build
 	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
-	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
+	      -I target/mips -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
 	      -I latx/compat -I latx/upstream/include -I . \
 	      $(CFLAGS) -Wno-gnu-empty-struct \
 	      tests/test_latm_cpu.c target/mips/latm/cpu/loongson-profile.c \
@@ -1112,7 +1112,7 @@ build/test_latm_insn_map: tests/test_latm_insn_map.c \
                           target/mips/latm/tb_insn_map.c
 	@mkdir -p build
 	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
-	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
+	      -I target/mips -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
 	      -I latx/compat -I latx/upstream/include -I . \
 	      $(CFLAGS) -Wno-gnu-empty-struct \
 	      tests/test_latm_insn_map.c target/mips/latm/tb_insn_map.c -o $@
@@ -1122,7 +1122,7 @@ build/test_latm_interrupts: tests/test_latm_interrupts.c \
                            target/mips/latm/helpers/exception.c
 	@mkdir -p build
 	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
-	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
+	      -I target/mips -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
 	      -I latx/compat -I latx/upstream/include -I . \
 	      $(CFLAGS) -Wno-gnu-empty-struct \
 	      tests/test_latm_interrupts.c target/mips/latm/helpers/cp0.c \
@@ -1136,7 +1136,7 @@ build/test_latm_tlb: tests/test_latm_tlb.c target/mips/latm/helpers/memory.c \
                      target/mips/latm/helpers/cp0.c target/mips/latm/helpers/exception.c
 	@mkdir -p build
 	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
-	      -I target/mips -I target/arm/lata/include -I target/arm/lata \
+	      -I target/mips -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
 	      -I latx/compat -I latx/upstream/include -I . \
 	      $(CFLAGS) -Wno-gnu-empty-struct \
 	      tests/test_latm_tlb.c target/mips/latm/helpers/memory.c \
@@ -1159,7 +1159,7 @@ LATM_BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdl
                -DTARGET_MIPS64 -DCONFIG_LATM -DCONFIG_LATM_STANDALONE \
                -D__WORDSIZE=64 -D__thread= \
                -I target/mips/latm/include -I target/mips/latm/compat -I target/mips \
-               -I target/arm/lata/include -I target/arm/lata \
+               -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
                -I latx/compat -I latx/include -I latx/upstream/include -I . \
                -isystem $(shell $(CLANG) -print-resource-dir)/include
 

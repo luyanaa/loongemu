@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#include "target/arm/lata/include/la-pvir.h"
+#include "shared/pvir/include/la-pvir.h"
 #include "target/arm/lata/ir1/sve-decode.h"
 #include "target/arm/lata/ir1/sve-pvir.h"
 

@@ -14,7 +14,7 @@ LATX        := ../latx
 BUILD       := build
 
 INCS := -I$(LATR)/include -I$(BUILD) -Icompat -I.. \
-        -I$(LATA)/include -I$(LATA) -I$(LATX)/compat -I$(LATX)/compat/include \
+        -I$(LATA)/include -I$(LATA) -I../shared/pvir/include -I$(LATX)/compat -I$(LATX)/compat/include \
         -I$(LATX)/upstream/include -I../include
 RESINC := $(shell $(CLANG) -print-resource-dir)/include
 DEFS := -DTARGET_RISCV64 -DCONFIG_LATR -DCONFIG_LATR_STANDALONE \
@@ -26,7 +26,7 @@ DEFS_HOST := $(DEFS) -D__thread=
 CFLAGS := $(BASE) $(INCS) -isystem $(RESINC) $(DEFS)
 HOST_CFLAGS ?= -std=gnu11 -O2 -Wall -Wextra -Werror -Wno-unused-parameter \
                -Wno-unused-function -I$(LATR)/include -I$(BUILD) \
-               -Icompat -I.. -I$(LATA)/include -I$(LATA) -I../include \
+               -Icompat -I.. -I$(LATA)/include -I$(LATA) -I../shared/pvir/include -I../include \
                -idirafter $(LATX)/compat -idirafter $(LATX)/compat/include \
                -idirafter $(LATX)/upstream/include
 
@@ -215,17 +215,17 @@ $(BUILD)/rvv.o: $(LATR)/translator/rvv.c $(LATR)/include/latr.h \
                 $(LATR)/include/translate.h $(LATR)/include/riscv-env.h | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/pvir.o: $(LATA)/pvir.c $(LATA)/include/la-pvir.h | $(BUILD)
+$(BUILD)/pvir.o: ../shared/pvir/src/pvir.c ../shared/pvir/include/la-pvir.h | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/pvir-exec.o: $(LATR)/translator/pvir-exec.c $(LATR)/include/latr.h \
                 $(LATR)/include/translate.h $(LATR)/include/riscv-env.h \
-                $(LATA)/include/la-pvir.h | $(BUILD)
+                ../shared/pvir/include/la-pvir.h | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/pvir-lower-lsx.o: $(LATR)/translator/pvir-lower-lsx.c $(LATR)/include/latr.h \
                 $(LATR)/include/translate.h $(LATR)/include/riscv-env.h \
-                $(LATA)/include/la-pvir.h $(LATX)/compat/qemu/cpu-features.h | $(BUILD)
+                ../shared/pvir/include/la-pvir.h $(LATX)/compat/qemu/cpu-features.h | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/cpu_features.o: $(LATX)/runtime/cpu_features.c \
