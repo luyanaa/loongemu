@@ -20,6 +20,7 @@
 #include "latx-smc.h"
 #include "latx-types.h"
 #include "ir2.h"
+#include "../../shared/backend/loongarch/include/ir2-patch.h"
 
 /* --- translation environment --- */
 ENV *lsenv;
@@ -42,13 +43,175 @@ void *tcg_tb_alloc(TCGContext *s)
     return calloc(1, sizeof(TranslationBlock));
 }
 
+static volatile int tb_jump_graph_lock;
+
+static void tb_jump_graph_acquire(void)
+{
+    while (__atomic_exchange_n(&tb_jump_graph_lock, 1, __ATOMIC_ACQUIRE)) {
+        while (__atomic_load_n(&tb_jump_graph_lock, __ATOMIC_RELAXED)) {
+        }
+    }
+}
+
+static void tb_jump_graph_release(void)
+{
+    __atomic_store_n(&tb_jump_graph_lock, 0, __ATOMIC_RELEASE);
+}
+
+static TranslationBlock *tb_jmp_node_tb(uintptr_t node)
+{
+    return (TranslationBlock *)(node & ~(uintptr_t)1);
+}
+
+static int tb_jmp_node_index(uintptr_t node)
+{
+    return (int)(node & 1u);
+}
+
+static bool tb_patch_branch(TranslationBlock *tb, int n, uintptr_t target)
+{
+    uint16_t offset;
+
+    if (tb == NULL || n < 0 || n > 1 || tb->tc.ptr == NULL) {
+        return false;
+    }
+    offset = tb->jmp_insn_offset[n];
+    if (offset == TB_JMP_OFFSET_INVALID ||
+        (size_t)offset > tb->tc.size ||
+        tb->tc.size - (size_t)offset < sizeof(uint32_t)) {
+        return false;
+    }
+    return loongarch_patch_b((uint32_t *)(void *)(tb->tc.ptr + offset),
+                             target);
+}
+
+static bool tb_patch_reset(TranslationBlock *tb, int n)
+{
+    uintptr_t target;
+
+    if (tb == NULL || n < 0 || n > 1 || tb->tc.ptr == NULL ||
+        tb->jmp_reset_offset[n] == TB_JMP_OFFSET_INVALID ||
+        (size_t)tb->jmp_reset_offset[n] >= tb->tc.size) {
+        return false;
+    }
+    target = (uintptr_t)tb->tc.ptr + tb->jmp_reset_offset[n];
+    return tb_patch_branch(tb, n, target);
+}
+
+static void tb_unlink_outgoing(TranslationBlock *tb, int n)
+{
+    TranslationBlock *dest = tb->next_tb[n];
+
+    if (tb->jmp_dest[n] != 0 && dest != NULL &&
+        (uintptr_t)dest->tc.ptr == tb->jmp_dest[n]) {
+        uintptr_t wanted = (uintptr_t)tb | (uintptr_t)n;
+        uintptr_t *link = &dest->jmp_list_head;
+
+        while (*link != 0) {
+            uintptr_t node = *link;
+            TranslationBlock *origin = tb_jmp_node_tb(node);
+            int index = tb_jmp_node_index(node);
+
+            if (node == wanted) {
+                *link = tb->jmp_list_next[n];
+                break;
+            }
+            link = &origin->jmp_list_next[index];
+        }
+    }
+    tb->jmp_list_next[n] = 0;
+    tb->jmp_dest[n] = 0;
+}
+
+static bool tb_reset_jump_locked(TranslationBlock *tb, int n)
+{
+    if (!tb_patch_reset(tb, n)) {
+        tb->cflags |= CF_INVALID;
+        return false;
+    }
+    tb_unlink_outgoing(tb, n);
+    return true;
+}
+
+static bool tb_unlink_incoming(TranslationBlock *tb)
+{
+    while (tb->jmp_list_head != 0) {
+        uintptr_t node = tb->jmp_list_head;
+        TranslationBlock *origin = tb_jmp_node_tb(node);
+        int n = tb_jmp_node_index(node);
+
+        if (!tb_patch_reset(origin, n)) {
+            origin->cflags |= CF_INVALID;
+            return false;
+        }
+        tb->jmp_list_head = origin->jmp_list_next[n];
+        origin->jmp_list_next[n] = 0;
+        origin->jmp_dest[n] = 0;
+    }
+    return true;
+}
+
+void tb_invalidate_tb(TranslationBlock *tb)
+{
+    if (tb == NULL) {
+        return;
+    }
+    tb_jump_graph_acquire();
+    tb->cflags |= CF_INVALID;
+    tb_unlink_incoming(tb);
+    for (int n = 0; n < 2; n++) {
+        tb_reset_jump_locked(tb, n);
+    }
+    tb_jump_graph_release();
+}
+
+void tb_reset_jump(TranslationBlock *tb, int n)
+{
+    if (tb == NULL || n < 0 || n > 1) {
+        return;
+    }
+    tb_jump_graph_acquire();
+    tb_reset_jump_locked(tb, n);
+    tb_jump_graph_release();
+}
+
 void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
 {
-    /* Direct jump patching belongs to the code-cache layer; the engine links
-     * blocks through the TB hash until that layer lands. */
-    (void)tb;
-    (void)n;
-    (void)addr;
+    TranslationBlock *dest;
+
+    if (tb == NULL || n < 0 || n > 1) {
+        return;
+    }
+    tb_jump_graph_acquire();
+    if (!tb_patch_reset(tb, n)) {
+        tb->cflags |= CF_INVALID;
+        tb_jump_graph_release();
+        return;
+    }
+    tb_unlink_outgoing(tb, n);
+    if ((tb->cflags & CF_INVALID) != 0) {
+        tb_jump_graph_release();
+        return;
+    }
+    dest = tb->next_tb[n];
+    if (dest != NULL && (uintptr_t)dest->tc.ptr != addr) {
+        dest = NULL;
+    }
+    if (dest != NULL && (dest->cflags & CF_INVALID) != 0) {
+        tb_jump_graph_release();
+        return;
+    }
+    if (addr == 0 || !tb_patch_branch(tb, n, addr)) {
+        tb_patch_reset(tb, n);
+        tb_jump_graph_release();
+        return;
+    }
+    tb->jmp_dest[n] = addr;
+    if (dest != NULL) {
+        tb->jmp_list_next[n] = dest->jmp_list_head;
+        dest->jmp_list_head = (uintptr_t)tb | (uintptr_t)n;
+    }
+    tb_jump_graph_release();
 }
 
 __attribute__((weak)) void latx_platform_cpu_loop_exit(CPUState *cs)

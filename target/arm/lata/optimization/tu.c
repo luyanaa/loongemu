@@ -14,6 +14,7 @@
 #include "target/arm/lata/translator/sve-lasx-lower.h"
 #include "tu.h"
 #include "disas/disas.h"
+#include "loongemu/tb_cache.h"
 
 #ifdef CONFIG_LATA_TU
 #ifdef CONFIG_SOFTMMU
@@ -118,10 +119,16 @@ static void tu_reset_tb(TranslationBlock *tb)
     tb->jmp_list_head = (uintptr_t)NULL;
     tb->jmp_list_next[0] = (uintptr_t)NULL;
     tb->jmp_list_next[1] = (uintptr_t)NULL;
+    tb->page_next[0] = 0;
+    tb->page_next[1] = 0;
+    tb->next_tb[0] = NULL;
+    tb->next_tb[1] = NULL;
 
     /* init top in and top out */
     tb->jmp_reset_offset[0] = TB_JMP_OFFSET_INVALID;
     tb->jmp_reset_offset[1] = TB_JMP_OFFSET_INVALID;
+    tb->jmp_insn_offset[0] = TB_JMP_OFFSET_INVALID;
+    tb->jmp_insn_offset[1] = TB_JMP_OFFSET_INVALID;
     tb_set_page_addr0(tb, -1);
     tb_set_page_addr1(tb, -1);
 #ifdef CONFIG_LATA_INSTS_PATTERN
@@ -601,19 +608,29 @@ static void register_tu(TranslationBlock **tb_list,
         if (tb->s_data->tu_tb_mode != TU_TB_MODE_BROKEN) {
             CPUArchState *env = cpu->env_ptr;
             tb_page_addr_t phys_pc;
-            // tb_page_addr_t phys_page2;
-            // target_ulong virt_page2;
+            tb_page_addr_t phys_page2 = (tb_page_addr_t)-1;
             phys_pc = get_page_addr_code(env, tb->pc);
             if (phys_pc == -1) {
                 /* Generate a one-shot TB with 1 insn in it */
                 cflags = (cflags & ~CF_COUNT_MASK) | CF_LAST_IO | 1;
+            } else if (tb->size != 0) {
+                target_ulong last_pc = tb->pc + (target_ulong)tb->size - 1;
+
+                if ((tb->pc & TBC_PAGE_MASK) !=
+                    (last_pc & TBC_PAGE_MASK)) {
+                    phys_page2 = get_page_addr_code(env, last_pc);
+                }
             }
             tb_set_page_addr0(tb, phys_pc);
-            tb_set_page_addr1(tb, -1);
+            tb_set_page_addr1(tb, phys_page2);
             if (phys_pc != -1) {
                 tb_lock_page0(phys_pc);
             }
-            // phys_page2 = -1;
+            if (phys_page2 != (tb_page_addr_t)-1 &&
+                (phys_page2 & TBC_PAGE_MASK) !=
+                    (phys_pc & TBC_PAGE_MASK)) {
+                tb_lock_page1(phys_page2);
+            }
             /* should inset TB to Qht */
             tb_link_page(tb);
             tcg_tb_insert(tb);

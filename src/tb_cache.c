@@ -230,6 +230,11 @@ void tbc_invalidate_range(TbCache *cache, uint64_t cr3, uint64_t addr,
     }
 }
 
+void tbc_invalidate_page(TbCache *cache, uint64_t cr3, uint64_t addr)
+{
+    tbc_invalidate_range(cache, cr3, addr & TBC_PAGE_MASK, TBC_PAGE_SIZE);
+}
+
 void tbc_invalidate_slot(TbCache *cache, uint32_t index)
 {
     if (cache == 0 || index >= cache->capacity || !cache->entries[index].used) {

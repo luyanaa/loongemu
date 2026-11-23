@@ -11,6 +11,7 @@
  *     so the caller can drop host-PC -> guest-PC maps.
  */
 #include <stdio.h>
+#include <pthread.h>
 #include <string.h>
 #include <stdint.h>
 #include "latr-tb-cache.h"
@@ -45,6 +46,39 @@ static LatrTbKey key(uint32_t asid, uint32_t priv)
 }
 
 static uint8_t blob[16];
+
+typedef struct ExecutionRace {
+    LatrTbCache *cache;
+    LatrTbKey key;
+    volatile int running;
+    volatile int leave_tb;
+    volatile int bad_code;
+    volatile int reads;
+    volatile int reclaimed;
+} ExecutionRace;
+
+static void *execute_during_shootdown(void *opaque)
+{
+    ExecutionRace *race = opaque;
+    LatrTbEntry *entry = latr_tb_cache_lookup(race->cache, 0x6000u,
+                                               race->key);
+    uint8_t *code = entry != NULL ? entry->code : NULL;
+
+    if (code == NULL) {
+        __atomic_store_n(&race->bad_code, 1, __ATOMIC_RELAXED);
+    }
+    __atomic_store_n(&race->running, 1, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&race->leave_tb, __ATOMIC_ACQUIRE)) {
+        if (code != NULL && code[0] != 0x5a) {
+            __atomic_store_n(&race->bad_code, 1, __ATOMIC_RELAXED);
+        }
+        __atomic_add_fetch(&race->reads, 1, __ATOMIC_RELAXED);
+    }
+    if (latr_tb_cache_safepoint(race->cache)) {
+        __atomic_store_n(&race->reclaimed, 1, __ATOMIC_RELEASE);
+    }
+    return NULL;
+}
 
 int main(void)
 {
@@ -260,6 +294,48 @@ int main(void)
         latr_tb_cache_unregister(&cache_a);
     }
 
+
+    /* 12. A shootdown retires an entry while another hart is executing its
+     * code. The arena remains intact until the executing owner reaches its
+     * safe point, then reclamation becomes legal. */
+    {
+        static const uint64_t PC = 0x6000u;
+        uint8_t code[16];
+        ExecutionRace race = {0};
+        pthread_t thread;
+        int thread_status;
+
+        memset(code, 0x5a, sizeof(code));
+        latr_tb_cache_init(&cache_a, arena_a, sizeof(arena_a));
+        race.cache = &cache_a;
+        race.key = key(9, 1);
+        CHECK(latr_tb_cache_insert(&cache_a, PC, race.key, code, sizeof(code),
+                                   1) != NULL,
+              "concurrent execution TB inserted");
+        thread_status = pthread_create(&thread, NULL,
+                                       execute_during_shootdown, &race);
+        CHECK(thread_status == 0, "execution worker starts");
+        if (thread_status == 0) {
+            while (!__atomic_load_n(&race.running, __ATOMIC_ACQUIRE) ||
+                   __atomic_load_n(&race.reads, __ATOMIC_RELAXED) == 0) {
+            }
+            latr_tb_shootdown_all(&cache_a);
+            CHECK(cache_a.count == 0, "shootdown retires live lookup entry");
+            CHECK(cache_a.arena_used == sizeof(code),
+                  "active code arena is not reclaimed by shootdown");
+            CHECK(cache_a.reclaim_pending == 1,
+                  "shootdown defers reclamation to owner safe point");
+            __atomic_store_n(&race.leave_tb, 1, __ATOMIC_RELEASE);
+            thread_status = pthread_join(thread, NULL);
+            CHECK(thread_status == 0, "execution worker joins");
+            CHECK(__atomic_load_n(&race.bad_code, __ATOMIC_RELAXED) == 0,
+                  "executing code remains mapped and unchanged after shootdown");
+            CHECK(__atomic_load_n(&race.reclaimed, __ATOMIC_ACQUIRE) == 1,
+                  "owner reclaims after leaving translated code");
+            CHECK(cache_a.arena_used == 0,
+                  "arena rewinds only after the safe point");
+        }
+    }
     printf("test-latr-tb-smp: %d checks, %d failures\n", checks, failures);
     if (failures == 0) {
         printf("test-latr-tb-smp: PASS\n");

@@ -138,9 +138,10 @@ struct separated_data {
 };
 
 struct TranslationBlock {
+    /* Link nodes tag their exit/page slot in the low pointer bit. */
     uintptr_t jmp_list_head;
     uintptr_t jmp_list_next[2];
-    uintptr_t jmp_dest[2];
+    uintptr_t jmp_dest[2]; /* patched host-code address, or 0 when unlinked */
 
     union {
         uintptr_t jmp_target_arg[2];
@@ -209,6 +210,8 @@ TranslationBlock *tcg_tb_lookup(uintptr_t pc);
 void *tcg_splitwx_to_rx(void *p);
 int   tcg_gen_code(TCGContext *s, uint8_t *search_pc);
 void  tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr);
+void  tb_reset_jump(TranslationBlock *tb, int n);
+void  tb_invalidate_tb(TranslationBlock *tb);
 void  qemu_thread_jit_write(void);
 void  qemu_spin_init(QemuSpin *s);
 int   cpu_lduw_code(CPUArchState *env, uint64_t addr);

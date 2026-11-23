@@ -8,6 +8,9 @@
  * SMC store.
  */
 #include "loongemu/tb_cache.h"
+#include "../shared/backend/loongarch/include/ir2-patch.h"
+
+#include <stddef.h>
 
 #include <stdio.h>
 
@@ -104,6 +107,148 @@ static void test_insert_is_idempotent(void)
     CHECK(tbc_count(&g_cache) == 1);
 }
 
+typedef struct FakeTb {
+    struct {
+        uint8_t *ptr;
+        size_t size;
+    } tc;
+    uint16_t jmp_insn_offset[2];
+    uint16_t jmp_reset_offset[2];
+    uintptr_t jmp_dest[2];
+    uintptr_t jmp_list_head;
+    uintptr_t jmp_list_next[2];
+    struct FakeTb *next_tb[2];
+} FakeTb;
+
+static uintptr_t decode_b_target(const uint32_t *site)
+{
+    uint32_t imm = *site & UINT32_C(0x03ffffff);
+    int64_t words = (imm & UINT32_C(0x02000000))
+                        ? (int64_t)imm - INT64_C(0x04000000)
+                        : (int64_t)imm;
+    int64_t bytes = words * 4;
+    uintptr_t pc = (uintptr_t)site;
+
+    return bytes < 0 ? pc - (uintptr_t)(-bytes)
+                     : pc + (uintptr_t)bytes;
+}
+
+static bool fake_set_jump(FakeTb *tb, int n, uintptr_t target)
+{
+    uint16_t offset = tb->jmp_insn_offset[n];
+    FakeTb *dest = tb->next_tb[n];
+    uint32_t *site;
+
+    if ((size_t)offset > tb->tc.size ||
+        tb->tc.size - (size_t)offset < sizeof(uint32_t)) {
+        return false;
+    }
+    site = (uint32_t *)(void *)(tb->tc.ptr + offset);
+    if (!loongarch_patch_b(site, target)) {
+        return false;
+    }
+    tb->jmp_dest[n] = target;
+    if (dest != NULL && (uintptr_t)dest->tc.ptr == target) {
+        tb->jmp_list_next[n] = dest->jmp_list_head;
+        dest->jmp_list_head = (uintptr_t)tb | (uintptr_t)n;
+    }
+    return true;
+}
+
+static void fake_reset_jump(FakeTb *tb, int n)
+{
+    FakeTb *dest = tb->next_tb[n];
+    uintptr_t wanted = (uintptr_t)tb | (uintptr_t)n;
+    uintptr_t *link = dest != NULL ? &dest->jmp_list_head : NULL;
+    uint32_t *site =
+        (uint32_t *)(void *)(tb->tc.ptr + tb->jmp_insn_offset[n]);
+    uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp_reset_offset[n];
+
+    if (!loongarch_patch_b(site, reset)) {
+        return;
+    }
+    while (link != NULL && *link != 0) {
+        uintptr_t node = *link;
+        FakeTb *origin = (FakeTb *)(node & ~(uintptr_t)1);
+        int index = (int)(node & 1u);
+
+        if (node == wanted) {
+            *link = tb->jmp_list_next[n];
+            break;
+        }
+        link = &origin->jmp_list_next[index];
+    }
+    tb->jmp_list_next[n] = 0;
+    tb->jmp_dest[n] = 0;
+}
+
+static void fake_invalidate_tb(FakeTb *tb)
+{
+    while (tb->jmp_list_head != 0) {
+        uintptr_t node = tb->jmp_list_head;
+        FakeTb *origin = (FakeTb *)(node & ~(uintptr_t)1);
+        int n = (int)(node & 1u);
+        uint32_t *site = (uint32_t *)(void *)(
+            origin->tc.ptr + origin->jmp_insn_offset[n]);
+        uintptr_t reset =
+            (uintptr_t)origin->tc.ptr + origin->jmp_reset_offset[n];
+
+        if (!loongarch_patch_b(site, reset)) {
+            break;
+        }
+        tb->jmp_list_head = origin->jmp_list_next[n];
+        origin->jmp_list_next[n] = 0;
+        origin->jmp_dest[n] = 0;
+    }
+}
+
+/* A two-TB chain patches to TB B; invalidating B unlinks and restores TB A's
+ * original dispatch stub. This decodes the emitted LoongArch instruction on
+ * the host, which need not itself execute LoongArch code. */
+static void test_direct_branch_chain_and_unlink(void)
+{
+    uint32_t code_a[4] = { UINT32_C(0x50000001) };
+    uint32_t code_b[4] = { UINT32_C(0x50000001) };
+    FakeTb a = {0}, b = {0};
+    uint32_t *site = &code_a[0];
+
+    a.tc.ptr = (uint8_t *)code_a;
+    a.tc.size = sizeof(code_a);
+    a.jmp_insn_offset[0] = 0;
+    a.jmp_reset_offset[0] = 4;
+    a.next_tb[0] = &b;
+    b.tc.ptr = (uint8_t *)code_b;
+    b.tc.size = sizeof(code_b);
+
+    CHECK(fake_set_jump(&a, 0, (uintptr_t)b.tc.ptr));
+    CHECK((*site & UINT32_C(0xfc000000)) == UINT32_C(0x50000000));
+    CHECK(decode_b_target(site) == (uintptr_t)b.tc.ptr);
+    CHECK(a.jmp_dest[0] == (uintptr_t)b.tc.ptr);
+    CHECK(b.jmp_list_head == (uintptr_t)&a);
+
+    fake_invalidate_tb(&b);
+    CHECK(decode_b_target(site) == (uintptr_t)&code_a[1]);
+    CHECK(a.jmp_dest[0] == 0);
+    CHECK(a.jmp_list_next[0] == 0);
+    CHECK(b.jmp_list_head == 0);
+}
+
+static void test_direct_branch_range(void)
+{
+    uint32_t code[2] = { UINT32_C(0x50000000), 0 };
+    uint32_t original = code[0];
+    uintptr_t site = (uintptr_t)&code[0];
+
+    CHECK(loongarch_patch_b(&code[0], site - UINT32_C(0x08000000)));
+    CHECK(decode_b_target(&code[0]) == site - UINT32_C(0x08000000));
+    code[0] = original;
+    CHECK(loongarch_patch_b(&code[0], site + UINT32_C(0x07fffffc)));
+    CHECK(decode_b_target(&code[0]) == site + UINT32_C(0x07fffffc));
+    code[0] = original;
+    CHECK(!loongarch_patch_b(&code[0], site + UINT32_C(0x08000000)));
+    CHECK(code[0] == original);
+}
+
 /* An SMC store must drop the blocks whose code covers the written page. */
 static void test_invalidate_range(void)
 {
@@ -124,6 +269,17 @@ static void test_invalidate_range(void)
     CHECK(tbc_lookup(&g_cache, 0x3000, 0, 0x1000, 0) == 0);
     CHECK(tbc_lookup(&g_cache, 0x5000, 0, 0x1000, 0) != 0);
     CHECK(tbc_count(&g_cache) == 1);
+}
+
+static void test_invalidate_page(void)
+{
+    reset();
+    tbc_insert(&g_cache, 0x3000, 0, 0x1000, 0);
+    tbc_insert(&g_cache, 0x4000, 0, 0x1000, 0);
+
+    tbc_invalidate_page(&g_cache, 0x1000, 0x3fff);
+    CHECK(tbc_lookup(&g_cache, 0x3000, 0, 0x1000, 0) == 0);
+    CHECK(tbc_lookup(&g_cache, 0x4000, 0, 0x1000, 0) != 0);
 }
 
 /* A block straddling a page boundary must be dropped by a write to either. */
@@ -253,7 +409,10 @@ int main(void)
     test_key_isolation();
     test_bucket_collision_still_distinguishes_cr3();
     test_insert_is_idempotent();
+    test_direct_branch_chain_and_unlink();
+    test_direct_branch_range();
     test_invalidate_range();
+    test_invalidate_page();
     test_invalidate_cross_page();
     test_invalidate_is_asid_scoped();
     test_flush_asid();

@@ -8,7 +8,7 @@
 TranslationBlock *tb_htable_lookup(CPUState *cpu, uint64_t pc, uint64_t cs_base,
                                    uint32_t flags, uint32_t cflags);
 void tb_link_page(TranslationBlock *tb);
-/* Invalidate every TB registered against the containing guest page. */
+/* Invalidate every TB registered against the containing physical page. */
 void tb_invalidate_page(tb_page_addr_t addr);
 /* Mark invalid and unlink incoming/outgoing direct jumps before retirement. */
 void tb_invalidate_tb(TranslationBlock *tb);

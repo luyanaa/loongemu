@@ -1,16 +1,9 @@
 /*
  * Translation-block cache.
  *
- * The single-block smoke harness rebuilt one hand-made TB and patched its
- * exit with a hard-coded jump.  A real run needs a keyed table instead: the
- * same guest PC means different code when the address space, the segment
- * base or the privilege level differs, and a self-modifying guest must be
- * able to drop the entries for a page.
- *
- * The table is fixed-size and allocation-free so it can live in a bare-metal
- * pool, and it stores only what the executor needs to resume: the key, the
- * code address and its size.  Everything else stays in the TranslationBlock
- * the translator filled in.
+ * The table is a fixed-size, allocation-free lookup index.  It stores the
+ * translation key and emitted-code address; the caller owns the code arena
+ * and the lifetime of the bytes at that address.
  *
  * Keys:
  *   pc       guest instruction pointer
@@ -18,9 +11,24 @@
  *   cr3      page-table root, i.e. the address space
  *   cpl      privilege level the code was translated for
  *
- * A hit requires all four to match.  tbc_invalidate_page() drops every block
- * that overlaps a guest page (SMC and INVLPG), and tbc_flush_asid() drops
- * everything for an address space (a CR3 write).
+ * Lifecycle owners:
+ *   allocate   the translation caller reserves arena space and emits code;
+ *   publish    tbc_insert* makes the key visible; LATA tb_link_page records
+ *              the TB's physical-page membership;
+ *   execute    the dispatcher enters code obtained from a successful lookup;
+ *   invalidate tbc_invalidate_* removes keys, while LATA tb_invalidate_page
+ *              and tb_flush mark page-linked TBs invalid;
+ *   unlink     before retirement, the LATA runtime drains incoming
+ *              jmp_list_head links and resets outgoing branches with the
+ *              resolved jmp_reset_offset (tb_reset_jump);
+ *   retire     invalidation removes a TB from lookup/page indexes but does
+ *              not free or reuse its emitted code;
+ *   reclaim    only the code-arena owner may reuse bytes after all execution
+ *              has left the arena (a safe point / quiescent state).
+ *
+ * TbCache itself is not synchronized and never owns/reclaims code. Callers
+ * serialize lookup, publish and invalidation, and must not rewind their code
+ * arena merely because an entry was invalidated.
  */
 #ifndef LOONGEMU_TB_CACHE_H
 #define LOONGEMU_TB_CACHE_H
@@ -30,6 +38,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
 
 #define TBC_NO_ENTRY UINT32_C(0xffffffff)
 
@@ -94,6 +103,8 @@ TbCacheEntry *tbc_insert_mips(TbCache *cache, uint64_t pc, uint32_t asid,
 /* Drop every block overlapping [addr, addr+len) in the given address space. */
 void tbc_invalidate_range(TbCache *cache, uint64_t cr3, uint64_t addr,
                           uint64_t len);
+/* Drop every block overlapping the guest page containing addr. */
+void tbc_invalidate_page(TbCache *cache, uint64_t cr3, uint64_t addr);
 
 /* Drop a single slot by index. */
 void tbc_invalidate_slot(TbCache *cache, uint32_t index);
