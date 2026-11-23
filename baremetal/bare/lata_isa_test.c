@@ -7294,6 +7294,43 @@ void kmain(void)
     }
 cun_probe_done:;
 
+    /* FPCR.FZ: a subnormal result is flushed to a signed zero. */
+    if (latx_cpu_has_lasx() != 0) {
+        DisasContext ds;
+        A64SVEPvirBuilder bs;
+
+        sve_init_direct(&ds, &bs, 256);
+        env.vfp.xregs[0] = UINT64_C(1) << 24; /* FPCR.FZ */
+        arm_sve_preg(&env, 1)[0] = 0x11u;
+        arm_sve_preg(&env, 1)[1] = 0x11u;
+        arm_sve_preg(&env, 1)[2] = 0x11u;
+        arm_sve_preg(&env, 1)[3] = 0x11u;
+        for (size_t l = 0; l < 8; ++l) {
+            write_le32(arm_sve_zreg(&env, 0) + l * 4u, 0x00800000u); /* min normal */
+            write_le32(arm_sve_zreg(&env, 2) + l * 4u, 0x40000000u); /* 2.0f */
+        }
+        check(sve_emit_decoded(&ds, 0x658d8440u, "FDIV z0.s with FZ"),
+              1, "FDIV lowers under FZ=1");
+        sve_exec_direct();
+        check(read_le32(arm_sve_zreg(&env, 0)), 0u,
+              "FZ=1 flushes the subnormal quotient to zero");
+
+        /* FZ=0 keeps the subnormal. */
+        sve_init_direct(&ds, &bs, 256);
+        arm_sve_preg(&env, 1)[0] = 0x11u;
+        arm_sve_preg(&env, 1)[1] = 0x11u;
+        arm_sve_preg(&env, 1)[2] = 0x11u;
+        arm_sve_preg(&env, 1)[3] = 0x11u;
+        for (size_t l = 0; l < 8; ++l) {
+            write_le32(arm_sve_zreg(&env, 0) + l * 4u, 0x00800000u);
+            write_le32(arm_sve_zreg(&env, 2) + l * 4u, 0x40000000u);
+        }
+        (void)sve_emit_decoded(&ds, 0x658d8440u, "FDIV z0.s without FZ");
+        sve_exec_direct();
+        check(read_le32(arm_sve_zreg(&env, 0)), UINT32_C(0x00400000),
+              "FZ=0 keeps the subnormal result");
+    }
+
     /* FPCR.DN on the inline binary path (lower_fp_binary). */
     if (latx_cpu_has_lasx() != 0) {
         DisasContext ds;

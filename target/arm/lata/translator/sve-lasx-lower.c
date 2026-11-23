@@ -1295,6 +1295,80 @@ static void lata_emit_dn_fixup(IR2_OPND res, bool is64)
     ra_free_temp(tmp);
 }
 
+/*
+ * FPCR.FZ: a subnormal result is replaced by a zero with the sign of the result.
+ * Implemented on the bit pattern (exponent == 0 && mantissa != 0) so it does not
+ * depend on the host's flush behaviour.
+ */
+static void lata_emit_fz_fixup(IR2_OPND res, bool is64)
+{
+    IR2_OPND skip = ir2_opnd_new_type(IR2_OPND_LABEL);
+    IR2_OPND exp = ra_alloc_ftemp();
+    IR2_OPND const_v = ra_alloc_ftemp();
+    IR2_OPND mant = ra_alloc_ftemp();
+    IR2_OPND ones = ra_alloc_ftemp();
+    IR2_OPND zero = ra_alloc_ftemp();
+    IR2_OPND m = ra_alloc_ftemp();
+    IR2_OPND sub = ra_alloc_ftemp();
+    IR2_OPND zeroed = ra_alloc_ftemp();
+
+    li_d(t0_ir2_opnd, env_offset_FPCR());
+    la_ldx_wu(t0_ir2_opnd, env_ir2_opnd, t0_ir2_opnd);
+    li_d(t1_ir2_opnd, INT64_C(1) << 24);
+    la_and(t0_ir2_opnd, t0_ir2_opnd, t1_ir2_opnd);
+    la_beqz(t0_ir2_opnd, skip);
+
+    la_xvxor_v(zero, zero, zero);
+    emit_xv_broadcast_u64(ones, UINT64_MAX);
+
+    /* exp = res & exponent_mask; expz = (exp == 0) */
+    if (is64) {
+        emit_xv_broadcast_u64(const_v, UINT64_C(0x7ff0000000000000));
+    } else {
+        emit_xv_broadcast_u64(const_v, UINT64_C(0x7f8000007f800000));
+    }
+    la_xvand_v(exp, res, const_v);
+    if (is64) {
+        la_xvseq_d(exp, exp, zero);
+    } else {
+        la_xvseq_w(exp, exp, zero);
+    }
+    /* mant = res & mantissa_mask; m = (mant == 0) */
+    if (is64) {
+        emit_xv_broadcast_u64(const_v, UINT64_C(0x000fffffffffffff));
+    } else {
+        emit_xv_broadcast_u64(const_v, UINT64_C(0x007fffff007fffff));
+    }
+    la_xvand_v(mant, res, const_v);
+    if (is64) {
+        la_xvseq_d(m, mant, zero);
+    } else {
+        la_xvseq_w(m, mant, zero);
+    }
+    /* notm = ~m  (vbitsel is "va ? vk : vj") */
+    la_xvbitsel_v(m, ones, zero, m);
+    /* sub = expz & notm */
+    la_xvand_v(sub, exp, m);
+    /* zeroed = sign(res) */
+    if (is64) {
+        emit_xv_broadcast_u64(const_v, UINT64_C(0x8000000000000000));
+    } else {
+        emit_xv_broadcast_u64(const_v, UINT64_C(0x8000000080000000));
+    }
+    la_xvand_v(zeroed, res, const_v);
+    la_xvbitsel_v(res, res, zeroed, sub);
+
+    la_label(skip);
+    ra_free_temp(zeroed);
+    ra_free_temp(sub);
+    ra_free_temp(m);
+    ra_free_temp(zero);
+    ra_free_temp(ones);
+    ra_free_temp(mant);
+    ra_free_temp(const_v);
+    ra_free_temp(exp);
+}
+
 static bool lower_fp_binary(DisasContext *s,
                             const A64SVEIR1Instruction *source,
                             const PvirInstruction *instruction)
@@ -1459,6 +1533,8 @@ static bool lower_fp_binary(DisasContext *s,
         }
         if (ok) {
             lata_emit_dn_fixup(result_value,
+                               operation->type.element_bits == 64);
+            lata_emit_fz_fixup(result_value,
                                operation->type.element_bits == 64);
             /* The chunk has not been stored yet, so env still holds old Zdn. */
             lata_env_xvld(old_value, destination_offset + (int)byte);
