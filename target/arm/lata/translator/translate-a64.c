@@ -370,6 +370,12 @@ static void lata_emit_native_pair_load(DisasContext *s, IR2_OPND lo,
                                        IR2_OPND hi, IR2_OPND base,
                                        int64_t disp, int dbytes,
                                        bool is_signed);
+static void lata_emit_native_vec_pair_store(DisasContext *s, IR2_OPND lo,
+                                            IR2_OPND hi, IR2_OPND base,
+                                            int64_t disp, int dbytes);
+static void lata_emit_native_vec_pair_load(DisasContext *s, IR2_OPND lo,
+                                           IR2_OPND hi, IR2_OPND base,
+                                           int64_t disp, int dbytes);
 
 static void lata_emit_guest_mem_probe(DisasContext *s, IR2_OPND addr_reg,
                                       int64_t offset, size_t size,
@@ -2980,23 +2986,58 @@ static bool trans_STP_v(DisasContext *s)
     if (!lata_guest_mem_inline_host_access_ok())
     {
         int64_t disp = (!a->w || a->p) ? (int64_t)offset : 0;
+        bool admitted_path = false;
 
-        if (dbytes == 16)
+        if (lata_guest_mem_direct_available())
         {
-            lata_emit_guest_mem_store_bulk(s, vreg_t, reg_n, disp, 16u);
-            lata_emit_guest_mem_store_bulk(s, vreg_t2, reg_n, disp + 16, 16u);
-        }
-        else
-        {
-            /* Narrow pairs store two scalar halves through the value hooks. */
-            for (int i = 0; i < 2; ++i)
+            IR2_OPND admitted = ir2_opnd_new_type(IR2_OPND_LABEL);
+            IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
+
+            lata_emit_scalar_span_admission(reg_n, disp,
+                                            (size_t)dbytes * 2u, true,
+                                            admitted);
+            admitted_path = true;
+            if (dbytes == 16)
             {
-                IR2_OPND half = ra_alloc_itemp();
-                la_vpickve2gr_du(half, i == 0 ? vreg_t : vreg_t2, 0);
-                lata_emit_guest_mem_store_call(s, half, reg_n,
-                                               disp + (int64_t)i * dbytes,
-                                               (size_t)dbytes);
-                ra_free_temp(half);
+                lata_emit_guest_mem_store_bulk(s, vreg_t, reg_n, disp, 16u);
+                lata_emit_guest_mem_store_bulk(s, vreg_t2, reg_n, disp + 16, 16u);
+            }
+            else
+            {
+                for (int i = 0; i < 2; ++i)
+                {
+                    IR2_OPND half = ra_alloc_itemp();
+                    la_vpickve2gr_du(half, i == 0 ? vreg_t : vreg_t2, 0);
+                    lata_emit_guest_mem_store_call(s, half, reg_n,
+                                                   disp + (int64_t)i * dbytes,
+                                                   (size_t)dbytes);
+                    ra_free_temp(half);
+                }
+            }
+            la_b(done);
+            la_label(admitted);
+            lata_emit_native_vec_pair_store(s, vreg_t, vreg_t2, reg_n, disp,
+                                            dbytes);
+            la_label(done);
+        }
+        if (!admitted_path)
+        {
+            if (dbytes == 16)
+            {
+                lata_emit_guest_mem_store_bulk(s, vreg_t, reg_n, disp, 16u);
+                lata_emit_guest_mem_store_bulk(s, vreg_t2, reg_n, disp + 16, 16u);
+            }
+            else
+            {
+                for (int i = 0; i < 2; ++i)
+                {
+                    IR2_OPND half = ra_alloc_itemp();
+                    la_vpickve2gr_du(half, i == 0 ? vreg_t : vreg_t2, 0);
+                    lata_emit_guest_mem_store_call(s, half, reg_n,
+                                                   disp + (int64_t)i * dbytes,
+                                                   (size_t)dbytes);
+                    ra_free_temp(half);
+                }
             }
         }
         if (a->w)
@@ -3107,23 +3148,61 @@ static bool trans_LDP_v(DisasContext *s)
     {
         int64_t disp = (!a->w || a->p) ? (int64_t)offset : 0;
 
-        if (dbytes == 16)
-        {
-            lata_emit_guest_mem_load_bulk(s, vreg_t, reg_n, disp, 16u);
-            lata_emit_guest_mem_load_bulk(s, vreg_t2, reg_n, disp + 16, 16u);
-        }
-        else
-        {
-            IR2_OPND lo = ra_alloc_itemp();
-            IR2_OPND hi = ra_alloc_itemp();
+        bool admitted_path = false;
 
-            lata_emit_guest_mem_load_pair(s, lo, hi, reg_n, disp,
-                                          disp + (int64_t)dbytes,
-                                          (size_t)dbytes, false);
-            la_vinsgr2vr_d(vreg_t, lo, 0);
-            la_vinsgr2vr_d(vreg_t2, hi, 0);
-            ra_free_temp(lo);
-            ra_free_temp(hi);
+        if (lata_guest_mem_direct_available())
+        {
+            IR2_OPND admitted = ir2_opnd_new_type(IR2_OPND_LABEL);
+            IR2_OPND done = ir2_opnd_new_type(IR2_OPND_LABEL);
+
+            lata_emit_scalar_span_admission(reg_n, disp,
+                                            (size_t)dbytes * 2u, false,
+                                            admitted);
+            admitted_path = true;
+            if (dbytes == 16)
+            {
+                lata_emit_guest_mem_load_bulk(s, vreg_t, reg_n, disp, 16u);
+                lata_emit_guest_mem_load_bulk(s, vreg_t2, reg_n, disp + 16, 16u);
+            }
+            else
+            {
+                IR2_OPND lo = ra_alloc_itemp();
+                IR2_OPND hi = ra_alloc_itemp();
+
+                lata_emit_guest_mem_load_pair(s, lo, hi, reg_n, disp,
+                                              disp + (int64_t)dbytes,
+                                              (size_t)dbytes, false);
+                la_vinsgr2vr_d(vreg_t, lo, 0);
+                la_vinsgr2vr_d(vreg_t2, hi, 0);
+                ra_free_temp(lo);
+                ra_free_temp(hi);
+            }
+            la_b(done);
+            la_label(admitted);
+            lata_emit_native_vec_pair_load(s, vreg_t, vreg_t2, reg_n, disp,
+                                           dbytes);
+            la_label(done);
+        }
+        if (!admitted_path)
+        {
+            if (dbytes == 16)
+            {
+                lata_emit_guest_mem_load_bulk(s, vreg_t, reg_n, disp, 16u);
+                lata_emit_guest_mem_load_bulk(s, vreg_t2, reg_n, disp + 16, 16u);
+            }
+            else
+            {
+                IR2_OPND lo = ra_alloc_itemp();
+                IR2_OPND hi = ra_alloc_itemp();
+
+                lata_emit_guest_mem_load_pair(s, lo, hi, reg_n, disp,
+                                              disp + (int64_t)dbytes,
+                                              (size_t)dbytes, false);
+                la_vinsgr2vr_d(vreg_t, lo, 0);
+                la_vinsgr2vr_d(vreg_t2, hi, 0);
+                ra_free_temp(lo);
+                ra_free_temp(hi);
+            }
         }
         if (a->w)
         {
@@ -3625,6 +3704,69 @@ static void lata_emit_native_pair_load(DisasContext *s, IR2_OPND lo, IR2_OPND hi
     default:
         la_ld_d(lo, addr, 0);
         la_ld_d(hi, addr, dbytes);
+        break;
+    }
+    ra_free_temp(addr);
+}
+
+/* Native vector pair forms for a run-time admitted span. */
+static void lata_emit_native_vec_pair_store(DisasContext *s, IR2_OPND lo,
+                                            IR2_OPND hi, IR2_OPND base,
+                                            int64_t disp, int dbytes)
+{
+    IR2_OPND addr = ra_alloc_itemp();
+
+    if (disp != 0) {
+        li_d(addr, disp);
+        la_add_d(addr, base, addr);
+    } else {
+        la_mov64(addr, base);
+    }
+    switch (dbytes) {
+    case 4:
+        la_fst_s(lo, addr, 0);
+        la_fst_s(hi, addr, 4);
+        break;
+    case 8:
+        la_fst_d(lo, addr, 0);
+        la_fst_d(hi, addr, 8);
+        break;
+    default:
+        la_vst(lo, addr, 0);
+        la_vst(hi, addr, 16);
+        break;
+    }
+    ra_free_temp(addr);
+}
+
+static void lata_emit_native_vec_pair_load(DisasContext *s, IR2_OPND lo,
+                                           IR2_OPND hi, IR2_OPND base,
+                                           int64_t disp, int dbytes)
+{
+    IR2_OPND addr = ra_alloc_itemp();
+
+    if (disp != 0) {
+        li_d(addr, disp);
+        la_add_d(addr, base, addr);
+    } else {
+        la_mov64(addr, base);
+    }
+    switch (dbytes) {
+    case 4:
+        la_fld_s(lo, addr, 0);
+        la_vand_v(lo, lo, fsmask_ir2_opnd);
+        la_fld_s(hi, addr, 4);
+        la_vand_v(hi, hi, fsmask_ir2_opnd);
+        break;
+    case 8:
+        la_fld_d(lo, addr, 0);
+        la_vinsgr2vr_d(lo, zero_ir2_opnd, 1);
+        la_fld_d(hi, addr, 8);
+        la_vinsgr2vr_d(hi, zero_ir2_opnd, 1);
+        break;
+    default:
+        la_vld(lo, addr, 0);
+        la_vld(hi, addr, 16);
         break;
     }
     ra_free_temp(addr);

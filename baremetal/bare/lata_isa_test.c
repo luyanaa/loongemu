@@ -7041,6 +7041,53 @@ void kmain(void)
         lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
     }
 
+    /* Vector pair under the policy: 16-byte pair and a narrow S pair both take
+     * the native path when admitted. */
+    {
+        static uint32_t stp_q[] __attribute__((aligned(16))) = {
+            0xad000420u, /* stp q0, q1, [x1] */
+        };
+        static uint32_t ldp_s[] __attribute__((aligned(16))) = {
+            0x2d400c22u, /* ldp s2, s3, [x1] */
+        };
+        static uint8_t vpbuf[32] __attribute__((aligned(16)));
+
+        for (size_t i = 0; i < 32; ++i) vpbuf[i] = 0;
+        policy_base = (uint64_t)(uintptr_t)vpbuf;
+        policy_limit = 32;
+
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        for (size_t i = 0; i < 16; ++i) {
+            arm_sve_zreg(&env, 0)[i] = (uint8_t)(0xb0u + i);
+            arm_sve_zreg(&env, 1)[i] = (uint8_t)(0xd0u + i);
+        }
+        env.xregs[1] = (uint64_t)(uintptr_t)vpbuf;
+        prov_stores = 0;
+        lata_guest_mem_clear_fault_regions(&env);
+        lata_set_guest_mem_ops(&prov_policy_ops);
+        check(sve_run_a64_tb(stp_q, 1, 128, 0x0fu, false, "policy STP Q admitted"),
+              1, "admitted STP Q runs");
+        check(prov_stores, 0, "admitted STP Q does not call the provider");
+        check(read_le64(vpbuf), UINT64_C(0xb7b6b5b4b3b2b1b0),
+              "admitted STP Q stores Q0 natively");
+        check(read_le64(vpbuf + 16), UINT64_C(0xd7d6d5d4d3d2d1d0),
+              "admitted STP Q stores Q1 natively");
+
+        write_le32(vpbuf, 0x11111111u);
+        write_le32(vpbuf + 4, 0x22222222u);
+        for (size_t i = 0; i < sizeof(env); ++i) ((uint8_t *)&env)[i] = 0;
+        env.xregs[1] = (uint64_t)(uintptr_t)vpbuf;
+        prov_loads = 0;
+        (void)sve_run_a64_tb(ldp_s, 1, 128, 0x0fu, false, "policy LDP S admitted");
+        check(prov_loads, 0, "admitted LDP S does not call the provider");
+        check(read_le32(arm_sve_zreg(&env, 2)), 0x11111111u,
+              "admitted LDP S loads the first half natively");
+        check(read_le32(arm_sve_zreg(&env, 3)), 0x22222222u,
+              "admitted LDP S loads the second half natively");
+        policy_limit = 8;
+        lata_set_guest_mem_ops(&lata_default_guest_mem_ops);
+    }
+
     latx_bare_uart_puts("lata-isa: checks=");
     putdec((uint64_t)checks);
     latx_bare_uart_puts(" fails=");
