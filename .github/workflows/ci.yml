@@ -30,14 +30,12 @@ jobs:
       - name: Host unit tests
         run: make test CC=clang
 
-      # The per-hart TB cache invariant tests are host-side and run in
-      # milliseconds; they are the only coverage of the SMP invalidation
-      # registry, so they must gate every push. `make check` also builds
-      # test-latr-machine-trap, which needs a header this tree does not carry
-      # yet, so the working targets are listed explicitly.
+      # Decode/legality/ELF/TB-cache-invariants/machine-trap, all host-side and
+      # in milliseconds. The TB cache tests are the only coverage of the SMP
+      # invalidation registry, so they must gate every push.
       - name: LATR host tests
         working-directory: latr
-        run: make all test-legality test-elf test-tb-smp CLANG=clang AR=llvm-ar
+        run: make check CLANG=clang AR=llvm-ar
 
   # ISA tier: boot the LATR and LATM bare ISA images.
   #

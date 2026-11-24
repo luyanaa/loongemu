@@ -32,11 +32,15 @@ BASE := --target=$(TARGET) -ffreestanding -nostdinc -fno-builtin \
         -fno-slp-vectorize -Wno-unused-parameter -Wno-unused-variable
 DEFS_HOST := $(DEFS) -D__thread=
 CFLAGS := $(BASE) $(INCS) -isystem $(RESINC) $(DEFS)
+# `-idirafter ../include`: the repo's include/ is incomplete (it has no
+# exec/tb-context.h, and its exec-all.h pulls one in), so the compat shims under
+# $(LATX)/compat must be found first. Only the loongemu/* headers are needed from
+# ../include, and nothing shadows those.
 HOST_CFLAGS ?= -std=gnu11 -O2 -Wall -Wextra -Werror -Wno-unused-parameter \
                -Wno-unused-function -I$(LATR)/include -I$(BUILD) \
-               -Icompat -I.. -I$(LATA)/include -I$(LATA) -I../shared/pvir/include -I../shared/backend/loongarch/include -I../shared/perf/include -I../include \
+               -Icompat -I.. -I$(LATA)/include -I$(LATA) -I../shared/pvir/include -I../shared/backend/loongarch/include -I../shared/perf/include \
                -idirafter $(LATX)/compat -idirafter $(LATX)/compat/include \
-               -idirafter $(LATX)/upstream/include
+               -idirafter $(LATX)/upstream/include -idirafter ../include
 
 # QEMU-LVZ is an optional override; a checked-in copy under ir1/qemu and
 # scripts/decodetree.py keeps the freestanding core buildable on its own.
