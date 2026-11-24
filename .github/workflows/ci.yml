@@ -67,6 +67,9 @@ jobs:
             QLVZ_REPO=/usr/bin/qemu-system-loongarch64
         env:
           QEMU_DEBUG: 1
+          # Distro la464 does not decode every instruction the translator emits
+          # (LSX/LASX lanes appear in generated code); `max` accepts them all.
+          QEMU_CPU: max
 
       - name: LATR ISA gate
         run: |
@@ -75,6 +78,9 @@ jobs:
             QLVZ_REPO=/usr/bin/qemu-system-loongarch64
         env:
           QEMU_DEBUG: 1
+          # Distro la464 does not decode every instruction the translator emits
+          # (LSX/LASX lanes appear in generated code); `max` accepts them all.
+          QEMU_CPU: max
 
       - name: LATM ISA gate
         run: |
@@ -83,3 +89,6 @@ jobs:
             QLVZ_REPO=/usr/bin/qemu-system-loongarch64
         env:
           QEMU_DEBUG: 1
+          # Distro la464 does not decode every instruction the translator emits
+          # (LSX/LASX lanes appear in generated code); `max` accepts them all.
+          QEMU_CPU: max
