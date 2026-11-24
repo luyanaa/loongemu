@@ -40,7 +40,7 @@ fi
 "$QEMU" -M virt -cpu "$CPU" -m "$MEM" -kernel "$KERNEL" \
     -display none -monitor none -nic none \
     -L "$(dirname "$QEMU")/../share/qemu" \
-    -serial "file:$LOG_FILE" -no-reboot "${QEMU_ARGS[@]}" \
+    -serial "file:$LOG_FILE" -no-reboot ${QEMU_ARGS[@]+"${QEMU_ARGS[@]}"} \
     >/dev/null 2>>"$ERR_FILE" &
 QEMU_PID=$!
 
