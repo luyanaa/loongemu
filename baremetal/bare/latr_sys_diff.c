@@ -161,6 +161,15 @@ void kmain(void)
         perf_put_hex(loongemu_perf_read(LOONGEMU_PERF_MMIO_TICKS));
         latx_bare_uart_puts(" recovery-ticks=");
         perf_put_hex(loongemu_perf_read(LOONGEMU_PERF_RECOVERY_TICKS));
+        {
+            uint64_t hot_page = 0;
+            uint32_t hot = latr_tb_hot_busiest(&cache, &hot_page);
+
+            latx_bare_uart_puts(" hot-translations=");
+            perf_put_hex(hot);
+            latx_bare_uart_puts(" hot-page=");
+            perf_put_hex(hot_page);
+        }
         latx_bare_uart_puts("\n");
     }
 #endif

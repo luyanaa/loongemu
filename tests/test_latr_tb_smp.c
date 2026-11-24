@@ -409,6 +409,41 @@ int main(void)
         }
     }
 
+    /* 12b. Hot-region accounting: every successful insert charges the guest
+     * page, which is the signal the AOT work will select regions from. */
+    {
+        uint64_t page = 0;
+        LatrTbCache c;
+
+        latr_tb_cache_init(&c, arena_b, sizeof(arena_b));
+        CHECK(latr_tb_hot_busiest(&c, &page) == 0,
+              "an untouched cache reports no hot page");
+        for (uint32_t i = 0; i < 3; i++) {
+            CHECK(latr_tb_cache_insert(&c, 0x9000u + i * 4u, key(1, 1), blob,
+                                       sizeof(blob), 1) != NULL,
+                  "hot-page insert");
+        }
+        CHECK(latr_tb_cache_insert(&c, 0xa100u, key(1, 1), blob, sizeof(blob),
+                                   1) != NULL, "second-page insert");
+        CHECK(latr_tb_hot_page(&c, (0x9000u >> 12) &
+                                      (LATR_TB_HOT_SLOTS - 1), &page) == 3,
+              "three translations charged to the first page");
+        CHECK(page == 0x9000u, "charged page is the guest page base");
+        CHECK(latr_tb_hot_busiest(&c, &page) == 3 && page == 0x9000u,
+              "busiest page is the one with three translations");
+        CHECK(latr_tb_hot_page(&c, LATR_TB_HOT_SLOTS, NULL) == 0,
+              "out-of-range slot reports nothing");
+        /* Direct-mapped: a page that lands in the same slot restarts its own
+         * count instead of inheriting the previous page's. */
+        CHECK(latr_tb_cache_insert(&c, 0x9000u + (LATR_TB_HOT_SLOTS << 12),
+                                   key(1, 1), blob, sizeof(blob), 1) != NULL,
+              "colliding-page insert");
+        CHECK(latr_tb_hot_page(&c, (0x9000u >> 12) &
+                                      (LATR_TB_HOT_SLOTS - 1), &page) == 1 &&
+              page == (0x9000u + (LATR_TB_HOT_SLOTS << 12)),
+              "collision restarts the slot with the new page");
+    }
+
     /* 13. Four harts translating and executing while invalidations land from
      * another thread: no torn entry, no corrupted code, no remote reclaim. */
     {

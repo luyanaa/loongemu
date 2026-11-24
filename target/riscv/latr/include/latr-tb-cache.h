@@ -42,6 +42,21 @@ typedef struct LatrTbEntry {
     int valid;
 } LatrTbEntry;
 
+/*
+ * Hot-region accounting. A "region" for AOT purposes is a guest 4 KiB page:
+ * every successful insert (i.e. every translation) charges the page its PC
+ * falls in, and a direct-mapped table keeps the busiest pages. This is the
+ * measurement P3 needs to pick what to compile ahead of time; the counters are
+ * plain bookkeeping and never affect translation or dispatch.
+ */
+#define LATR_TB_HOT_SLOTS 64
+
+typedef struct LatrTbHotPage {
+    uint64_t page;
+    uint32_t translations;
+    uint8_t valid;
+} LatrTbHotPage;
+
 typedef struct LatrTbCache {
     LatrTbEntry entries[LATR_TB_CACHE_ENTRIES];
     uint8_t *arena;
@@ -56,6 +71,7 @@ typedef struct LatrTbCache {
     volatile int lock;
     /* Set by shootdown; the owner resets the arena at its next safe point. */
     uint32_t reclaim_pending;
+    LatrTbHotPage hot[LATR_TB_HOT_SLOTS];
 } LatrTbCache;
 
 LatrTbKey latr_tb_cache_key_parts(uint64_t satp, uint32_t privilege,
@@ -79,6 +95,17 @@ void latr_tb_shootdown_privilege(LatrTbCache *cache, uint32_t privilege);
 bool latr_tb_cache_safepoint(LatrTbCache *cache);
 void latr_tb_cache_reclaim_all(LatrTbCache *cache);
 uint32_t latr_tb_cache_available(const LatrTbCache *cache);
+
+/*
+ * Hot-region accounting. `latr_tb_hot_page()` reports the slot's page base and
+ * how many translations landed in it since the cache was initialised; slots
+ * are direct-mapped on the page number, so a page that collides inherits the
+ * slot's count. `latr_tb_hot_busiest()` returns the slot with the highest count
+ * (0 when nothing has been translated).
+ */
+uint32_t latr_tb_hot_page(const LatrTbCache *cache, unsigned slot,
+                          uint64_t *page);
+uint32_t latr_tb_hot_busiest(const LatrTbCache *cache, uint64_t *page);
 
 /*
  * Cross-core shootdowns: every registered vCPU cache is invalidated. The VMM

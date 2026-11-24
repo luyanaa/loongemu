@@ -41,6 +41,24 @@ void latr_tb_cache_init(LatrTbCache *cache, uint8_t *arena, uint32_t size)
     cache->victim = 0;
     cache->lock = 0;
     cache->reclaim_pending = 0;
+    for (int i = 0; i < LATR_TB_HOT_SLOTS; i++) {
+        cache->hot[i].valid = 0;
+    }
+}
+
+/* Charges the page `pc` belongs to. Called under the cache lock. */
+static void tb_hot_charge(LatrTbCache *cache, uint64_t pc)
+{
+    uint64_t page = pc & ~UINT64_C(0xfff);
+    LatrTbHotPage *slot = &cache->hot[(page >> 12) &
+                                      (LATR_TB_HOT_SLOTS - 1)];
+
+    if (!slot->valid || slot->page != page) {
+        slot->page = page;
+        slot->translations = 0;
+        slot->valid = 1;
+    }
+    slot->translations++;
 }
 
 LatrTbKey latr_tb_cache_key_parts(uint64_t satp, uint32_t privilege,
@@ -159,6 +177,7 @@ LatrTbEntry *latr_tb_cache_insert(LatrTbCache *cache, uint64_t pc,
     entry->valid = 1;
     cache->arena_used += code_size;
     cache->count++;
+    tb_hot_charge(cache, pc);
     result = entry;
     cache_unlock(cache);
     return result;
@@ -253,6 +272,41 @@ void latr_tb_cache_reclaim_all(LatrTbCache *cache)
     }
     latr_tb_shootdown_all(cache);
     latr_tb_cache_safepoint(cache);
+}
+
+uint32_t latr_tb_hot_page(const LatrTbCache *cache, unsigned slot,
+                          uint64_t *page)
+{
+    if (cache == NULL || slot >= LATR_TB_HOT_SLOTS) {
+        return 0;
+    }
+    if (!cache->hot[slot].valid) {
+        return 0;
+    }
+    if (page != NULL) {
+        *page = cache->hot[slot].page;
+    }
+    return cache->hot[slot].translations;
+}
+
+uint32_t latr_tb_hot_busiest(const LatrTbCache *cache, uint64_t *page)
+{
+    uint32_t best = 0;
+    unsigned best_slot = 0;
+
+    if (cache == NULL) {
+        return 0;
+    }
+    for (unsigned i = 0; i < LATR_TB_HOT_SLOTS; i++) {
+        if (cache->hot[i].valid && cache->hot[i].translations > best) {
+            best = cache->hot[i].translations;
+            best_slot = i;
+        }
+    }
+    if (best != 0 && page != NULL) {
+        *page = cache->hot[best_slot].page;
+    }
+    return best;
 }
 
 uint32_t latr_tb_cache_available(const LatrTbCache *cache)
