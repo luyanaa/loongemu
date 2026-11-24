@@ -135,10 +135,17 @@ jobs:
           # Dispatch traces (build with TB_SYS_TRACE=1) localise it: after the
           # identical first two steps, TB 0x1109 exits NORMAL to 0x10c1 under
           # clang 23 but to 0x7fd0 (a stack address) under clang 19, and the
-          # guest then traps forever at 0x7fd2. That TB is straight-line code
-          # (store CR2/EC/RIP, inc the run counter, patch the PTE) with no
-          # branch, so the bad target looks like a corrupted chained-jump
-          # destination (fast_jmp_cache / gr2scr+jiscr0), not the #PF frame.
+          # guest then traps forever at 0x7fd2. That TB is the *handler* (it
+          # stores CR2/EC/RIP, increments the run counter, patches the PTE) and
+          # ends with `add rsp,8; iretq`.
+          # The two observed values pinpoint the frame offset: EC read 0x100 is
+          # the saved EFLAGS and the iretq target 0x7fd0 is the saved RSP, which
+          # are frame slots 3 and 4. Reading them as slots 0 and 1 after
+          # `add rsp,8` means the handler's rsp was 3 words (24 bytes) above the
+          # frame base -- i.e. the delivery wrote the frame lower than the entry
+          # rsp. Both delivery paths (latx_x86_deliver_fault and
+          # deliver_x86_exception) compute `(rsp & ~15) - nwords*8`, so the next
+          # question is which path ran and where its rsp came from.
           # Run it by hand with:
           #   make tb-sys-smp-run QLVZ=/usr/bin/qemu-system-loongarch64
           SCRIPT
