@@ -184,11 +184,10 @@ kinds, all flag-related).
 ## 5. Phases
 
 **P0 - done.** Decode `MRS/MSR NZCV` (`lata_nzcv_reginfo`, §3.3) and add the raw
-probe (`run_raw_flag_probes`, §3.4). Result: the round trip is checked and green;
-the producers are not visible through it, which is finding §3.4. P0 therefore
-closes with a *narrower* P1: the software path owns `pstate[31:28]` and replaces
-the four consumers, and the port's split flag views are a separate bug (a guest
-MRS after arithmetic returns 0 today, on LBT included).
+probe (`run_raw_flag_probes`, §3.4). The probe's first reading was an artifact of
+the unreachable `ARM_CP_NZCV` case; once fixed it showed the producers were
+already correct, and the only defect was `armmfflag`'s sign extension (§3.4).
+Both are fixed, and the probes are now assertions on the AArch64 nibbles.
 
 **P1 - done.** Helpers in §4.2 are implemented and wired into all 28 sites, with
 `lata_have_lbt` as the selector; `LATA_FORCE_NO_LBT=1` builds the image with the
