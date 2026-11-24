@@ -161,6 +161,10 @@ void kmain(void)
 
         latx_bare_uart_puts("latr-regcache: flushes=");
         putdec((unsigned)rc.flushes);
+        latx_bare_uart_puts(" empty=");
+        putdec((unsigned)rc.empty_flushes);
+        latx_bare_uart_puts(" scans=");
+        putdec((unsigned)rc.scan_entries);
         latx_bare_uart_puts(" writebacks=");
         putdec((unsigned)rc.writebacks);
         latx_bare_uart_puts(" reloads=");

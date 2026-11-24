@@ -371,7 +371,12 @@ fault recovery cost.
    a missing snapshot, a stale generation and a native-internal fault). Entering
    the guest's own trap vector still needs the EL/exception plumbing from the
    next item.
-6. 5.1 step 3 (label/branch flush elision) on top of the measured baseline.
+6. 5.1 step 3 (flush elision) - done: per-bank dirty/resident counts let a clean
+   bank skip its writeback scan and an empty bank skip its release loop
+   (entries visited per flush 128 -> 1.9 on the ISA image, 128 -> 4.9 on the
+   guest boot; writebacks unchanged, so semantics are identical). Call-site
+   elision at the ten hand-placed flushes stays open and needs its own
+   measurement first.
 7. 5.3 relocation round trip (builds on `latr_emit_code_symbol`).
 8. 2.2 LATR: remaining RVV encodings, then real SMP.
 9. 2.3 LATM: vmlinux boot, then SMP, then 3A4000 platform alignment.

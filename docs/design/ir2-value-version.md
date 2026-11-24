@@ -65,6 +65,19 @@ label-flush elision of §3.2. What does not: the version counters of §3.1, and 
 "redundant writeback" motivation in the original cost model - both refuted by
 measurement. This is the outcome P0 existed to produce.
 
+Measured effect of the fast path (P1):
+
+| workload | flushes | empty | entries visited per flush | writebacks |
+|---|---|---|---|---|
+| ISA image | 12801 | 12519 | 128 -> 1.9 | 282 (unchanged) |
+| guest boot | 10022 | 9417 | 128 -> 4.9 | 605 (unchanged) |
+
+So ~97% / ~92% of the scanning is gone, and the writeback count is bit-identical:
+the fast path removes work, not semantics. What is left is per-flush call
+overhead (a counter compare) plus the *number* of flush calls, which is what
+§3.2's label elision would attack next - it is not yet justified by a second
+measurement, so it stays a separate step.
+
 ## 3. Design
 
 ### 3.1 Versioned entries - dropped
@@ -125,7 +138,7 @@ regcache is therefore *not* an implementation detail: it is evidence.
 | phase | change | gate |
 |---|---|---|
 | P0 | done: `LatrRegCacheStats` counters, printed by both LATR harnesses | `latr-isa 1607`, `latr-sys`, numbers in §2 |
-| P1 | dirty-counter fast path in `latr_regcache_flush` (return before the scan when the bank is clean); drop the version counters from §3.1 | `latr-isa 1607`, `latr-sys`, flush cost visible in the same counters; no semantic change, so no new test beyond the existing gates |
+| P1 | done: per-bank dirty and resident counts; `latr_regcache_flush` skips a bank's writeback scan when it is clean and its release loop when it is empty, with an invariant assert that both banks end empty and clean | `latr-isa 1607`, `latr-sys`; identical `writebacks` (282 / 605) prove semantics unchanged, and entries visited per flush fell from 128 to ~1.9 / ~4.9 |
 | P2 | label flush elision (3.2), only if the counters still show flushes dominating after P1 | same |
 | P3 | load hoisting (3.3), only if the data justifies it | same |
 | P4 | LATM parity for the fast path (LATM has the same flush shape) | `latm-isa 60`, board smoke |

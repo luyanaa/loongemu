@@ -373,6 +373,62 @@ static void regcache_touch(LatrRegCacheEntry *entry)
     entry->age = ++lsenv->tr_data->regcache.clock;
 }
 
+static void regcache_set_dirty(LatrRegCacheEntry *entry, bool is_fpr)
+{
+    LatrRegCache *cache = &lsenv->tr_data->regcache;
+
+    if (!entry->dirty) {
+        entry->dirty = 1;
+        if (is_fpr) {
+            cache->fpr_dirty++;
+        } else {
+            cache->gpr_dirty++;
+        }
+    }
+}
+
+static void regcache_set_valid(LatrRegCacheEntry *entry, bool is_fpr)
+{
+    LatrRegCache *cache = &lsenv->tr_data->regcache;
+
+    if (!entry->valid) {
+        entry->valid = 1;
+        if (is_fpr) {
+            cache->fpr_valid++;
+        } else {
+            cache->gpr_valid++;
+        }
+    }
+}
+
+static void regcache_clear_valid(LatrRegCacheEntry *entry, bool is_fpr)
+{
+    LatrRegCache *cache = &lsenv->tr_data->regcache;
+
+    if (entry->valid) {
+        entry->valid = 0;
+        if (is_fpr) {
+            cache->fpr_valid--;
+        } else {
+            cache->gpr_valid--;
+        }
+    }
+}
+
+static void regcache_clear_dirty(LatrRegCacheEntry *entry, bool is_fpr)
+{
+    LatrRegCache *cache = &lsenv->tr_data->regcache;
+
+    if (entry->dirty) {
+        entry->dirty = 0;
+        if (is_fpr) {
+            cache->fpr_dirty--;
+        } else {
+            cache->gpr_dirty--;
+        }
+    }
+}
+
 static void regcache_writeback(LatrRegCacheEntry *entry, bool is_fpr)
 {
     IR2_OPND value = ir2_opnd_new(is_fpr ? IR2_OPND_FPR : IR2_OPND_GPR,
@@ -400,9 +456,9 @@ static void regcache_release(LatrRegCacheEntry *entry, bool is_fpr,
     int temp = entry->temp;
     int slot = regcache_temp_slot(temp, is_fpr);
     uint8_t *borrows = regcache_borrows(is_fpr);
+    regcache_clear_dirty(entry, is_fpr);
+    regcache_clear_valid(entry, is_fpr);
     entry->temp = -1;
-    entry->valid = 0;
-    entry->dirty = 0;
     entry->age = 0;
     if (slot >= 0 && borrows[slot] == 0) {
         if (is_fpr) {
@@ -447,7 +503,7 @@ static bool regcache_evict(bool is_fpr)
 void latr_regcache_reset(void)
 {
     LatrRegCache *cache = &lsenv->tr_data->regcache;
-    memset(cache, 0, sizeof(*cache));
+    memset(cache, 0, sizeof(*cache)); /* includes the dirty counters */
     for (int i = 0; i < 32; i++) {
         cache->gpr[i].temp = -1;
         cache->fpr[i].temp = -1;
@@ -456,23 +512,56 @@ void latr_regcache_reset(void)
 
 void latr_regcache_flush(void)
 {
+    LatrRegCache *cache = &lsenv->tr_data->regcache;
     LatrRegCacheEntry *gpr = regcache_entries(false);
-
-    latr_regcache_stats_counters.flushes++;
     LatrRegCacheEntry *fpr = regcache_entries(true);
 
-    for (int i = 0; i < 32; i++) {
-        if (gpr[i].valid && gpr[i].dirty) {
-            regcache_writeback(&gpr[i], false);
-        }
-        if (fpr[i].valid && fpr[i].dirty) {
-            regcache_writeback(&fpr[i], true);
+    latr_regcache_stats_counters.flushes++;
+    if (cache->gpr_dirty == 0 && cache->fpr_dirty == 0) {
+        latr_regcache_stats_counters.empty_flushes++;
+    }
+    /*
+     * Only walk a bank that has something to write back. The release loop still
+     * visits both banks: a clean entry must leave the cache at a control-flow
+     * edge even though it costs no store.
+     */
+    if (cache->gpr_valid != 0 && cache->gpr_dirty != 0) {
+        for (int i = 0; i < 32; i++) {
+            latr_regcache_stats_counters.scan_entries++;
+            if (gpr[i].valid && gpr[i].dirty) {
+                regcache_writeback(&gpr[i], false);
+            }
         }
     }
-    for (int i = 0; i < 32; i++) {
-        regcache_release(&gpr[i], false, false);
-        regcache_release(&fpr[i], true, false);
+    if (cache->fpr_valid != 0 && cache->fpr_dirty != 0) {
+        for (int i = 0; i < 32; i++) {
+            latr_regcache_stats_counters.scan_entries++;
+            if (fpr[i].valid && fpr[i].dirty) {
+                regcache_writeback(&fpr[i], true);
+            }
+        }
     }
+    if (cache->gpr_valid != 0) {
+        for (int i = 0; i < 32; i++) {
+            latr_regcache_stats_counters.scan_entries++;
+            regcache_release(&gpr[i], false, false);
+        }
+    }
+    if (cache->fpr_valid != 0) {
+        for (int i = 0; i < 32; i++) {
+            latr_regcache_stats_counters.scan_entries++;
+            regcache_release(&fpr[i], true, false);
+        }
+    }
+    /*
+     * The fast path trusts the counters, so check them: a flush must leave both
+     * banks empty and clean. A desync here would show up much later as a stale
+     * or missing guest value, which is exactly the failure mode this cache is
+     * hardest to debug.
+     */
+    lsassertm(cache->gpr_valid == 0 && cache->fpr_valid == 0 &&
+              cache->gpr_dirty == 0 && cache->fpr_dirty == 0,
+              "register-cache counters desynced after flush");
 }
 
 bool latr_regcache_evict_itemp(void)
@@ -535,7 +624,7 @@ static void regcache_store(int reg, IR2_OPND value, bool is_fpr)
     lsassertm(slot >= 0, "guest register writeback requires a temporary operand");
 
     if (entry->valid && entry->temp == value._reg_num) {
-        entry->dirty = 1;
+        regcache_set_dirty(entry, is_fpr);
         regcache_touch(entry);
         return;
     }
@@ -546,14 +635,14 @@ static void regcache_store(int reg, IR2_OPND value, bool is_fpr)
         if (old_owner->dirty) {
             regcache_writeback(old_owner, is_fpr);
         }
+        regcache_clear_dirty(old_owner, is_fpr);
+        regcache_clear_valid(old_owner, is_fpr);
         old_owner->temp = -1;
-        old_owner->valid = 0;
-        old_owner->dirty = 0;
         old_owner->age = 0;
     }
     entry->temp = value._reg_num;
-    entry->valid = 1;
-    entry->dirty = 1;
+    regcache_set_valid(entry, is_fpr);
+    regcache_set_dirty(entry, is_fpr);
     regcache_touch(entry);
 }
 
@@ -767,7 +856,7 @@ IR2_OPND alloc_gpr_src(int reg)
     IR2_OPND value = ra_alloc_itemp();
     regcache_borrow(value, false);
     entry->temp = value._reg_num;
-    entry->valid = 1;
+    regcache_set_valid(entry, false);
     entry->dirty = 0;
     regcache_touch(entry);
     latr_regcache_stats_counters.reloads++;
@@ -816,7 +905,7 @@ IR2_OPND alloc_fpr_src(int reg)
     IR2_OPND value = ra_alloc_ftemp();
     regcache_borrow(value, true);
     entry->temp = value._reg_num;
-    entry->valid = 1;
+    regcache_set_valid(entry, true);
     entry->dirty = 0;
     regcache_touch(entry);
     latr_regcache_stats_counters.reloads++;

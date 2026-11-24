@@ -81,6 +81,19 @@ typedef struct LatrRegCache {
     uint8_t itemp_borrows[6];
     uint8_t ftemp_borrows[6];
     uint64_t clock;
+    /*
+     * Dirty counts per bank. Measured on the ISA image: 12801 flushes for 282
+     * writebacks, i.e. 98% of flushes walk 64 entries to find nothing. A bank
+     * whose count is zero can skip the walk entirely; the release loop below
+     * still runs because a clean entry must still leave the cache at a
+     * control-flow edge.
+     */
+    uint8_t gpr_dirty;
+    uint8_t fpr_dirty;
+    /* Resident-count per bank: a bank with no valid entry makes the flush's
+     * release loop and writeback scan both no-ops, so skip them by count. */
+    uint8_t gpr_valid;
+    uint8_t fpr_valid;
 } LatrRegCache;
 
 
@@ -306,6 +319,8 @@ void latr_regcache_reset(void);
  */
 typedef struct LatrRegCacheStats {
     uint64_t flushes;    /* latr_regcache_flush() calls */
+    uint64_t empty_flushes; /* ... of which found nothing dirty */
+    uint64_t scan_entries;  /* entries examined by flush/eviction scans */
     uint64_t writebacks; /* guest-state stores emitted (flush and eviction) */
     uint64_t reloads;    /* env loads because the value was not resident */
     uint64_t stores;     /* guest-register writes taken by store_gpr_dst() */
