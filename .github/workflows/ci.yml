@@ -38,6 +38,7 @@ jobs:
       - name: LATR host tests
         working-directory: latr
         run: make all test-legality test-elf test-tb-smp CLANG=clang AR=llvm-ar
+
   # ISA tier: build every port core and boot the three bare ISA images.
   #
   # The gates run inside a container because the generated code uses instructions
