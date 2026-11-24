@@ -86,12 +86,15 @@ else
 fi
 echo "run_qemu_lata: log tail ($LOG_FILE):" >&2
 tail -n 20 "$LOG_FILE" 2>/dev/null >&2
+echo "run_qemu_lata: log bytes: $(wc -c <"$LOG_FILE" 2>/dev/null || echo 0)" >&2
 if [[ -s "$ERR_FILE" ]]; then
     echo "run_qemu_lata: qemu stderr ($ERR_FILE):" >&2
     tail -n 20 "$ERR_FILE" >&2
 fi
 if [[ -s "$TRACE_FILE" ]]; then
+    echo "run_qemu_lata: qemu trace head ($TRACE_FILE):" >&2
+    head -n 12 "$TRACE_FILE" >&2
     echo "run_qemu_lata: qemu trace tail ($TRACE_FILE):" >&2
-    tail -n 20 "$TRACE_FILE" >&2
+    tail -n 12 "$TRACE_FILE" >&2
 fi
 exit "$status"
