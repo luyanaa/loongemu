@@ -2074,7 +2074,29 @@ static void run_sve_not_runtime(uint16_t vl_bits, unsigned zd, unsigned zm,
 
 static void append_sve_nzcv_capture(uint64_t *results, unsigned index)
 {
-    la_armmfflag(a1_ir2_opnd, 0x39);
+    extern bool lata_have_lbt;
+    extern IR2_OPND ra_alloc_itemp(void);
+    extern void free_alloc_gpr(IR2_OPND opnd);
+
+    if (lata_have_lbt)
+    {
+        IR2_OPND addr = ra_alloc_itemp();
+
+        la_armmfflag(a1_ir2_opnd, 0x39);
+        /* The transfer sign-extends the 32-bit flag word; the fixtures compare
+         * against a zero-extended nibble, and the software path below produces
+         * one, so normalise here rather than carry two expectations. */
+        la_bstrpick_d(a1_ir2_opnd, a1_ir2_opnd, 31, 0);
+        free_alloc_gpr(addr);
+    }
+    else
+    {
+        IR2_OPND addr = ra_alloc_itemp();
+
+        li_d(addr, env_offset_PSTATE());
+        la_ldx_wu(a1_ir2_opnd, env_ir2_opnd, addr);
+        free_alloc_gpr(addr);
+    }
     li_d(a0_ir2_opnd, (int64_t)(uintptr_t)results);
     la_st_d(a1_ir2_opnd, a0_ir2_opnd, (int)(index * sizeof(*results)));
 }

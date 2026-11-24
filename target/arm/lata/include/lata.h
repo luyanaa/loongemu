@@ -306,6 +306,8 @@ void lata_env_ld_wu(IR2_OPND scalar, int offset);
 void lata_env_ld_du(IR2_OPND scalar, int offset);
 void lata_env_st_b(IR2_OPND scalar, int offset);
 void lata_env_st_wu(IR2_OPND scalar, int offset);
+/* Software-path flag write: rj bits 31:28 -> env->pstate. */
+void lata_emit_nzcv_write(IR2_OPND rj);
 
 IR2_OPND alloc_gpr_src(int i);
 IR2_OPND alloc_gpr_src_sp(int i);

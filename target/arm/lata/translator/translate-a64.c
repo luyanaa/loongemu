@@ -1020,14 +1020,10 @@ static void gen_nzcv_read(IR2_OPND rd)
     free_alloc_gpr(nib);
 }
 
-/* MSR of NZCV: take bits 31:28 of the source. */
+/* MSR of NZCV: take bits 31:28 of the source (shared with the SVE lowering). */
 static void gen_nzcv_write(IR2_OPND rj)
 {
-    IR2_OPND nib = ra_alloc_itemp();
-
-    la_bstrpick_d(nib, rj, 31, 28);
-    nzcv_nibble_store(nib);
-    free_alloc_gpr(nib);
+    lata_emit_nzcv_write(rj);
 }
 
 /* Flags of a + b (is_sub: a - b), into pstate. */

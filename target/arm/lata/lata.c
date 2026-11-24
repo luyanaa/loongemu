@@ -366,6 +366,10 @@ void lata_force_no_lbt(void)
 {
     lata_have_lbt = false;
     lata_have_lbt_probed = true;
+    /* Keep the shared capability query in step: emulators can advertise LBT
+     * and still fail to decode it, so a forced build must look LBT-less to
+     * every consumer, not just to this port. */
+    latx_cpu_set_lbt_feature(0);
 }
 
 void lata_tr_data_init(CPUArchState *env)
@@ -1045,6 +1049,25 @@ void lata_env_ld_du(IR2_OPND scalar, int offset)
     if (plan.materialize_address) {
         ra_free_temp(base);
     }
+}
+
+/*
+ * Write a flag nibble held in bits 31:28 of `rj` into env->pstate. This is the
+ * software-path replacement for every armmtflag call site outside the main
+ * translator (the SVE lowering path has four); it lives here so those files do
+ * not each carry their own pstate sequence.
+ */
+void lata_emit_nzcv_write(IR2_OPND rj)
+{
+    IR2_OPND nib = ra_alloc_itemp();
+    IR2_OPND word = ra_alloc_itemp();
+
+    la_bstrpick_d(nib, rj, 31, 28);
+    lata_env_ld_wu(word, env_offset_PSTATE());
+    la_bstrins_d(word, nib, 31, 28);
+    lata_env_st_wu(word, env_offset_PSTATE());
+    ra_free_temp(nib);
+    ra_free_temp(word);
 }
 
 void lata_env_st_wu(IR2_OPND scalar, int offset)

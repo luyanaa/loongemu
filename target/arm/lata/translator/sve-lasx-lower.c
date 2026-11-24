@@ -187,7 +187,11 @@ static void emit_predtest_nzcv(size_t vl_bytes, uint8_t element_bits,
 
     la_xori(any_active, any_active, 1); /* Z = !any_active */
     la_bstrins_d(flags, any_active, 30, 30);
-    la_armmtflag(flags, 0x39);
+    if (lata_have_lbt)
+    {
+        la_armmtflag(flags, 0x39);
+    }
+    /* Software path: the pstate store below already carries bits 31:28. */
     li_d(seen_first, env_offset_PSTATE());
     la_ldx_wu(word, env_ir2_opnd, seen_first);
     la_bstrpick_d(flags, flags, 31, 28);
@@ -290,7 +294,14 @@ static bool lower_predicate_constant(DisasContext *s,
         }
         flags = ra_alloc_itemp();
         li_d(flags, (int64_t)flags_value);
-        la_armmtflag(flags, 0x39);
+        if (lata_have_lbt)
+        {
+            la_armmtflag(flags, 0x39);
+        }
+        else
+        {
+            lata_emit_nzcv_write(flags);
+        }
         ra_free_temp(flags);
     }
 
@@ -716,7 +727,14 @@ static bool lower_predicate_lane_compare(
     la_slli_d(shift_value, last_active, 29);
     la_or(flags, flags, shift_value);
     if (generator->status_state.present) {
-        la_armmtflag(flags, 0x39);
+        if (lata_have_lbt)
+        {
+            la_armmtflag(flags, 0x39);
+        }
+        else
+        {
+            lata_emit_nzcv_write(flags);
+        }
     }
     (void)any_active;
 
@@ -1986,7 +2004,10 @@ static bool emit_sve_helper_call_body(DisasContext *s,
     la_mov64(s8_ir2_opnd, env_ir2_opnd); /* ensure env reg intact */
     la_mov64(t2_ir2_opnd, a0_ir2_opnd);
     emit_restore_guest_gprs_from_env();
-    if (instruction_writes_nzcv_static(instruction, source)) {
+    if (lata_have_lbt && instruction_writes_nzcv_static(instruction, source)) {
+        /* LBT keeps the live flags in its own register, so the value the helper
+         * parked in pstate has to be pushed into it. The software path reads
+         * pstate directly, which is where the helper already put it. */
         li_d(t0_ir2_opnd, env_offset_PSTATE());
         la_ldx_wu(t1_ir2_opnd, env_ir2_opnd, t0_ir2_opnd);
         la_armmtflag(t1_ir2_opnd, 0x39);
