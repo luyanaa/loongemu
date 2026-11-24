@@ -144,12 +144,21 @@ jobs:
           # `add rsp,8` means the handler's rsp was 3 words (24 bytes) above the
           # frame base -- i.e. the delivery wrote the frame lower than the entry
           # rsp. Both delivery paths compute `(rsp & ~15) - nwords*8`.
-          # The trace now prints rsp after each dispatch, and it shows the
-          # delivery's new_rsp is lost: after the fault rsp reads back as the
-          # pre-fault 0x7fd0 (not 0x7fa0), and after the handler's iretq it is
-          # 0x80010001. So the PLV3 resume restores rsp from somewhere other
-          # than the value deliver_x86_exception wrote -- that is the bug to
-          # chase, and it is in the harness (tb_sys.c), not the translator.
+          # The trace (rsp_in/rsp_out per step, plus the delivery's own values)
+          # corrects the earlier guess twice over:
+          #   - the guest stack pointer is $s4 (reg_gpr_map[esp] = la_s4 = 27),
+          #     so the trap stub's CSR 0x30 juggling never touches it; the stub
+          #     restores $s4 from frame offset 216, and the print shows that
+          #     slot already holding the delivered value 0x7fd0. The stub is
+          #     not the bug.
+          #   - delivery is also correct: before=0x8000, ret=0, after=0x7fd0,
+          #     err=3, i.e. the frame sits at 0x7fd0 with EC at +0.
+          #   - the handler TB starts with exactly rsp_in=0x7fd0, yet its
+          #     `mov ecx,[rsp]` / `mov rcx,[rsp+8]` read slots +24 and +32.
+          # So the shift happens inside the handler TB's execution, not in the
+          # delivery or the stub. Remaining suspects: that TB's translated
+          # address computation under clang 19, or the guest-TLB coherency
+          # between the walker's physical writes and the handler's reads.
           # Run it by hand with:
           #   make tb-sys-smp-run QLVZ=/usr/bin/qemu-system-loongarch64
           SCRIPT

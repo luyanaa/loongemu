@@ -7653,11 +7653,41 @@ void tb_sys_handle_trap(uint64_t *regs, int trap_is_refill)
                                        ? x86_tr.fault_error_code
                                        : latx_x86_fault_error_code(&env, x86_r,
                                                                    x86_access));
-            if (latx_x86_deliver_fault(&env, 14) != 0) {
-                g_plv3_exit.reason = PLV3_EXIT_TRAP;
+            {
+#ifdef TB_SYS_TRACE_STEPS
+                uint64_t rsp_before = env.regs[R_ESP];
+                int dr = latx_x86_deliver_fault(&env, 14);
+                latx_bare_uart_puts("tb-sys: pf-call before=");
+                puthex(rsp_before);
+                latx_bare_uart_puts(" ret=");
+                puthex((uint64_t)dr);
+                latx_bare_uart_puts(" after=");
+                puthex(env.regs[R_ESP]);
+                latx_bare_uart_puts(" cr2=");
+                puthex(env.cr[2]);
+                latx_bare_uart_puts(" err=");
+                puthex((uint64_t)(uint32_t)env.error_code);
+                latx_bare_uart_puts("\n");
+#else
+                int dr = latx_x86_deliver_fault(&env, 14);
+#endif
+                if (dr != 0) {
+                    g_plv3_exit.reason = PLV3_EXIT_TRAP;
+                }
             }
             latx_platform_tlb_flush_all();
             sync_env_to_trap_regs(regs);
+#ifdef TB_SYS_TRACE_STEPS
+            latx_bare_uart_puts("tb-sys: pf-deliver env_rsp=");
+            puthex(env.regs[R_ESP]);
+            latx_bare_uart_puts(" frame_slot=");
+            puthex((uint64_t)reg_gpr_map[R_ESP]);
+            latx_bare_uart_puts(":");
+            puthex(regs[reg_gpr_map[R_ESP]]);
+            latx_bare_uart_puts(" slot3=");
+            puthex(regs[3]);
+            latx_bare_uart_puts("\n");
+#endif
 
             if (is_refill) {
                 /* Keep ISTLBR=1 in TLBRERA and clear TLBRPRMD.PPLV=0 so ERTN
@@ -8382,6 +8412,15 @@ void kmain(void)
         g_current_tb_pc = e->pc;
         g_current_tb_map = &tb_insn_maps[slot_idx];
 
+#ifdef TB_SYS_TRACE_STEPS
+        latx_bare_uart_puts("tb-sys: step=");
+        puthex((uint64_t)steps);
+        latx_bare_uart_puts(" tb=");
+        puthex(e->pc);
+        latx_bare_uart_puts(" rsp_in=");
+        puthex(env.regs[R_ESP]);
+        latx_bare_uart_puts("\n");
+#endif
         tb_sys_run_plv3((void *)(uintptr_t)pro_buf,
                         (void *)(uintptr_t)e->code,
                         &env);
@@ -8390,6 +8429,8 @@ void kmain(void)
         puthex((uint64_t)steps);
         latx_bare_uart_puts(" tb=");
         puthex(e->pc);
+        latx_bare_uart_puts(" rsp_out=");
+        puthex(env.regs[R_ESP]);
         latx_bare_uart_puts(" exit=");
         puthex(g_plv3_exit.reason);
         latx_bare_uart_puts(" rip=");
