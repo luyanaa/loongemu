@@ -111,14 +111,19 @@ jobs:
           #   qemu 10.0.13 (x86_64 container, clang 19)  fails=0xb
           #   qemu 11.1.3  (x86_64 container, clang 19)  fails=0xb
           # The 11 failures are one chain starting at "hardware trap delivered
-          # guest #PF". Emulator version is ruled out, and so is the host:
-          # the artifact built by this container toolchain fails the same way
-          # when replayed on an arm64 host with the same qemu 11.1.3, while the
-          # clang-23 image passes there. So the variable is the compiler that
-          # builds the image -- a real ordering/UB bug to find in the guest #PF
-          # path, not an emulator quirk. Observed delta in the harness summary:
-          # error code 0x100 instead of 0x3, tlb_fills 7 instead of 9,
-          # g_hw_guest_pf 0 instead of 1.
+          # guest #PF". Emulator version and host are ruled out: the artifact
+          # built here fails identically when replayed on an arm64 host with the
+          # qemu 11.1.3 that passes the clang-23 image. Reproduced locally with
+          # llvm@19, so the variable is the compiler that builds the image.
+          # Ruled out: optimisation level (-O1 and -O2 pass under clang 23),
+          # uninitialised stack (auto-var-init=zero under clang 19 still fails),
+          # strict aliasing (-fno-strict-aliasing still fails).
+          # What the failing image does instead: g_hw_guest_pf stays 0, so the
+          # PLV3 hardware-trap path never runs and a software path delivers the
+          # fault; the handler then reads 0x100 (bit 8, i.e. the saved EFLAGS)
+          # where it expects the error code, which means the frame it reads is
+          # not the one latx_x86_deliver_fault pushes. Next: find why the
+          # translated store does not take the hardware path under clang 19.
           # Run it by hand with:
           #   make tb-sys-smp-run QLVZ=/usr/bin/qemu-system-loongarch64
           SCRIPT
