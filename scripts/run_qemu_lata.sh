@@ -18,7 +18,10 @@ KERNEL="${QEMU_KERNEL:-$ROOT_DIR/build/bare_lata.elf}"
 LOG_FILE="${QEMU_LOG:-$ROOT_DIR/build/lata_smoke.log}"
 DONE_TOKEN="${QEMU_DONE:-lata-isa: done}"
 TIMEOUT_SEC="${QEMU_TIMEOUT:-120}"
-CPU="${QEMU_CPU:-la464}"
+# `QEMU_CPU` wins over the `CPU` the make rules export; a distro qemu may need
+# `max` when its `la464` model does not decode an instruction the translator
+# emits (LSX/LASX, LBT).
+CPU="${QEMU_CPU:-${CPU:-la464}}"
 # qemu-system-loongarch64 rejects ram_size <= 1G for the la464 virt machine in
 # some distro builds, so ask for the smallest size that also works there.
 MEM="${QEMU_MEM:-1G}"
