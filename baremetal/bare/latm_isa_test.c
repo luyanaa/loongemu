@@ -642,7 +642,6 @@ static void test_tb_recovery(void)
 void kmain(void)
 {
     latx_bare_uart_puts("latm-isa: begin\n");
-
     lata_tr_data_init(&env);
     {
         CPUMIPSState env2;
