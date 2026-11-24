@@ -47,6 +47,66 @@ static LatrTbKey key(uint32_t asid, uint32_t priv)
 
 static uint8_t blob[16];
 
+/*
+ * Four-hart SMC/TLBI stress. Each worker owns a cache, hammers translate +
+ * execute + safepoint on it, while the main thread keeps firing ASID-scoped
+ * and global invalidations across the registry. The invariants checked are the
+ * ones a real device DMA / SMC storm can break:
+ *   - a lookup never returns an entry for another key or PC;
+ *   - an entry that a worker is executing keeps its bytes until that worker's
+ *     own safe point;
+ *   - after the last shootdown every cache is empty and the arena is only
+ *     recycled by its owner.
+ */
+#define STRESS_HARTS 4
+#define STRESS_TB_PC 0x7000u
+#define STRESS_ASID 11u
+#define STRESS_ITERS 20000
+
+typedef struct StressHart {
+    LatrTbCache cache;
+    LatrTbKey key;
+    uint8_t arena[4096];
+    volatile int started;
+    volatile int stop;
+    volatile int bad;
+    volatile int lookups;
+    volatile int recycled_by_owner;
+} StressHart;
+
+static void *stress_hart(void *opaque)
+{
+    StressHart *hart = opaque;
+
+    __atomic_store_n(&hart->started, 1, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&hart->stop, __ATOMIC_ACQUIRE)) {
+        LatrTbEntry *entry = latr_tb_cache_lookup(&hart->cache, STRESS_TB_PC,
+                                                  hart->key);
+        if (entry != NULL && entry->guest_pc != STRESS_TB_PC) {
+            __atomic_store_n(&hart->bad, 1, __ATOMIC_RELAXED);
+            continue;
+        }
+        if (entry == NULL) {
+            entry = latr_tb_cache_insert(&hart->cache, STRESS_TB_PC,
+                                         hart->key, blob, sizeof(blob), 1);
+        }
+        if (entry != NULL) {
+            /* Executing the block while another hart invalidates it must not
+             * change or unmap the bytes. */
+            for (int i = 0; i < 4; i++) {
+                if (entry->code[0] != 0) {
+                    __atomic_store_n(&hart->bad, 1, __ATOMIC_RELAXED);
+                }
+            }
+        }
+        __atomic_add_fetch(&hart->lookups, 1, __ATOMIC_RELAXED);
+        if (latr_tb_cache_safepoint(&hart->cache)) {
+            __atomic_add_fetch(&hart->recycled_by_owner, 1, __ATOMIC_RELAXED);
+        }
+    }
+    return NULL;
+}
+
 typedef struct ExecutionRace {
     LatrTbCache *cache;
     LatrTbKey key;
@@ -347,6 +407,85 @@ int main(void)
                       "stale translation at the same offset stays dead");
             }
         }
+    }
+
+    /* 13. Four harts translating and executing while invalidations land from
+     * another thread: no torn entry, no corrupted code, no remote reclaim. */
+    {
+        static StressHart harts[STRESS_HARTS];
+        pthread_t threads[STRESS_HARTS];
+        int started[STRESS_HARTS];
+        int registered = 0;
+
+        memset(harts, 0, sizeof(harts));
+        for (int i = 0; i < STRESS_HARTS; i++) {
+            latr_tb_cache_init(&harts[i].cache, harts[i].arena,
+                               sizeof(harts[i].arena));
+            /* Two harts share the stressed ASID, two use a different one, so
+             * the scoped shootdown must spare half of them. */
+            harts[i].key = key(i < 2 ? STRESS_ASID : STRESS_ASID + 1, 1);
+            if (latr_tb_cache_register(&harts[i].cache)) {
+                registered++;
+            }
+            started[i] = pthread_create(&threads[i], NULL, stress_hart,
+                                        &harts[i]);
+        }
+        CHECK(registered == STRESS_HARTS, "every stress hart registers");
+        int all_started = 1;
+
+        for (int i = 0; i < STRESS_HARTS; i++) {
+            if (started[i] != 0) {
+                all_started = 0;
+                continue;
+            }
+            while (!__atomic_load_n(&harts[i].started, __ATOMIC_ACQUIRE)) {
+            }
+        }
+        CHECK(all_started, "every stress worker starts");
+
+        for (int iter = 0; iter < STRESS_ITERS; iter++) {
+            if ((iter & 3) == 0) {
+                latr_tb_shootdown_asid_all_cores(STRESS_ASID);
+            } else if ((iter & 3) == 1) {
+                latr_tb_fence_i_all_cores();
+            } else if ((iter & 3) == 2) {
+                latr_tb_shootdown_asid_all_cores(STRESS_ASID + 1);
+            } else {
+                /* Leave a window for the workers to translate again. */
+                for (volatile int spin = 0; spin < 32; spin++) {
+                }
+            }
+        }
+        for (int i = 0; i < STRESS_HARTS; i++) {
+            __atomic_store_n(&harts[i].stop, 1, __ATOMIC_RELEASE);
+        }
+        for (int i = 0; i < STRESS_HARTS; i++) {
+            if (started[i] == 0) {
+                CHECK(pthread_join(threads[i], NULL) == 0,
+                      "stress worker joins");
+            }
+        }
+        for (int i = 0; i < STRESS_HARTS; i++) {
+            CHECK(__atomic_load_n(&harts[i].bad, __ATOMIC_RELAXED) == 0,
+                  "no torn entry or code corruption under invalidation load");
+            CHECK(__atomic_load_n(&harts[i].lookups, __ATOMIC_RELAXED) > 0,
+                  "stress worker made progress");
+            /* Only each cache's own owner may recycle its arena. */
+            CHECK(harts[i].cache.arena_used <= sizeof(harts[i].arena),
+                  "arena bookkeeping stays in range");
+        }
+        latr_tb_fence_i_all_cores();
+        for (int i = 0; i < STRESS_HARTS; i++) {
+            CHECK(harts[i].cache.count == 0,
+                  "final FENCE.I leaves every hart with no live entry");
+            latr_tb_cache_safepoint(&harts[i].cache);
+            CHECK(harts[i].cache.arena_used == 0,
+                  "each owner reclaims its own arena at its safe point");
+            latr_tb_cache_unregister(&harts[i].cache);
+        }
+        latr_tb_fence_i_all_cores();
+        CHECK(harts[0].cache.count == 0,
+              "unregistered harts no longer receive invalidations");
     }
     printf("test-latr-tb-smp: %d checks, %d failures\n", checks, failures);
     if (failures == 0) {

@@ -46,6 +46,15 @@ jobs:
         working-directory: latm
         run: make CLANG=clang AR=llvm-ar
 
+      # The per-hart TB cache invariant tests are host-side and run in
+      # milliseconds; they are the only coverage of the SMP invalidation
+      # registry, so they must gate every push. `make check` also builds
+      # test-latr-machine-trap, which needs a header this tree does not carry
+      # yet, so the working targets are listed explicitly.
+      - name: LATR host tests
+        working-directory: latr
+        run: make all test-legality test-elf test-tb-smp CLANG=clang AR=llvm-ar
+
       # QLVZ_REPO default points at a checked-in macOS qemu binary; the ISA
       # gates only need a generic virt+la464 machine, which stock
       # qemu-system-loongarch64 (qemu-system-misc) provides. run_qemu_lata.sh
