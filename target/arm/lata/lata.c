@@ -674,6 +674,8 @@ uint8_t lata_regcache_snapshot_gpr_binds(LataRecoveryBinding *out)
         if (arm_la_map[r] < 0 && cache->gpr[r].valid && cache->gpr[r].dirty) {
             out[n].guest_reg = (uint8_t)r;
             out[n].temp = cache->gpr[r].temp;
+            out[n].is_fpr = 0;
+            out[n].is_spill = 0;
             n++;
         }
     }

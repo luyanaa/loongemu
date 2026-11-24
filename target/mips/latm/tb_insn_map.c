@@ -73,13 +73,19 @@ void latm_tb_insn_map_add(void *trd, uint64_t guest_pc, uint32_t native_start,
     span->guest_pc = guest_pc;
     span->native_start = native_start;
     span->native_end = native_end;
-    span->delay_slot = delay_slot;
+    latm_span_set_delay_slot(span, delay_slot);
     span->site = site;
+    span->phase = LE_PHASE_BEFORE_INSN;
+    span->effect_id = 0;
     span->retired_before = retired_before;
     span->bind_first = map->bind_pool_used;
+    span->bind_flags = 0;
     if (binds && bind_cnt) {
         uint32_t room = LATM_TB_RECOVERY_BINDS - map->bind_pool_used;
         if (bind_cnt > room) {
+            /* Truncated uncommitted state must not read as a clean snapshot:
+             * flag the span so precise-recovery-dependent paths are denied. */
+            span->bind_flags |= LE_BIND_OVERFLOW;
             bind_cnt = (uint8_t)room;
         }
         memcpy(&map->binds[map->bind_pool_used], binds,
@@ -211,7 +217,7 @@ int latm_tb_insn_map_resolve(void *trd, uintptr_t host_pc,
         *guest_pc = best->guest_pc;
     }
     if (delay_slot) {
-        *delay_slot = best->delay_slot;
+        *delay_slot = (uint8_t)latm_span_delay_slot(best);
     }
     return 1;
 }

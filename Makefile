@@ -646,6 +646,7 @@ LATA_BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdl
                -DTARGET_AARCH64 -DCONFIG_LATA -DCONFIG_LATA_TU -DCONFIG_LATA_STANDALONE \
                -D__WORDSIZE=64 -D__thread= \
                -I lata/compat -I . -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
+               -I shared/backend/loongarch/include \
                -I latx/compat -I latx/include -I latx/upstream/include \
                -isystem $(shell $(CLANG) -print-resource-dir)/include
 

@@ -597,6 +597,8 @@ uint8_t latm_regcache_snapshot_gpr_binds(LatmRecoveryBinding *out)
         }
         out[n].guest_reg = (uint8_t)r;
         out[n].temp = e->temp;
+        out[n].is_fpr = 0;
+        out[n].is_spill = 0;
         n++;
     }
     return n;

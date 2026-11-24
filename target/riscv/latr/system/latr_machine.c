@@ -595,12 +595,30 @@ int latr_machine_host_fault(LatrMachine *m, uint32_t hartid,
      * Replay the span's bindings into env BEFORE entering the guest trap, so
      * the guest handler sees the architectural register state at the fault
      * point -- not whatever stale value env happened to hold. Precise replay
-     * requires the fault-time host register snapshot: if the span carries
-     * bindings and no snapshot was supplied, we refuse to claim a precise
-     * recovery (applied stays 0) but still hand the trap to the guest.
+     * requires the fault-time host register snapshot. Fail closed: a span
+     * that carries bindings (or was flagged LE_BIND_OVERFLOW during record)
+     * but has no host snapshot to apply is NOT safe to project -- handing the
+     * guest a trap with partially-reconstructed state would corrupt its view.
+     * Report the unresolved snapshot and return 0 (caller aborts dispatch)
+     * rather than let `applied=false` continue into take_guest_trap.
      */
     bool applied = false;
-    if (host_gprs != NULL) {
+    if (span->bind_cnt != 0 || (span->bind_flags & LE_BIND_OVERFLOW)) {
+        if (host_gprs == NULL) {
+            if (info != NULL) {
+                info->guest_pc = guest_pc;
+                info->resolved = true;
+                info->site = span->site;
+                info->retired_before = span->retired_before;
+                info->bind_cnt = span->bind_cnt;
+                info->applied = false;
+            }
+            latr_context_restore(saved);
+            return 0;
+        }
+        applied = latr_tb_recovery_apply(span, rmap, host_gprs, host_fprs,
+                                         &h->env);
+    } else if (host_gprs != NULL) {
         applied = latr_tb_recovery_apply(span, rmap, host_gprs, host_fprs,
                                          &h->env);
     }

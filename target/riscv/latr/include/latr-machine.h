@@ -61,7 +61,9 @@ typedef struct LatrMachineFaultInfo {
     /* C1-followup: 1 when the fault-time host register snapshot was supplied
      * and latr_tb_recovery_apply() replayed the span's bindings (including the
      * empty-binding case -- architectural state was already committed). 0 when
-     * the snapshot was missing, so the recovery must NOT be claimed precise. */
+     * the snapshot was missing. Since P0 recovery-v2 a span carrying bindings
+     * with no snapshot fails closed: the function returns 0 and no guest trap
+     * is taken, rather than delivering a trap over incomplete state. */
     uint8_t  applied;
 } LatrMachineFaultInfo;
 

@@ -72,20 +72,33 @@ void latr_tb_insn_map_add(uint64_t guest_pc, uint32_t native_start,
     span->guest_pc = guest_pc;
     span->native_start = native_start;
     span->native_end = native_end;
-    span->raw_len = raw_len;
+    latr_span_set_raw_len(span, raw_len);
     span->site = site;
+    span->phase = LE_PHASE_BEFORE_INSN;
+    span->effect_id = 0;
     span->retired_before = retired_before;
     span->bind_cnt = 0;
     span->bind_first = 0;
-    if (binds != NULL && bind_cnt != 0 &&
-        map->bind_pool_used + bind_cnt <= LATR_TB_RECOVERY_BINDS) {
+    span->bind_flags = 0;
+    if (binds != NULL && bind_cnt != 0) {
         uint8_t n = bind_cnt > LATR_RECOVERY_MAX_BINDS_PER_SPAN
                         ? LATR_RECOVERY_MAX_BINDS_PER_SPAN : bind_cnt;
-        span->bind_first = (uint16_t)map->bind_pool_used;
-        for (uint8_t i = 0; i < n; i++) {
-            map->binds[map->bind_pool_used++] = binds[i];
+        if (map->bind_pool_used + n > LATR_TB_RECOVERY_BINDS) {
+            n = 0;
         }
-        span->bind_cnt = n;
+        if (n < bind_cnt) {
+            /* Truncating uncommitted state must never look like a clean
+             * snapshot: flag the span so precise-recovery-dependent code
+             * paths are denied rather than silently applied. */
+            span->bind_flags |= LE_BIND_OVERFLOW;
+        }
+        if (n != 0) {
+            span->bind_first = (uint16_t)map->bind_pool_used;
+            for (uint8_t i = 0; i < n; i++) {
+                map->binds[map->bind_pool_used++] = binds[i];
+            }
+            span->bind_cnt = n;
+        }
     }
 }
 
@@ -123,7 +136,7 @@ bool latr_tb_insn_map_resolve(uintptr_t host_pc, uint64_t *guest_pc,
         *guest_pc = best->guest_pc;
     }
     if (raw_len != NULL) {
-        *raw_len = best->raw_len;
+        *raw_len = latr_span_raw_len(best);
     }
     return true;
 }

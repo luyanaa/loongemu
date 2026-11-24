@@ -36,32 +36,22 @@
 #define LATR_TB_RECOVERY_BINDS 512
 #define LATR_RECOVERY_MAX_BINDS_PER_SPAN 8
 
-typedef enum LatrRecoverySite {
-    LATR_RECOV_GUEST_ACCESS = 0, /* guest load/store/amo: fault projects to guest */
-    LATR_RECOV_GUEST_CHECK,      /* explicit guest trap (ecall/break/mret/...) */
-    LATR_RECOV_HELPER,           /* helper call that may fault (reserved) */
-    LATR_RECOV_NATIVE_INTERNAL,  /* fault here = host bug; do not project */
-} LatrRecoverySite;
+#include "le-recovery.h"
 
-typedef struct LatrRecoveryBinding {
-    uint8_t guest_reg;   /* guest GPR or FPR index holding an uncommitted value */
-    int8_t  temp;        /* host phys reg: itemp->phys (GPR) or ftemp->phys (FPR) */
-    uint8_t is_fpr;      /* C4: 1 = reads host_fprs[temp], writes env->fpr */
-    uint8_t reserved;
-} LatrRecoveryBinding;
+/* Span rows and binding pool entries come from shared/recovery. The port
+ * aliases keep call sites readable while the layout is the shared schema.
+ * aux carries the guest insn raw_len (bytes) for fetch-fault decode. */
+typedef LeRecoverySiteKind LatrRecoverySite;
+#define LATR_RECOV_GUEST_ACCESS    LE_RECOV_GUEST_ACCESS
+#define LATR_RECOV_GUEST_CHECK     LE_RECOV_GUEST_CHECK
+#define LATR_RECOV_HELPER          LE_RECOV_HELPER
+#define LATR_RECOV_NATIVE_INTERNAL LE_RECOV_NATIVE_INTERNAL
 
-typedef struct LatrTbInsnSpan {
-    uint64_t guest_pc;
-    uint32_t native_start;
-    uint32_t native_end;
-    uint32_t raw_len;
-    /* Precise-recovery metadata (C1): site kind + guest-insn-retired count +
-     * a slice of the map's binding pool for uncommitted regcache state. */
-    uint8_t  site;             /* LatrRecoverySite */
-    uint8_t  bind_cnt;
-    uint16_t bind_first;
-    uint32_t retired_before;
-} LatrTbInsnSpan;
+typedef LeRecoveryBinding LatrRecoveryBinding;
+typedef LeRecoverySpan    LatrTbInsnSpan;
+
+#define latr_span_raw_len(s)      ((s)->aux)
+#define latr_span_set_raw_len(s,v) ((s)->aux = (v))
 
 typedef struct LatrTbInsnMap {
     uintptr_t code_base;

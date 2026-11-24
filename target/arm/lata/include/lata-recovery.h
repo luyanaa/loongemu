@@ -17,28 +17,19 @@
 #define LATA_TB_RECOVERY_BINDS 512
 #define LATA_RECOVERY_MAX_BINDS_PER_SPAN 8
 
-typedef enum LataRecoverySite {
-    LATA_RECOV_GUEST_ACCESS = 0, /* guest load/store/amo: fault projects to guest */
-    LATA_RECOV_GUEST_CHECK,      /* explicit guest trap (svc/brk/hlt/sm*...) */
-    LATA_RECOV_HELPER,           /* helper call that may fault (reserved) */
-    LATA_RECOV_NATIVE_INTERNAL,  /* fault here = host bug; do not project */
-} LataRecoverySite;
+#include "le-recovery.h"
 
-typedef struct LataRecoveryBinding {
-    uint8_t guest_reg;   /* guest GPR index holding an uncommitted value */
-    int8_t  temp;        /* host phys reg number (la_t0..la_t5 == 12..17) */
-} LataRecoveryBinding;
+typedef LeRecoverySiteKind LataRecoverySite;
+#define LATA_RECOV_GUEST_ACCESS    LE_RECOV_GUEST_ACCESS
+#define LATA_RECOV_GUEST_CHECK     LE_RECOV_GUEST_CHECK
+#define LATA_RECOV_HELPER          LE_RECOV_HELPER
+#define LATA_RECOV_NATIVE_INTERNAL LE_RECOV_NATIVE_INTERNAL
 
-typedef struct LataTbInsnSpan {
-    uint64_t guest_pc;
-    uint32_t native_start;
-    uint32_t native_end;
-    uint32_t raw_len;
-    uint8_t  site;             /* LataRecoverySite */
-    uint8_t  bind_cnt;
-    uint16_t bind_first;
-    uint32_t retired_before;
-} LataTbInsnSpan;
+typedef LeRecoveryBinding LataRecoveryBinding;
+/* aux carries the guest insn raw_len (bytes). */
+typedef LeRecoverySpan    LataTbInsnSpan;
+#define lata_span_raw_len(s)       ((s)->aux)
+#define lata_span_set_raw_len(s,v) ((s)->aux = (v))
 
 typedef struct LataTbInsnMap {
     uintptr_t code_base;

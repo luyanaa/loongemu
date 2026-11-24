@@ -546,7 +546,7 @@ static uint8_t latr_regcache_snapshot_gpr_binds(LatrRecoveryBinding *out)
             out[n].guest_reg = (uint8_t)r;
             out[n].temp = cache->gpr[r].temp;
             out[n].is_fpr = 0;
-            out[n].reserved = 0;
+            out[n].is_spill = 0;
             n++;
         }
     }
@@ -557,7 +557,7 @@ static uint8_t latr_regcache_snapshot_gpr_binds(LatrRecoveryBinding *out)
             out[n].guest_reg = (uint8_t)r;
             out[n].temp = cache->fpr[r].temp;
             out[n].is_fpr = 1;
-            out[n].reserved = 0;
+            out[n].is_spill = 0;
             n++;
         }
     }

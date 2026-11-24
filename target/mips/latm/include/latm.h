@@ -22,28 +22,20 @@
 
 /* C3 precise recovery. Loads/stores/AMOs project a host fault to the guest;
  * explicit guest traps are checks; anything else faulting is a host bug. */
-typedef enum LatmRecoverySite {
-    LATM_RECOV_GUEST_ACCESS = 0,
-    LATM_RECOV_GUEST_CHECK,
-    LATM_RECOV_HELPER,
-    LATM_RECOV_NATIVE_INTERNAL,
-} LatmRecoverySite;
+#include "le-recovery.h"
 
-typedef struct LatmRecoveryBinding {
-    uint8_t guest_reg;   /* env-resident guest GPR with a deferred value */
-    int8_t  temp;        /* host phys reg number (la_t0..la_t2 itemp pool) */
-} LatmRecoveryBinding;
+typedef LeRecoverySiteKind LatmRecoverySite;
+#define LATM_RECOV_GUEST_ACCESS    LE_RECOV_GUEST_ACCESS
+#define LATM_RECOV_GUEST_CHECK     LE_RECOV_GUEST_CHECK
+#define LATM_RECOV_HELPER          LE_RECOV_HELPER
+#define LATM_RECOV_NATIVE_INTERNAL LE_RECOV_NATIVE_INTERNAL
 
-typedef struct LatmTbInsnSpan {
-    uint64_t guest_pc;
-    uint32_t native_start;
-    uint32_t native_end;
-    uint8_t delay_slot;
-    uint8_t  site;             /* LatmRecoverySite */
-    uint8_t  bind_cnt;
-    uint16_t bind_first;
-    uint32_t retired_before;
-} LatmTbInsnSpan;
+typedef LeRecoveryBinding LatmRecoveryBinding;
+/* aux packs the branch-delay-slot flag in bit0; upper bits are reserved for a
+ * partial-effect progress id (branch-link side-effect index). */
+typedef LeRecoverySpan    LatmTbInsnSpan;
+#define latm_span_delay_slot(s)      ((s)->aux & 1u)
+#define latm_span_set_delay_slot(s,v) ((s)->aux = ((v) ? 1u : 0u))
 
 typedef struct LatmTbInsnMap LatmTbInsnMap;
 struct LatmTbInsnMap {
