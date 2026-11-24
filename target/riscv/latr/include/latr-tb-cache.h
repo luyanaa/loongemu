@@ -101,7 +101,9 @@ uint32_t latr_tb_cache_available(const LatrTbCache *cache);
  * how many translations landed in it since the cache was initialised; slots
  * are direct-mapped on the page number, so a page that collides inherits the
  * slot's count. `latr_tb_hot_busiest()` returns the slot with the highest count
- * (0 when nothing has been translated).
+ * (0 when nothing has been translated). Readers do not take the cache lock:
+ * the counters are diagnostic and may observe a concurrent update from their
+ * own hart's insert, which is why nothing else reads them.
  */
 uint32_t latr_tb_hot_page(const LatrTbCache *cache, unsigned slot,
                           uint64_t *page);
