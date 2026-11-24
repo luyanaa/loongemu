@@ -47,6 +47,16 @@ static LatrTbCache cache;
 static TranslationBlock tb;
 static CPUState cpu;
 
+static void perf_put_hex(uint64_t value)
+{
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        unsigned digit = (unsigned)((value >> shift) & 0xfu);
+
+        latx_bare_uart_putc(digit < 10u ? (char)('0' + digit)
+                                        : (char)('a' + digit - 10u));
+    }
+}
+
 void kmain(void)
 {
     uint64_t entry = 0;
