@@ -118,12 +118,14 @@ jobs:
           # Ruled out: optimisation level (-O1 and -O2 pass under clang 23),
           # uninitialised stack (auto-var-init=zero under clang 19 still fails),
           # strict aliasing (-fno-strict-aliasing still fails).
-          # What the failing image does instead: g_hw_guest_pf stays 0, so the
-          # PLV3 hardware-trap path never runs and a software path delivers the
-          # fault; the handler then reads 0x100 (bit 8, i.e. the saved EFLAGS)
-          # where it expects the error code, which means the frame it reads is
-          # not the one latx_x86_deliver_fault pushes. Next: find why the
-          # translated store does not take the hardware path under clang 19.
+          # What the failing image does instead (both builds report
+          # plv3_exit=1): the guest loop burns all 128 steps instead of halting
+          # after 0x2b, g_hw_guest_pf stays 0 so the #PF comes from a software
+          # path, and the handler then reads 0x100 (bit 8, the saved EFLAGS)
+          # where the error code belongs -- the frame it reads is not the one
+          # latx_x86_deliver_fault pushes.
+          # Next: why the clang-19 image's guest stops making progress (128 vs
+          # 43 steps, 5 vs 4 translated TBs) before the halt block.
           # Run it by hand with:
           #   make tb-sys-smp-run QLVZ=/usr/bin/qemu-system-loongarch64
           SCRIPT
