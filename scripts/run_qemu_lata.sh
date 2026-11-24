@@ -19,13 +19,16 @@ LOG_FILE="${QEMU_LOG:-$ROOT_DIR/build/lata_smoke.log}"
 DONE_TOKEN="${QEMU_DONE:-lata-isa: done}"
 TIMEOUT_SEC="${QEMU_TIMEOUT:-120}"
 CPU="${QEMU_CPU:-la464}"
+# qemu-system-loongarch64 rejects ram_size <= 1G for the la464 virt machine in
+# some distro builds, so ask for the smallest size that also works there.
+MEM="${QEMU_MEM:-1G}"
 
 [[ -x "$QEMU" ]] || { echo "no qemu at $QEMU" >&2; exit 1; }
 [[ -f "$KERNEL" ]] || { echo "no image at $KERNEL" >&2; exit 1; }
 
 ERR_FILE="${LOG_FILE%.log}.err"
 rm -f "$LOG_FILE" "$ERR_FILE"
-"$QEMU" -M virt -cpu "$CPU" -m 512M -kernel "$KERNEL" \
+"$QEMU" -M virt -cpu "$CPU" -m "$MEM" -kernel "$KERNEL" \
     -display none -monitor none -nic none \
     -L "$(dirname "$QEMU")/../share/qemu" \
     -serial "file:$LOG_FILE" -no-reboot >/dev/null 2>"$ERR_FILE" &
