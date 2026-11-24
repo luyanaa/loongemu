@@ -12,6 +12,21 @@ on:
   workflow_dispatch:
 
 jobs:
+  # The LATA gate is not here on purpose: LATA keeps AArch64 NZCV in the
+  # LoongArch binary-translation flag register, and no distro qemu implements
+  # LBT. The dependency is small enough to enumerate (checked against the tree):
+  #   flag generation  x86add_d/w (gen_add_CC), armmtflag + x86adc_d/w
+  #                    (gen_sub_CC), the same pair in insts-pattern.c and
+  #                    sve-lasx-lower.c
+  #   flag consumption armmove x3 (csel/cset, translate-a64.c:8252/8303/8307),
+  #                    armmfflag x1 (MRS NZCV, :1841), x86adc/sbc carry chains
+  #   flag transfer    armmtflag x6 (MSR NZCV, ccmp FALSE path: 870, 883, 1848,
+  #                    8207, 9078, 9236)
+  # A software path therefore means: compute NZCV for add/sub in GPRs, keep the
+  # nibble in env->pstate between instructions, and turn armmove into
+  # predicate-from-nibble + select. Four helpers, ~14 emission sites. Until
+  # that lands, `make lata-isa-run` locally (6525 checks) is the gate.
+
   # Fast tier: everything that runs on the build host. No qemu, no bare image,
   # so a regression is reported in minutes instead of behind an emulator run.
   host-tests:
@@ -60,13 +75,6 @@ jobs:
   # the instruction itself. With LBT both chaining cases run (60 checks); under
   # the fallback 92 checks pass with 0 failures on qemu 11.1.3.
   #
-  # The LATA gate is not here on purpose: LATA lowers AArch64 NZCV through the
-  # LoongArch binary-translation instruction `armmtflag` (translate-a64.c:870,
-  # 883, 1848, 8207, 9078; sve-lasx-lower.c; insts-pattern.c). QEMU-LVZ
-  # implements LBT, every distro qemu (8.2 through 10.0) does not, so the image
-  # dies on the first subs/cset block there. Run it locally with
-  # `make lata-isa-run`. Giving LATA a software NZCV path for non-LBT hosts is
-  # the change that would let this gate return.
   isa-latr:
     runs-on: ubuntu-24.04
     steps:
