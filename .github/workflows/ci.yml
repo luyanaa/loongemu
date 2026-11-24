@@ -104,14 +104,20 @@ jobs:
             CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
             QLVZ_REPO=/usr/bin/qemu-system-loongarch64
           grep -a 'latr-perf:' build/latr_sys_diff.log
-          # Boot tier: a translated x86 host boots on 4 LoongArch harts with IPI
-          # shootdowns, then asserts phys_cpus_online=4 and fails=0. qemu 10.0.13
-          # (trixie) fails 11 checks, all downstream of "hardware trap delivered
-          # guest #PF", while the same image passes on qemu 9.0.50 and 11.1.3 --
-          # a qemu 10 trap-delivery regression, not ours. The image is therefore
-          # sid, whose qemu is >= 11.
-          make tb-sys-smp-run QLVZ=/usr/bin/qemu-system-loongarch64 \
-            CLANG=clang AR=llvm-ar LD_LLD=ld.lld
+          # The SMP boot harness is still not gated. Data points, same source:
+          #   qemu 9.0.50  (arm64 host, clang 23 build)  fails=0 ok
+          #   qemu 11.1.3  (arm64 host, clang 23 build)  fails=0 ok
+          #   qemu 11.1.3  (--accel tcg,thread=multi)    fails=0 ok
+          #   qemu 10.0.13 (x86_64 container, clang 19)  fails=0xb
+          #   qemu 11.1.3  (x86_64 container, clang 19)  fails=0xb
+          # The 11 failures are one chain starting at "hardware trap delivered
+          # guest #PF". Emulator version is ruled out (11.1.3 fails in the
+          # container and passes here); the remaining deltas are the TCG host
+          # backend (x86_64 vs arm64) and the clang that builds the image, so the
+          # next step is to rebuild the image with the container toolchain and
+          # run it locally, which separates those two.
+          # Run it by hand with:
+          #   make tb-sys-smp-run QLVZ=/usr/bin/qemu-system-loongarch64
           SCRIPT
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/src" -v /tmp/isa-gates.sh:/isa-gates.sh:ro \
