@@ -4,6 +4,7 @@
 #include "translate.h"
 #include "loongemu/phys_mem.h"
 #include "loongemu/mmio_bus.h"
+#include "loongemu-perf.h"
 
 #define CSR_SATP_ADDR   0x180
 #define CSR_MSTATUS_ADDR 0x300
@@ -426,8 +427,15 @@ int latr_walk(CPUArchState *env, uint64_t va, unsigned access, uint64_t *pa_out)
     {
         int cached = tlb_lookup(env, va, access, privilege, pa_out);
         if (cached <= 0) {
+            if (cached == 0) {
+                loongemu_perf_count(LOONGEMU_PERF_TLB_HIT, 1);
+            } else {
+                loongemu_perf_count(LOONGEMU_PERF_MEM_FAULT, 1);
+            }
             return cached;
         }
+        /* Exactly 1: the software TLB has no entry, walk the page table. */
+        loongemu_perf_count(LOONGEMU_PERF_TLB_MISS, 1);
     }
 
     uint64_t table = SATP_ROOT(env->csr[CSR_SATP_ADDR]);
@@ -717,6 +725,9 @@ int latr_translate(CPUArchState *env, uint64_t va, unsigned access,
     env->mem_mmio = 0;
     cause = latr_walk(env, va, access, &pa);
     if (cause != 0) {
+        /* TLB permission faults are already counted at tlb_lookup; this
+         * catches what the walk itself rejects. */
+        loongemu_perf_count(LOONGEMU_PERF_MEM_FAULT, 1);
         return cause;
     }
     cause = latr_pmp_check(env, pa, size, access,
@@ -749,6 +760,7 @@ int latr_translate(CPUArchState *env, uint64_t va, unsigned access,
         /* The emitted path must call the MMIO helpers; `host` carries the
          * guest physical address and must never be dereferenced. */
         env->mem_mmio = 1;
+        loongemu_perf_count(LOONGEMU_PERF_MMIO_ACCESS, 1);
         *host = pa;
         return 0;
     default:

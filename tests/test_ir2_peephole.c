@@ -108,6 +108,21 @@ static void test_perf_counter(void)
     assert(loongemu_perf_host_insns() == 16);
     assert(loongemu_perf_guest_insns() == 4);
     assert(loongemu_perf_host_insns_per_guest_insn() == 4.0);
+
+    /* Guest memory-access events are counted per class and reset with the
+     * rest of the perf state. */
+    loongemu_perf_count(LOONGEMU_PERF_TLB_HIT, 3);
+    loongemu_perf_count(LOONGEMU_PERF_TLB_HIT, 2);
+    loongemu_perf_count(LOONGEMU_PERF_MMIO_ACCESS, 1);
+    assert(loongemu_perf_read(LOONGEMU_PERF_TLB_HIT) == 5);
+    assert(loongemu_perf_read(LOONGEMU_PERF_TLB_MISS) == 0);
+    assert(loongemu_perf_read(LOONGEMU_PERF_MMIO_ACCESS) == 1);
+    assert(loongemu_perf_read(LOONGEMU_PERF_COUNTERS) == 0);
+    loongemu_perf_count(LOONGEMU_PERF_COUNTERS, 1);
+    assert(loongemu_perf_read(LOONGEMU_PERF_TLB_HIT) == 5);
+    loongemu_perf_reset();
+    assert(loongemu_perf_read(LOONGEMU_PERF_TLB_HIT) == 0);
+    assert(loongemu_perf_read(LOONGEMU_PERF_MMIO_ACCESS) == 0);
 }
 
 static void test_peephole(void)
