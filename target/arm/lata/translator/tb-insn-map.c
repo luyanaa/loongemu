@@ -127,6 +127,11 @@ const LataTbInsnSpan *lata_tb_recovery_resolve(uintptr_t host_pc,
             if (offset < span->native_start || offset >= span->native_end) {
                 continue;
             }
+            /* A row must belong to the map generation that produced it: after a
+             * reclaim the bytes at this address describe different guest code. */
+            if (!le_recovery_span_is_live(span, map->generation)) {
+                continue;
+            }
             if (best == NULL || map->generation >= best_generation) {
                 best = span;
                 best_map = map;
@@ -197,4 +202,55 @@ bool lata_tb_recovery_apply(const LataTbInsnSpan *span,
     }
     env->pc = span->guest_pc;
     return true;
+}
+
+int lata_host_fault(CPUARMState *env, uintptr_t host_pc,
+                    const uint64_t host_gprs[32], const void *host_vregs,
+                    LataRecoveryFaultInfo *info)
+{
+    const LataTbInsnMap *map = NULL;
+    const LataTbInsnSpan *span;
+
+    if (info != NULL) {
+        memset(info, 0, sizeof(*info));
+        info->host_pc = host_pc;
+    }
+    span = lata_tb_recovery_resolve(host_pc, &map);
+    if (span == NULL || map == NULL) {
+        return 0;
+    }
+    if (info != NULL) {
+        info->resolved = true;
+        info->guest_pc = span->guest_pc;
+        info->retired_before = span->retired_before;
+        info->site = span->site;
+        info->phase = span->phase;
+        info->bind_cnt = span->bind_cnt;
+        info->flags_state = span->flags_state;
+    }
+    /*
+     * One shared decision, so LATA cannot drift from LATR: native-internal
+     * never projects, a stale generation never projects, bindings or deferred
+     * flags without a snapshot never project.
+     */
+    if (!le_recovery_can_project(span, map->generation, host_gprs != NULL)) {
+        return 0;
+    }
+    /*
+     * Element-wise progress that bindings cannot describe is not a precise
+     * projection; abort rather than hand the guest a half-applied instruction.
+     */
+    if (span->phase == LE_PHASE_PARTIAL_EFFECT) {
+        return 0;
+    }
+    if (!lata_tb_recovery_apply(span, map, host_gprs, host_vregs, env)) {
+        return 0;
+    }
+    if (env != NULL) {
+        env->pc = span->guest_pc;
+    }
+    if (info != NULL) {
+        info->applied = true;
+    }
+    return 1;
 }

@@ -62,4 +62,34 @@ bool lata_tb_recovery_apply(const LataTbInsnSpan *span,
                             const void *host_vregs,
                             struct CPUARMState *env);
 
+/* Why a host fault was or was not projected, for diagnostics and tests. */
+typedef struct LataRecoveryFaultInfo {
+    uintptr_t host_pc;
+    uint64_t guest_pc;      /* valid when resolved */
+    uint32_t retired_before;
+    uint8_t site;           /* LataRecoverySite */
+    uint8_t phase;          /* LeRecoveryPhase */
+    uint8_t bind_cnt;
+    uint8_t flags_state;    /* LeRecoveryFlagsState */
+    bool resolved;          /* a span covered host_pc */
+    bool applied;           /* guest state was rebuilt from the snapshot */
+} LataRecoveryFaultInfo;
+
+/*
+ * The machine's host-fault entry point: resolve the native PC, decide with the
+ * shared le_recovery_can_project() rule, and rebuild guest state from the
+ * fault-time host register file. Returns 1 when the fault was projected onto
+ * the guest (env->pc is set to the span's guest PC; entering the guest's trap
+ * vector is the caller's job until the exception plumbing exists), 0 when it
+ * must abort dispatch instead.
+ *
+ * Fail-closed cases, all of them deliberate: no span, a NATIVE_INTERNAL span, a
+ * span from a reclaimed arena (generation mismatch), a span that binds registers
+ * or defers flags with no snapshot to replay, and a PARTIAL_EFFECT span whose
+ * progress cannot be described by bindings alone.
+ */
+int lata_host_fault(struct CPUARMState *env, uintptr_t host_pc,
+                    const uint64_t host_gprs[32], const void *host_vregs,
+                    LataRecoveryFaultInfo *info);
+
 #endif /* LATA_RECOVERY_H */

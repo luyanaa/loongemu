@@ -696,6 +696,54 @@ static void test_tb_recovery(void)
               "apply sets env.pc to the ldr");
     }
 
+    /*
+     * The machine-level entry point over the shared ABI: resolve + decide +
+     * apply in one call. This is what the fault path will call, so the checks
+     * below are about its fail-closed edges as much as its success path.
+     */
+    if (sld != NULL) {
+        uint64_t fault_pc = (uintptr_t)code_buf +
+                            (uintptr_t)sld->native_start;
+        uint64_t host_gprs3[32] = {0};
+        LataRecoveryFaultInfo info;
+
+        for (uint8_t i = 0; i < sld->bind_cnt; i++) {
+            const LataRecoveryBinding *b = &map->binds[sld->bind_first + i];
+
+            if (b->guest_reg == 11) {
+                host_gprs3[b->temp] = UINT64_C(0xfeedface);
+            }
+        }
+        env.xregs[11] = 0;
+        check(lata_host_fault(&env, fault_pc, host_gprs3, NULL, &info), 1,
+              "host fault on a guest-access span projects");
+        check(info.resolved && info.applied, 1, "fault info reports projection");
+        check(info.guest_pc == (uint64_t)(uintptr_t)&block[1], 1,
+              "fault info names the ldr guest PC");
+        check(env.xregs[11] == UINT64_C(0xfeedface), 1,
+              "host fault rebuilt x11 from the snapshot");
+        check(env.pc == (uint64_t)(uintptr_t)&block[1], 1,
+              "host fault left env.pc at the faulting guest insn");
+
+        /* No snapshot: the span binds x11, so the fault must not project. */
+        env.xregs[11] = 0;
+        check(lata_host_fault(&env, fault_pc, NULL, NULL, &info), 0,
+              "guest-access span without a snapshot fails closed");
+        check(info.resolved && !info.applied, 1,
+              "fault info records the refusal");
+        check(env.xregs[11], 0, "refused fault leaves guest state untouched");
+
+        /* A generation that disagrees with the map is not evidence. */
+        check(le_recovery_span_is_live(sld, sld->tb_generation), 1,
+              "span generation matches its map");
+        check(!le_recovery_span_is_live(sld, sld->tb_generation + 1), 1,
+              "span generation mismatch is refused by the shared rule");
+    }
+
+    /* A host-internal span must never be dressed up as a guest exception. */
+    check(lata_host_fault(&env, (uintptr_t)code_buf, NULL, NULL, NULL), 0,
+          "native-internal host fault is refused");
+
     /* C4: dedicated host FP/vector regs v0-v8 (arm_la_fmap[i] >= 0) are
      * replayed from host_vregs as 16-byte lanes into env->sve.zregs. Pick a
      * dedicated lane (v0 -> host freg arm_la_fmap[0]) and verify the lane

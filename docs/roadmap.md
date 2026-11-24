@@ -77,7 +77,7 @@ Rest of the LATA route:
 | priority | work |
 |---|---|
 | P0 | arena bounds, reclaim, SMC, I-cache sync ownership |
-| P0 | host fault -> precise guest PC / register recovery |
+| P0 | host fault -> precise guest PC / register recovery - **done**: `lata_host_fault()` resolves, decides with the shared rule, replays bindings and sets `env->pc` |
 | P1 | AArch64 Linux boot contract: EL1, GIC, generic timer |
 | P1 | exclusive monitor, LSE atomics, SMP validation |
 | P1 | SVE, FPCR/FPSR, exception and rounding semantics |
@@ -366,7 +366,11 @@ fault recovery cost.
    LATR's arena implementation (item 13) and cross-core invalidation with real
    SMP (item 8).
 4. 3.3 shared recovery ABI - done (schema, decision function, generation guard).
-5. 2.1 LATA host-fault precise recovery.
+5. 2.1 LATA host-fault precise recovery - done (`lata_host_fault` uses the shared
+   decision, a generation guard and binding replay; the tests cover projection,
+   a missing snapshot, a stale generation and a native-internal fault). Entering
+   the guest's own trap vector still needs the EL/exception plumbing from the
+   next item.
 6. 5.1 step 3 (label/branch flush elision) on top of the measured baseline.
 7. 5.3 relocation round trip (builds on `latr_emit_code_symbol`).
 8. 2.2 LATR: remaining RVV encodings, then real SMP.
