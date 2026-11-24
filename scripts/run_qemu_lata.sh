@@ -23,11 +23,12 @@ CPU="${QEMU_CPU:-la464}"
 [[ -x "$QEMU" ]] || { echo "no qemu at $QEMU" >&2; exit 1; }
 [[ -f "$KERNEL" ]] || { echo "no image at $KERNEL" >&2; exit 1; }
 
-rm -f "$LOG_FILE"
+ERR_FILE="${LOG_FILE%.log}.err"
+rm -f "$LOG_FILE" "$ERR_FILE"
 "$QEMU" -M virt -cpu "$CPU" -m 512M -kernel "$KERNEL" \
     -display none -monitor none -nic none \
     -L "$(dirname "$QEMU")/../share/qemu" \
-    -serial "file:$LOG_FILE" -no-reboot >/dev/null 2>&1 &
+    -serial "file:$LOG_FILE" -no-reboot >/dev/null 2>"$ERR_FILE" &
 QEMU_PID=$!
 
 # Watchdog: nothing here may leave a QEMU behind.  It records that it fired so a
@@ -72,4 +73,8 @@ else
 fi
 echo "run_qemu_lata: log tail ($LOG_FILE):" >&2
 tail -n 20 "$LOG_FILE" 2>/dev/null >&2
+if [[ -s "$ERR_FILE" ]]; then
+    echo "run_qemu_lata: qemu stderr ($ERR_FILE):" >&2
+    tail -n 20 "$ERR_FILE" >&2
+fi
 exit "$status"
