@@ -6,7 +6,41 @@ on:
   pull_request:
 
 jobs:
-  build-and-isa-gates:
+  # Fast tier: everything that runs on the build host. No qemu, no bare image,
+  # so a regression is reported in minutes instead of behind an emulator run.
+  host-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm python3 make
+
+      - name: Toolchain versions
+        run: |
+          clang --version | head -1
+          llvm-ar --version | head -1
+          python3 --version
+
+      # CC=clang: the host tests build with -Werror=pedantic and stock cc on
+      # Ubuntu is gcc, which rejects __int128 in loongbt_semantics.c.
+      - name: Host unit tests
+        run: make test CC=clang
+
+      # The per-hart TB cache invariant tests are host-side and run in
+      # milliseconds; they are the only coverage of the SMP invalidation
+      # registry, so they must gate every push. `make check` also builds
+      # test-latr-machine-trap, which needs a header this tree does not carry
+      # yet, so the working targets are listed explicitly.
+      - name: LATR host tests
+        working-directory: latr
+        run: make all test-legality test-elf test-tb-smp CLANG=clang AR=llvm-ar
+
+  # ISA tier: build every port core and boot each bare ISA image under qemu.
+  isa-gates:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -20,15 +54,8 @@ jobs:
       - name: Toolchain versions
         run: |
           clang --version | head -1
-          llvm-ar --version | head -1
           ld.lld --version | head -1
           qemu-system-loongarch64 --version | head -1
-          python3 --version
-
-      # CC=clang: the host tests build with -Werror=pedantic and stock cc on
-      # Ubuntu is gcc, which rejects __int128 in loongbt_semantics.c.
-      - name: Host unit tests
-        run: make test CC=clang
 
       # Port core archives are prerequisites of the bare ISA images but have
       # no rule in the top-level Makefile; build them first. CLANG/AR are
@@ -46,20 +73,17 @@ jobs:
         working-directory: latm
         run: make CLANG=clang AR=llvm-ar
 
-      # The per-hart TB cache invariant tests are host-side and run in
-      # milliseconds; they are the only coverage of the SMP invalidation
-      # registry, so they must gate every push. `make check` also builds
-      # test-latr-machine-trap, which needs a header this tree does not carry
-      # yet, so the working targets are listed explicitly.
-      - name: LATR host tests
-        working-directory: latr
-        run: make all test-legality test-elf test-tb-smp CLANG=clang AR=llvm-ar
-
       # QLVZ_REPO default points at a checked-in macOS qemu binary; the ISA
-      # gates only need a generic virt+la464 machine, which stock
+      # gates only need a generic virt machine, which stock
       # qemu-system-loongarch64 (qemu-system-misc) provides. run_qemu_lata.sh
       # resolves bios/keymaps via `dirname $QEMU_BIN`/../share/qemu, which
       # lands on /usr/share/qemu for the distro package.
+      #
+      # QEMU_CPU=max: distro la464 does not decode every instruction the
+      # translator emits (LSX lanes appear in generated code).
+      # QEMU_DEBUG=1: print qemu's stderr, execution trace and serial byte
+      # count when a gate fails, because a distro qemu can die before the
+      # guest writes its first byte.
       - name: LATA ISA gate
         run: |
           make lata-isa-run \
@@ -67,8 +91,6 @@ jobs:
             QLVZ_REPO=/usr/bin/qemu-system-loongarch64
         env:
           QEMU_DEBUG: 1
-          # Distro la464 does not decode every instruction the translator emits
-          # (LSX/LASX lanes appear in generated code); `max` accepts them all.
           QEMU_CPU: max
 
       - name: LATR ISA gate
@@ -78,8 +100,6 @@ jobs:
             QLVZ_REPO=/usr/bin/qemu-system-loongarch64
         env:
           QEMU_DEBUG: 1
-          # Distro la464 does not decode every instruction the translator emits
-          # (LSX/LASX lanes appear in generated code); `max` accepts them all.
           QEMU_CPU: max
 
       - name: LATM ISA gate
@@ -89,6 +109,4 @@ jobs:
             QLVZ_REPO=/usr/bin/qemu-system-loongarch64
         env:
           QEMU_DEBUG: 1
-          # Distro la464 does not decode every instruction the translator emits
-          # (LSX/LASX lanes appear in generated code); `max` accepts them all.
           QEMU_CPU: max
