@@ -1711,6 +1711,18 @@ static const ARMCPRegInfo lata_fpcr_reginfo = {
     .fieldoffset = offsetof(CPUARMState, vfp.xregs[ARM_VFP_FPCR]),
 };
 
+/*
+ * NZCV: the flag nibble lives in bits 31:28 of the field. With LBT the flags sit
+ * in the translation flag register and this entry is only reached through
+ * armmfflag/armmtflag; on a host without LBT the same nibble is what the
+ * software path reads and writes. Either way the register has to be decodable,
+ * otherwise no guest instruction can observe a flag result directly.
+ */
+static const ARMCPRegInfo lata_nzcv_reginfo = {
+    .name = "NZCV",
+    .type = ARM_CP_NZCV,
+};
+
 static const ARMCPRegInfo lata_spsr_reginfo = {
     .name = "SPSR_EL1",
     .type = 0,
@@ -1749,6 +1761,9 @@ static const ARMCPRegInfo *lata_local_sysreg(unsigned op0, unsigned op1,
      * collides with ELR_EL1 (0x330000 both ways). */
     if (op0 != 3) {
         return NULL;
+    }
+    if (op1 == 3 && crn == 4 && crm == 2 && op2 == 0) {
+        return &lata_nzcv_reginfo;
     }
     if (op1 == 3 && crn == 4 && crm == 4 && op2 <= 1) {
         return (op2 == 0) ? &lata_fpcr_reginfo : &lata_fpsr_reginfo;

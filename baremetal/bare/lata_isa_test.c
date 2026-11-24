@@ -695,6 +695,108 @@ static void test_tb_recovery(void)
     }
 }
 
+/*
+ * Raw flag probes (P0 of docs/design/lata-software-nzcv.md).
+ *
+ * Everything above observes NZCV indirectly, through CSET/CSEL, so a wrong flag
+ * layout and a wrong condition test are indistinguishable. These blocks read the
+ * register back with MRS immediately after one producer, which pins down the
+ * producer side on its own. `mrs` is now decodable because the NZCV system
+ * register joined the LATA-local sysreg table (`lata_nzcv_reginfo`).
+ *
+ * The two round-trip blocks (MSR then MRS) must reproduce the written nibble on
+ * any implementation, so they are checked. The producer probes print what the
+ * host actually produces: whether that equals the AArch64 value is the
+ * measurement, not an assumption, and tests/test_lata_nzcv.c holds the
+ * reference for comparison.
+ */
+static void probe_raw_flags(uint32_t *guest, int insns, const char *name)
+{
+    run_block(guest, insns, name);
+    latx_bare_uart_puts("lata-isa: nzcv ");
+    latx_bare_uart_puts(name);
+    latx_bare_uart_puts(" mrs=");
+    puthex(lata_result_x5);
+    latx_bare_uart_puts("\n");
+}
+
+static void run_raw_flag_probes(void)
+{
+    /* adds -1 + 1: result 0, carry out; AArch64 nibble = Z|C = 0x6. */
+    static uint32_t p_adds_carry[] __attribute__((aligned(4096))) = {
+        0x92800001u, /* movn x1, #0 */
+        0xd2800022u, /* movz x2, #1 */
+        0xab020023u, /* adds x3, x1, x2 */
+        0xd53b4205u, /* mrs x5, nzcv */
+    };
+    /* subs 0 - 1: result -1, borrow; AArch64 nibble = N = 0x8. */
+    static uint32_t p_subs_borrow[] __attribute__((aligned(4096))) = {
+        0xd2800001u, /* movz x1, #0 */
+        0xd2800022u, /* movz x2, #1 */
+        0xeb020023u, /* subs x3, x1, x2 */
+        0xd53b4205u, /* mrs x5, nzcv */
+    };
+    /* adds INT64_MIN + INT64_MIN: result 0, carry and overflow; N=0,Z=1,C=1,V=1. */
+    static uint32_t p_adds_overflow[] __attribute__((aligned(4096))) = {
+        0xd2800021u, /* movz x1, #1 */
+        0xd3410021u, /* lsl x1, x1, #63 */
+        0xab010023u, /* adds x3, x1, x1 */
+        0xd53b4205u, /* mrs x5, nzcv */
+    };
+    /* ands 0 & 0: logical ops clear C and V; result 0 so Z=1. */
+    static uint32_t p_ands_zero[] __attribute__((aligned(4096))) = {
+        0xd2800001u, /* movz x1, #0 */
+        0xea010023u, /* ands x3, x1, x1 */
+        0xd53b4205u, /* mrs x5, nzcv */
+    };
+    /* adcs after a carry-setting adds: carry-in must be consumed (1+0+1). */
+    static uint32_t p_adcs_chain[] __attribute__((aligned(4096))) = {
+        0x92800001u, /* movn x1, #0 */
+        0xd2800022u, /* movz x2, #1 */
+        0xab020023u, /* adds x3, x1, x2: 0, C=1 */
+        0xba020064u, /* adcs x4, x3, x2 */
+        0xd53b4205u, /* mrs x5, nzcv */
+    };
+    /* MSR/MRS round trip: a written nibble must read back unchanged. */
+    static uint32_t p_msr_mrs[] __attribute__((aligned(4096))) = {
+        0xd28c0005u, /* movz x5, #0x6000 */
+        0xd370bca5u, /* lsl x5, x5, #16 -> 0x6000_0000 */
+        0xd51b4205u, /* msr nzcv, x5 */
+        0xd53b4205u, /* mrs x5, nzcv */
+    };
+    static uint32_t p_msr_mrs_nv[] __attribute__((aligned(4096))) = {
+        0xd2800125u, /* movz x5, #9 */
+        0xd3648ca5u, /* lsl x5, x5, #28 -> 0x9000_0000 */
+        0xd51b4205u, /* msr nzcv, x5 */
+        0xd53b4205u, /* mrs x5, nzcv */
+    };
+
+    latx_bare_uart_puts("lata-isa: raw flags begin\n");
+    probe_raw_flags(p_adds_carry, 4, "adds-carry");
+    probe_raw_flags(p_subs_borrow, 4, "subs-borrow");
+    probe_raw_flags(p_adds_overflow, 4, "adds-overflow");
+    probe_raw_flags(p_ands_zero, 3, "ands-zero");
+    probe_raw_flags(p_adcs_chain, 5, "adcs-chain");
+    /* The subtract/adc path additionally sets ARM carry via armmtflag; if that
+     * register were the one MRS reads, these would be non-zero while the pure
+     * x86add producers above are zero. */
+    {
+        static uint32_t p_subs_armcarry[] __attribute__((aligned(4096))) = {
+            0xd28000a1u, /* movz x1, #5 */
+            0xd28000a2u, /* movz x2, #5 */
+            0xeb020023u, /* subs x3, x1, x2 */
+            0xd53b4205u, /* mrs x5, nzcv */
+        };
+
+        probe_raw_flags(p_subs_armcarry, 4, "subs-armcarry");
+    }
+    probe_raw_flags(p_msr_mrs, 4, "msr-mrs");
+    check(lata_result_x5, 0x60000000u, "MSR/MRS NZCV round trip 0x6");
+    probe_raw_flags(p_msr_mrs_nv, 4, "msr-mrs-nv");
+    check(lata_result_x5, 0x90000000u, "MSR/MRS NZCV round trip 0x9");
+    latx_bare_uart_puts("lata-isa: raw flags done\n");
+}
+
 static void run_integer_nzcv_matrix(void)
 {
     /* Encodings assembled with clang --target=aarch64-none-elf and llvm-objdump. */
@@ -893,6 +995,7 @@ static void run_integer_nzcv_matrix(void)
     };
 
     enable_bte_only();
+
     latx_bare_uart_puts("lata-isa: integer/NZCV matrix begin\n");
 
     run_block(adds_carry_zero, 10, "adds-carry-zero");
@@ -951,7 +1054,10 @@ static void run_integer_nzcv_matrix(void)
     check(lata_result_x3, 4, "CSEL GT destination");
     check(lata_result, 1, "CSEL GT preserves NZCV nibble");
 
+
     latx_bare_uart_puts("lata-isa: integer/NZCV matrix done\n");
+
+    run_raw_flag_probes();
 }
 
 

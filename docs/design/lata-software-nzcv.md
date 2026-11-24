@@ -40,33 +40,82 @@ host that has LBT, and reverted. Three results, all reproduced:
 Substituting a constant nibble for the pstate read still produced 0 at the flag
 consumers, so the arithmetic was never implicated: `armmove` and friends are.
 
-### 3.2 `armmove`'s contract is undocumented and, as read from its callers,
-contradictory
+### 3.2 `armmove`: a contradiction that dissolved on measurement
 
-* `disas_cond_select`, CSET path: `rd = 1; armmove(rd, 0, cond)`. The ISA suite
-  asserts `cset x2, eq` after `subs` to zero yields 1, i.e. cond true must
-  **leave rd unchanged**.
-* Same function, CSEL path: `rd = false_value; armmove(rd, true_value, cond)`.
-  The suite asserts `csel x3, x2, x4, lt` with LT true yields the true value,
-  i.e. cond true must **write rd**.
+An earlier reading concluded the two callers demanded opposite polarities:
 
-Both pass on LBT. No single conditional-move polarity satisfies both, so the
-LBT encoding carries more than a 4-bit ARM condition test. The failing side is
-always CSET; the split follows bit 3 of the condition field (`EQ..VC` vs
-`HI..LE`), which is exactly where ARM's simple/compound boundary sits.
+* CSET: `rd = 1; armmove(rd, 0, cond)`, and the suite wants 1 when `cset`'s
+  condition holds;
+* CSEL: `rd = false_value; armmove(rd, true_value, cond)`, and the suite wants
+  the true value when its condition holds.
 
-Hypothesis worth testing before any code is written: the LBT flag register
-layout differs per producer (`x86add` vs `armmtflag`+`x86adc`), and the suite's
-expectations were recorded against that difference rather than against AArch64.
-If true, the port has a latent conformance bug independent of this design.
+That was a misreading of the *encoding*, not of the hardware. `cset rd, cond` is
+not an instruction: it assembles to `csinc rd, xzr, xzr, invert(cond)`, so the
+condition the translator decodes for CSET is already inverted. Verified with the
+assembler: `cset x2, eq` and `csinc x2, xzr, xzr, ne` are the same word
+(`0x9a9f17e2`, cond field `0x1` = NE).
 
-### 3.3 MRS NZCV is not decodable in this configuration
+With that, a single rule satisfies both callers and AArch64:
 
-`baremetal/bare/lata_isa_test.c:702`: "Direct MRS NZCV is not implemented by
-this compatibility decoder." So the obvious measurement - read the raw flag
-register after each producer - is currently blocked by another missing feature.
-That makes the decode of `MSR/MRS NZCV` (op0=3, op1=3, CRn=4, CRm=2) the first
-task, not an optional one.
+```
+armmove(rd, rj, cond)  ==  if (cond) rd = rj
+```
+
+CSET: cond (inverted) false exactly when the guest's condition holds, so rd keeps
+its pre-set 1 - which is what the suite asserts. CSEL: rd takes the true value
+when the condition holds.
+
+The corollary matters more than the rule: the reverted software implementation
+wrote `rd = rj & mask`, which drops `rd` unconditionally; that is what made every
+CSET read 0 while CSEL looked fine. The fix is
+`rd = (rd & ~mask) | (rj & mask)`.
+
+### 3.3 MRS/MSR NZCV were not decodable; now they are
+
+`baremetal/bare/lata_isa_test.c:702` said "Direct MRS NZCV is not implemented by
+this compatibility decoder". The handler existed (`case ARM_CP_NZCV`,
+`translate-a64.c:1835`), but nothing ever returned an `ARMCPRegInfo` for it: the
+bare runtime's `get_arm_cp_reginfo` is a weak stub returning NULL
+(`lata/runtime.c:39`), so every MRS/MSR became "Unknown register".
+
+Fixed by adding `lata_nzcv_reginfo { .type = ARM_CP_NZCV }` to the port-local
+sysreg table (`lata_local_sysreg`, `translate-a64.c:1766`), which is where the
+bare build serves the registers it models itself (FPCR/FPSR/SPSR/ELR/ESR).
+`mrs x5, nzcv` and `msr nzcv, x5` now decode and round-trip.
+
+### 3.4 The producers' flags are not visible through MRS: two flag views
+
+With MRS working, the raw probe (`run_raw_flag_probes`, same file) reports:
+
+| block | `mrs x5, nzcv` |
+|---|---|
+| `adds x3, x1, x2` (-1 + 1) | `0x00000000` |
+| `subs x3, x1, x2` (0 - 1) | `0x00000000` |
+| `adds` MIN+MIN | `0x00000000` |
+| `ands` | `0x00000000` |
+| `adcs` chain | `0x00000000` |
+| `subs` 5-5 (runs `armmtflag` carry setup first) | `0x00000000` |
+| `msr nzcv, 0x6000_0000; mrs` | `0x60000000` (checked) |
+| `msr nzcv, 0x9000_0000; mrs` | `0x90000000` (checked) |
+
+So `armmtflag`/`armmfflag` form a consistent pair, and the arithmetic producers
+write *somewhere else*: the port's `x86add`/`x86adc` path feeds the register that
+`armmove`/`setarmj` read (which is why CSET/CSEL/branches are correct), while
+`MRS NZCV` reads the ARM-layout register that only `armmtflag` writes - and
+`x86adc` appears to leave it cleared even after `armmtflag` set the carry.
+
+Consequences for this design, and they are stronger than the earlier guess:
+
+1. **Neither LBT flag register can be the software path's storage.** The design
+   already said `env->pstate[31:28]`; now it is the only choice that is
+   observable, testable and host-independent.
+2. **The ISA suite cannot see this gap** - nothing in it reads NZCV directly, so
+   a guest MRS after arithmetic silently returns 0 today. That is a port bug
+   independent of LBT availability, recorded here rather than fixed here: fixing
+   it means deciding which register is canonical, which is exactly what P1 does.
+3. **P1's consumer set is confirmed complete at four instructions** (`armmove`,
+   `setarmj`, `armmfflag`, `armmtflag`), because those are the only readers and
+   writers of the ARM-layout register.
 
 ### 3.4 Temporary-register budget
 
@@ -122,19 +171,20 @@ kinds, all flag-related).
 
 ### 4.4 Caller semantics that the suite asserts, restated
 
-* CSET: emitted as `gen_select(rd=1, rj=0, cond)` -> 1 when cond false, 0 when
-  true, matching the *existing* LBT behaviour the suite encodes; the AArch64
-  reading of `cset` is the opposite, and that discrepancy is finding §3.2.
+* CSET: emitted as `gen_select(rd=1, rj=0, cond)` where `cond` is the *decoded*
+  field, i.e. the inverse of the assembly-level condition (§3.2). The result is
+  AArch64-correct - 1 when the guest's condition holds - so no inversion is
+  introduced or reproduced.
 * CSEL/CSINC/CSINV/CSNEG: `gen_select(rd=false_value, rj=true_value, cond)`.
 
 ## 5. Phases
 
-**P0 - make flags observable (blocking, ~1 day).** Decode `MRS/MSR NZCV`; the
-decoder already has the handler (`case ARM_CP_NZCV`, `translate-a64.c:1835`) and
-maps MRS to `la_armmfflag` (1841) / MSR to `la_armmtflag` (1848), so the gap is
-in what reaches it, not in the handler; add an ISA-suite block that reads the raw flags after
-`adds`, `subs`, `adcs`, `ands` and prints them. Deliverable: one log line per
-producer showing the actual nibble, which settles §3.2/§3.1 or refutes them.
+**P0 - done.** Decode `MRS/MSR NZCV` (`lata_nzcv_reginfo`, §3.3) and add the raw
+probe (`run_raw_flag_probes`, §3.4). Result: the round trip is checked and green;
+the producers are not visible through it, which is finding §3.4. P0 therefore
+closes with a *narrower* P1: the software path owns `pstate[31:28]` and replaces
+the four consumers, and the port's split flag views are a separate bug (a guest
+MRS after arithmetic returns 0 today, on LBT included).
 
 **P1 - software helpers behind a switch.** Implement §4.2, wire every producer
 and consumer, keep `lata_have_lbt` as the selector. Gate: `make lata-isa-run`
@@ -185,13 +235,12 @@ decisive. If P0 shows the LBT layout is producer-dependent, this design needs a
 new section and the port needs a conformance bug fixed first - that is a better
 outcome than silently matching it.
 
-**Objection 3: §4.4 says CSET in LATA is inverted relative to AArch64 but the
-design reproduces it. Should the port be fixed to AArch64 instead?**
-It should, and the design makes that decision explicit rather than accidental:
-fix it in P2 as a separate, visible commit that also fixes the suite's `cset`
-expectations, because a silent semantic change inside a "make it work without
-LBT" change is exactly the kind of coupling that hides a regression. The
-`csel` fixtures already encode AArch64, so the suite will notice.
+**Objection 3 (answered by measurement): is LATA's CSET inverted?**
+No - the objection came from an earlier misreading of the encoding, corrected in
+§3.2: `cset` decodes as `csinc … , invert(cond)`, so the single rule
+`armmove = if (cond) rd = rj` produces AArch64-correct results for both CSET and
+CSEL. Nothing in the port needs inverting, and the P2 "fix the suite" step this
+objection asked for is dropped.
 
 **Objection 4: does the software path interact with the recovery work?**
 Yes: `LeRecoverySpan` records which guest registers a partially executed

@@ -20,12 +20,13 @@ jobs:
   #                    sve-lasx-lower.c
   #   flag consumption armmove x3 (csel/cset, translate-a64.c:8252/8303/8307),
   #                    armmfflag x1 (MRS NZCV, :1841), x86adc/sbc carry chains
-  #   flag transfer    armmtflag x6 (MSR NZCV, ccmp FALSE path: 870, 883, 1848,
-  #                    8207, 9078, 9236)
+  #   flag transfer    armmtflag x7 (carry=1 for subs: 870, 883; MSR NZCV 1848;
+  #                    ccmp FALSE 8207; fp compare 9078, 9108, 9236)
   # A software path therefore means: compute NZCV for add/sub in GPRs, keep the
-  # nibble in env->pstate between instructions, and turn armmove into
-  # predicate-from-nibble + select. Four helpers, ~14 emission sites. Until
-  # that lands, `make lata-isa-run` locally (6525 checks) is the gate.
+  # nibble in env->pstate between instructions, and turn armmove/setarmj into
+  # predicate-from-nibble + select. Six helpers over 28 instruction sites (see
+  # docs/design/lata-software-nzcv.md for the counted table). Until that lands,
+  # `make lata-isa-run` locally is the gate.
   #
   # A software path was implemented and reverted; what it proved is below, so
   # nobody repeats the blind part. tests/test_lata_nzcv.c pins the reference
@@ -33,19 +34,25 @@ jobs:
   # `res < a` alone gets wrong) and the full 16 x 16 condition matrix -- in the
   # fast host tier.
   #
-  # Findings, all reproduced by building the ISA image with the software path
-  # forced on (lbt=0) on a host that has LBT:
+  # Findings, reproduced by building the ISA image with the software path forced
+  # on (lbt=0) on a host that has LBT, then by reading the raw flags back through
+  # MRS NZCV once that decode existed (P0 of docs/design/lata-software-nzcv.md):
   #   1. The flag *arithmetic* is not the open problem; the *consumers* are.
-  #   2. armmove's semantics are undocumented in the tree, and the two call
-  #      sites demand opposite polarities for any plain conditional move:
-  #      CSET pre-sets rd=1 and needs rd unchanged when cond holds, while CSEL
-  #      pre-loads the false value and needs rd = rj when cond holds. Both are
-  #      asserted AArch64-correct by the suite and both pass on LBT, so the LBT
-  #      encoding must carry something a 4-bit ARM condition test does not
-  #      (bit 3 splits EQ..VC from HI..LE, and the failing cases sit on the
-  #      CSET side only). Getting armmove right needs the LBT ISA description,
-  #      not more inference.
-  #   3. Pool pressure is real: gen_cond_value (3 itemps) called from
+  #   2. armmove has no documented contract in the tree, but measurement settled
+  #      it: `armmove(rd, rj, cond)` is `if (cond) rd = rj`, and `cset rd, cond`
+  #      decodes with the condition already inverted (`csinc rd, xzr, xzr, ne`
+  #      for `cset rd, eq`), so one rule serves CSET and CSEL. The reverted
+  #      software path wrote `rd = rj & mask`, dropping rd unconditionally - that
+  #      is what made every CSET read 0.
+  #   3. The port keeps *two* flag views: x86add/x86adc feed the register that
+  #      armmove/setarmj read (so CSET/CSEL/branches are correct), while
+  #      armmtflag/armmfflag form a separate ARM-layout pair used by MSR/MRS NZCV.
+  #      Measured: after adds/subs/ands/adcs, `mrs nzcv` returns 0; after
+  #      `msr nzcv, X`, `mrs` returns X. A guest reading NZCV after arithmetic
+  #      therefore sees 0 today - a port bug independent of LBT, and the reason
+  #      the software path must own env->pstate[31:28] rather than either
+  #      register.
+  #   4. Pool pressure is real: gen_cond_value (3 itemps) called from
   #      gen_cond_move (2 more) trips ra_alloc_itemp at csel blocks, whose
   #      dispatch already holds operands. Any implementation needs to free
   #      before emitting the store, not after.
