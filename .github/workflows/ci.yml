@@ -27,13 +27,28 @@ jobs:
   # predicate-from-nibble + select. Four helpers, ~14 emission sites. Until
   # that lands, `make lata-isa-run` locally (6525 checks) is the gate.
   #
-  # An attempt at that path reached 6504/6525 before being reverted: the
-  # residual mismatches were flag nibbles off by one condition, so the emitted
-  # arithmetic still disagrees with AArch64. tests/test_lata_nzcv.c now pins the
-  # reference semantics -- add-with-carry over 32/64 bits (including the
-  # carry-in rule that `res < a` alone gets wrong) and the full 16 x 16
-  # condition matrix -- in the fast host tier, so the next attempt starts from
-  # verified ground truth instead of a 6525-check round trip.
+  # A software path was implemented and reverted; what it proved is below, so
+  # nobody repeats the blind part. tests/test_lata_nzcv.c pins the reference
+  # semantics -- AddWithCarry over 32/64 bits (including the carry-in rule that
+  # `res < a` alone gets wrong) and the full 16 x 16 condition matrix -- in the
+  # fast host tier.
+  #
+  # Findings, all reproduced by building the ISA image with the software path
+  # forced on (lbt=0) on a host that has LBT:
+  #   1. The flag *arithmetic* is not the open problem; the *consumers* are.
+  #   2. armmove's semantics are undocumented in the tree, and the two call
+  #      sites demand opposite polarities for any plain conditional move:
+  #      CSET pre-sets rd=1 and needs rd unchanged when cond holds, while CSEL
+  #      pre-loads the false value and needs rd = rj when cond holds. Both are
+  #      asserted AArch64-correct by the suite and both pass on LBT, so the LBT
+  #      encoding must carry something a 4-bit ARM condition test does not
+  #      (bit 3 splits EQ..VC from HI..LE, and the failing cases sit on the
+  #      CSET side only). Getting armmove right needs the LBT ISA description,
+  #      not more inference.
+  #   3. Pool pressure is real: gen_cond_value (3 itemps) called from
+  #      gen_cond_move (2 more) trips ra_alloc_itemp at csel blocks, whose
+  #      dispatch already holds operands. Any implementation needs to free
+  #      before emitting the store, not after.
 
   # Fast tier: everything that runs on the build host. No qemu, no bare image,
   # so a regression is reported in minutes instead of behind an emulator run.
