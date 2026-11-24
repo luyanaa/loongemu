@@ -7,6 +7,7 @@
  */
 #include "qemu/osdep.h"
 #define LATM_REGCACHE_WRAP
+#include "qemu/cpu-features.h"
 #include "latm.h"
 #include "mem.h"
 #include "translate.h"
@@ -187,6 +188,10 @@ void lata_tr_data_init(void *envp)
         env->latm_jmp_cache = mm_calloc(LATM_JMP_CACHE_SIZE,
                                         sizeof(LatmJmpCacheEntry));
     }
+    /* The translator emits `gr2scr`/`jiscr0` only when the host decodes LBT;
+     * without the probe a non-LBT host takes an instruction-nonexistent fault
+     * on the first chained indirect jump. */
+    latm_have_lbt = latx_cpu_has_lbt() != 0;
     lsenv = env->latm_env;
     tr_data = env->latm_tr_data;
     lsenv->cpu_state = env;

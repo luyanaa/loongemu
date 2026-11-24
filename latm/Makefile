@@ -25,7 +25,8 @@ CFLAGS := $(BASE) $(INCS) $(DEFS)
 
 SHARED := ../shared/backend/loongarch/ir2.c ../shared/backend/loongarch/ir2-peephole.c \
           ../shared/backend/loongarch/ir2-assemble.c ../shared/backend/loongarch/la-append.c \
-          ../shared/perf/src/perf.c mem-latm.c $(LATA)/translator/macro-helper.c
+          ../shared/perf/src/perf.c mem-latm.c $(LATA)/translator/macro-helper.c \
+          $(LATX)/runtime/cpu_features.c
 CORE   := $(LATM)/latm.c $(LATM)/tb_insn_map.c $(LATM)/cpu/loongson-profile.c $(LATM)/runtime.c $(LATM)/translator/reg-alloc.c \
           $(LATM)/ir1/decode-mips.c $(LATM)/translator/translate-mips.c \
           ../target/mips/fpu.c

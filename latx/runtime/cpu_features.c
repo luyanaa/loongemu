@@ -35,11 +35,25 @@ static uint32_t cpucfg2(void)
 /* Test hook: a harness may force the feature level. */
 static int forced_lsx = -1;
 static int forced_lasx = -1;
+static int forced_lbt = -1;
 
 void latx_cpu_set_vector_features(int lsx, int lasx)
 {
     forced_lsx = lsx;
     forced_lasx = lasx;
+}
+
+void latx_cpu_set_lbt_feature(int lbt)
+{
+    forced_lbt = lbt;
+}
+
+int latx_cpu_has_lbt(void)
+{
+    if (forced_lbt >= 0) {
+        return forced_lbt;
+    }
+    return (cpucfg2() & (1u << 22)) != 0; /* CPUCFG.2[22] = LBT */
 }
 
 int latx_cpu_has_lsx(void)
