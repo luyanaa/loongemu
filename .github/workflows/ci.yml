@@ -110,75 +110,25 @@ jobs:
             CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
             QLVZ_REPO=/usr/bin/qemu-system-loongarch64
           grep -a 'latr-perf:' build/latr_sys_diff.log
-          # The SMP boot harness is still not gated. Data points, same source:
-          #   qemu 9.0.50  (arm64 host, clang 23 build)  fails=0 ok
-          #   qemu 11.1.3  (arm64 host, clang 23 build)  fails=0 ok
-          #   qemu 11.1.3  (--accel tcg,thread=multi)    fails=0 ok
-          #   qemu 10.0.13 (x86_64 container, clang 19)  fails=0xb
-          #   qemu 11.1.3  (x86_64 container, clang 19)  fails=0xb
-          # The 11 failures are one chain starting at "hardware trap delivered
-          # guest #PF". Emulator version and host are ruled out: the artifact
-          # built here fails identically when replayed on an arm64 host with the
-          # qemu 11.1.3 that passes the clang-23 image. Reproduced locally with
-          # llvm@19, so the variable is the compiler that builds the image.
-          # Ruled out: optimisation level (-O1 and -O2 pass under clang 23),
-          # uninitialised stack (auto-var-init=zero under clang 19 still fails),
-          # strict aliasing (-fno-strict-aliasing still fails).
-          # What the failing image does instead (both builds report
-          # plv3_exit=1): the guest loop burns all 128 steps instead of halting
-          # after 0x2b, g_hw_guest_pf stays 0 so the #PF comes from a software
-          # path, and the handler then reads 0x100 (bit 8, the saved EFLAGS)
-          # where the error code belongs -- the frame it reads is not the one
-          # latx_x86_deliver_fault pushes.
-          # Next: why the clang-19 image's guest stops making progress (128 vs
-          # 43 steps, 5 vs 4 translated TBs) before the halt block.
-          # Dispatch traces (build with TB_SYS_TRACE=1) localise it: after the
-          # identical first two steps, TB 0x1109 exits NORMAL to 0x10c1 under
-          # clang 23 but to 0x7fd0 (a stack address) under clang 19, and the
-          # guest then traps forever at 0x7fd2. That TB is the *handler* (it
-          # stores CR2/EC/RIP, increments the run counter, patches the PTE) and
-          # ends with `add rsp,8; iretq`.
-          # The two observed values pinpoint the frame offset: EC read 0x100 is
-          # the saved EFLAGS and the iretq target 0x7fd0 is the saved RSP, which
-          # are frame slots 3 and 4. Reading them as slots 0 and 1 after
-          # `add rsp,8` means the handler's rsp was 3 words (24 bytes) above the
-          # frame base -- i.e. the delivery wrote the frame lower than the entry
-          # rsp. Both delivery paths compute `(rsp & ~15) - nwords*8`.
-          # The trace (rsp_in/rsp_out per step, plus the delivery's own values)
-          # corrects the earlier guess twice over:
-          #   - the guest stack pointer is $s4 (reg_gpr_map[esp] = la_s4 = 27),
-          #     so the trap stub's CSR 0x30 juggling never touches it; the stub
-          #     restores $s4 from frame offset 216, and the print shows that
-          #     slot already holding the delivered value 0x7fd0. The stub is
-          #     not the bug.
-          #   - delivery is also correct: before=0x8000, ret=0, after=0x7fd0,
-          #     err=3, i.e. the frame sits at 0x7fd0 with EC at +0.
-          #   - the handler TB starts with exactly rsp_in=0x7fd0, yet its
-          #     `mov ecx,[rsp]` / `mov rcx,[rsp+8]` read slots +24 and +32.
-          # Two more measurements narrow it further:
-          #   - CPUX86State layout is identical in both translation units (size
-          #     0x1b20, regs 0x158, eip 0x1d8, eflags 0x1e0, segs 0x210), so the
-          #     compat header is not being resolved differently.
-          #   - reading the six frame words back through the guest walker right
-          #     after delivery yields junk (0x100, 0x7fd0, 0, 0, 0x80010001, 0)
-          #     instead of (err, eip, cs, eflags, rsp, ss), while the caller sees
-          #     err=3 and rsp=0x7fd0.
-          # So the pushes did not land where the walker's own read-back looks,
-          # even though frame writes and the read-back both use latx_x86_walk.
-          # Root cause, located to the statement: the PLV0 trap stub builds its
-          # 256-byte register frame on the *guest* stack (frame 0x7f00 while the
-          # fault-time guest rsp is 0x8000), so sync_env_to_trap_regs() writes
-          # over the exception frame at 0x7fd0/0x7fd8 that delivery just pushed
-          # -- read-backs show 0x7fd0 = 3 until sync, 0x100 after. The harness now
-          # prints `PLV0 trap frame ... overlaps the guest #PF frame at ...` when
-          # that happens (it does for the clang-19 image, never for clang-23).
-          # Switching the stub to the per-core g_trap_stack was tried and broke
-          # PLV3 re-entry (translate failures, lgdt checks), so the fix needs the
-          # question "which register is the PLV3 stack: $sp or $s4?" answered
-          # first -- the stub enters with $sp == guest rsp while reg_gpr_map maps
-          # the guest ESP to $s4.
-          # Run it by hand with:
-          #   make tb-sys-smp-run QLVZ=/usr/bin/qemu-system-loongarch64
+          # Boot tier: a translated x86 host boots on 4 LoongArch harts with IPI
+          # shootdowns, then asserts phys_cpus_online=4, `tb-sys: done` and
+          # fails=0. The initramfs it embeds is gitignored, but the Makefile
+          # generates a valid kernel-only one when it is absent, so a fresh
+          # checkout builds it, and -nic none keeps qemu from needing an option
+          # ROM. It ends through the rule 90s timeout by design.
+          #
+          # This gate used to fail 11 checks for one reason, now fixed: the PLV0
+          # trap stub saved its 256-byte register frame on the interrupted
+          # (guest) stack, right on top of the 48-byte exception frame that
+          # delivery pushes, so sync_env_to_trap_regs() overwrote CR2/RIP/EC and
+          # the handler read EFLAGS as the error code (0x100) and the saved RSP
+          # as RIP. Whether the windows collided depended on the fault-time guest
+          # rsp, which is why a clang-23 image passed and a clang-19 image failed
+          # while the emulator, host arch and optimisation level made no
+          # difference. The stub now keeps its frame 48 bytes lower
+          # (`addi.d $sp, $sp, -304`), and both toolchains report 117/0.
+          make tb-sys-smp-run QLVZ=/usr/bin/qemu-system-loongarch64 \
+            CLANG=clang AR=llvm-ar LD_LLD=ld.lld
           SCRIPT
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/src" -v /tmp/isa-gates.sh:/isa-gates.sh:ro \
