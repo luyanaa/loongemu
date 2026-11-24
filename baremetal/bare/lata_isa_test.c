@@ -106,6 +106,29 @@ static void putdec(uint64_t v)
 }
 
 static int checks, fails;
+
+/*
+ * True when a 32-bit word ends a translated block: an unconditional branch, an
+ * indirect jump, the conditional-branch family, or an explicit trap. Anything
+ * else means the emitter stopped short and the harness would fall through into
+ * stale buffer contents.
+ */
+static bool lata_block_terminates(uint32_t word)
+{
+    unsigned op = word >> 26;
+
+    if (op == 0x13u) {           /* jirl */
+        return true;
+    }
+    if (op == 0x14u || op == 0x15u) { /* b, bl */
+        return true;
+    }
+    if (op >= 0x16u && op <= 0x1bu) { /* beq..bgeu and friends */
+        return true;
+    }
+    return word == 0x002a0000u || word == 0x002b0000u; /* break, syscall */
+}
+
 static bool test_aa64_lse;
 
 static void check(uint64_t got, uint64_t want, const char *what)
@@ -294,6 +317,24 @@ static void run_block(uint32_t *guest, int insns, const char *name)
     latx_bare_uart_puts(" past=");
     puthex(words > 0 ? words_out[words] : 0);
     latx_bare_uart_puts("\n");
+
+    /*
+     * A block that does not end in a control transfer runs off into whatever
+     * the buffer held before: the following bytes decode as data and the
+     * harness dies on an impossible instruction instead of reporting which
+     * block was truncated. Fail here, by name.
+     */
+    checks++;
+    if (words <= 0 || !lata_block_terminates(words_out[words - 1])) {
+        fails++;
+        latx_bare_uart_puts("lata-isa: FAIL ");
+        latx_bare_uart_puts(name);
+        latx_bare_uart_puts(" unterminated words=");
+        putdec((unsigned)words);
+        latx_bare_uart_puts(" last=");
+        puthex(words > 0 ? words_out[words - 1] : 0);
+        latx_bare_uart_puts("\n");
+    }
 
     lata_enter_tb(&env, code_buf);
     latx_bare_uart_puts("lata-isa: ");

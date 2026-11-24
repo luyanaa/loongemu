@@ -1,5 +1,5 @@
 # Freestanding LATM (MIPS64r2 -> LoongArch) translation core.
-LLVM    ?= $(shell brew --prefix llvm)
+LLVM    ?= $(shell brew --prefix llvm 2>/dev/null)
 CLANG   ?= $(LLVM)/bin/clang
 AR      := $(LLVM)/bin/llvm-ar
 TARGET  ?= loongarch64-unknown-linux-gnu

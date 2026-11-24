@@ -1,6 +1,6 @@
 # Freestanding RISC-V -> LoongArch translation core. QEMU's decoder tables are
 # generated from the adjacent QEMU-LVZ checkout, which is also the golden ref.
-LLVM_PREFIX ?= $(shell brew --prefix llvm)
+LLVM_PREFIX ?= $(shell brew --prefix llvm 2>/dev/null)
 CLANG       ?= $(LLVM_PREFIX)/bin/clang
 AR          := $(LLVM_PREFIX)/bin/llvm-ar
 HOST_CC     ?= cc

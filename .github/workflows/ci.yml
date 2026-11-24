@@ -38,75 +38,23 @@ jobs:
       - name: LATR host tests
         working-directory: latr
         run: make all test-legality test-elf test-tb-smp CLANG=clang AR=llvm-ar
-
-  # ISA tier: build every port core and boot the LATR/LATM bare ISA images.
-  # These two need only base LA64, which the distro qemu implements.
+  # ISA tier: build every port core and boot the three bare ISA images.
+  #
+  # The gates run inside a container because the generated code uses instructions
+  # the distro qemu 8.2 does not decode: LATA lowers AArch64 NZCV through the
+  # LoongArch binary-translation `armmtflag`, and LATR's RVV lowering emits
+  # LSX/LASX lanes. Both are fatal "Instruction Non-Existent" faults there. Debian
+  # trixie ships qemu 10, whose decoder covers them.
+  #
+  # QEMU_CPU=max exercises every implemented feature; QEMU_DEBUG=1 makes a
+  # failing gate print qemu's stderr, the first exception with its traceback,
+  # and the serial text, instead of an empty log.
   isa-gates:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang lld llvm qemu-system-misc python3 make
-
-      - name: Toolchain versions
-        run: |
-          clang --version | head -1
-          ld.lld --version | head -1
-          qemu-system-loongarch64 --version | head -1
-
-      # Port core archives are prerequisites of the bare ISA images but have
-      # no rule in the top-level Makefile; build them first. CLANG/AR are
-      # passed as command-line vars so they propagate into the $(MAKE) -C
-      # port sub-makes via MAKEFLAGS.
-      - name: Build LATR core
-        working-directory: latr
-        run: make CLANG=clang AR=llvm-ar
-
-      - name: Build LATM core
-        working-directory: latm
-        run: make CLANG=clang AR=llvm-ar
-
-      # QLVZ_REPO default points at a checked-in macOS qemu binary; the ISA
-      # gates only need a generic virt machine, which stock
-      # qemu-system-loongarch64 (qemu-system-misc) provides. run_qemu_lata.sh
-      # resolves bios/keymaps via `dirname $QEMU_BIN`/../share/qemu, which
-      # lands on /usr/share/qemu for the distro package.
-      #
-      # QEMU_DEBUG=1: print qemu's stderr, execution trace and serial text
-      # when a gate fails, because a distro qemu can die before the guest
-      # writes its first byte.
-      - name: LATR ISA gate
-        run: |
-          make latr-isa-run \
-            CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
-            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
-        env:
-          QEMU_DEBUG: 1
-          QEMU_CPU: max
-
-      - name: LATM ISA gate
-        run: |
-          make latm-isa-run \
-            CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
-            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
-        env:
-          QEMU_DEBUG: 1
-          QEMU_CPU: max
-
-  # LATA lowers AArch64 NZCV through the LoongArch binary-translation (LBT)
-  # instruction `armmtflag`, which qemu 8.2 (Ubuntu 24.04) does not decode —
-  # the gate died with "Instruction Non-Existent" on the first subs/cset
-  # block. Run it on a distro whose qemu implements LBT.
-  lata-gate:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: LATA ISA gate (qemu with LBT)
+      - name: ISA gates (qemu with LBT/LSX)
         run: |
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/src" -w /src \
@@ -117,7 +65,16 @@ jobs:
               apt-get install -y -qq --no-install-recommends \
                 clang lld llvm qemu-system-misc make python3 ca-certificates
               qemu-system-loongarch64 --version | head -1
+              make -C lata all CLANG=clang AR=llvm-ar
+              make -C latr all CLANG=clang AR=llvm-ar
+              make -C latm all CLANG=clang AR=llvm-ar
               make lata-isa-run \
+                CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+                QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+              make latr-isa-run \
+                CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+                QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+              make latm-isa-run \
                 CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
                 QLVZ_REPO=/usr/bin/qemu-system-loongarch64
             '
