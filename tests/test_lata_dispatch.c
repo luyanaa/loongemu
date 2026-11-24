@@ -33,21 +33,49 @@ typedef struct FakeCpu {
     uint64_t mapping_epoch_new;
     int translate_calls;
     int enter_calls;
+    size_t last_capacity;
+    size_t emit_bytes;
+    int lie_about_size;
+    int sync_calls;
     uint64_t translated_pcs[64];
     int translated_n;
 } FakeCpu;
 
-static uint32_t fake_translate(void *o, uint64_t pc, void *code_addr)
+static int fake_translate(void *o, uint64_t pc, void *code_addr,
+                          size_t capacity, TbEmitResult *result)
 {
     FakeCpu *c = o;
-    /* Emit a fixed 16-byte stub so the arena advances deterministically. */
-    memset(code_addr, 0x90, 16);
+    size_t want = c->emit_bytes != 0 ? c->emit_bytes : 16;
+
     c->translate_calls++;
+    c->last_capacity = capacity;
     if (c->translated_n < (int)(sizeof(c->translated_pcs) /
                               sizeof(c->translated_pcs[0]))) {
         c->translated_pcs[c->translated_n++] = pc;
     }
-    return 16;
+    if (want > capacity) {
+        /* A real translator must not write past the reservation. The loop is
+         * also required to catch a translator that claims more than it had. */
+        if (c->lie_about_size) {
+            result->code_size = (uint32_t)want;
+            return 0;
+        }
+        return -1;
+    }
+    memset(code_addr, 0x90, want);
+    result->code_size = (uint32_t)want;
+    result->guest_size = 4;
+    result->recovery_count = 1;
+    return 0;
+}
+
+static void fake_sync(void *o, void *code_addr, size_t len)
+{
+    FakeCpu *c = o;
+
+    (void)code_addr;
+    (void)len;
+    c->sync_calls++;
 }
 
 static void fake_enter(void *o, uint64_t pc, void *code_addr)
@@ -86,6 +114,7 @@ static bool fake_halt(void *o)
 
 static const LataDispatchOps OPS = {
     .translate = fake_translate,
+    .sync_icache = fake_sync,
     .enter = fake_enter,
     .next_pc = fake_next_pc,
     .address_space = fake_asid,
@@ -211,12 +240,95 @@ static void test_bad_geometry(void)
           "rejects missing mapping-epoch callback");
 }
 
+/* The translator sees exactly the bytes left, and a TB that would not fit is
+ * refused instead of being written past the reservation. */
+static void test_capacity_is_respected(void)
+{
+    static const uint64_t stream[] = { 0x5000, 0x6000, 0 };
+    FakeCpu c = {0};
+    LataDispatch d;
+
+    zero_storage();
+    c.pc_stream = stream;
+    c.stream_len = 2;
+    c.pc = 0x4000;
+    /* Arena of 200 bytes, 16-byte TBs: the third must see less than 64 left. */
+    CHECK(lata_dispatch_init(&d, &OPS, &c, g_entries, g_buckets, CAP,
+                             g_arena, 200),
+          "capacity init");
+    lata_dispatch_run(&d);
+    CHECK(c.sync_calls == c.translate_calls,
+          "dispatcher syncs I-cache once per translation");
+    CHECK(c.last_capacity <= 200, "capacity never exceeds the arena");
+
+    /* A translator that lies about its size must be refused, not cached. */
+    {
+        static const uint64_t s2[] = { 0 };
+        FakeCpu c2 = {0};
+        LataDispatch d2;
+
+        zero_storage();
+        c2.pc_stream = s2;
+        c2.stream_len = 0;
+        c2.pc = 0x7000;
+        c2.emit_bytes = 400;   /* larger than the arena passed below */
+        c2.lie_about_size = 1;
+        CHECK(lata_dispatch_init(&d2, &OPS, &c2, g_entries, g_buckets, CAP,
+                                 g_arena, 200),
+              "lying-translator init");
+        lata_dispatch_run(&d2);
+        CHECK(d2.refused == 1, "oversized translation is refused");
+        CHECK(d2.translated == 0, "refused TB is not counted as translated");
+    }
+}
+
+/* Arena exhaustion reclaims the cache and continues; a TB bigger than the whole
+ * arena stops the loop instead of spinning. */
+static void test_arena_reclaim(void)
+{
+    static const uint64_t stream[] = { 2, 3, 4, 5, 6, 0 };
+    FakeCpu c = {0};
+    LataDispatch d;
+
+    zero_storage();
+    c.pc_stream = stream;
+    c.stream_len = 5;
+    c.pc = 1;
+    CHECK(lata_dispatch_init(&d, &OPS, &c, g_entries, g_buckets, CAP,
+                             g_arena, 48),   /* room for three 16-byte TBs */
+          "reclaim init");
+    lata_dispatch_run(&d);
+    CHECK(d.executed == 6, "all scripted TBs execute across a reclaim");
+    CHECK(d.reclaims > 0, "arena was reclaimed instead of stopping");
+    CHECK(d.arena_used <= 48, "arena stays inside its bounds");
+
+    {
+        static const uint64_t s2[] = { 0 };
+        FakeCpu c2 = {0};
+        LataDispatch d2;
+
+        zero_storage();
+        c2.pc_stream = s2;
+        c2.stream_len = 0;
+        c2.pc = 9;
+        c2.emit_bytes = 4096;   /* cannot ever fit in 64 bytes */
+        CHECK(lata_dispatch_init(&d2, &OPS, &c2, g_entries, g_buckets, CAP,
+                                 g_arena, 64),
+              "oversized-single-TB init");
+        lata_dispatch_run(&d2);
+        CHECK(d2.executed == 0, "a TB larger than the arena executes nothing");
+        CHECK(d2.reclaims == 0, "an empty arena cannot be reclaimed");
+    }
+}
+
 int main(void)
 {
     test_revisits_translate_once();
     test_asid_isolation();
     test_mapping_epoch_isolation();
     test_bad_geometry();
+    test_capacity_is_respected();
+    test_arena_reclaim();
     if (fails == 0) {
         printf("lata-dispatch: all checks passed\n");
         return 0;

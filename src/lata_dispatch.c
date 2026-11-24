@@ -39,6 +39,8 @@ bool lata_dispatch_init(LataDispatch *d, const LataDispatchOps *ops,
     d->translated = 0;
     d->executed = 0;
     d->cache_hits = 0;
+    d->reclaims = 0;
+    d->refused = 0;
     if (tbc_init(&d->cache, entries, buckets, capacity) == 0) {
         return false;
     }
@@ -49,7 +51,27 @@ void lata_dispatch_flush(LataDispatch *d)
 {
     if (d != NULL) {
         tbc_flush_all(&d->cache);
+        /* The arena is only reclaimable together with the cache: every entry
+         * points into it. Callers must not be executing out of it, which is why
+         * the loop only flushes between TBs. */
+        d->arena_used = 0;
     }
+}
+
+/*
+ * Make room for one more TB: drop the cache, then reuse the arena from zero.
+ * Returns false when the arena is already empty, i.e. a single TB does not fit
+ * and flushing cannot help.
+ */
+static bool lata_dispatch_reclaim(LataDispatch *d)
+{
+    if (d->arena_used == 0) {
+        return false;
+    }
+    tbc_flush_all(&d->cache);
+    d->arena_used = 0;
+    d->reclaims++;
+    return true;
 }
 
 uint64_t lata_dispatch_run(LataDispatch *d)
@@ -75,14 +97,34 @@ uint64_t lata_dispatch_run(LataDispatch *d)
             /* Emit into the arena, aligned so the next TB starts clean. */
             uint32_t off = (d->arena_used + 15u) & ~15u;
             if (off >= d->arena_size) {
-                /* No room for a new TB; stop rather than corrupt the arena. */
-                break;
+                /* Out of arena: reclaim and retry once. A TB larger than the
+                 * whole arena cannot be helped by a flush, so stop then. */
+                if (!lata_dispatch_reclaim(d)) {
+                    break;
+                }
+                continue;
             }
             code = d->arena + off;
-            uint32_t bytes = d->ops->translate(d->opaque, pc, code);
-            if (bytes == 0) {
+            uint32_t capacity = d->arena_size - off;
+            TbEmitResult result = {0};
+            if (d->ops->translate(d->opaque, pc, code, capacity, &result) != 0 ||
+                result.code_size == 0) {
                 break;
             }
+            /*
+             * The translator promised the size it used. Trusting it blindly is
+             * exactly how a bump allocator turns into an out-of-bounds write,
+             * so a size that exceeds the reservation is refused, counted, and
+             * the loop stops rather than caching a lie.
+             */
+            if (result.code_size > capacity) {
+                d->refused++;
+                break;
+            }
+            if (d->ops->sync_icache != NULL) {
+                d->ops->sync_icache(d->opaque, code, result.code_size);
+            }
+            uint32_t bytes = result.code_size;
             d->translated++;
             e = tbc_insert_mode(&d->cache, pc, mapping_epoch, asid, el, 0);
             if (e == NULL) {

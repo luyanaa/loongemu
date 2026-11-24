@@ -17,6 +17,7 @@
 #ifndef LOONGEMU_LATA_DISPATCH_H
 #define LOONGEMU_LATA_DISPATCH_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include "loongemu/tb_cache.h"
@@ -25,13 +26,38 @@
 extern "C" {
 #endif
 
+/*
+ * What a translation actually produced. `code_size` is what the arena advances
+ * by; the rest is bookkeeping the dispatcher and its callers need (a TB's guest
+ * footprint, how many recovery rows it published, and per-port flags), so a
+ * translator never has to smuggle those through globals.
+ */
+typedef struct TbEmitResult {
+    uint32_t code_size;       /* bytes written at code_addr, <= capacity */
+    uint32_t guest_size;      /* guest bytes covered by the TB */
+    uint32_t recovery_count;  /* recovery rows published for this TB */
+    uint32_t flags;           /* port-defined (e.g. needs I-cache sync) */
+} TbEmitResult;
+
 /* Where a new TB's host code is emitted and how the loop drives it. The
  * embedder supplies these; the dispatch loop calls them in order. */
 typedef struct LataDispatchOps {
-    /* Fill `tb` for guest `pc` (disasm + generate), assemble into
-     * `code_addr`, and return emitted byte count, or 0 on failure. Must not
-     * advance the arena itself; the loop bumps it by the returned size. */
-    uint32_t (*translate)(void *opaque, uint64_t pc, void *code_addr);
+    /*
+     * Fill `tb` for guest `pc` (disasm + generate), assemble into `code_addr`,
+     * which has exactly `capacity` bytes left, and report the emitted size in
+     * `result`. Returns 0 on success, non-zero on failure. Refusing on
+     * capacity is the translator's job as well as the loop's: a translator
+     * that cannot honour it must fail rather than write past the arena.
+     */
+    int (*translate)(void *opaque, uint64_t pc, void *code_addr,
+                     size_t capacity, TbEmitResult *result);
+    /*
+     * Publish freshly written code to the instruction stream. The dispatcher
+     * calls this after every successful translate and before entering the TB,
+     * so the owner of the loop owns the sync; NULL means the embedder insists
+     * on doing it itself (and that is recorded as a deliberate choice).
+     */
+    void (*sync_icache)(void *opaque, void *code_addr, size_t len);
     /* Enter previously-emitted host code for `pc`; returns when the TB
      * exits. `env.pc` afterwards is the next guest PC to dispatch. */
     void (*enter)(void *opaque, uint64_t pc, void *code_addr);
@@ -65,6 +91,8 @@ typedef struct LataDispatch {
     uint64_t translated;    /* TBs actually disassembled+generated */
     uint64_t executed;      /* TBs entered (hits + misses) */
     uint64_t cache_hits;    /* served from cache without re-translating */
+    uint64_t reclaims;      /* arena reclaimed because it could not fit a TB */
+    uint64_t refused;       /* translations rejected for exceeding capacity */
 } LataDispatch;
 
 /* Init with caller-owned, zeroed storage. `capacity` must be a power of two
@@ -78,7 +106,8 @@ bool lata_dispatch_init(LataDispatch *d, const LataDispatchOps *ops,
  * Returns the number of TBs executed. */
 uint64_t lata_dispatch_run(LataDispatch *d);
 
-/* Drop all cached TBs (e.g. after an address-space switch or SMC). */
+/* Drop all cached TBs and reclaim the arena. Safe only between TBs, which is
+ * the only place the loop calls it: nothing is executing out of the arena. */
 void lata_dispatch_flush(LataDispatch *d);
 
 #ifdef __cplusplus

@@ -71,7 +71,10 @@ typedef struct TbCache {
 
 /*
  * capacity must be a power of two and at least 2.  storage must hold
- * capacity entries and capacity bucket heads.  Returns 0 on a bad geometry.
+ * capacity entries and capacity bucket heads, and both must be zeroed before
+ * the first init: tbc_init establishes the geometry but does not clear stale
+ * entries, so reusing non-zeroed storage resurrects old keys (a lookup for an
+ * unrelated pc then reports a false hit). Returns 0 on a bad geometry.
  */
 int tbc_init(TbCache *cache, TbCacheEntry *storage, uint32_t *bucket_storage,
              uint32_t capacity);

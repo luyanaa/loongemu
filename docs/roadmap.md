@@ -16,7 +16,7 @@ Already landed and **not** re-opened here (see the design docs for evidence):
 | ValueVersion P0 | `LatrRegCacheStats` counters; writebacks == stores, evictions == 0, 94-98% of flushes are no-ops |
 | Persistent-cache P0 | `latr_emit_code_symbol()`; 485 relocation sites over 286 blocks, overflow is a hard failure |
 
-## 2.1 LATA: stop treating NZCV as the front line; the runtime is
+## 2.1 LATA: stop treating NZCV as the front line; the runtime is - ABI DONE
 
 NZCV is done. The next LATA work is multi-TB lifecycle, and two items are
 potential out-of-bounds writes, not performance:
@@ -32,7 +32,8 @@ potential out-of-bounds writes, not performance:
 | I-cache synchronisation is the embedder's job | a dispatcher user that forgets it executes stale bytes |
 | no owner safepoint, no cross-core invalidation, no reclaim | unlike LATR (`latr_tb_cache_reclaim_all`, `latr_context_safepoint`, `latr_tb_shootdown_*_all_cores`) |
 
-Target ABI (from the review):
+Target ABI (from the review) - implemented in `include/loongemu/lata_dispatch.h`
+and `src/lata_dispatch.c`:
 
 ```c
 typedef struct TbEmitResult {
@@ -49,6 +50,15 @@ int translate_tb(void *opaque, uint64_t guest_pc, void *code_addr,
 The dispatcher must reserve the whole TB before the translator runs, refuse when
 it does not fit, reclaim on flush, own the I-cache sync, and reuse LATR's arena
 lifecycle instead of a second implementation.
+
+Status: capacity is now passed down (`size_t capacity`), the translator reports
+`TbEmitResult`, a result larger than the reservation is refused and counted
+(`refused`), arena exhaustion reclaims the cache and arena and retries once
+(`reclaims`) instead of stopping, `lata_dispatch_flush()` reclaims the arena with
+the cache, and `sync_icache` is a dispatcher-called op instead of an embedder
+duty. Tests cover capacity, a translator that lies about its size, reclaim across
+six TBs, and a TB too large for the whole arena. Still open on this line: LATR
+arena lifecycle reuse, owner safepoint, cross-core invalidation, SMC.
 
 Rest of the LATA route:
 
@@ -323,10 +333,12 @@ fault recovery cost.
 
 ## Order of work (single list)
 
-1. 3.1 DMA cache overflow fix + negative tests.
-2. 3.2 GuestWriteTransaction contract (coarse lock), DMA routed through it.
+1. 3.1 DMA cache overflow fix + negative tests - done.
+2. 3.2 GuestWriteTransaction contract (coarse lock), DMA routed through it - done;
+   CPU stores/AMO/SC still to adopt it.
 3. 2.1 LATA `translate_tb` capacity ABI, whole-TB reservation, reclaim, I-cache
-   sync ownership, then LATR arena reuse.
+   sync ownership - done; next is LATR arena lifecycle reuse, safepoint,
+   cross-core invalidation and SMC.
 4. 3.3 shared recovery ABI.
 5. 2.1 LATA host-fault precise recovery.
 6. 5.1 step 3 (label/branch flush elision) on top of the measured baseline.
