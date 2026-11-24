@@ -4,12 +4,32 @@
 static uint64_t perf_tb_count;
 static uint64_t perf_host_insns;
 static uint64_t perf_guest_insns;
+static uint64_t perf_counters[LOONGEMU_PERF_COUNTERS];
 
 void loongemu_perf_reset(void)
 {
     __atomic_store_n(&perf_tb_count, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&perf_host_insns, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&perf_guest_insns, 0, __ATOMIC_RELAXED);
+    for (unsigned i = 0; i < LOONGEMU_PERF_COUNTERS; i++) {
+        __atomic_store_n(&perf_counters[i], 0, __ATOMIC_RELAXED);
+    }
+}
+
+void loongemu_perf_count(unsigned counter, uint64_t delta)
+{
+    if (counter >= LOONGEMU_PERF_COUNTERS || delta == 0) {
+        return;
+    }
+    __atomic_fetch_add(&perf_counters[counter], delta, __ATOMIC_RELAXED);
+}
+
+uint64_t loongemu_perf_read(unsigned counter)
+{
+    if (counter >= LOONGEMU_PERF_COUNTERS) {
+        return 0;
+    }
+    return __atomic_load_n(&perf_counters[counter], __ATOMIC_RELAXED);
 }
 
 void loongemu_perf_record_tb(uint64_t host_insns, uint64_t guest_insns)
