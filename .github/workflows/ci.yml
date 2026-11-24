@@ -118,8 +118,22 @@ jobs:
           # run it locally, which separates those two.
           # Run it by hand with:
           #   make tb-sys-smp-run QLVZ=/usr/bin/qemu-system-loongarch64
+          #
+          # TEMPORARY: build the image with this container toolchain and keep it,
+          # so it can be replayed on an arm64 host to separate the TCG backend
+          # from the clang that built it.
+          make build/tb_sys.elf CLANG=clang AR=llvm-ar LD_LLD=ld.lld
           SCRIPT
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/src" -v /tmp/isa-gates.sh:/isa-gates.sh:ro \
             -w /src -e QEMU_DEBUG=1 -e QEMU_CPU=max \
             debian:sid bash /isa-gates.sh
+
+      # TEMPORARY (see the note in the script above).
+      - name: Keep the container-built SMP image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tb-sys-elf
+          path: build/tb_sys.elf
+          if-no-files-found: warn
