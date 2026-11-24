@@ -197,10 +197,25 @@ same change: the unreachable `ARM_CP_NZCV` case (§3.4) and `armmfflag`'s sign
 extension of the 32-bit NZCV word.
 
 **P2 - retire the LBT flag path (now a cost decision).** Both paths are correct
-and measured, so deleting the LBT branch is no longer a correctness argument; it
-buys a single code shape and costs the ~4-8 host instructions per flag-setting
-instruction on LBT hosts. Gate: PERF tick delta on the same workload, and the ISA
-image green with the branch removed.
+and measured, so deleting the LBT branch is no longer a correctness argument.
+
+Code size, measured from the ISA image (`words=` per block, both builds):
+
+| fixture kind | LBT path | software path | delta |
+|---|---|---|---|
+| single producer + MRS | 17-21 | 27-37 | +10..+16 |
+| ADDS/SUBS + 4x CSET pack | 30-40 | 75-85 | +45 |
+| CSEL pair + 4x CSET pack | 36-38 | 88-90 | +50..+54 |
+| ADC/SBC chain | 35-37 | 83-85 | +48 |
+| 14-condition pack + MRS (8 CSETs) | 44-52 | 116-118 | +66..+72 |
+| whole image, 21 flag-heavy blocks | 644 | 1416 | **+772 (+120%)** |
+| whole image, every block | 3149 | 3931 | +782 (+25%) |
+
+That is the cost side only: it is static code size, not runtime, and the fixture
+set is deliberately flag-dense (a real guest spends most instructions on
+non-flag work). A runtime number needs the image running on hardware rather than
+under QEMU, which this environment does not provide - so P2's gate stays "measure
+on a native LBT host, or keep both branches". Keeping both is the default.
 
 ## 6. Invariants and failure modes
 
@@ -220,7 +235,7 @@ image green with the branch removed.
 | layer | check |
 |---|---|
 | semantics | `tests/test_lata_nzcv.c` (host, ms) |
-| emitted code | new ISA-suite blocks: producer x consumer matrix, all 16 conds |
+| emitted code | ISA-suite blocks: producer x consumer matrix; every encodable condition (EQ..VC, HI..LE - 14; AL/NV are aliases the assembler rejects for CSET and are covered by the always-taken branch fixtures) packed into two bytes, over two flag states (N only, Z\|C), on both paths |
 | integration | `make lata-isa-run` (6525 checks) on both paths during P1 |
 | conformance | review of finding §3.2: the CSET expectation is either fixed in LATA or in the suite, with the AArch64 pseudocode quoted in the commit |
 | cost | PERF tick delta on the same guest workload |

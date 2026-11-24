@@ -800,6 +800,81 @@ static void run_raw_flag_probes(void)
     check(lata_result_x5, 0x60000000u, "MSR/MRS NZCV round trip 0x6");
     probe_raw_flags(p_msr_mrs_nv, 4, "msr-mrs-nv");
     check(lata_result_x5, 0x90000000u, "MSR/MRS NZCV round trip 0x9");
+    /*
+     * Condition coverage: every condition that these forms can encode (EQ..LE,
+     * 14 of them; AL/NV are aliases rejected by the assembler and are exercised
+     * by the "always" branch fixtures instead). Two flag states so that a
+     * swapped or inverted bit shows up: N only, and Z|C.
+     */
+    {
+        static uint32_t lo_nc[] __attribute__((aligned(4096))) = {
+            0xd2800002u, /* movz x2, #0 */
+            0xd2800001u, /* movz x1, #0 */
+            0xd2800025u, /* movz x5, #1 */
+            0xeb05003fu, /* cmp x1, x5: N */
+            0x9a9f17e4u, /* cset x4, eq */
+            0xaa040042u, /* orr x2, x2, x4 */
+            0x9a9f07e4u, /* cset x4, ne */
+            0xaa040442u, /* orr x2, x2, x4, lsl #1 */
+            0x9a9f37e4u, /* cset x4, hs */
+            0xaa040842u, /* orr x2, x2, x4, lsl #2 */
+            0x9a9f27e4u, /* cset x4, lo */
+            0xaa040c42u, /* orr x2, x2, x4, lsl #3 */
+            0x9a9f57e4u, /* cset x4, mi */
+            0xaa041042u, /* orr x2, x2, x4, lsl #4 */
+            0x9a9f47e4u, /* cset x4, pl */
+            0xaa041442u, /* orr x2, x2, x4, lsl #5 */
+            0x9a9f77e4u, /* cset x4, vs */
+            0xaa041842u, /* orr x2, x2, x4, lsl #6 */
+            0x9a9f67e4u, /* cset x4, vc */
+            0xaa041c42u, /* orr x2, x2, x4, lsl #7 */
+            0xaa0203e5u, /* mov x5, x2 */
+        };
+        static uint32_t hi_nc[] __attribute__((aligned(4096))) = {
+            0xd2800002u, /* movz x2, #0 */
+            0xd2800001u, /* movz x1, #0 */
+            0xd2800025u, /* movz x5, #1 */
+            0xeb05003fu, /* cmp x1, x5: N */
+            0x9a9f97e4u, /* cset x4, hi */
+            0xaa040042u, /* orr x2, x2, x4 */
+            0x9a9f87e4u, /* cset x4, ls */
+            0xaa040442u, /* orr x2, x2, x4, lsl #1 */
+            0x9a9fb7e4u, /* cset x4, ge */
+            0xaa040842u, /* orr x2, x2, x4, lsl #2 */
+            0x9a9fa7e4u, /* cset x4, lt */
+            0xaa040c42u, /* orr x2, x2, x4, lsl #3 */
+            0x9a9fd7e4u, /* cset x4, gt */
+            0xaa041042u, /* orr x2, x2, x4, lsl #4 */
+            0x9a9fc7e4u, /* cset x4, le */
+            0xaa041442u, /* orr x2, x2, x4, lsl #5 */
+            0xaa0203e5u, /* mov x5, x2 */
+        };
+        static uint32_t lo_zc[] __attribute__((aligned(4096))) = {
+            0xd2800002u, 0xd28000a1u, 0xd28000a5u, 0xeb05003fu,
+            0x9a9f17e4u, 0xaa040042u, 0x9a9f07e4u, 0xaa040442u,
+            0x9a9f37e4u, 0xaa040842u, 0x9a9f27e4u, 0xaa040c42u,
+            0x9a9f57e4u, 0xaa041042u, 0x9a9f47e4u, 0xaa041442u,
+            0x9a9f77e4u, 0xaa041842u, 0x9a9f67e4u, 0xaa041c42u,
+            0xaa0203e5u, /* cmp x1, x5 with x1 = x5 = 5: Z|C */
+        };
+        static uint32_t hi_zc[] __attribute__((aligned(4096))) = {
+            0xd2800002u, 0xd28000a1u, 0xd28000a5u, 0xeb05003fu,
+            0x9a9f97e4u, 0xaa040042u, 0x9a9f87e4u, 0xaa040442u,
+            0x9a9fb7e4u, 0xaa040842u, 0x9a9fa7e4u, 0xaa040c42u,
+            0x9a9fd7e4u, 0xaa041042u, 0x9a9fc7e4u, 0xaa041442u,
+            0xaa0203e5u,
+        };
+
+        probe_raw_flags(lo_nc, 21, "cond-lo-n");
+        check(lata_result_x5, 0x9Au, "conditions EQ..VC with N set");
+        probe_raw_flags(hi_nc, 17, "cond-hi-n");
+        check(lata_result_x5, 0x2Au, "conditions HI..LE with N set");
+        probe_raw_flags(lo_zc, 21, "cond-lo-zc");
+        check(lata_result_x5, 0xA5u, "conditions EQ..VC with Z|C set");
+        probe_raw_flags(hi_zc, 17, "cond-hi-zc");
+        check(lata_result_x5, 0x26u, "conditions HI..LE with Z|C set");
+    }
+
     latx_bare_uart_puts("lata-isa: raw flags done\n");
 }
 
