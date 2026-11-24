@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <string.h>
+#include "qemu/cpu-features.h"
 #include "lata.h"
 #include "lata-mem.h"
 #include "lata-vcache.h"
@@ -354,8 +355,11 @@ void lata_context_bind(LataContext *ctx)
     global_register_init();
 }
 
+bool lata_have_lbt = true;
+
 void lata_tr_data_init(CPUArchState *env)
 {
+    lata_have_lbt = latx_cpu_has_lbt() != 0;
     LataContext *ctx = lata_context_current();
     if (!ctx->initialized) {
         bool preserve_vcache = lata_vcache_enabled();

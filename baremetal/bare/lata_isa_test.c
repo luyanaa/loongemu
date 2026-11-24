@@ -5247,6 +5247,15 @@ static __attribute__((noinline)) void run_sve_p0_p1_gap_regression_runtime(void)
 void kmain(void)
 {
     latx_bare_uart_puts("lata-isa: start\n");
+    {
+        /* Record the host's LBT state: NZCV lives in the LBT flag register, so a
+         * host without it cannot run this image at all. */
+        extern bool lata_have_lbt;
+
+        latx_bare_uart_puts("lata-isa: lbt=");
+        latx_bare_uart_puts(lata_have_lbt ? "1" : "0");
+        latx_bare_uart_puts("\n");
+    }
     run_scalar_gpr_regcache_ir2_test();
     test_tb_recovery();
 

@@ -194,6 +194,13 @@ LataContext *lata_context_current(void);
 uint8_t lata_recovery_site_of(int insn_type);
 uint8_t lata_regcache_snapshot_gpr_binds(LataRecoveryBinding *out);
 
+/*
+ * LATA keeps AArch64 NZCV in the LoongArch binary-translation flag register, so
+ * a host without LBT cannot run translated code at all: this records what the
+ * host reports, and the ISA harness prints it so a failing gate says why.
+ */
+extern bool lata_have_lbt;
+
 void lata_tr_data_init(CPUArchState *env);
 void tr_init(void*);
 void tr_fini(void);
