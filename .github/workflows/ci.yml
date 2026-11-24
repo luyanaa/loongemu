@@ -39,8 +39,7 @@ jobs:
         working-directory: latr
         run: make all test-legality test-elf test-tb-smp CLANG=clang AR=llvm-ar
 
-  # ISA tier: boot the LATR bare ISA image, the one gate all distro qemus can
-  # run once the stack pointer is set pc-relative.
+  # ISA tier: boot the LATR and LATM bare ISA images.
   #
   # Runner image: Debian trixie ships qemu 10, which decodes the LSX/LASX lanes
   # that LATR's RVV lowering emits and that Ubuntu 24.04's qemu 8.2 rejects with
@@ -48,12 +47,14 @@ jobs:
   # feature; QEMU_DEBUG=1 makes a failing gate print qemu's stderr, the first
   # exception with 30 lines of traceback, and the serial text.
   #
-  # The LATM gate is not here either. It stops right after `fpu-bc-likely
-  # done`, i.e. when `chain-jiscr0` starts, taking a guest exception inside
-  # the code-fetch path and jumping to PC 0. Reproduced on qemu 11.1.3 as well
-  # as 10.0.13. Not LBT: forcing the plain `jirl` chain path still fails there,
-  # while `make latm-isa-run` passes 60/0 on QEMU-LVZ 9.0.50, so it is a
-  # code-fetch/exception-path difference to bisect.
+  # qemu advertises CPUCFG.2[22] (LBT) on its `max` model but does not decode
+  # `gr2scr`/`jiscr0`: the LATM chaining case dies with "Instruction
+  # Non-Existent" at the first chained indirect jump on qemu 10.0.13 and
+  # 11.1.3. The gate builds with LATM_FORCE_NO_LBT=1, which selects the plain
+  # `jirl` fallback the translator already carries; the harness then prints
+  # `chain-jiscr1 skipped (no LBT)` because that one case exists to exercise
+  # the instruction itself. With LBT both chaining cases run (60 checks); under
+  # the fallback 92 checks pass with 0 failures on qemu 11.1.3.
   #
   # The LATA gate is not here on purpose: LATA lowers AArch64 NZCV through the
   # LoongArch binary-translation instruction `armmtflag` (translate-a64.c:870,
@@ -80,6 +81,10 @@ jobs:
               qemu-system-loongarch64 --version | head -1
               make -C latr all CLANG=clang AR=llvm-ar
               make latr-isa-run \
+                CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+                QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+              make -C latm all CLANG=clang AR=llvm-ar
+              make latm-isa-run LATM_FORCE_NO_LBT=1 \
                 CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
                 QLVZ_REPO=/usr/bin/qemu-system-loongarch64
             '

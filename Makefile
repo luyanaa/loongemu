@@ -1206,6 +1206,13 @@ LATM_BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdl
                -I latx/compat -I latx/include -I latx/upstream/include -I . \
                -isystem $(shell $(CLANG) -print-resource-dir)/include
 
+# LATM_FORCE_NO_LBT=1 makes the LATM image take the plain `jirl` chaining path.
+# qemu advertises CPUCFG.2[22] but does not decode `gr2scr`/`jiscr0`, so the
+# CI gate builds with this and the harness skips the jiscr1-only case.
+ifeq ($(LATM_FORCE_NO_LBT),1)
+LATM_BARE_CFLAGS += -DLATM_FORCE_NO_LBT
+endif
+
 latm-core:
 	@$(MAKE) -C latm all
 

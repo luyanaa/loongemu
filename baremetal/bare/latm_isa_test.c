@@ -9,6 +9,7 @@
 #include "exec/exec-all.h"
 #include "tcg/tcg.h"
 #include "cpu.h"
+#include "qemu/cpu-features.h"
 #include "latm.h"
 #include "env.h"
 #include "translate.h"
@@ -642,6 +643,16 @@ static void test_tb_recovery(void)
 void kmain(void)
 {
     latx_bare_uart_puts("latm-isa: begin\n");
+#ifdef LATM_FORCE_NO_LBT
+    /* Emulators can advertise CPUCFG.2[22] and still fail to decode
+     * `gr2scr`/`jiscr0` (qemu 10/11 do); this build exercises the plain `jirl`
+     * fallback instead. */
+    latx_cpu_set_lbt_feature(0);
+#endif
+    /* Record the host feature level in every gate log. */
+    latx_bare_uart_puts("latm-isa: lbt=");
+    latx_bare_uart_puts(latx_cpu_has_lbt() ? "1" : "0");
+    latx_bare_uart_puts("\n");
     lata_tr_data_init(&env);
     {
         CPUMIPSState env2;
@@ -837,7 +848,13 @@ void kmain(void)
           "bc1fl FCC2 fallthrough");
 
     run_chain(0);
-    run_chain(1);
+    if (latx_cpu_has_lbt()) {
+        run_chain(1);
+    } else {
+        /* jiscr1 is the LBT instruction this case exists to exercise; a host
+         * without it cannot run the case at all. Say so instead of failing. */
+        latx_bare_uart_puts("latm-isa: chain-jiscr1 skipped (no LBT)\n");
+    }
 
     {
         static const uint32_t flush_ops[] = { 0xbc500000, 0xbc400000, 0x045f0000 };
