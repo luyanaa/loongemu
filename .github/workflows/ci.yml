@@ -163,14 +163,20 @@ jobs:
           make -C lata all CLANG=clang AR=llvm-ar
           # LATA_FORCE_NO_LBT=1 keeps the image free of LBT instructions, which a
           # distro qemu does not decode; the software path is the one under test.
-          QEMU_CPU=max make lata-isa-run LATA_FORCE_NO_LBT=1 \
+          make lata-isa-run LATA_FORCE_NO_LBT=1 \
             CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
             QLVZ_REPO=/usr/bin/qemu-system-loongarch64
           # lata-isa-run already asserts "lata-isa: PASS" (fails == 0); the
           # summary is echoed so a regression names itself in the job log.
           grep -a 'lata-isa: checks=' build/lata_isa.log
+
           SCRIPT
-          bash /tmp/gate.sh
+          # Same container as the LATR/LATM jobs: root for apt, a modern qemu, and
+          # QEMU_CPU=max for the instructions a distro la464 model may not decode.
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" -v /tmp/gate.sh:/gate.sh:ro \
+            -w /src -e QEMU_DEBUG=1 -e QEMU_CPU=max \
+            debian:sid bash /gate.sh
 
   boot-smp:
     runs-on: ubuntu-24.04
