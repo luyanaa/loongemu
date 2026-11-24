@@ -20483,6 +20483,14 @@ bool tr_ir2_generate(struct TranslationBlock *tb)
         lsenv->tr_data->tb_insn_label[i] = ir2_opnd_label_id(&insn_lbl);
         lsenv->tr_data->tb_insn_pc[i] = pir1->pc_curr;
         lsenv->tr_data->tb_insn_site[i] = lata_recovery_site_of(pir1->insn_type);
+        /* P0-2: snapshot env-resident bindings BEFORE this insn translates.
+         * A host fault inside its span must replay only the state live at the
+         * faultable access point: deferred writes from retired insns are
+         * included; this insn's own results must NOT be (they postdate the
+         * fault). The span opens at this label, so regcache state now ==
+         * state at the first host insn of the span. */
+        lsenv->tr_data->tb_insn_bind_cnt[i] =
+            lata_regcache_snapshot_gpr_binds(lsenv->tr_data->tb_insn_binds[i]);
         (la_label)(insn_lbl);
         bool trans_success = false;
         if (translate_functions[pir1->insn_type] != NULL)
@@ -20505,11 +20513,6 @@ bool tr_ir2_generate(struct TranslationBlock *tb)
         tcg_ctx->gen_insn_end_off[i] = (lsenv->tr_data->real_ir2_inst_num) << 2;
         tcg_ctx->gen_insn_data[i * TARGET_INSN_START_WORDS] = pir1->pc_curr;
 #endif
-        /* C2: snapshot the env-resident bindings deferred in the regcache AFTER
-         * this insn translated, so a fault in its span replays its own pending
-         * result too. */
-        lsenv->tr_data->tb_insn_bind_cnt[i] =
-            lata_regcache_snapshot_gpr_binds(lsenv->tr_data->tb_insn_binds[i]);
         lsenv->tr_data->tb_insn_count = i + 1;
         pir1++;
     }

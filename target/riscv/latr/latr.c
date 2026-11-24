@@ -846,17 +846,16 @@ bool tr_ir2_generate(TranslationBlock *tb)
         if (labels_are_targets[i]) {
             latr_regcache_flush();
         }
+        /* P0-2: binds describe state live at the faultable access, which
+         * opens this guest insn's span. Snapshot BEFORE translate so the
+         * insn's own results postdate the fault and are never replayed. */
+        data->tb_insn_site[i] = latr_recovery_site_of(insns[i].opcode);
+        data->tb_insn_bind_cnt[i] = latr_regcache_snapshot_gpr_binds(
+            data->tb_insn_binds[i]);
         (la_label)(labels[i]);
         if (!latr_translate_ir1(&ctx)) {
             return false;
         }
-        /* C1: tag the fault-site kind and snapshot the GPR regcache bindings
-         * live at this guest insn, so a host fault in its span can replay the
-         * uncommitted state. Snapshot AFTER translate so the insn's own
-         * deferred result is captured too. */
-        data->tb_insn_site[i] = latr_recovery_site_of(insns[i].opcode);
-        data->tb_insn_bind_cnt[i] = latr_regcache_snapshot_gpr_binds(
-            data->tb_insn_binds[i]);
     }
 
     latr_regcache_flush();

@@ -261,6 +261,10 @@ static void translate_delay_slot(DisasContext *s)
     TRANSLATION_DATA *td = lsenv->tr_data;
     uint32_t start = (uint32_t)td->real_ir2_inst_num << 2;
     uint32_t end;
+    LatmRecoveryBinding binds[LATM_RECOVERY_MAX_BINDS_PER_SPAN];
+    /* P0-2: binds describe state entering the delay slot (its span opens at
+     * the faultable access), so snapshot before it translates. */
+    uint8_t nb = latm_regcache_snapshot_gpr_binds(binds);
 
     latm_set_delay_flag(s, true);
     if (mips_ir1_is_branch(&d->ir1)) {
@@ -270,12 +274,8 @@ static void translate_delay_slot(DisasContext *s)
     }
     latm_set_delay_flag(s, false);
     end = (uint32_t)td->real_ir2_inst_num << 2;
-    {
-        LatmRecoveryBinding binds[LATM_RECOVERY_MAX_BINDS_PER_SPAN];
-        uint8_t nb = latm_regcache_snapshot_gpr_binds(binds);
-        latm_tb_insn_map_add(td, d->ir1.pc, start, end, 1,
-                             latm_recovery_site_of(d->ir1.op), 0, binds, nb);
-    }
+    latm_tb_insn_map_add(td, d->ir1.pc, start, end, 1,
+                         latm_recovery_site_of(d->ir1.op), 0, binds, nb);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1659,9 +1659,12 @@ bool tr_ir2_generate(TranslationBlock *tb)
             TRANSLATION_DATA *td = lsenv->tr_data;
             LatmRecoveryBinding binds[LATM_RECOVERY_MAX_BINDS_PER_SPAN];
             uint32_t start = (uint32_t)td->real_ir2_inst_num << 2;
-            translate_one(pir1);
+            /* P0-2: snapshot bindings BEFORE the insn translates so a host
+             * fault inside its span replays only state live at the access,
+             * never this insn's own (post-fault) results. */
             uint8_t site = latm_recovery_site_of(pir1->ir1.op);
             uint8_t nb = latm_regcache_snapshot_gpr_binds(binds);
+            translate_one(pir1);
             latm_tb_insn_map_add(td, pir1->ir1.pc, start,
                                  (uint32_t)td->real_ir2_inst_num << 2, 0,
                                  site, i, binds, nb);
