@@ -19,6 +19,7 @@
 #include "target/arm/tcg/translate.h"
 #include "target/arm/lata/include/env.h"
 #include "shared/backend/loongarch/include/la-append.h"
+#include "shared/backend/loongarch/include/ir2-lbt-opcodes.h"
 #include "target/arm/lata/include/macro-inst.h"
 #include "target/arm/lata/ir1/sve-pvir.h"
 #include "target/arm/lata/translator/sve-lasx-lower.h"
@@ -147,11 +148,35 @@ static void check(uint64_t got, uint64_t want, const char *what)
 }
 
 /* Called by the exit trampoline with whatever the TB left in $a2. */
+/*
+ * A software-path image must not contain a single LBT instruction: qemu does not
+ * decode them, so a leak shows up as a guest that dies with no diagnostic rather
+ * than as a failing check. Every assembled instruction passes through this hook,
+ * which makes it the cheapest place to prove the property.
+ */
+extern bool lata_have_lbt;
+static unsigned lbt_opcodes_emitted;
+static unsigned lbt_opcodes_reported;
+
 /* Strong hook: print the assembled word for the widening-add opcodes. */
 int lata_ir2_debug_trace;
 void lata_ir2_debug(unsigned int opcode, unsigned int word)
 {
     char buf[48];
+    /* Count everywhere: on the LBT path the non-zero count is what proves this
+     * hook actually sees the instructions, so the software-path assertion below
+     * cannot pass by being vacuous. */
+    if (ir2_opcode_is_lbt((int)opcode))
+    {
+        lbt_opcodes_emitted++;
+        if (!lata_have_lbt && lbt_opcodes_reported < 8)
+        {
+            lbt_opcodes_reported++;
+            latx_bare_uart_puts("lata-isa: LBT opcode in software image: ");
+            putdec((uint64_t)opcode);
+            latx_bare_uart_puts("\n");
+        }
+    }
     if (!lata_ir2_debug_trace)
     {
         return;
@@ -8124,6 +8149,25 @@ cun_probe_done:;
         check(env.xregs[1], UINT64_C(0xb0000001), "MRS ESR_EL1");
         check(env.xregs[2], UINT64_C(0x1234), "MRS ELR_EL1");
         check(env.xregs[3], UINT64_C(0x3c5), "MRS SPSR_EL1");
+    }
+
+    /*
+     * Detector self-test plus the real assertion: the LBT path must have emitted
+     * some LBT instructions (otherwise this hook is vacuous), and the software
+     * path must have emitted none.
+     */
+    latx_bare_uart_puts("lata-isa: lbt-opcodes=");
+    putdec((uint64_t)lbt_opcodes_emitted);
+    latx_bare_uart_puts("\n");
+    if (lata_have_lbt)
+    {
+        check(lbt_opcodes_emitted > 0, 1,
+              "LBT path emits LBT opcodes (detector is live)");
+    }
+    else
+    {
+        check((uint64_t)lbt_opcodes_emitted, 0,
+              "software path emits no LBT opcodes");
     }
 
     latx_bare_uart_puts("lata-isa: checks=");

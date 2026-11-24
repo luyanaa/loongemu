@@ -304,7 +304,7 @@ test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging buil
       build/test_riscv_uart build/test_riscv_fw \
       build/test_fpsr \
       build/test_sve_helper_support build/test_sve_helper_lifecycle \
-      build/test_lata_nzcv
+      build/test_lata_nzcv build/test_ir2_lbt_opcodes
 	./build/test_ir2_peephole
 	./build/test_loongbt
 	./build/test_loongbt_cpu
@@ -333,6 +333,7 @@ test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging buil
 	./build/test_latm_insn_map
 	./build/test_lata_dispatch
 	./build/test_lata_nzcv
+	./build/test_ir2_lbt_opcodes
 
 # Back-end selection and the EFLAGS pack/unpack bridge.  Kept separate from
 # test_loongbt so a failure points at the glue rather than the semantics.
@@ -363,6 +364,15 @@ test-pci-host: build/test_pci_host
 
 # AArch64 NZCV / condition reference (see tests/test_lata_nzcv.c): the software
 # path LATA needs on hosts without LBT has to match this before it is wired in.
+# LBT-opcode classifier + drift check against the enum it is generated from.
+IR2_BACKEND_INC := shared/backend/loongarch/include
+build/test_ir2_lbt_opcodes: tests/test_ir2_lbt_opcodes.c $(IR2_BACKEND_INC)/ir2-lbt-opcodes.h $(IR2_BACKEND_INC)/ir2-opcode.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -I $(IR2_BACKEND_INC) \
+	      -DIR2_OPCODE_HEADER='"$(IR2_BACKEND_INC)/ir2-opcode.h"' \
+	      -DIR2_LBT_HEADER='"$(IR2_BACKEND_INC)/ir2-lbt-opcodes.h"' \
+	      tests/test_ir2_lbt_opcodes.c -o $@
+
 build/test_lata_nzcv: tests/test_lata_nzcv.c
 	@mkdir -p build
 	$(CC) $(CFLAGS) tests/test_lata_nzcv.c -o $@
