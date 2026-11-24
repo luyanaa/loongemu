@@ -11,6 +11,10 @@ void loongemu_guest_dma_init(LoongemuGuestDma *dma, const LoongemuMemMap *map,
     dma->map = map;
     dma->notify = notify;
     dma->notify_opaque = opaque;
+    dma->write_lock = 0;
+    dma->write_gpa = 0;
+    dma->write_len = 0;
+    dma->write_active = 0;
     for (unsigned i = 0; i < LOONGEMU_GUEST_DMA_CACHE_SLOTS; i++) {
         dma->cache[i].valid = 0;
     }
@@ -29,6 +33,16 @@ bool loongemu_guest_dma_ptr(const LoongemuGuestDma *dma, uint64_t gpa,
         return false;
     }
     /*
+     * Reject a range that wraps before any fast-path arithmetic can see it. The
+     * slow path (loongemu_mem_resolve) checks the same thing, but the cache hit
+     * below it did not, so a valid entry plus a huge len used to make
+     * `gpa + len` wrap and pass the containment test - and the caller then
+     * memcpy'd past the region.
+     */
+    if (gpa > UINT64_MAX - len) {
+        return false;
+    }
+    /*
      * The cache is keyed by page base, so a descriptor that walks a buffer in
      * 4 KiB steps resolves the region once per page instead of once per chunk.
      * Every hit is validated against the map generation; a region add/remove
@@ -39,11 +53,18 @@ bool loongemu_guest_dma_ptr(const LoongemuGuestDma *dma, uint64_t gpa,
     {
         uint64_t page = gpa & ~UINT64_C(0xfff);
 
-        if (entry->valid && entry->gpa == page &&
-            entry->generation == dma->map->generation &&
-            gpa + len <= page + entry->span) {
-            *out = (uint8_t *)(uintptr_t)(entry->hpa + (gpa - page));
-            return true;
+        /*
+         * Subtraction form: containment is expressed without adding to `gpa`, so
+         * it cannot wrap even if the guard above is ever relaxed.
+         */
+        if (entry->valid && entry->generation == dma->map->generation &&
+            gpa >= entry->gpa) {
+            uint64_t offset = gpa - entry->gpa;
+
+            if (offset <= entry->span && len <= entry->span - offset) {
+                *out = (uint8_t *)(uintptr_t)(entry->hpa + offset);
+                return true;
+            }
         }
         if (loongemu_mem_resolve(dma->map, gpa, len, &lookup) !=
             LOONGEMU_MEM_RAM) {
@@ -92,16 +113,80 @@ static void dma_notify(LoongemuGuestDma *dma, uint64_t gpa, uint64_t len)
     }
 }
 
+static int dma_lock(LoongemuGuestDma *dma)
+{
+    return __atomic_exchange_n(&dma->write_lock, 1, __ATOMIC_ACQUIRE) == 0;
+}
+
+static void dma_unlock(LoongemuGuestDma *dma)
+{
+    __atomic_store_n(&dma->write_lock, 0, __ATOMIC_RELEASE);
+}
+
+int loongemu_guest_write_begin(LoongemuGuestDma *dma, uint64_t gpa,
+                               uint64_t len, uint8_t **host)
+{
+    if (dma == NULL || !dma_lock(dma)) {
+        return -1;
+    }
+    if (!loongemu_guest_dma_ptr(dma, gpa, len, host)) {
+        dma_unlock(dma);
+        return -1;
+    }
+    dma->write_gpa = gpa;
+    dma->write_len = len;
+    dma->write_active = 1;
+    return 0;
+}
+
+int loongemu_guest_write_commit(LoongemuGuestDma *dma, uint64_t gpa,
+                                const void *data, uint64_t len)
+{
+    uint8_t *host;
+
+    if (dma == NULL || data == NULL || len == 0 || !dma->write_active) {
+        return -1;
+    }
+    if (gpa < dma->write_gpa || len > dma->write_len ||
+        gpa - dma->write_gpa > dma->write_len - len) {
+        return -1; /* outside the range this transaction reserved */
+    }
+    if (!loongemu_guest_dma_ptr(dma, gpa, len, &host)) {
+        return -1;
+    }
+    memcpy(host, data, (size_t)len);
+    return 0;
+}
+
+void loongemu_guest_write_end(LoongemuGuestDma *dma)
+{
+    uint64_t gpa;
+    uint64_t len;
+
+    if (dma == NULL || !dma->write_active) {
+        return;
+    }
+    gpa = dma->write_gpa;
+    len = dma->write_len;
+    dma->write_active = 0;
+    dma->write_len = 0;
+    /* Notify while still holding the lock: the store and its reservation
+     * invalidation are one critical section. */
+    dma_notify(dma, gpa, len);
+    dma_unlock(dma);
+}
+
 int loongemu_guest_dma_write(LoongemuGuestDma *dma, uint64_t gpa,
                              const void *buf, uint64_t len)
 {
     uint8_t *host;
 
-    if (buf == NULL || !loongemu_guest_dma_ptr(dma, gpa, len, &host)) {
+    if (buf == NULL || len == 0 ||
+        loongemu_guest_write_begin(dma, gpa, len, &host) != 0) {
         return -1;
     }
     memcpy(host, buf, (size_t)len);
-    dma_notify(dma, gpa, len);
+    loongemu_guest_write_end(dma);
     return 0;
 }
 
@@ -110,11 +195,11 @@ int loongemu_guest_dma_fill(LoongemuGuestDma *dma, uint64_t gpa, uint8_t value,
 {
     uint8_t *host;
 
-    if (!loongemu_guest_dma_ptr(dma, gpa, len, &host)) {
+    if (len == 0 || loongemu_guest_write_begin(dma, gpa, len, &host) != 0) {
         return -1;
     }
     memset(host, value, (size_t)len);
-    dma_notify(dma, gpa, len);
+    loongemu_guest_write_end(dma);
     return 0;
 }
 

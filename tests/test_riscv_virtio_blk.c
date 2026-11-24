@@ -503,6 +503,45 @@ static void test_dma_cache(void)
      * from a window that was clipped to the region. */
     CHECK(!loongemu_guest_dma_ptr(&dma, RAM_BASE + RAM_SIZE - 8, 16, &q));
 
+    /*
+     * Overflow must be rejected on both paths. The cache hit is the one that
+     * used to be reachable: a valid entry plus a len that wraps gpa made
+     * `gpa + len` land back inside the page, and the caller memcpy'd past the
+     * region. Prime the entry first so the fast path is the one under test.
+     */
+    CHECK(loongemu_guest_dma_ptr(&dma, gpa, 16, &p));
+    CHECK(!loongemu_guest_dma_ptr(&dma, RAM_BASE, UINT64_MAX - RAM_BASE + 1, &q));
+    CHECK(!loongemu_guest_dma_ptr(&dma, UINT64_MAX - 3, 16, &q));
+    CHECK(!loongemu_guest_dma_ptr(&dma, gpa, UINT64_MAX, &q));
+    CHECK(loongemu_guest_dma_write(&dma, gpa, ram, UINT64_MAX) != 0);
+    /* The same entry still serves a sane range afterwards. */
+    CHECK(loongemu_guest_dma_ptr(&dma, gpa, 16, &q));
+    CHECK(q == p);
+
+    /*
+     * Write transactions: the store and the reservation notification are one
+     * critical section, and a nested begin must be refused instead of silently
+     * interleaving two writers.
+     */
+    {
+        uint8_t *w = NULL;
+        unsigned before = notify.calls;
+
+        CHECK(loongemu_guest_write_begin(&dma, gpa, 8, &w) == 0);
+        CHECK(w == at(gpa));
+        CHECK(loongemu_guest_write_begin(&dma, gpa, 8, &w) != 0);
+        CHECK(loongemu_guest_write_commit(&dma, gpa, "ABCDEFGH", 8) == 0);
+        /* Outside the reserved range must be refused, not written. */
+        CHECK(loongemu_guest_write_commit(&dma, gpa + 4, "12345678", 8) != 0);
+        loongemu_guest_write_end(&dma);
+        CHECK(notify.calls == before + 1);
+        CHECK(notified_range(gpa, 8));
+        CHECK(memcmp(at(gpa), "ABCDEFGH", 8) == 0);
+        /* end() without a transaction is a no-op. */
+        loongemu_guest_write_end(&dma);
+        CHECK(notify.calls == before + 1);
+    }
+
     /* Move the RAM window to a different host address: the map generation must
      * retire the cached translation. */
     CHECK(loongemu_mem_map_remove(&map, RAM_BASE));

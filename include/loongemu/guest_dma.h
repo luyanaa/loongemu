@@ -49,6 +49,24 @@ typedef struct LoongemuGuestDmaEntry {
 
 typedef struct LoongemuGuestDma {
     const LoongemuMemMap *map;
+    /*
+     * Coarse write-transaction lock.
+     *
+     * A device write has two observable steps: the bytes become visible, and the
+     * CPU-side reservation domain is told the range changed. Writing first and
+     * notifying second leaves a window in which an SC can still succeed against
+     * data the device already replaced. Every writer therefore runs inside
+     * begin()..end(), with the notification issued at end() while the lock is
+     * still held.
+     *
+     * CPU stores and AMOs must adopt the same contract before the machine runs
+     * vCPUs in parallel; today they are serialised by the cooperative
+     * dispatcher, so this lock only orders device writes against each other.
+     */
+    volatile int write_lock;
+    uint64_t write_gpa;
+    uint64_t write_len;
+    int write_active;
     /* May be NULL: a host-side unit test has no reservation domain. In the
      * VMM this is latr_reservation_notify_write() wrapped by the machine. */
     LoongemuGuestWriteNotify notify;
@@ -78,6 +96,18 @@ int loongemu_guest_dma_fill(LoongemuGuestDma *dma, uint64_t gpa, uint8_t value,
 /* Little-endian store of `size` (1..8) bytes; notifies like any other write. */
 int loongemu_guest_dma_write_le(LoongemuGuestDma *dma, uint64_t gpa,
                                 uint64_t value, unsigned size);
+
+/*
+ * Write transaction: begin resolves and locks, the caller stores through the
+ * returned pointer (or uses commit()), and end() notifies the reservation domain
+ * and releases. begin() fails if another transaction is open on this domain, so
+ * a nested use is a bug the caller sees instead of a silent ordering hole.
+ */
+int loongemu_guest_write_begin(LoongemuGuestDma *dma, uint64_t gpa,
+                               uint64_t len, uint8_t **host);
+int loongemu_guest_write_commit(LoongemuGuestDma *dma, uint64_t gpa,
+                                const void *data, uint64_t len);
+void loongemu_guest_write_end(LoongemuGuestDma *dma);
 
 #ifdef __cplusplus
 }
