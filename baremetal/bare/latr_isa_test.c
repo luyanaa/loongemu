@@ -164,6 +164,13 @@ static void reset_guest_state(void)
     env.csr[0x30a] = UINT64_C(1) << 61;
 }
 
+/* Code-symbol census over every block this harness executes. */
+static unsigned code_symbol_blocks;
+static unsigned code_symbol_blocks_with_syms;
+static unsigned code_symbol_total;
+static unsigned code_symbol_max;
+static unsigned code_symbol_overflows;
+
 /* Runs one TB against the current env; callers own env setup. */
 static bool latr_execute_block(const void *guest, int insns)
 {
@@ -187,6 +194,24 @@ static bool latr_execute_block(const void *guest, int insns)
         int words = tr_ir2_assemble(code_buf);
         if ((size_t)words * 4 > sizeof(code_buf)) {
             return false; /* TB buffer overflow must never corrupt memory */
+        }
+        /* Code-symbol accounting (persistent-code-cache P0): how many absolute
+         * host addresses this block embeds, i.e. how many words a cache would
+         * have to relocate instead of copying. */
+        {
+            int syms = latr_tb_code_symbol_count();
+
+            code_symbol_blocks++;
+            code_symbol_total += (unsigned)syms;
+            if (syms > 0) {
+                code_symbol_blocks_with_syms++;
+            }
+            if (code_symbol_max < (unsigned)syms) {
+                code_symbol_max = (unsigned)syms;
+            }
+            if (latr_tb_code_symbols_overflowed()) {
+                code_symbol_overflows++;
+            }
         }
         __asm__ volatile("ibar 0" ::: "memory");
         latr_enter_tb(&env, code_buf);
@@ -6755,6 +6780,31 @@ void kmain(void)
         puthex(loongemu_perf_now() - perf_suite_start);
     }
 #endif
+    {
+        /* Code-symbol census: the relocation surface a persistent cache would
+         * have to rewrite, measured rather than assumed. */
+        latx_bare_uart_puts("\nlatr-code-syms: blocks=");
+        putdec(code_symbol_blocks);
+        latx_bare_uart_puts(" with_syms=");
+        putdec(code_symbol_blocks_with_syms);
+        latx_bare_uart_puts(" total=");
+        putdec(code_symbol_total);
+        latx_bare_uart_puts(" max_per_block=");
+        putdec(code_symbol_max);
+        latx_bare_uart_puts(" overflows=");
+        putdec(code_symbol_overflows);
+        checks++;
+        if (code_symbol_blocks_with_syms == 0) {
+            failures++;
+            latx_bare_uart_puts("\nlatr-isa: FAIL code-symbol registry never fired");
+        }
+        /* A truncated relocation list is silently wrong; fail instead. */
+        checks++;
+        if (code_symbol_overflows != 0) {
+            failures++;
+            latx_bare_uart_puts("\nlatr-isa: FAIL code-symbol table overflowed");
+        }
+    }
     {
         /* Register-cache accounting for design P0 (ir2-value-version.md): the
          * numbers that decide whether versioned state is worth building. */

@@ -56,7 +56,7 @@ static void emit_fp_rmm_call(const RiscvIR1 *ir1)
     li_d(a5, ir1->arg.rs3);
     li_d(a6, ir1->arg.rm);
     li_d(a7, ir1->pc);
-    li_d(target, (uint64_t)(uintptr_t)&latr_riscv_fp_rmm);
+    latr_emit_code_symbol(target, (const void *)&latr_riscv_fp_rmm);
     la_jirl(ra_ir2_opnd, target, 0);
     ra_free_temp(target);
     la_ld_d(ra_ir2_opnd, sp, 0);

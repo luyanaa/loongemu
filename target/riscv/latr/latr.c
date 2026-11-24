@@ -282,6 +282,49 @@ void latr_tr_data_init(CPUArchState *env)
 
 static LatrRegCacheStats latr_regcache_stats_counters;
 
+void latr_emit_code_symbol(IR2_OPND dst, const void *sym)
+{
+    TRANSLATION_DATA *data = lsenv->tr_data;
+
+    if (data->tb_code_sym_count < LATR_TB_CODE_SYMS) {
+        int i = data->tb_code_sym_count++;
+
+        data->tb_code_sym_ir2[i] = data->ir2_inst_num_current;
+        data->tb_code_sym_fn[i] = sym;
+    } else {
+        /* A block that needs more slots than this is not a size problem: it is
+         * a block whose relocation list is incomplete, so say so loudly. */
+        data->tb_code_sym_overflow = 1;
+    }
+    li_d(dst, (int64_t)(uintptr_t)sym);
+}
+
+int latr_tb_code_symbol_count(void)
+{
+    return lsenv->tr_data->tb_code_sym_count;
+}
+
+const void *latr_tb_code_symbol(int index)
+{
+    if (index < 0 || index >= lsenv->tr_data->tb_code_sym_count) {
+        return NULL;
+    }
+    return lsenv->tr_data->tb_code_sym_fn[index];
+}
+
+int latr_tb_code_symbols_overflowed(void)
+{
+    return lsenv->tr_data->tb_code_sym_overflow;
+}
+
+int latr_tb_code_symbol_ir2(int index)
+{
+    if (index < 0 || index >= lsenv->tr_data->tb_code_sym_count) {
+        return -1;
+    }
+    return lsenv->tr_data->tb_code_sym_ir2[index];
+}
+
 void latr_regcache_stats_reset(void)
 {
     latr_regcache_stats_counters = (LatrRegCacheStats){0};
@@ -657,6 +700,8 @@ void tr_init(void *tb)
     data->first_ir2 = NULL;
     data->last_ir2 = NULL;
     data->label_num = 0;
+    data->tb_code_sym_count = 0;
+    data->tb_code_sym_overflow = 0;
 #if LATR_IR2_LIST_CHECK
     latr_ir2_cap_at_tb_start = data->ir2_inst_num_max;
 #endif

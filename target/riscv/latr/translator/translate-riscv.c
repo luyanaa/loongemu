@@ -47,7 +47,7 @@ static LatrStoreLock emit_store_lock_acquire(void)
     };
     IR2_OPND retry = ir2_opnd_new_type(IR2_OPND_LABEL);
 
-    li_d(lock.address, (int64_t)(uintptr_t)&latr_guest_store_lock);
+    latr_emit_code_symbol(lock.address, (const void *)&latr_guest_store_lock);
     la_label(retry);
     la_ll_d(lock.epoch, lock.address, 0);
     la_andi(lock.status, lock.epoch, 1);
@@ -163,7 +163,7 @@ static void emit_load(const RiscvIR1 *ir1)
         li_d(a2_ir2_opnd, size);
         la_mov64(a0_ir2_opnd, env_ir2_opnd);
         latr_env_store_d(ra_ir2_opnd, env_offset_host_return_address());
-        li_d(target, (int64_t)(uintptr_t)&latr_mmio_load);
+        latr_emit_code_symbol(target, (const void *)&latr_mmio_load);
         la_jirl(ra_ir2_opnd, target, 0);
         ra_free_temp(target);
         latr_env_load_d(ra_ir2_opnd, env_offset_host_return_address());
@@ -215,7 +215,7 @@ static void emit_load(const RiscvIR1 *ir1)
         li_d(a2_ir2_opnd, size);
         la_mov64(a0_ir2_opnd, env_ir2_opnd);
         latr_env_store_d(ra_ir2_opnd, env_offset_host_return_address());
-        li_d(target, (int64_t)(uintptr_t)&latr_cross_load);
+        latr_emit_code_symbol(target, (const void *)&latr_cross_load);
         la_jirl(ra_ir2_opnd, target, 0);
         ra_free_temp(target);
         latr_env_load_d(ra_ir2_opnd, env_offset_host_return_address());
@@ -289,7 +289,7 @@ static void emit_store(const RiscvIR1 *ir1)
         ra_free_temp(stored);
         la_mov64(a0_ir2_opnd, env_ir2_opnd);
         latr_env_store_d(ra_ir2_opnd, env_offset_host_return_address());
-        li_d(target, (int64_t)(uintptr_t)&latr_mmio_store);
+        latr_emit_code_symbol(target, (const void *)&latr_mmio_store);
         la_jirl(ra_ir2_opnd, target, 0);
         ra_free_temp(target);
         latr_env_load_d(ra_ir2_opnd, env_offset_host_return_address());
@@ -318,7 +318,7 @@ static void emit_store(const RiscvIR1 *ir1)
         ra_free_temp(stored);
         la_mov64(a0_ir2_opnd, env_ir2_opnd);
         latr_env_store_d(ra_ir2_opnd, env_offset_host_return_address());
-        li_d(target, (int64_t)(uintptr_t)&latr_cross_store);
+        latr_emit_code_symbol(target, (const void *)&latr_cross_store);
         la_jirl(ra_ir2_opnd, target, 0);
         ra_free_temp(target);
         latr_env_load_d(ra_ir2_opnd, env_offset_host_return_address());
@@ -521,7 +521,7 @@ static void emit_lr(const RiscvIR1 *ir1, bool word)
     IR2_OPND scratch = ra_alloc_itemp();
 
     la_dbar(0);
-    li_d(lock_address, (int64_t)(uintptr_t)&latr_guest_store_lock);
+    latr_emit_code_symbol(lock_address, (const void *)&latr_guest_store_lock);
     la_ld_d(before, lock_address, 0);
     if (word) {
         la_ld_w(result, a0_ir2_opnd, 0);

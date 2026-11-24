@@ -82,6 +82,19 @@ typedef struct LatrRegCache {
 
 
 
+/*
+ * Host-address code symbols (design: docs/design/persistent-code-cache.md, P0).
+ *
+ * Emitted code materialises a handful of absolute host addresses - the helper
+ * entry points it calls. Those are the only addresses in a block that a
+ * persistent cache cannot simply copy: they change with PIE/ASLR and with any
+ * rebuild. Recording them at emission turns "which words need relocation" into
+ * an enumerable list instead of a code scan.
+ */
+/* Measured on the ISA suite: 485 sites over 286 blocks, at most 20 in one
+ * block, so 24 was one block away from truncating a relocation list. */
+#define LATR_TB_CODE_SYMS 64
+
 typedef struct TRANSLATION_DATA {
     void *curr_tb;
     uint32_t w_write_flag;
@@ -106,6 +119,12 @@ typedef struct TRANSLATION_DATA {
     uint64_t tb_insn_pc[LATR_TB_MAP_SPANS];
     uint32_t tb_insn_len[LATR_TB_MAP_SPANS];
     int tb_insn_label[LATR_TB_MAP_SPANS + 1];
+    /* Host addresses emitted by this block, with the IR2 index of the
+     * instruction that materialised each one. */
+    int tb_code_sym_count;
+    uint8_t tb_code_sym_overflow;
+    int tb_code_sym_ir2[LATR_TB_CODE_SYMS];
+    const void *tb_code_sym_fn[LATR_TB_CODE_SYMS];
     /* Per-insn recovery staging (C1): site kind + regcache binding snapshot
      * captured during translate, committed into the map at assemble. */
     uint8_t tb_insn_site[LATR_TB_MAP_SPANS];
@@ -294,6 +313,13 @@ void latr_regcache_stats_reset(void);
 LatrRegCacheStats latr_regcache_stats(void);
 
 void latr_regcache_flush(void);
+
+/* Emit `dst = sym` and record the symbol as a relocation site. */
+void latr_emit_code_symbol(IR2_OPND dst, const void *sym);
+int latr_tb_code_symbol_count(void);
+const void *latr_tb_code_symbol(int index);
+int latr_tb_code_symbol_ir2(int index);
+int latr_tb_code_symbols_overflowed(void);
 bool latr_regcache_evict_itemp(void);
 bool latr_regcache_evict_ftemp(void);
 void latr_regcache_prepare_fpr_write(IR2_OPND value);

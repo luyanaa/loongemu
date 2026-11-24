@@ -120,7 +120,7 @@ static void emit_rvv_call(uintptr_t function)
 
     la_mov64(a0_ir2_opnd, env_ir2_opnd);
     latr_env_store_d(ra_ir2_opnd, env_offset_host_return_address());
-    li_d(target, (int64_t)function);
+    latr_emit_code_symbol(target, (const void *)function);
     la_jirl(ra_ir2_opnd, target, 0);
     ra_free_temp(target);
     latr_env_load_d(ra_ir2_opnd, env_offset_host_return_address());
@@ -879,7 +879,7 @@ bool latr_translate_rvv(const RiscvIR1 *ir1)
     la_mov64(a2_ir2_opnd, vtype);
     la_mov64(a0_ir2_opnd, env_ir2_opnd);
     latr_env_store_d(ra_ir2_opnd, env_offset_host_return_address());
-    li_d(target, (int64_t)(uintptr_t)&latr_rvv_vsetvl);
+    latr_emit_code_symbol(target, (const void *)&latr_rvv_vsetvl);
     la_jirl(ra_ir2_opnd, target, 0);
     ra_free_temp(target);
     latr_env_load_d(ra_ir2_opnd, env_offset_host_return_address());

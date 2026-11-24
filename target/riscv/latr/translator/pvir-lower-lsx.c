@@ -795,7 +795,7 @@ bool latr_pvir_try_lower_lsx(const RiscvIR1 *ir1, IR2_OPND *fallback_label,
         la_mov64(a0_ir2_opnd, env_ir2_opnd);
         li_d(a1_ir2_opnd, (int64_t)packed);
         latr_env_store_d(ra_ir2_opnd, env_offset_host_return_address());
-        li_d(target, (int64_t)(uintptr_t)&latr_rvv_direct_prepare);
+        latr_emit_code_symbol(target, (const void *)&latr_rvv_direct_prepare);
         la_jirl(ra_ir2_opnd, target, 0);
         ra_free_temp(target);
         latr_env_load_d(ra_ir2_opnd, env_offset_host_return_address());

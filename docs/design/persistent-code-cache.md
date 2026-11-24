@@ -29,9 +29,16 @@ A TB is an arena-resident sequence of LoongArch words produced by
   plus `guest_pc` (`latr-tb-cache.h:19`).
 
 So a block is *almost* relocatable: relative branches work, exits work, and the
-only absolute addresses in emitted code are the helper/target symbols loaded with
-`li_d(target, &fn)`. Those literals plus the recovery rows are the whole
-relocation surface.
+only absolute addresses in emitted code are the helper entry points.
+
+**Measured (P0, done), not assumed:** the LATR ISA image executes 286 blocks; 171
+of them embed at least one host address, 485 sites in total, at most 20 in one
+block. The first implementation of the registry used 24 slots per block - one
+block away from truncating a relocation list - so it is 64 now and overflow is a
+hard failure in the harness. The sites are no longer scattered `li_d(target,
+&fn)` calls: `latr_emit_code_symbol()` records `(ir2 index, symbol)` and emits the
+load, which turns "which words need relocation" into an enumerable list.
+Symbols plus the recovery rows are the whole relocation surface.
 That is the whole design surface.
 
 ## 2. Design
@@ -135,7 +142,7 @@ because a checksum whose collision an attacker can compute is not a checksum.
 
 | phase | change | gate |
 |---|---|---|
-| P0 | reloc emission + symbol table publishing; no persistence yet | **relocation test**: translate at arena base A, apply relocs to base B, execute from B, compare guest results (see §4) |
+| P0 | done: `latr_emit_code_symbol()` + per-TB symbol table (485 sites measured, cap 64, overflow is a harness failure); every absolute address in the LATR translator goes through it | `latr-isa 1607` with the symbol census; sites rewired: 6 in `translate-riscv.c`, 1 each in the CSR/FP/RVV/PVIR files |
 | P1 | in-process serialise/deserialise round trip of one TB (memory only) | same test + `latr-isa` with round trip forced on |
 | P2 | on-disk format, fingerprint, validation, refusal paths | boot smoke; corrupted-file/negative tests |
 | P3 | lazy load, hit/miss counters, size budget/eviction | PERF counters: load time vs translate time |
