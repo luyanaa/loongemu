@@ -334,6 +334,18 @@ int main(void)
                   "owner reclaims after leaving translated code");
             CHECK(cache_a.arena_used == 0,
                   "arena rewinds only after the safe point");
+            /* Reuse of the recycled slot must not resurrect the dead entry:
+             * a new translation landing at offset 0 owns it outright. */
+            {
+                LatrTbKey k2 = key(10, 1);
+                LatrTbEntry *fresh = latr_tb_cache_insert(
+                    &cache_a, PC + 0x400u, k2, code, sizeof(code), 1);
+
+                CHECK(fresh != NULL && fresh->code == arena_a,
+                      "recycled arena publishes the new translation at base");
+                CHECK(latr_tb_cache_lookup(&cache_a, PC, race.key) == NULL,
+                      "stale translation at the same offset stays dead");
+            }
         }
     }
     printf("test-latr-tb-smp: %d checks, %d failures\n", checks, failures);

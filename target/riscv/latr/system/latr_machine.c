@@ -716,11 +716,17 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
      */
     latr_system_update_hart(&m->sys, &h->env, h->hartid);
     if (h->env.sfence_pending) {
-        latr_tb_shootdown_asid(&h->tb_cache, (uint32_t)h->env.sfence_asid);
+        /* SFENCE.VMA on one hart must shoot down translated code keyed by that
+         * ASID on *every* registered hart's cache: each hart may hold blocks
+         * translated under the same guest address space, and letting another
+         * hart keep dispatching them executes stale mappings. */
+        latr_tb_shootdown_asid_all_cores((uint32_t)h->env.sfence_asid);
         h->env.sfence_pending = 0;
     }
     if (h->env.fence_i_pending) {
-        latr_tb_shootdown_all(&h->tb_cache);
+        /* FENCE.I is the guest's SMC notification; every hart's cache may
+         * contain translations of the overwritten page. */
+        latr_tb_fence_i_all_cores();
         h->env.fence_i_pending = 0;
     }
     latr_context_safepoint(h->ctx);
