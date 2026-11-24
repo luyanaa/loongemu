@@ -7678,6 +7678,27 @@ void tb_sys_handle_trap(uint64_t *regs, int trap_is_refill)
             latx_platform_tlb_flush_all();
             sync_env_to_trap_regs(regs);
 #ifdef TB_SYS_TRACE_STEPS
+            {
+                /* Read the six frame words back through the guest walker: if
+                 * they are right, the handler's shifted reads are an address
+                 * computation problem, not a write-placement one. */
+                uint64_t frame_gva = env.regs[R_ESP];
+
+                latx_bare_uart_puts("tb-sys: frame@");
+                puthex(frame_gva);
+                for (int w = 0; w < 6; w++) {
+                    LatxX86Translation tw;
+                    uint64_t val = 0;
+
+                    latx_bare_uart_puts(" ");
+                    if (walk_ok(latx_x86_walk(&env, frame_gva + (uint64_t)w * 8,
+                                              LATX_X86_ACCESS_READ, &tw))) {
+                        val = latx_platform_phys_read(tw.gpa, 8);
+                    }
+                    puthex(val);
+                }
+                latx_bare_uart_puts("\n");
+            }
             latx_bare_uart_puts("tb-sys: pf-deliver env_rsp=");
             puthex(env.regs[R_ESP]);
             latx_bare_uart_puts(" frame_slot=");

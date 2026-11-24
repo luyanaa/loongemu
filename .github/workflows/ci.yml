@@ -155,10 +155,19 @@ jobs:
           #     err=3, i.e. the frame sits at 0x7fd0 with EC at +0.
           #   - the handler TB starts with exactly rsp_in=0x7fd0, yet its
           #     `mov ecx,[rsp]` / `mov rcx,[rsp+8]` read slots +24 and +32.
-          # So the shift happens inside the handler TB's execution, not in the
-          # delivery or the stub. Remaining suspects: that TB's translated
-          # address computation under clang 19, or the guest-TLB coherency
-          # between the walker's physical writes and the handler's reads.
+          # Two more measurements narrow it further:
+          #   - CPUX86State layout is identical in both translation units (size
+          #     0x1b20, regs 0x158, eip 0x1d8, eflags 0x1e0, segs 0x210), so the
+          #     compat header is not being resolved differently.
+          #   - reading the six frame words back through the guest walker right
+          #     after delivery yields junk (0x100, 0x7fd0, 0, 0, 0x80010001, 0)
+          #     instead of (err, eip, cs, eflags, rsp, ss), while the caller sees
+          #     err=3 and rsp=0x7fd0.
+          # So the pushes did not land where the walker's own read-back looks,
+          # even though frame writes and the read-back both use latx_x86_walk.
+          # Next: compare latx_platform_phys_write and latx_platform_phys_read
+          # for the same gpa in that window, i.e. whether the GPA->HPA map used
+          # by the harness diverges between them.
           # Run it by hand with:
           #   make tb-sys-smp-run QLVZ=/usr/bin/qemu-system-loongarch64
           SCRIPT
