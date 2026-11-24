@@ -115,6 +115,23 @@ int main(void)
     CHECK(loongemu_mmio_bus_read(&bus, 0x10000100, 1, &value) != 0,
           "out-of-window UART access fails");
 
+    /*
+     * Route cache: a repeated access reuses the remembered device, but the
+     * width is part of the key and a registry change invalidates it.
+     */
+    CHECK(loongemu_mmio_bus_read(&bus, 0x10000005, 1, &value) == 0 &&
+          value == 0x60, "repeat access hits the route cache");
+    CHECK(loongemu_mmio_bus_read(&bus, 0x10000005, 4, &value) == 0,
+          "same address with another width still resolves");
+    CHECK(loongemu_mmio_bus_remove(&bus, 0x10000000) == 1,
+          "UART detaches from the bus");
+    CHECK(loongemu_mmio_bus_read(&bus, 0x10000005, 1, &value) != 0,
+          "a cached route cannot outlive its device");
+    CHECK(loongemu_uart16550_attach(&bus, &uart, 0x10000000, 0x100) == 1,
+          "UART re-attaches after removal");
+    CHECK(loongemu_mmio_bus_read(&bus, 0x10000005, 1, &value) == 0 &&
+          value == 0x60, "re-attached UART answers the same address");
+
     printf("UART: %d checks passed\n", checks);
     return failures == 0 ? 0 : 1;
 }
