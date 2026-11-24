@@ -41,6 +41,11 @@ bool lata_dispatch_init(LataDispatch *d, const LataDispatchOps *ops,
     d->cache_hits = 0;
     d->reclaims = 0;
     d->refused = 0;
+    d->smc_flushes = 0;
+    d->epoch = 1;
+    d->in_tb = 0;
+    d->safepoint_violations = 0;
+    d->smc_epoch_last = ops->smc_epoch != NULL ? ops->smc_epoch(opaque) : 0;
     if (tbc_init(&d->cache, entries, buckets, capacity) == 0) {
         return false;
     }
@@ -49,13 +54,24 @@ bool lata_dispatch_init(LataDispatch *d, const LataDispatchOps *ops,
 
 void lata_dispatch_flush(LataDispatch *d)
 {
-    if (d != NULL) {
-        tbc_flush_all(&d->cache);
-        /* The arena is only reclaimable together with the cache: every entry
-         * points into it. Callers must not be executing out of it, which is why
-         * the loop only flushes between TBs. */
-        d->arena_used = 0;
+    if (d == NULL) {
+        return;
     }
+    /*
+     * Safepoint rule, enforced rather than assumed: while ops->enter is running,
+     * the guest is executing code from this arena, so reclaiming it would hand
+     * the next TB bytes that are still in use. Refuse and count instead of
+     * silently corrupting state.
+     */
+    if (d->in_tb) {
+        d->safepoint_violations++;
+        return;
+    }
+    tbc_flush_all(&d->cache);
+    /* The arena is only reclaimable together with the cache: every entry points
+     * into it. */
+    d->arena_used = 0;
+    d->epoch++;
 }
 
 /*
@@ -65,11 +81,12 @@ void lata_dispatch_flush(LataDispatch *d)
  */
 static bool lata_dispatch_reclaim(LataDispatch *d)
 {
-    if (d->arena_used == 0) {
+    if (d->arena_used == 0 || d->in_tb) {
         return false;
     }
     tbc_flush_all(&d->cache);
     d->arena_used = 0;
+    d->epoch++;
     d->reclaims++;
     return true;
 }
@@ -80,6 +97,22 @@ uint64_t lata_dispatch_run(LataDispatch *d)
         return 0;
     }
     while (!d->ops->halt(d->opaque)) {
+        /*
+         * SMC check before anything else: guest code may have changed since the
+         * last dispatch, in which case every cached TB and the arena are suspect.
+         * This is the dispatcher's half of LATR's fence.i + shootdown contract.
+         */
+        if (d->ops->smc_epoch != NULL) {
+            uint64_t now = d->ops->smc_epoch(d->opaque);
+
+            if (now != d->smc_epoch_last) {
+                d->smc_epoch_last = now;
+                tbc_flush_all(&d->cache);
+                d->arena_used = 0;
+                d->epoch++;
+                d->smc_flushes++;
+            }
+        }
         uint64_t pc = d->ops->next_pc(d->opaque);
         uint64_t asid = d->ops->address_space(d->opaque);
         uint64_t mapping_epoch = d->ops->mapping_epoch(d->opaque);
@@ -139,7 +172,9 @@ uint64_t lata_dispatch_run(LataDispatch *d)
             e->code_size = bytes;
             d->arena_used = off + ((bytes + 15u) & ~15u);
         }
+        d->in_tb = 1;
         d->ops->enter(d->opaque, pc, code);
+        d->in_tb = 0;
         d->executed++;
     }
     return d->executed;

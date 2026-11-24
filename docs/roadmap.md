@@ -57,8 +57,20 @@ Status: capacity is now passed down (`size_t capacity`), the translator reports
 (`reclaims`) instead of stopping, `lata_dispatch_flush()` reclaims the arena with
 the cache, and `sync_icache` is a dispatcher-called op instead of an embedder
 duty. Tests cover capacity, a translator that lies about its size, reclaim across
-six TBs, and a TB too large for the whole arena. Still open on this line: LATR
-arena lifecycle reuse, owner safepoint, cross-core invalidation, SMC.
+six TBs, and a TB too large for the whole arena.
+
+Safepoint and SMC are now explicit too: `in_tb` marks the window in which the
+guest executes arena bytes, a flush from inside `enter` is refused and counted
+(`safepoint_violations`), every flush/reclaim bumps a generation (`epoch`), and
+the new optional `smc_epoch` op lets the embedder announce that guest code
+changed - the loop then drops the cache and arena before the next dispatch
+(`smc_flushes`), which is the dispatcher's half of LATR's fence.i + shootdown
+contract. Tests drive both paths.
+
+Still open on this line: reusing LATR's arena implementation rather than the same
+policy written twice, owner-side safepoint integration with the machine's halt
+path, and cross-core invalidation once vCPUs run in parallel (that last one is
+listed under 2.2 SMP).
 
 Rest of the LATA route:
 
@@ -350,8 +362,9 @@ fault recovery cost.
 2. 3.2 GuestWriteTransaction contract (coarse lock), DMA routed through it - done;
    CPU stores/AMO/SC still to adopt it.
 3. 2.1 LATA `translate_tb` capacity ABI, whole-TB reservation, reclaim, I-cache
-   sync ownership - done; next is LATR arena lifecycle reuse, safepoint,
-   cross-core invalidation and SMC.
+   sync ownership, safepoint enforcement and SMC epoch - done; next is reusing
+   LATR's arena implementation (item 13) and cross-core invalidation with real
+   SMP (item 8).
 4. 3.3 shared recovery ABI - done (schema, decision function, generation guard).
 5. 2.1 LATA host-fault precise recovery.
 6. 5.1 step 3 (label/branch flush elision) on top of the measured baseline.

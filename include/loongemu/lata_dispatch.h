@@ -70,6 +70,16 @@ typedef struct LataDispatchOps {
      * installed. It is keyed in cs_base without truncation. */
     uint64_t (*mapping_epoch)(void *opaque);
     uint8_t (*exception_level)(void *opaque);
+    /*
+     * Guest code-change epoch: bump it when guest memory that may have been
+     * translated is modified (AArch64 `dc cvau`/`ic ivau`, a page write under an
+     * SMC policy, a remap). The loop compares it before every dispatch and, on a
+     * change, drops the cache and reclaims the arena at a safepoint - the same
+     * contract LATR implements with fence.i plus shootdown. NULL means "this
+     * embedder has no SMC policy", which is a deliberate choice, not an
+     * oversight: the field is optional and documented as such.
+     */
+    uint64_t (*smc_epoch)(void *opaque);
     /* Stop condition: return true to end the loop (e.g. env.pc==halt, or a
      * budget of dispatched TBs exhausted). */
     bool (*halt)(void *opaque);
@@ -93,6 +103,11 @@ typedef struct LataDispatch {
     uint64_t cache_hits;    /* served from cache without re-translating */
     uint64_t reclaims;      /* arena reclaimed because it could not fit a TB */
     uint64_t refused;       /* translations rejected for exceeding capacity */
+    uint64_t smc_flushes;   /* cache+arena dropped because the SMC epoch moved */
+    uint64_t epoch;         /* bumped on every reclaim/flush (diagnostics) */
+    int in_tb;              /* inside enter(): no reclaim is legal here */
+    uint64_t safepoint_violations; /* flush attempted from inside a TB */
+    uint64_t smc_epoch_last;       /* last value seen from ops->smc_epoch */
 } LataDispatch;
 
 /* Init with caller-owned, zeroed storage. `capacity` must be a power of two
@@ -106,8 +121,9 @@ bool lata_dispatch_init(LataDispatch *d, const LataDispatchOps *ops,
  * Returns the number of TBs executed. */
 uint64_t lata_dispatch_run(LataDispatch *d);
 
-/* Drop all cached TBs and reclaim the arena. Safe only between TBs, which is
- * the only place the loop calls it: nothing is executing out of the arena. */
+/* Drop all cached TBs and reclaim the arena. A safepoint: legal only between
+ * TBs. A call from inside ops->enter is refused and counted in
+ * safepoint_violations, because the code being executed lives in that arena. */
 void lata_dispatch_flush(LataDispatch *d);
 
 #ifdef __cplusplus

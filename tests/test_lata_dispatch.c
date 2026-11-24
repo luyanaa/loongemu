@@ -37,6 +37,8 @@ typedef struct FakeCpu {
     size_t emit_bytes;
     int lie_about_size;
     int sync_calls;
+    uint64_t smc_epoch;
+    LataDispatch *flush_from_enter; /* non-NULL: try to flush during enter */
     uint64_t translated_pcs[64];
     int translated_n;
 } FakeCpu;
@@ -83,6 +85,10 @@ static void fake_enter(void *o, uint64_t pc, void *code_addr)
     FakeCpu *c = o;
     (void)code_addr;
     c->enter_calls++;
+    if (c->flush_from_enter != NULL) {
+        /* A flush is only legal between TBs; the loop must refuse this. */
+        lata_dispatch_flush(c->flush_from_enter);
+    }
     c->pc = pc;
     /* Advance along the scripted control-flow stream. */
     if (c->stream_pos < c->stream_len) {
@@ -106,6 +112,7 @@ static uint64_t fake_mapping_epoch(void *o)
     return ((FakeCpu *)o)->mapping_epoch;
 }
 static uint8_t fake_el(void *o) { return ((FakeCpu *)o)->el; }
+static uint64_t fake_smc(void *o) { return ((FakeCpu *)o)->smc_epoch; }
 static bool fake_halt(void *o)
 {
     FakeCpu *c = o;
@@ -120,6 +127,7 @@ static const LataDispatchOps OPS = {
     .address_space = fake_asid,
     .mapping_epoch = fake_mapping_epoch,
     .exception_level = fake_el,
+    .smc_epoch = fake_smc,
     .halt = fake_halt,
 };
 
@@ -321,6 +329,58 @@ static void test_arena_reclaim(void)
     }
 }
 
+/* A guest code-change epoch must drop cached TBs and reclaim the arena. */
+static void test_smc_epoch_flushes(void)
+{
+    static const uint64_t stream[] = { 0x2000, 0, 0x2000, 0 };
+    FakeCpu c = {0};
+    LataDispatch d;
+
+    zero_storage();
+    c.pc_stream = stream;
+    c.stream_len = 4;
+    c.pc = 0x1000;
+    c.smc_epoch = 1;
+    CHECK(lata_dispatch_init(&d, &OPS, &c, g_entries, g_buckets, CAP,
+                             g_arena, sizeof(g_arena)),
+          "smc init");
+    /* First pass caches both guest PCs. */
+    lata_dispatch_run(&d);
+    CHECK(d.translated == 2, "first pass translates both PCs");
+    CHECK(d.smc_flushes == 0, "no flush without an epoch change");
+
+    /* Rewind the guest and pretend its code changed: both TBs must be rebuilt. */
+    c.pc = 0x1000;
+    c.stream_pos = 0;
+    c.enter_calls = 0;
+    c.smc_epoch = 2;
+    lata_dispatch_run(&d);
+    CHECK(d.smc_flushes == 1, "epoch change flushes the cache once");
+    CHECK(d.translated == 4, "both PCs are re-translated after the flush");
+    CHECK(d.cache_hits == 0, "no TB survives the epoch change");
+    CHECK(d.epoch > 1, "arena generation advanced with the flush");
+}
+
+/* Flushing from inside a TB is a safepoint violation: refused and counted. */
+static void test_safepoint_is_enforced(void)
+{
+    static const uint64_t stream[] = { 0x4000, 0 };
+    FakeCpu c = {0};
+    LataDispatch d;
+
+    zero_storage();
+    c.pc_stream = stream;
+    c.stream_len = 1;
+    c.pc = 0x3000;
+    CHECK(lata_dispatch_init(&d, &OPS, &c, g_entries, g_buckets, CAP,
+                             g_arena, sizeof(g_arena)),
+          "safepoint init");
+    c.flush_from_enter = &d;
+    lata_dispatch_run(&d);
+    CHECK(d.safepoint_violations == 2, "every in-TB flush is refused and counted");
+    CHECK(d.executed == 2, "both TBs still run after the refused flushes");
+}
+
 int main(void)
 {
     test_revisits_translate_once();
@@ -329,6 +389,8 @@ int main(void)
     test_bad_geometry();
     test_capacity_is_respected();
     test_arena_reclaim();
+    test_smc_epoch_flushes();
+    test_safepoint_is_enforced();
     if (fails == 0) {
         printf("lata-dispatch: all checks passed\n");
         return 0;
