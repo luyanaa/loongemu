@@ -17,12 +17,32 @@
 #define TARGET_INSN_START_WORDS 2
 #define LATM_TB_MAP_MAX TCG_MAX_INSNS
 #define LATM_TB_MAP_POOL 32
+#define LATM_TB_RECOVERY_BINDS 512
+#define LATM_RECOVERY_MAX_BINDS_PER_SPAN 8
+
+/* C3 precise recovery. Loads/stores/AMOs project a host fault to the guest;
+ * explicit guest traps are checks; anything else faulting is a host bug. */
+typedef enum LatmRecoverySite {
+    LATM_RECOV_GUEST_ACCESS = 0,
+    LATM_RECOV_GUEST_CHECK,
+    LATM_RECOV_HELPER,
+    LATM_RECOV_NATIVE_INTERNAL,
+} LatmRecoverySite;
+
+typedef struct LatmRecoveryBinding {
+    uint8_t guest_reg;   /* env-resident guest GPR with a deferred value */
+    int8_t  temp;        /* host phys reg number (la_t0..la_t2 itemp pool) */
+} LatmRecoveryBinding;
 
 typedef struct LatmTbInsnSpan {
     uint64_t guest_pc;
     uint32_t native_start;
     uint32_t native_end;
     uint8_t delay_slot;
+    uint8_t  site;             /* LatmRecoverySite */
+    uint8_t  bind_cnt;
+    uint16_t bind_first;
+    uint32_t retired_before;
 } LatmTbInsnSpan;
 
 typedef struct LatmTbInsnMap LatmTbInsnMap;
@@ -33,8 +53,10 @@ struct LatmTbInsnMap {
     uint16_t count;
     uint8_t valid;
     uint8_t reserved;
+    uint32_t bind_pool_used;
     LatmTbInsnMap *next;
     LatmTbInsnSpan spans[LATM_TB_MAP_MAX];
+    LatmRecoveryBinding binds[LATM_TB_RECOVERY_BINDS];
 };
 
 typedef struct LatmRegCacheEntry {
@@ -138,9 +160,20 @@ void latm_jmp_cache_flush(void *cpu);
 uint64_t latm_jmp_cache_lookup(void *cpu, uint64_t guest_pc);
 void latm_tb_insn_map_begin(void *trd, const void *code, uint32_t code_size);
 void latm_tb_insn_map_add(void *trd, uint64_t guest_pc, uint32_t native_start,
-                          uint32_t native_end, uint8_t delay_slot);
+                          uint32_t native_end, uint8_t delay_slot,
+                          uint8_t site, uint32_t retired_before,
+                          const LatmRecoveryBinding *binds, uint8_t bind_cnt);
 int latm_tb_insn_map_resolve(void *trd, uintptr_t host_pc,
                              uint64_t *guest_pc, uint8_t *delay_slot);
+/* C3: resolve a host PC to its span + owning map, then replay guest state. */
+const LatmTbInsnSpan *latm_tb_recovery_resolve(void *trd, uintptr_t host_pc,
+                                               const LatmTbInsnMap **map_out);
+bool latm_tb_recovery_apply(const LatmTbInsnSpan *span,
+                            const LatmTbInsnMap *map,
+                            const uint64_t host_gprs[32],
+                            void *cpu);
+uint8_t latm_recovery_site_of(int op);
+uint8_t latm_regcache_snapshot_gpr_binds(LatmRecoveryBinding *out);
 void latm_tb_insn_map_flush(void *trd);
 void latm_tb_insn_map_forget(void *trd, const void *code);
 void latm_tb_insn_map_release(void *trd, void *tb);

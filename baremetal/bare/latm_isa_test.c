@@ -196,6 +196,14 @@ static uint32_t llsc_code[] __attribute__((aligned(4096))) = {
     0xe0450000, 0xc0460000, 0xac430000, 0xe0470000,
 };
 
+/* C3 recovery block: env-resident deferred write then a guest load.
+ * daddiu $23,$0,7 ; ld $3,0($6). $23 is NOT_DEF (env-resident) so its value
+ * stays in a host temp across the ld; $3 is dedicated. */
+static uint32_t recov_code[] __attribute__((aligned(4096))) = {
+    0x64170007, 0xdcc30000,
+};
+#define RECOV_INSNS 2
+
 /* COP1X: LDXC1/SDXC1, LWXC1/SWXC1, LUXC1/SUXC1. */
 static uint32_t cop1x_code[] __attribute__((aligned(4096))) = {
     0x64020400, 0x64030000, 0x3c043ff8, 0x0004203c, 0xfc440000,
@@ -519,6 +527,118 @@ static void run_regcache_ir2_test(void)
     latx_bare_uart_puts("\n");
 }
 
+/* C3: precise host-fault recovery. Build a TB with an env-resident deferred
+ * write (daddiu $23) ahead of a guest load (ld $3,0($6)). Walk the span map:
+ * the daddiu span is NATIVE_INTERNAL, the ld span is GUEST_ACCESS carrying a
+ * bind for $23, and apply() must restore $23 and the PC from host_gprs. */
+static void test_tb_recovery(void)
+{
+    uint8_t *tb_code = code_buf + TB_OFFSET;
+    /* daddiu $23,$0,7 ; ld $3,0($6) ; then let the block exit normally */
+    uint32_t *guest = recov_code;
+
+    {
+        void *le = env.latm_env, *lt = env.latm_tr_data, *lc = env.latm_jmp_cache;
+        for (size_t i = 0; i < sizeof(env); i++) {
+            ((uint8_t *)&env)[i] = 0;
+        }
+        env.latm_env = le;
+        env.latm_tr_data = lt;
+        env.latm_jmp_cache = lc;
+    }
+    for (size_t i = 0; i < sizeof(tb); i++) {
+        ((uint8_t *)&tb)[i] = 0;
+    }
+    for (size_t i = 0; i < CODE_BUF_SIZE; i++) {
+        code_buf[i] = 0;
+    }
+    env.active_tc.PC = (uint64_t)(uintptr_t)guest;
+    tcg_ctx->code_ptr = tb_code;
+    tcg_ctx->gen_insn_data = latx_tcg_gen_insn_data;
+    tb.pc = (uint64_t)(uintptr_t)guest;
+    tb.tc.ptr = tb_code;
+    tb.jmp_reset_offset[0] = 0xffff;
+    tb.jmp_reset_offset[1] = 0xffff;
+
+    TRANSLATION_DATA *td = (TRANSLATION_DATA *)env.latm_tr_data;
+    int max_insns = RECOV_INSNS;
+    target_disasm(&tb, &max_insns, &env);
+    if (tb.icount == 0 || !tr_ir2_generate(&tb)) {
+        fails++;
+        checks++;
+        latx_bare_uart_puts("latm-isa: FAIL tb-recovery translate\n");
+        tr_fini();
+        return;
+    }
+    int n = tr_ir2_assemble(tb_code);
+    tr_fini();
+    check(n > 0, 1, "tb-recovery assemble");
+
+    uintptr_t base = (uintptr_t)tb_code;
+    const LatmTbInsnMap *map = NULL;
+
+    /* First span: daddiu $23 — NATIVE_INTERNAL; apply refuses. */
+    const LatmTbInsnSpan *s0 = latm_tb_recovery_resolve(td, base, &map);
+    check(s0 != NULL, 1, "tb-recovery resolve first span");
+    if (s0) {
+        check(s0->site, LATM_RECOV_NATIVE_INTERNAL, "tb-recovery daddiu site");
+        uint64_t hg[32] = {0};
+        check(latm_tb_recovery_apply(s0, map, hg, &env), 0,
+              "tb-recovery apply refuses NATIVE_INTERNAL");
+    }
+
+    /* Find the ld span (GUEST_ACCESS) by scanning host words. */
+    const LatmTbInsnSpan *ld = NULL;
+    for (uint32_t off = 0; off < (uint32_t)n; off += 4) {
+        const LatmTbInsnMap *m2 = NULL;
+        const LatmTbInsnSpan *s = latm_tb_recovery_resolve(td, base + off, &m2);
+        if (s && s->site == LATM_RECOV_GUEST_ACCESS) {
+            ld = s;
+            map = m2;
+            break;
+        }
+    }
+    check(ld != NULL, 1, "tb-recovery found ld span");
+    if (!ld) {
+        latx_bare_uart_puts("latm-isa: tb-recovery no-ld\n");
+        return;
+    }
+    check(ld->guest_pc, (uint64_t)(uintptr_t)(guest + 1),
+          "tb-recovery ld guest_pc");
+    check(ld->bind_cnt >= 1, 1, "tb-recovery ld has bind");
+
+    /* The bind must name env-resident $23 in a host temp. Replay it. */
+    int8_t t23 = -1;
+    if (map) {
+        for (int i = 0; i < ld->bind_cnt; i++) {
+            const LatmRecoveryBinding *b = &map->binds[ld->bind_first + i];
+            if (b->guest_reg == 23) {
+                t23 = b->temp;
+            }
+        }
+    }
+    check(t23 >= 0, 1, "tb-recovery $23 bound to a host temp");
+
+    uint64_t hg[32];
+    for (int i = 0; i < 32; i++) hg[i] = 0xdead0000 + i;
+    if (t23 >= 0) hg[t23] = 0x515253540000ull;
+    /* dedicated $3 lives in a3 (mips_la_map[3]) — give it a fault-time value */
+    hg[mips_la_map[3]] = 0xaabbccdd;
+
+    env.active_tc.gpr[23] = 0;
+    env.active_tc.gpr[3] = 0;
+    env.active_tc.PC = 0;
+    check(latm_tb_recovery_apply(ld, map, hg, &env), 1,
+          "tb-recovery apply ok");
+    check(env.active_tc.gpr[23], 0x515253540000ull,
+          "tb-recovery restores $23 from bind");
+    check(env.active_tc.gpr[3], 0xaabbccdd,
+          "tb-recovery restores dedicated $3");
+    check(env.active_tc.PC, ld->guest_pc,
+          "tb-recovery restores PC");
+    latx_bare_uart_puts("latm-isa: tb-recovery done\n");
+}
+
 void kmain(void)
 {
     latx_bare_uart_puts("latm-isa: begin\n");
@@ -763,6 +883,7 @@ void kmain(void)
     }
 
     run_regcache_ir2_test();
+    test_tb_recovery();
 
     latx_bare_uart_puts("latm-isa: checks=");
     puthex(checks);

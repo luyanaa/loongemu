@@ -552,6 +552,56 @@ static void generate_context_switch_native_to_bt(void)
     la_jirl(zero_ir2_opnd, ra_ir2_opnd, 0);
 }
 
+/* C3: classify a guest insn's fault site. ir1.op is a coarse category — the
+ * load/store/AMO classes all project a host fault to the guest memory access;
+ * explicit guest traps (syscall/break/trap) and privileged ops are guest
+ * checks; everything else faulting is a host bug. */
+uint8_t latm_recovery_site_of(int op)
+{
+    switch (op) {
+    case MIPS_OP_LOAD:
+    case MIPS_OP_STORE:
+    case MIPS_OP_AMO:
+    case MIPS_OP_LOONGSON_MEM:
+    case MIPS_OP_FPU_LDST:
+        return LATM_RECOV_GUEST_ACCESS;
+    case MIPS_OP_SYSCALL:
+    case MIPS_OP_BREAK:
+    case MIPS_OP_TRAP:
+    case MIPS_OP_CP0_OP:
+    case MIPS_OP_TLB:
+        return LATM_RECOV_GUEST_CHECK;
+    default:
+        return LATM_RECOV_NATIVE_INTERNAL;
+    }
+}
+
+/* Snapshot env-resident guest GPRs holding a deferred (uncommitted) value in
+ * a host temp. `mips_la_map[r] < 0` marks env-resident; the regcache tracks a
+ * live binding only when valid+dirty. Returns the count (<= max). */
+uint8_t latm_regcache_snapshot_gpr_binds(LatmRecoveryBinding *out)
+{
+    const LatmRegCacheEntry *gpr = lsenv->tr_data->regcache.gpr;
+    uint8_t n = 0;
+
+    for (int r = 1; r < 32; r++) {
+        if (mips_la_map[r] >= 0) {
+            continue;
+        }
+        const LatmRegCacheEntry *e = &gpr[r];
+        if (!e->valid || !e->dirty || e->temp < 0) {
+            continue;
+        }
+        if (n == LATM_RECOVERY_MAX_BINDS_PER_SPAN) {
+            break;
+        }
+        out[n].guest_reg = (uint8_t)r;
+        out[n].temp = e->temp;
+        n++;
+    }
+    return n;
+}
+
 int lata_gen_prologue_env(void *cpu, TCGContext *tcg_ctx)
 {
     void *code_buf_rw = tcg_ctx->code_ptr;
