@@ -4,6 +4,7 @@
  */
 #include <stdint.h>
 #include "latr.h"
+#include "loongemu-perf.h"
 #include "latr-system.h"
 #include "translate.h"
 #include "latr_system_guest_elf.c"
@@ -139,5 +140,24 @@ void kmain(void)
     latx_bare_uart_puts(" latr-sys: guest=");
     latx_bare_uart_puts(latr_system_uart_log(&sys));
     latx_bare_uart_puts(halted ? "\nlatr-sys: PASS\n" : "\nlatr-sys: FAIL\n");
+#ifdef LOONGEMU_PERF
+    {
+        /* A paged workload with real MMIO and traps: the numbers the P1
+         * fast-path work has to move, as opposed to the ISA suite's mix. */
+        static const char *const names[] = {
+            "tlb-hit", "tlb-miss", "mmio", "mem-fault", "plan-hit",
+        };
+        const unsigned report = (unsigned)(sizeof(names) / sizeof(names[0]));
+
+        latx_bare_uart_puts("latr-perf:");
+        for (unsigned i = 0; i < report; i++) {
+            latx_bare_uart_putc(' ');
+            latx_bare_uart_puts(names[i]);
+            latx_bare_uart_putc('=');
+            perf_put_hex(loongemu_perf_read(i));
+        }
+        latx_bare_uart_puts("\n");
+    }
+#endif
     latx_bare_uart_puts("latr-sys: done\n");
 }
