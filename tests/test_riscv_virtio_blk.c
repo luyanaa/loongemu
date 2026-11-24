@@ -479,6 +479,40 @@ static void test_dma_outside_ram(void)
     CHECK(at(status)[0] == LOONGEMU_VIRTIO_BLK_S_IOERR);
 }
 
+/*
+ * The DMA pointer cache remembers one translation per page and retires it when
+ * the memory map changes. Its two failure modes are a hit that returns a stale
+ * HPA after a remap, and a hit that ignores a region edge; both are checked
+ * here directly (the virtio paths only exercise the happy case).
+ */
+static void test_dma_cache(void)
+{
+    uint8_t *p = NULL;
+    uint8_t *q = NULL;
+    uint64_t gpa = RAM_BASE + 0x1234;
+
+    setup(8);
+
+    /* First resolve fills the per-page entry, the second one hits it. */
+    CHECK(loongemu_guest_dma_ptr(&dma, gpa, 16, &p));
+    CHECK(p == at(gpa));
+    CHECK(loongemu_guest_dma_ptr(&dma, gpa + 4, 8, &q));
+    CHECK(q == p + 4);
+
+    /* A chunk that runs past the RAM region end must be refused, not served
+     * from a window that was clipped to the region. */
+    CHECK(!loongemu_guest_dma_ptr(&dma, RAM_BASE + RAM_SIZE - 8, 16, &q));
+
+    /* Move the RAM window to a different host address: the map generation must
+     * retire the cached translation. */
+    CHECK(loongemu_mem_map_remove(&map, RAM_BASE));
+    CHECK(loongemu_mem_map_add(&map, RAM_BASE, RAM_SIZE,
+                               (uint64_t)(uintptr_t)ram + 0x1000,
+                               LOONGEMU_MEM_RAM, "ram2"));
+    CHECK(loongemu_guest_dma_ptr(&dma, gpa, 16, &q));
+    CHECK(q == at(gpa) + 0x1000);
+}
+
 static void test_queue_not_ready(void)
 {
     setup(8);
@@ -507,6 +541,7 @@ int main(void)
     test_unknown_type_and_flush();
     test_indices_wrap();
     test_dma_outside_ram();
+    test_dma_cache();
     test_queue_not_ready();
 
     if (failures != 0) {

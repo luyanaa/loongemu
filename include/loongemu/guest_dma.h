@@ -31,12 +31,29 @@ extern "C" {
 typedef void (*LoongemuGuestWriteNotify)(void *opaque, uint64_t gpa,
                                          uint64_t len);
 
+/*
+ * One remembered GPA -> HPA translation. A device walks descriptors page after
+ * page, so the same region lookup would otherwise run for every chunk; the
+ * cache keeps the last translation and the `map->generation` it was made under,
+ * which makes a stale entry unusable rather than dangerous.
+ */
+#define LOONGEMU_GUEST_DMA_CACHE_SLOTS 4
+
+typedef struct LoongemuGuestDmaEntry {
+    uint64_t gpa;
+    uint64_t hpa;
+    uint64_t span;   /* bytes from gpa that stay inside the same RAM region */
+    uint32_t generation;
+    uint8_t valid;
+} LoongemuGuestDmaEntry;
+
 typedef struct LoongemuGuestDma {
     const LoongemuMemMap *map;
     /* May be NULL: a host-side unit test has no reservation domain. In the
      * VMM this is latr_reservation_notify_write() wrapped by the machine. */
     LoongemuGuestWriteNotify notify;
     void *notify_opaque;
+    LoongemuGuestDmaEntry cache[LOONGEMU_GUEST_DMA_CACHE_SLOTS];
 } LoongemuGuestDma;
 
 void loongemu_guest_dma_init(LoongemuGuestDma *dma, const LoongemuMemMap *map,

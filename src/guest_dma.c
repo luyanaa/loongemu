@@ -11,12 +11,16 @@ void loongemu_guest_dma_init(LoongemuGuestDma *dma, const LoongemuMemMap *map,
     dma->map = map;
     dma->notify = notify;
     dma->notify_opaque = opaque;
+    for (unsigned i = 0; i < LOONGEMU_GUEST_DMA_CACHE_SLOTS; i++) {
+        dma->cache[i].valid = 0;
+    }
 }
 
 bool loongemu_guest_dma_ptr(const LoongemuGuestDma *dma, uint64_t gpa,
                             uint64_t len, uint8_t **out)
 {
     LoongemuMemLookup lookup;
+    LoongemuGuestDmaEntry *entry;
 
     if (out != NULL) {
         *out = NULL;
@@ -24,12 +28,49 @@ bool loongemu_guest_dma_ptr(const LoongemuGuestDma *dma, uint64_t gpa,
     if (dma == NULL || dma->map == NULL || len == 0 || out == NULL) {
         return false;
     }
-    if (loongemu_mem_resolve(dma->map, gpa, len, &lookup) !=
-        LOONGEMU_MEM_RAM) {
-        return false;
+    /*
+     * The cache is keyed by page base, so a descriptor that walks a buffer in
+     * 4 KiB steps resolves the region once per page instead of once per chunk.
+     * Every hit is validated against the map generation; a region add/remove
+     * therefore retires the whole cache instead of returning a stale HPA.
+     */
+    entry = (LoongemuGuestDmaEntry *)&dma->cache[(gpa >> 12) &
+                                                 (LOONGEMU_GUEST_DMA_CACHE_SLOTS - 1)];
+    {
+        uint64_t page = gpa & ~UINT64_C(0xfff);
+
+        if (entry->valid && entry->gpa == page &&
+            entry->generation == dma->map->generation &&
+            gpa + len <= page + entry->span) {
+            *out = (uint8_t *)(uintptr_t)(entry->hpa + (gpa - page));
+            return true;
+        }
+        if (loongemu_mem_resolve(dma->map, gpa, len, &lookup) !=
+            LOONGEMU_MEM_RAM) {
+            entry->valid = 0;
+            return false;
+        }
+        *out = (uint8_t *)(uintptr_t)lookup.hpa;
+        {
+            uint64_t region_start = gpa - lookup.offset;
+            uint64_t region_end = gpa + lookup.avail;
+            uint64_t lo = region_start > page ? region_start : page;
+            uint64_t hi = region_end < page + UINT64_C(0x1000)
+                              ? region_end
+                              : page + UINT64_C(0x1000);
+
+            if (gpa < lo || gpa + len > hi) {
+                entry->valid = 0; /* page straddles a region edge */
+                return true;
+            }
+            entry->gpa = lo;
+            entry->hpa = lookup.hpa - (gpa - lo);
+            entry->span = hi - lo;
+            entry->generation = dma->map->generation;
+            entry->valid = 1;
+        }
+        return true;
     }
-    *out = (uint8_t *)(uintptr_t)lookup.hpa;
-    return true;
 }
 
 int loongemu_guest_dma_read(const LoongemuGuestDma *dma, uint64_t gpa,
