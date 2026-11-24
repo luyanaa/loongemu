@@ -391,6 +391,8 @@ static void tlb_insert(CPUArchState *env, uint64_t va, uint64_t pte,
 
     e->valid = 0;
     e->plan_valid = 0;
+    e->plan_ctx = 0;
+    e->plan_ok_kinds = 0;
     e->va_page = va >> 12;
     e->satp = env->csr[CSR_SATP_ADDR];
     e->pte = pte;
@@ -763,6 +765,136 @@ static void tlb_plan_fill(CPUArchState *env, LatrTlbEntry *e, uint64_t pa,
     e->plan_valid = 1;
 }
 
+/*
+ * The permission verdict for a TLB entry depends on who is asking (privilege,
+ * mstatus.SUM/MXR) and on what for (load/store/fetch). `plan_ctx` records the
+ * first half and `plan_ok_kinds` the kinds already validated under it, so the
+ * fast path can prove "this entry was permission-checked for exactly this
+ * request" from two bytes instead of re-running pte_permits().
+ */
+static uint8_t plan_ctx_key(const CPUArchState *env, unsigned access)
+{
+    uint64_t status = env->csr[CSR_MSTATUS_ADDR];
+    unsigned privilege = effective_privilege(env, access);
+    unsigned sum = (unsigned)((status >> MSTATUS_SUM_BIT) & 1u);
+    unsigned mxr = (unsigned)((status >> MSTATUS_MXR_BIT) & 1u);
+
+    return (uint8_t)((privilege & 3u) << 2 | sum << 1 | mxr);
+}
+
+static unsigned plan_kind_bit(unsigned access)
+{
+    if (access == LATR_ACCESS_STORE) {
+        return 1u;
+    }
+    if (access == LATR_ACCESS_EXEC) {
+        return 2u;
+    }
+    return 0u;
+}
+
+/* The walker just accepted this access for this entry: record it. */
+static void tlb_plan_note_access(CPUArchState *env, LatrTlbEntry *e,
+                                 unsigned access)
+{
+    uint8_t ctx = plan_ctx_key(env, access);
+
+    if (e->plan_ctx != ctx) {
+        e->plan_ctx = ctx;
+        e->plan_ok_kinds = 0;
+    }
+    e->plan_ok_kinds |= (uint8_t)(1u << plan_kind_bit(access));
+}
+
+/*
+ * Serve an access straight from the cached plan, without the walker.
+ *
+ * Every check here corresponds to something latr_walk() would have done:
+ *   - pending SFENCE/FENCE.I or an unapplied flush  -> let the walker apply it
+ *   - satp / va_page mismatch                       -> different translation
+ *   - plan map/generation mismatch                  -> region set changed
+ *   - plan_ctx / kind not validated                 -> permission not proven
+ *   - PTE no longer equals the snapshot             -> unsynchronised edit
+ *   - A/D not set                                   -> walker updates + refills
+ *   - PMP                                           -> always re-evaluated
+ *
+ * Returns 0 when it served the access, a fault cause (> 0) when it decided a
+ * fault, and -1 when the caller must take the normal path.
+ */
+static int latr_fast_access(CPUArchState *env, uint64_t va, unsigned access,
+                            unsigned size, uint64_t *host, uint64_t *phys)
+{
+    LatrTlbEntry *e;
+    uint64_t pte;
+    uint64_t required;
+    uint64_t pa;
+    int pmp;
+
+    if (env->mem_map == NULL) {
+        return -1;
+    }
+    if (env->sfence_pending || env->fence_i_pending ||
+        env->tlb_flush_seq != env->tlb_flush_seen) {
+        return -1;
+    }
+    e = &env->tlb[(va >> 12) & (LATR_TLB_ENTRIES - 1)];
+    if (!e->valid || e->va_page != (va >> 12) ||
+        e->satp != env->csr[CSR_SATP_ADDR]) {
+        return -1;
+    }
+    if (!e->plan_valid || e->plan_map != env->mem_map ||
+        e->plan_gen != env->mem_map->generation) {
+        return -1;
+    }
+    if (e->plan_ctx != plan_ctx_key(env, access) ||
+        !(e->plan_ok_kinds & (uint8_t)(1u << plan_kind_bit(access)))) {
+        return -1;
+    }
+    pte = *(volatile uint64_t *)(uintptr_t)e->pte_host;
+    if (pte != e->pte) {
+        return -1;
+    }
+    required = LATR_PTE_A;
+    if (access == LATR_ACCESS_STORE) {
+        required |= LATR_PTE_D;
+    }
+    if ((pte & required) != required) {
+        return -1;
+    }
+    pa = e->pa_page | (va & e->page_mask);
+    if (pa < e->plan_page || pa + size > e->plan_page + e->plan_span) {
+        return -1;
+    }
+    pmp = latr_pmp_check(env, pa, size, access,
+                         effective_privilege(env, access));
+    if (pmp != 0) {
+        return pmp;
+    }
+    if (phys != NULL) {
+        *phys = pa;
+    }
+    switch ((LoongemuMemKind)e->plan_kind) {
+    case LOONGEMU_MEM_RAM:
+        *host = e->plan_hpa + (pa - e->plan_page);
+        loongemu_perf_count(LOONGEMU_PERF_FAST_HIT, 1);
+        return 0;
+    case LOONGEMU_MEM_ROM:
+        if (access == LATR_ACCESS_STORE) {
+            return LATR_EXCP_STORE_ACCESS_FAULT;
+        }
+        *host = e->plan_hpa + (pa - e->plan_page);
+        loongemu_perf_count(LOONGEMU_PERF_FAST_HIT, 1);
+        return 0;
+    case LOONGEMU_MEM_MMIO:
+        env->mem_mmio = 1;
+        *host = pa;
+        loongemu_perf_count(LOONGEMU_PERF_FAST_HIT, 1);
+        return 0;
+    default:
+        return -1;
+    }
+}
+
 int latr_translate(CPUArchState *env, uint64_t va, unsigned access,
                    unsigned size, uint64_t *host, uint64_t *phys)
 {
@@ -770,12 +902,29 @@ int latr_translate(CPUArchState *env, uint64_t va, unsigned access,
     int cause;
 
     env->mem_mmio = 0;
+    cause = latr_fast_access(env, va, access, size, host, phys);
+    if (cause == 0) {
+        return 0;
+    }
+    if (cause > 0) {
+        loongemu_perf_count(LOONGEMU_PERF_MEM_FAULT, 1);
+        return cause;
+    }
     cause = latr_walk(env, va, access, &pa);
     if (cause != 0) {
         /* TLB permission faults are already counted at tlb_lookup; this
          * catches what the walk itself rejects. */
         loongemu_perf_count(LOONGEMU_PERF_MEM_FAULT, 1);
         return cause;
+    }
+    {
+        /* The walker validated this access for the entry it filled: remember
+         * the context so the next identical access can take the fast path. */
+        LatrTlbEntry *e = &env->tlb[(va >> 12) & (LATR_TLB_ENTRIES - 1)];
+
+        if (e->valid && e->va_page == (va >> 12)) {
+            tlb_plan_note_access(env, e, access);
+        }
     }
     cause = latr_pmp_check(env, pa, size, access,
                            effective_privilege(env, access));

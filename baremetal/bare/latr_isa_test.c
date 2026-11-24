@@ -1475,6 +1475,26 @@ static uint64_t *alloc_pte_table(void)
     return pte_table[pte_tables_used++];
 }
 
+/* Leaf PTE of `va` under the tables map_page() builds, so a test can edit a
+ * page table behind the walker's back. NULL when no leaf exists. */
+static uint64_t *leaf_pte(unsigned mode, uint64_t va)
+{
+    int levels = mode == 8 ? 3 : mode == 9 ? 4 : 5;
+    uint64_t *table = pte_table[0];
+
+    for (int level = levels - 1; level > 0; level--) {
+        uint64_t vpn = (va >> (12 + 9 * level)) & 0x1ff;
+
+        if ((table[vpn] & LATR_PTE_V) == 0) {
+            return NULL;
+        }
+        table = (uint64_t *)(uintptr_t)(((table[vpn] >> LATR_PTE_PPN_SHIFT) &
+                                        LATR_PTE_PPN_MASK)
+                                       << 12);
+    }
+    return &table[(va >> 12) & 0x1ff];
+}
+
 /* Maps one 4 KiB page under Sv39/Sv48/Sv57, allocating sub-tables. */
 static void map_page(unsigned mode, uint64_t va, uint64_t pa, uint64_t flags)
 {
@@ -1743,6 +1763,90 @@ static void test_phys_map(void)
           "access running past the region end still faults");
     check(loongemu_mem_map_remove(&test_mem_map, UINT64_C(0x4000)), 1,
           "short RAM window is removed");
+
+    /*
+     * The fast path may skip pte_permits() only when the entry was validated
+     * for the *same* privilege / SUM / MXR context and the same access kind,
+     * and only while the leaf PTE still equals the snapshot. Each of those is
+     * checked below by changing exactly one of them between two accesses that
+     * the fast path would otherwise have served.
+     */
+    check(loongemu_mem_map_add(&test_mem_map, UINT64_C(0x6000),
+                               UINT64_C(0x1000),
+                               (uint64_t)(uintptr_t)map_host_page2,
+                               LOONGEMU_MEM_RAM, "ctx-ram"),
+          1, "context-test RAM window registers");
+    clear_page_tables();
+    map_page(8, UINT64_C(0x1c000), UINT64_C(0x6000),
+             LATR_PTE_V | LATR_PTE_R | LATR_PTE_W | LATR_PTE_U |
+                 LATR_PTE_A | LATR_PTE_D);
+    reset_guest_state();
+    env.privilege = LATR_RISCV_PRIV_S;
+    env.csr[0x180] = (UINT64_C(8) << 60) |
+                     ((uint64_t)(uintptr_t)pte_table[0] >> 12);
+    env.mem_map = &test_mem_map;
+    /* S-mode touching a U page needs mstatus.SUM. */
+    (void)latr_resolve_guest_address(&env, UINT64_C(0x1c010),
+                                     LATR_ACCESS_LOAD, 8);
+    check(env.mem_fault_cause, LATR_EXCP_LOAD_PAGE_FAULT,
+          "S-mode load of a U page faults without SUM");
+    env.csr[0x300] |= UINT64_C(1) << 18; /* SUM = 1 */
+    check(latr_resolve_guest_address(&env, UINT64_C(0x1c010),
+                                     LATR_ACCESS_LOAD, 8),
+          (uint64_t)(uintptr_t)map_host_page2 + 0x10,
+          "SUM=1 lets the same access through");
+    check(latr_resolve_guest_address(&env, UINT64_C(0x1c018),
+                                     LATR_ACCESS_LOAD, 8),
+          (uint64_t)(uintptr_t)map_host_page2 + 0x18,
+          "repeat access under the same context");
+    env.csr[0x300] &= ~(UINT64_C(1) << 18); /* SUM = 0 */
+    (void)latr_resolve_guest_address(&env, UINT64_C(0x1c010),
+                                     LATR_ACCESS_LOAD, 8);
+    check(env.mem_fault_cause, LATR_EXCP_LOAD_PAGE_FAULT,
+          "clearing SUM invalidates the cached verdict");
+    env.csr[0x300] |= UINT64_C(1) << 18;
+
+    /* An unsynchronised page-table edit must be observed, not patched over. */
+    {
+        uint64_t *pte = leaf_pte(8, UINT64_C(0x1c020));
+
+        check(pte != NULL, 1, "leaf PTE is locatable");
+        if (pte != NULL) {
+            uint64_t saved = *pte;
+
+            *pte = saved & ~LATR_PTE_V;
+            (void)latr_resolve_guest_address(&env, UINT64_C(0x1c020),
+                                             LATR_ACCESS_LOAD, 8);
+            check(env.mem_fault_cause, LATR_EXCP_LOAD_PAGE_FAULT,
+                  "a leaf-V clear behind the walker's back faults");
+            *pte = saved;
+            check(latr_resolve_guest_address(&env, UINT64_C(0x1c020),
+                                             LATR_ACCESS_LOAD, 8),
+                  (uint64_t)(uintptr_t)map_host_page2 + 0x20,
+                  "restoring the PTE makes the access work again");
+        }
+    }
+
+    /* A store is a different access kind: it needs its own validation. */
+    reset_guest_state();
+    env.privilege = LATR_RISCV_PRIV_S;
+    env.csr[0x180] = (UINT64_C(8) << 60) |
+                     ((uint64_t)(uintptr_t)pte_table[0] >> 12);
+    env.csr[0x300] |= UINT64_C(1) << 18;
+    env.mem_map = &test_mem_map;
+    check(latr_resolve_guest_address(&env, UINT64_C(0x1c030),
+                                     LATR_ACCESS_LOAD, 8),
+          (uint64_t)(uintptr_t)map_host_page2 + 0x30, "load in the ctx page");
+    check(latr_resolve_guest_address(&env, UINT64_C(0x1c030),
+                                     LATR_ACCESS_STORE, 8),
+          (uint64_t)(uintptr_t)map_host_page2 + 0x30,
+          "store to the same address validates its own kind");
+    check(latr_resolve_guest_address(&env, UINT64_C(0x1c038),
+                                     LATR_ACCESS_STORE, 8),
+          (uint64_t)(uintptr_t)map_host_page2 + 0x38,
+          "second store is served from the store bit");
+    check(loongemu_mem_map_remove(&test_mem_map, UINT64_C(0x6000)), 1,
+          "context-test RAM window is removed");
 }
 
 static LoongemuMmioBus test_bus;
@@ -6476,6 +6580,7 @@ void kmain(void)
          * does not drive, so those counters stay out of this line. */
         static const char *const names[] = {
             "tlb-hit", "tlb-miss", "mmio", "mem-fault", "plan-hit",
+            "fast-hit",
         };
         const unsigned report = (unsigned)(sizeof(names) / sizeof(names[0]));
 

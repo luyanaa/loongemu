@@ -146,6 +146,7 @@ void kmain(void)
          * fast-path work has to move, as opposed to the ISA suite's mix. */
         static const char *const names[] = {
             "tlb-hit", "tlb-miss", "mmio", "mem-fault", "plan-hit",
+            "fast-hit",
         };
         const unsigned report = (unsigned)(sizeof(names) / sizeof(names[0]));
 

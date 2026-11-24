@@ -56,6 +56,14 @@ typedef struct LatrTlbEntry {
     uint64_t plan_span;
     const void *plan_map; /* LoongemuMemMap the plan was resolved against */
     uint32_t plan_gen;
+    /*
+     * Access kinds this entry has already been permission-checked for under
+     * `plan_ctx` (privilege | mstatus.SUM | mstatus.MXR). A fast access may
+     * only skip the permission logic when its own context and kind are
+     * recorded here and the PTE still matches `pte`.
+     */
+    uint8_t plan_ctx;
+    uint8_t plan_ok_kinds;
     uint8_t plan_valid;
     uint8_t plan_kind;
     uint32_t valid;
