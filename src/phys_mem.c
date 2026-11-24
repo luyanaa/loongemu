@@ -18,6 +18,7 @@ void loongemu_mem_map_init(LoongemuMemMap *map)
         return;
     }
     map->count = 0;
+    map->generation++;
 }
 
 static uint8_t default_mat_for_kind(LoongemuMemKind kind)
@@ -72,6 +73,7 @@ int loongemu_mem_map_add_mat(LoongemuMemMap *map,
     map->regions[map->count].reserved[2] = 0;
     map->regions[map->count].name = name;
     map->count++;
+    map->generation++;
     return 1;
 }
 
@@ -97,6 +99,7 @@ int loongemu_mem_map_remove(LoongemuMemMap *map, uint64_t gpa_base)
                 map->regions[j - 1u] = map->regions[j];
             }
             map->count--;
+            map->generation++;
             return 1;
         }
     }

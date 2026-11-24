@@ -1569,6 +1569,7 @@ static void test_mmu_fetch(void)
 }
 
 static uint64_t map_host_page[1024] __attribute__((aligned(4096)));
+static uint64_t map_host_page2[1024] __attribute__((aligned(4096)));
 static LoongemuMemMap test_mem_map;
 
 static void test_phys_map(void)
@@ -1666,6 +1667,82 @@ static void test_phys_map(void)
     check(latr_resolve_guest_address(&env, UINT64_C(0x1010),
                                      LATR_ACCESS_LOAD, 8),
           UINT64_C(0x1010), "no map keeps the identity translation");
+
+    /*
+     * The TLB caches the physical-map resolution of a page so a repeat access
+     * skips the region lookup. Two things must still hold: the cached plan is
+     * used for the right bytes, and a structural map change (generation bump)
+     * forces a refill instead of handing back the old host page.
+     */
+    clear_page_tables();
+    map_page(8, UINT64_C(0x10000), UINT64_C(0x1000),
+             LATR_PTE_V | LATR_PTE_R | LATR_PTE_W | LATR_PTE_X);
+    reset_guest_state();
+    env.privilege = 1;
+    env.csr[0x180] = (UINT64_C(8) << 60) |
+                     ((uint64_t)(uintptr_t)pte_table[0] >> 12);
+    env.mem_map = &test_mem_map;
+    check(latr_resolve_guest_address(&env, UINT64_C(0x10010),
+                                     LATR_ACCESS_LOAD, 8),
+          (uint64_t)(uintptr_t)map_host_page + 0x10,
+          "first access fills the map plan");
+    check(latr_resolve_guest_address(&env, UINT64_C(0x10018),
+                                     LATR_ACCESS_LOAD, 8),
+          (uint64_t)(uintptr_t)map_host_page + 0x18,
+          "repeat access reuses the plan at the right offset");
+    check(latr_resolve_guest_address(&env, UINT64_C(0x10008),
+                                     LATR_ACCESS_STORE, 8),
+          (uint64_t)(uintptr_t)map_host_page + 0x8,
+          "store to the planned page resolves");
+    check(env.mem_fault_cause, 0, "planned store does not fault");
+
+    /* Move the RAM window to a different host page: the plan must not survive
+     * the map change. */
+    check(loongemu_mem_map_remove(&test_mem_map, UINT64_C(0x1000)), 1,
+          "RAM window is removable for the remap test");
+    check(loongemu_mem_map_add(&test_mem_map, UINT64_C(0x1000),
+                               UINT64_C(0x1000),
+                               (uint64_t)(uintptr_t)map_host_page2,
+                               LOONGEMU_MEM_RAM, "ram2"),
+          1, "RAM window re-registers at a new host page");
+    check(latr_resolve_guest_address(&env, UINT64_C(0x10010),
+                                     LATR_ACCESS_LOAD, 8),
+          (uint64_t)(uintptr_t)map_host_page2 + 0x10,
+          "generation bump refills the plan at the new host page");
+    check(loongemu_mem_map_remove(&test_mem_map, UINT64_C(0x1000)), 1,
+          "second RAM window is removable");
+    check(loongemu_mem_map_add(&test_mem_map, UINT64_C(0x1000),
+                               UINT64_C(0x1000),
+                               (uint64_t)(uintptr_t)map_host_page,
+                               LOONGEMU_MEM_RAM, "ram"),
+          1, "original RAM window is restored");
+
+    /* A region shorter than a page clips the plan: an access that runs past
+     * the region end must fault even though the earlier one in the same page
+     * succeeded. */
+    clear_page_tables();
+    map_page(8, UINT64_C(0x14000), UINT64_C(0x4000),
+             LATR_PTE_V | LATR_PTE_R | LATR_PTE_W);
+    check(loongemu_mem_map_add(&test_mem_map, UINT64_C(0x4000),
+                               UINT64_C(0x100),
+                               (uint64_t)(uintptr_t)map_host_page2,
+                               LOONGEMU_MEM_RAM, "short"),
+          1, "short RAM window registers");
+    reset_guest_state();
+    env.privilege = 1;
+    env.csr[0x180] = (UINT64_C(8) << 60) |
+                     ((uint64_t)(uintptr_t)pte_table[0] >> 12);
+    env.mem_map = &test_mem_map;
+    check(latr_resolve_guest_address(&env, UINT64_C(0x14080),
+                                     LATR_ACCESS_LOAD, 8),
+          (uint64_t)(uintptr_t)map_host_page2 + 0x80,
+          "access inside the short window resolves");
+    (void)latr_resolve_guest_address(&env, UINT64_C(0x140fc),
+                                     LATR_ACCESS_LOAD, 8);
+    check(env.mem_fault_cause, LATR_EXCP_LOAD_ACCESS_FAULT,
+          "access running past the region end still faults");
+    check(loongemu_mem_map_remove(&test_mem_map, UINT64_C(0x4000)), 1,
+          "short RAM window is removed");
 }
 
 static LoongemuMmioBus test_bus;
@@ -6390,7 +6467,7 @@ void kmain(void)
         /* `make latr-isa-run PERF=1` reports the guest-access event mix; the
          * default build has no counters and prints nothing. */
         static const char *const names[LOONGEMU_PERF_COUNTERS] = {
-            "tlb-hit", "tlb-miss", "mmio", "mem-fault",
+            "tlb-hit", "tlb-miss", "mmio", "mem-fault", "plan-hit",
         };
 
         latx_bare_uart_puts("\nlatr-perf:");

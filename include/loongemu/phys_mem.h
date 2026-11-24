@@ -51,6 +51,12 @@ typedef struct LoongemuMemRegion {
 typedef struct LoongemuMemMap {
     LoongemuMemRegion regions[LOONGEMU_MEM_MAX_REGIONS];
     uint32_t count;
+    /*
+     * Bumped by every structural change (init/add/remove). Caches that hold a
+     * resolved GPA -> HPA/kind result (the translator's TLB plan) compare it
+     * with the value they filled from and refill when it moves.
+     */
+    uint32_t generation;
 } LoongemuMemMap;
 
 typedef struct LoongemuMemLookup {

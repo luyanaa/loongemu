@@ -14,6 +14,7 @@ enum {
     LOONGEMU_PERF_TLB_MISS,
     LOONGEMU_PERF_MMIO_ACCESS,
     LOONGEMU_PERF_MEM_FAULT,
+    LOONGEMU_PERF_PLAN_HIT, /* TLB hit that also reused the cached map plan */
     LOONGEMU_PERF_COUNTERS
 };
 

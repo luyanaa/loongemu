@@ -390,6 +390,7 @@ static void tlb_insert(CPUArchState *env, uint64_t va, uint64_t pte,
     LatrTlbEntry *e = &env->tlb[(va >> 12) & (LATR_TLB_ENTRIES - 1)];
 
     e->valid = 0;
+    e->plan_valid = 0;
     e->va_page = va >> 12;
     e->satp = env->csr[CSR_SATP_ADDR];
     e->pte = pte;
@@ -716,6 +717,52 @@ uint64_t latr_cross_store(CPUArchState *env, uint64_t va, unsigned size,
     return 0;
 }
 
+/*
+ * Cache the physical-memory resolution of the page that `pa` falls in, so the
+ * next TLB hit on the same page skips loongemu_mem_resolve(). The plan records
+ * the byte range [plan_page, plan_page + plan_span) that resolves identically:
+ * it is clipped to the containing region and to the 4 KiB page, and an access
+ * that would cross either edge simply misses and re-resolves.
+ *
+ * UNMAPPED and RESERVED are deliberately never planned: their verdict depends
+ * on where the *next* region starts, which the lookup does not report.
+ */
+static void tlb_plan_fill(CPUArchState *env, LatrTlbEntry *e, uint64_t pa,
+                          unsigned size)
+{
+    LoongemuMemLookup lookup;
+    LoongemuMemKind kind = loongemu_mem_resolve(env->mem_map, pa, size, &lookup);
+    uint64_t page_start;
+    uint64_t lo;
+    uint64_t hi;
+
+    e->plan_valid = 0;
+    e->plan_kind = (uint8_t)kind;
+    e->plan_gen = env->mem_map->generation;
+    e->plan_map = env->mem_map;
+    if (kind != LOONGEMU_MEM_RAM && kind != LOONGEMU_MEM_ROM &&
+        kind != LOONGEMU_MEM_MMIO) {
+        return;
+    }
+    uint64_t region_start = pa - lookup.offset;
+    uint64_t region_end = pa + lookup.avail;
+
+    page_start = pa & ~UINT64_C(0xfff);
+    lo = region_start > page_start ? region_start : page_start;
+    hi = region_end < page_start + UINT64_C(0x1000)
+             ? region_end
+             : page_start + UINT64_C(0x1000);
+    if (pa < lo || pa + size > hi) {
+        return;
+    }
+    e->plan_page = lo;
+    e->plan_span = hi - lo;
+    e->plan_hpa = (kind == LOONGEMU_MEM_RAM || kind == LOONGEMU_MEM_ROM)
+                      ? lookup.hpa - (pa - lo)
+                      : 0;
+    e->plan_valid = 1;
+}
+
 int latr_translate(CPUArchState *env, uint64_t va, unsigned access,
                    unsigned size, uint64_t *host, uint64_t *phys)
 {
@@ -741,6 +788,36 @@ int latr_translate(CPUArchState *env, uint64_t va, unsigned access,
     if (env->mem_map == NULL) {
         *host = pa;
         return 0;
+    }
+
+    {
+        LatrTlbEntry *e = &env->tlb[(va >> 12) & (LATR_TLB_ENTRIES - 1)];
+
+        if (e->valid && e->va_page == (va >> 12) && e->plan_valid &&
+            e->plan_map == env->mem_map &&
+            e->plan_gen == env->mem_map->generation &&
+            pa >= e->plan_page && pa + size <= e->plan_page + e->plan_span) {
+            loongemu_perf_count(LOONGEMU_PERF_PLAN_HIT, 1);
+            switch ((LoongemuMemKind)e->plan_kind) {
+            case LOONGEMU_MEM_RAM:
+                *host = e->plan_hpa + (pa - e->plan_page);
+                return 0;
+            case LOONGEMU_MEM_ROM:
+                if (access == LATR_ACCESS_STORE) {
+                    return LATR_EXCP_STORE_ACCESS_FAULT;
+                }
+                *host = e->plan_hpa + (pa - e->plan_page);
+                return 0;
+            case LOONGEMU_MEM_MMIO:
+                env->mem_mmio = 1;
+                loongemu_perf_count(LOONGEMU_PERF_MMIO_ACCESS, 1);
+                *host = pa;
+                return 0;
+            default:
+                break; /* not planned; fall through and re-resolve */
+            }
+        }
+        tlb_plan_fill(env, e, pa, size);
     }
 
     LoongemuMemLookup lookup;

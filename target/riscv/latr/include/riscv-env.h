@@ -43,6 +43,21 @@ typedef struct LatrTlbEntry {
     uint64_t pte_host;  /* host address of the leaf PTE */
     uint64_t pa_page;   /* leaf PPN << 12 */
     uint64_t page_mask; /* VA/PA offset mask for the leaf level */
+    /*
+     * Cached resolution of pa_page through the physical memory map, so a TLB
+     * hit does not re-walk the region list. `plan_gen` is the map generation
+     * the plan was filled from; a mismatch forces a refill. `plan_page` is
+     * the guest-physical page base the plan covers, and `plan_span` how many
+     * bytes it is valid for (0 = only `plan_page` itself, no reuse).
+     * `plan_kind` keeps the LoongemuMemKind the range resolved to.
+     */
+    uint64_t plan_hpa;  /* HPA of plan_page for RAM/ROM, else 0 */
+    uint64_t plan_page;
+    uint64_t plan_span;
+    const void *plan_map; /* LoongemuMemMap the plan was resolved against */
+    uint32_t plan_gen;
+    uint8_t plan_valid;
+    uint8_t plan_kind;
     uint32_t valid;
 } LatrTlbEntry;
 
