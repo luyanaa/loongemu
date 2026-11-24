@@ -632,11 +632,25 @@ int latr_machine_host_fault(LatrMachine *m, uint32_t hartid,
             latr_context_restore(saved);
             return 0;
         }
+#ifdef LOONGEMU_PERF
+        uint64_t recovery_started = loongemu_perf_now();
+#endif
         applied = latr_tb_recovery_apply(span, rmap, host_gprs, host_fprs,
                                          &h->env);
+#ifdef LOONGEMU_PERF
+        loongemu_perf_count(LOONGEMU_PERF_RECOVERY_TICKS,
+                            loongemu_perf_now() - recovery_started);
+#endif
     } else if (host_gprs != NULL) {
+#ifdef LOONGEMU_PERF
+        uint64_t recovery_started = loongemu_perf_now();
+#endif
         applied = latr_tb_recovery_apply(span, rmap, host_gprs, host_fprs,
                                          &h->env);
+#ifdef LOONGEMU_PERF
+        loongemu_perf_count(LOONGEMU_PERF_RECOVERY_TICKS,
+                            loongemu_perf_now() - recovery_started);
+#endif
     }
     if (info != NULL) {
         info->applied = applied;

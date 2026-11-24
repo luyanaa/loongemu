@@ -18,6 +18,8 @@ enum {
     LOONGEMU_PERF_FAST_HIT, /* access served without entering the walker */
     LOONGEMU_PERF_TB_COMPILE_TICKS, /* translate+assemble time per TB */
     LOONGEMU_PERF_TB_EXEC_TICKS,    /* time spent inside generated code */
+    LOONGEMU_PERF_MMIO_TICKS,       /* ticks inside the MMIO dispatch helpers */
+    LOONGEMU_PERF_RECOVERY_TICKS,   /* ticks spent replaying recovery bindings */
     LOONGEMU_PERF_COUNTERS
 };
 

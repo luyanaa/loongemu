@@ -7,10 +7,14 @@
 #include "latr.h"
 #include "mmu.h"
 #include "loongemu/mmio_bus.h"
+#include "loongemu-perf.h"
 
 uint64_t latr_mmio_load(CPUArchState *env, uint64_t pa, unsigned size)
 {
     uint64_t value = 0;
+#ifdef LOONGEMU_PERF
+    uint64_t started = loongemu_perf_now();
+#endif
 
     env->mem_mmio = 0;
     if (env->mmio == 0 ||
@@ -19,12 +23,19 @@ uint64_t latr_mmio_load(CPUArchState *env, uint64_t pa, unsigned size)
         return 0;
     }
     env->mem_fault_cause = 0;
+#ifdef LOONGEMU_PERF
+    loongemu_perf_count(LOONGEMU_PERF_MMIO_TICKS, loongemu_perf_now() - started);
+#endif
     return value;
 }
 
 void latr_mmio_store(CPUArchState *env, uint64_t pa, unsigned size,
                      uint64_t value)
 {
+#ifdef LOONGEMU_PERF
+    uint64_t started = loongemu_perf_now();
+#endif
+
     env->mem_mmio = 0;
     if (env->mmio == 0 ||
         loongemu_mmio_bus_write(env->mmio, pa, size, value) != 0) {
@@ -32,4 +43,7 @@ void latr_mmio_store(CPUArchState *env, uint64_t pa, unsigned size,
         return;
     }
     env->mem_fault_cause = 0;
+#ifdef LOONGEMU_PERF
+    loongemu_perf_count(LOONGEMU_PERF_MMIO_TICKS, loongemu_perf_now() - started);
+#endif
 }
