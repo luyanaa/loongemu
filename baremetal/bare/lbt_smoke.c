@@ -8,7 +8,7 @@ uint64_t membuf[2];
 void run_lbt(void);
 void kmain(void);
 __asm__(
-".text\n.globl _start\n_start:\n la $sp, kstack\n lu12i.w $t0, 16\n add.d $sp,$sp,$t0\n bl kmain\n1: b 1b\n"
+".text\n.globl _start\n_start:\n pcalau12i $sp, %pc_hi20(kstack)\n  addi.d $sp, $sp, %pc_lo12(kstack)\n lu12i.w $t0, 16\n add.d $sp,$sp,$t0\n bl kmain\n1: b 1b\n"
 ".text\n.globl run_lbt\nrun_lbt:\n"
 " la $s0, out\n"
 " la $t0, membuf\n addi.d $t0, $t0, 1\n"

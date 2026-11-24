@@ -91,7 +91,7 @@ __asm__(
 "  jirl   $zero, $ra, 0\n");
 
 void kmain(void);
-__asm__(".text\n.globl _start\n_start:\n  la $sp, opensbi_stack\n"
+__asm__(".text\n.globl _start\n_start:\n  pcalau12i $sp, %pc_hi20(opensbi_stack)\n  addi.d $sp, $sp, %pc_lo12(opensbi_stack)\n"
         "  lu12i.w $t0, 256\n  add.d $sp, $sp, $t0\n  bl kmain\n1: b 1b\n");
 static uint8_t opensbi_stack[1u << 20] __attribute__((aligned(16), used));
 

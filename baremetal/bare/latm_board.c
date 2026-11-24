@@ -862,7 +862,7 @@ void kmain(void)
     latx_bare_uart_puts("\nlatm-board: done\n");
 }
 void kmain(void);
-__asm__(".text\n.globl _start\n_start:\n  la $sp, kstack\n  lu12i.w $t0, 16\n"
+__asm__(".text\n.globl _start\n_start:\n  pcalau12i $sp, %pc_hi20(kstack)\n  addi.d $sp, $sp, %pc_lo12(kstack)\n  lu12i.w $t0, 16\n"
         "  add.d $sp, $sp, $t0\n  bl kmain\n1:\n  b 1b\n");
 static char kstack[65536] __attribute__((aligned(16), used));
 FILE *stderr;

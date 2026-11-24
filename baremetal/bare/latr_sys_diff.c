@@ -36,7 +36,7 @@ void latx_bare_uart_puts(const char *s)
 
 
 void kmain(void);
-__asm__(".text\n.globl _start\n_start:\n  la $sp, latr_sys_stack\n"
+__asm__(".text\n.globl _start\n_start:\n  pcalau12i $sp, %pc_hi20(latr_sys_stack)\n  addi.d $sp, $sp, %pc_lo12(latr_sys_stack)\n"
         "  lu12i.w $t0, 128\n  add.d $sp, $sp, $t0\n  bl kmain\n1: b 1b\n");
 static uint8_t latr_sys_stack[512u << 10] __attribute__((aligned(16), used));
 
