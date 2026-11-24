@@ -259,8 +259,17 @@ const LatrTbInsnSpan *latr_tb_recovery_resolve(uintptr_t host_pc,
  * register file in $r0..$r31 order (what a ucontext/sigframe provides). Each
  * binding's `temp` is the host phys reg number (la_t0..la_t5 == 12..17) that
  * held the uncommitted guest value, so env->gpr[guest_reg] = host_gprs[temp].
+ *
  * Returns false for NATIVE_INTERNAL rows: a fault there is a host bug and must
  * never be dressed up as a guest exception.
+ *
+ * Two rules make the writeback atomic:
+ *   - the snapshot must cover what the span needs. A GPR binding with no
+ *     `host_gprs` (or an FPR binding with no `host_fprs`) means the state is
+ *     unknown, and applying only the reachable half would hand the guest a
+ *     register file that never existed;
+ *   - every binding is validated before the first store, so a bad row leaves
+ *     env untouched instead of half-patched.
  */
 bool latr_tb_recovery_apply(const LatrTbInsnSpan *span,
                             const LatrTbInsnMap *map,
@@ -268,22 +277,41 @@ bool latr_tb_recovery_apply(const LatrTbInsnSpan *span,
                             const uint64_t host_fprs[32],
                             CPUArchState *env)
 {
-    if (span == NULL || env == NULL ||
+    uint64_t gprs[32];
+    uint64_t fprs[32];
+    uint64_t gpr_mask = 0;
+    uint64_t fpr_mask = 0;
+
+    if (span == NULL || env == NULL || map == NULL ||
         span->site == LATR_RECOV_NATIVE_INTERNAL) {
         return false;
     }
     for (uint8_t i = 0; i < span->bind_cnt; i++) {
         const LatrRecoveryBinding *b = &map->binds[span->bind_first + i];
-        int host_reg = b->temp;
-        if (b->is_fpr) {
-            if (host_fprs && host_reg >= 0 && host_reg < 32 &&
-                b->guest_reg < 32) {
-                env->fpr[b->guest_reg] = host_fprs[host_reg];
-            }
-            continue;
+
+        if (b->guest_reg >= 32 || b->temp < 0 || b->temp >= 32) {
+            return false;
         }
-        if (host_reg >= 0 && host_reg < 32 && b->guest_reg < 32) {
-            env->gpr[b->guest_reg] = host_gprs[host_reg];
+        if (b->is_fpr) {
+            if (host_fprs == NULL) {
+                return false;
+            }
+            fprs[b->guest_reg] = host_fprs[b->temp];
+            fpr_mask |= UINT64_C(1) << b->guest_reg;
+        } else {
+            if (host_gprs == NULL) {
+                return false;
+            }
+            gprs[b->guest_reg] = host_gprs[b->temp];
+            gpr_mask |= UINT64_C(1) << b->guest_reg;
+        }
+    }
+    for (unsigned reg = 0; reg < 32; reg++) {
+        if (gpr_mask & (UINT64_C(1) << reg)) {
+            env->gpr[reg] = gprs[reg];
+        }
+        if (fpr_mask & (UINT64_C(1) << reg)) {
+            env->fpr[reg] = fprs[reg];
         }
     }
     env->pc = span->guest_pc;

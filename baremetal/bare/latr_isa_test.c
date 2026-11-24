@@ -2404,6 +2404,85 @@ static void test_tb_recovery(void)
     }
 }
 
+/*
+ * Recovery writeback must be all-or-nothing: a span whose snapshot does not
+ * cover its bindings, or whose rows are malformed, must leave the guest
+ * register file exactly as it was. A half-applied replay would deliver a trap
+ * over state the guest never had.
+ */
+static void test_recovery_atomic_apply(void)
+{
+    static LatrTbInsnMap map;
+    LatrTbInsnSpan span;
+    uint64_t host[32];
+    uint64_t fhost[32];
+
+    for (size_t i = 0; i < sizeof(map); i++) {
+        ((uint8_t *)&map)[i] = 0;
+    }
+    memset(&span, 0, sizeof(span));
+    memset(host, 0, sizeof(host));
+    memset(fhost, 0, sizeof(fhost));
+    host[3] = UINT64_C(0x7777);
+    host[4] = UINT64_C(0x8888);
+    fhost[7] = UINT64_C(0x9999);
+
+    map.binds[0].guest_reg = 5;
+    map.binds[0].temp = 3;
+    map.binds[1].guest_reg = 6;
+    map.binds[1].temp = 4;
+    span.site = LATR_RECOV_GUEST_ACCESS;
+    span.phase = LE_PHASE_BEFORE_INSN;
+    span.guest_pc = UINT64_C(0x1234);
+    span.bind_first = 0;
+    span.bind_cnt = 2;
+
+    reset_guest_state();
+    env.gpr[5] = UINT64_C(0xaa);
+    env.gpr[6] = UINT64_C(0xbb);
+    env.pc = UINT64_C(0xdead);
+
+    /* No snapshot: nothing may change, not even pc. */
+    check(latr_tb_recovery_apply(&span, &map, NULL, NULL, &env), 0,
+          "missing GPR snapshot is refused");
+    check(env.gpr[5], UINT64_C(0xaa), "refused apply leaves gpr5 alone");
+    check(env.gpr[6], UINT64_C(0xbb), "refused apply leaves gpr6 alone");
+    check(env.pc, UINT64_C(0xdead), "refused apply leaves pc alone");
+
+    /* A malformed row rejects the whole span. */
+    map.binds[1].temp = 40; /* outside the host register file */
+    check(latr_tb_recovery_apply(&span, &map, host, NULL, &env), 0,
+          "out-of-range host register refuses the span");
+    check(env.gpr[5], UINT64_C(0xaa), "bad row leaves the first binding unapplied");
+    check(env.gpr[6], UINT64_C(0xbb), "bad row leaves the second binding unapplied");
+    map.binds[1].temp = 4;
+
+    /* Valid snapshot: both bindings land and pc points at the span. */
+    check(latr_tb_recovery_apply(&span, &map, host, fhost, &env), 1,
+          "valid snapshot applies");
+    check(env.gpr[5], UINT64_C(0x7777), "first binding committed");
+    check(env.gpr[6], UINT64_C(0x8888), "second binding committed");
+    check(env.pc, UINT64_C(0x1234), "pc projection committed");
+
+    /* An FPR binding without the FPR snapshot is refused the same way. */
+    memset(&span, 0, sizeof(span));
+    span.site = LATR_RECOV_GUEST_ACCESS;
+    span.guest_pc = UINT64_C(0x4321);
+    span.bind_first = 0;
+    span.bind_cnt = 1;
+    map.binds[0].guest_reg = 9;
+    map.binds[0].temp = 7;
+    map.binds[0].is_fpr = 1;
+    env.fpr[9] = UINT64_C(0xcc);
+    env.pc = UINT64_C(0xbeef);
+    check(latr_tb_recovery_apply(&span, &map, host, NULL, &env), 0,
+          "missing FPR snapshot is refused");
+    check(env.fpr[9], UINT64_C(0xcc), "refused FPR apply leaves the register");
+    check(latr_tb_recovery_apply(&span, &map, host, fhost, &env), 1,
+          "FPR snapshot applies");
+    check(env.fpr[9], UINT64_C(0x9999), "FPR binding committed");
+}
+
 static void test_mmu_walk(void)
 {
     clear_page_tables();
@@ -6613,6 +6692,7 @@ void kmain(void)
     test_rvv_pvir_lsx_lasx();
     test_tb_insn_map();
     test_tb_recovery();
+    test_recovery_atomic_apply();
     test_mmu_fetch();
     test_counters();
     latx_bare_uart_puts("latr-diff=");
