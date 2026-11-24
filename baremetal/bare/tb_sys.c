@@ -7246,6 +7246,30 @@ static void unlink_tb_at_pc(uint64_t fault_pc)
 
 void tb_sys_handle_trap(uint64_t *regs, int trap_is_refill)
 {
+    /*
+     * The trap stub builds its 256-byte register frame on whatever stack the
+     * PLV3 code was using, and in this harness that is the guest stack. If the
+     * guest's own exception frame (delivery pushes 48 bytes just below the
+     * fault-time rsp) overlaps the stub frame, sync_env_to_trap_regs() writes
+     * over CR2/RIP/EC before the handler can read them -- which surfaces as
+     * eleven unrelated-looking checks failing. Name the hazard instead.
+     */
+    {
+        static int warned;
+        uintptr_t frame_lo = (uintptr_t)regs;
+        uintptr_t frame_hi = frame_lo + 256u;
+        uint64_t guest_sp = env.regs[R_ESP];
+
+        if (!warned && guest_sp >= 64u && frame_lo < guest_sp &&
+            (uintptr_t)(guest_sp - 64u) < frame_hi) {
+            warned = 1;
+            latx_bare_uart_puts("tb-sys: PLV0 trap frame ");
+            puthex((uint64_t)frame_lo);
+            latx_bare_uart_puts(" overlaps the guest #PF frame at ");
+            puthex(guest_sp);
+            latx_bare_uart_puts("\n");
+        }
+    }
     uint64_t tlbrera = csrrd(0x8a);
     uint64_t estat = csrrd(0x5);
     int is_refill = trap_is_refill || (int)(tlbrera & 1u);

@@ -165,9 +165,18 @@ jobs:
           #     err=3 and rsp=0x7fd0.
           # So the pushes did not land where the walker's own read-back looks,
           # even though frame writes and the read-back both use latx_x86_walk.
-          # Next: compare latx_platform_phys_write and latx_platform_phys_read
-          # for the same gpa in that window, i.e. whether the GPA->HPA map used
-          # by the harness diverges between them.
+          # Root cause, located to the statement: the PLV0 trap stub builds its
+          # 256-byte register frame on the *guest* stack (frame 0x7f00 while the
+          # fault-time guest rsp is 0x8000), so sync_env_to_trap_regs() writes
+          # over the exception frame at 0x7fd0/0x7fd8 that delivery just pushed
+          # -- read-backs show 0x7fd0 = 3 until sync, 0x100 after. The harness now
+          # prints `PLV0 trap frame ... overlaps the guest #PF frame at ...` when
+          # that happens (it does for the clang-19 image, never for clang-23).
+          # Switching the stub to the per-core g_trap_stack was tried and broke
+          # PLV3 re-entry (translate failures, lgdt checks), so the fix needs the
+          # question "which register is the PLV3 stack: $sp or $s4?" answered
+          # first -- the stub enters with $sp == guest rsp while reg_gpr_map maps
+          # the guest ESP to $s4.
           # Run it by hand with:
           #   make tb-sys-smp-run QLVZ=/usr/bin/qemu-system-loongarch64
           SCRIPT
