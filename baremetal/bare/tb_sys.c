@@ -8385,6 +8385,17 @@ void kmain(void)
         tb_sys_run_plv3((void *)(uintptr_t)pro_buf,
                         (void *)(uintptr_t)e->code,
                         &env);
+#ifdef TB_SYS_TRACE_STEPS
+        latx_bare_uart_puts("tb-sys: step=");
+        puthex((uint64_t)steps);
+        latx_bare_uart_puts(" tb=");
+        puthex(e->pc);
+        latx_bare_uart_puts(" exit=");
+        puthex(g_plv3_exit.reason);
+        latx_bare_uart_puts(" rip=");
+        puthex(env.eip);
+        latx_bare_uart_puts("\n");
+#endif
     }
 
     ro_byte_observed = *(volatile uint8_t *)gpa_to_host_ptr(RO_PC);

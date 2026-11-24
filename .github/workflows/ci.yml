@@ -132,6 +132,13 @@ jobs:
           # latx_x86_deliver_fault pushes.
           # Next: why the clang-19 image's guest stops making progress (128 vs
           # 43 steps, 5 vs 4 translated TBs) before the halt block.
+          # Dispatch traces (build with TB_SYS_TRACE=1) localise it: after the
+          # identical first two steps, TB 0x1109 exits NORMAL to 0x10c1 under
+          # clang 23 but to 0x7fd0 (a stack address) under clang 19, and the
+          # guest then traps forever at 0x7fd2. That TB is straight-line code
+          # (store CR2/EC/RIP, inc the run counter, patch the PTE) with no
+          # branch, so the bad target looks like a corrupted chained-jump
+          # destination (fast_jmp_cache / gr2scr+jiscr0), not the #PF frame.
           # Run it by hand with:
           #   make tb-sys-smp-run QLVZ=/usr/bin/qemu-system-loongarch64
           SCRIPT

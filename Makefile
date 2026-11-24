@@ -666,6 +666,7 @@ ifeq ($(PERF),1)
 LATR_BARE_CFLAGS += -DLOONGEMU_PERF
 endif
 
+
 build/latr_isa_test.o: baremetal/bare/latr_isa_test.c \
                        target/riscv/latr/include/riscv-env.h \
                        target/riscv/latr/include/latr.h \
@@ -1362,6 +1363,12 @@ BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
                -I latx/upstream/include \
                -isystem $(shell $(CLANG) -print-resource-dir)/include \
                -include latx/compat/latx_bare_prelude.h
+# TB_SYS_TRACE=1 prints one line per dispatched TB in the paging/PLV3 test, to
+# compare a stalling image against a working one.
+ifeq ($(TB_SYS_TRACE),1)
+BARE_CFLAGS += -DTB_SYS_TRACE_STEPS
+endif
+
 BARE_DEPFLAGS = -MD -MP -MF $(patsubst %.o,%.d,$@) -MT $@
 BARE_DEP_OBJECTS := build/bare_main.o build/tb_loop.o build/lbt_emu.o \
                     build/tb_cache_bare.o build/tb_harness.o \
