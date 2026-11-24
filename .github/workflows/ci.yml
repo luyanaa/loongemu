@@ -109,6 +109,16 @@ jobs:
               # Makefile generates a valid kernel-only one when it is absent, so
               # a fresh checkout builds it. It ends through the rule's 90s
               # timeout by design (qemu runs until killed).
-              make tb-sys-smp-run QLVZ=/usr/bin/qemu-system-loongarch64 \
+              # Built in a scratch copy: the harness compiles the whole bare-metal
+              # tree, and writing into the mounted workspace hit
+              # `build/tb_sys.o: Permission denied` there. The probes below make
+              # the reason visible if it happens again.
+              id; df -h /src /tmp | tail -2
+              ls -ld /src/build 2>/dev/null || true
+              ( touch /src/build/.probe && rm -f /src/build/.probe ) \
+                && echo "src/build writable" || echo "src/build NOT writable"
+              rm -rf /tmp/smp && mkdir -p /tmp/smp && cp -a /src/. /tmp/smp/
+              cd /tmp/smp && make tb-sys-smp-run \
+                QLVZ=/usr/bin/qemu-system-loongarch64 \
                 CLANG=clang AR=llvm-ar LD_LLD=ld.lld
             '
