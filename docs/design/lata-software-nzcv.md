@@ -124,7 +124,7 @@ kinds, all flag-related).
 
 * CSET: emitted as `gen_select(rd=1, rj=0, cond)` -> 1 when cond false, 0 when
   true, matching the *existing* LBT behaviour the suite encodes; the AArch64
-  reading of `cset` is the opposite, and that discrepancy is §5.1.
+  reading of `cset` is the opposite, and that discrepancy is finding §3.2.
 * CSEL/CSINC/CSINV/CSNEG: `gen_select(rd=false_value, rj=true_value, cond)`.
 
 ## 5. Phases
@@ -163,7 +163,7 @@ NZCV, drop the probe to a diagnostic, measure the delta.
 | semantics | `tests/test_lata_nzcv.c` (host, ms) |
 | emitted code | new ISA-suite blocks: producer x consumer matrix, all 16 conds |
 | integration | `make lata-isa-run` (6525 checks) on both paths during P1 |
-| conformance | §5.1 review: the CSET expectation is either fixed in LATA or in the suite, with the AArch64 pseudocode quoted in the commit |
+| conformance | review of finding §3.2: the CSET expectation is either fixed in LATA or in the suite, with the AArch64 pseudocode quoted in the commit |
 | cost | PERF tick delta on the same guest workload |
 
 ## 8. Self-review
