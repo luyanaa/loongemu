@@ -45,8 +45,10 @@ typedef enum LatrRecoverySite {
 } LatrRecoverySite;
 
 typedef struct LatrRecoveryBinding {
-    uint8_t guest_reg;   /* guest GPR index holding an uncommitted value */
-    int8_t  temp;        /* host itemp slot (reg_itemp_map[temp] -> phys reg) */
+    uint8_t guest_reg;   /* guest GPR or FPR index holding an uncommitted value */
+    int8_t  temp;        /* host phys reg: itemp->phys (GPR) or ftemp->phys (FPR) */
+    uint8_t is_fpr;      /* C4: 1 = reads host_fprs[temp], writes env->fpr */
+    uint8_t reserved;
 } LatrRecoveryBinding;
 
 typedef struct LatrTbInsnSpan {
@@ -233,7 +235,9 @@ const LatrTbInsnSpan *latr_tb_recovery_resolve(uintptr_t host_pc,
                                                const LatrTbInsnMap **map_out);
 bool latr_tb_recovery_apply(const LatrTbInsnSpan *span,
                             const LatrTbInsnMap *map,
-                            const uint64_t host_gprs[32], CPUArchState *env);
+                            const uint64_t host_gprs[32],
+                            const uint64_t host_fprs[32],
+                            CPUArchState *env);
 
 void latr_tr_data_init(CPUArchState *env);
 

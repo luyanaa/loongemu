@@ -134,6 +134,7 @@ const LataTbInsnSpan *lata_tb_recovery_resolve(uintptr_t host_pc,
 bool lata_tb_recovery_apply(const LataTbInsnSpan *span,
                             const LataTbInsnMap *map,
                             const uint64_t host_gprs[32],
+                            const void *host_vregs,
                             CPUARMState *env)
 {
     if (span == NULL || env == NULL ||
@@ -151,6 +152,20 @@ bool lata_tb_recovery_apply(const LataTbInsnSpan *span,
         int host_reg = b->temp;
         if (host_reg >= 0 && host_reg < 32 && b->guest_reg < 32) {
             env->xregs[b->guest_reg] = host_gprs[host_reg];
+        }
+    }
+    /* C4: dedicated host FP/vector regs (arm_la_fmap[i] >= 0) hold the
+     * uncommitted 128-bit lane of guest zreg i; env-resident v9..v31 were
+     * already written through with lata_env_vst. host_vregs is the host's
+     * saved FP/vector register file as 32 x 16-byte lanes. */
+    if (host_vregs != NULL) {
+        const uint8_t *lanes = (const uint8_t *)host_vregs;
+        for (int i = 0; i < 32; i++) {
+            int host_freg = arm_la_fmap[i];
+            if (host_freg >= 0 && host_freg < 32) {
+                memcpy(arm_sve_vreg(env, (unsigned)i),
+                       lanes + (size_t)host_freg * 16u, 16u);
+            }
         }
     }
     env->pc = span->guest_pc;

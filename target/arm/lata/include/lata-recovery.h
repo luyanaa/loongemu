@@ -66,6 +66,7 @@ const LataTbInsnSpan *lata_tb_recovery_resolve(uintptr_t host_pc,
 bool lata_tb_recovery_apply(const LataTbInsnSpan *span,
                             const LataTbInsnMap *map,
                             const uint64_t host_gprs[32],
+                            const void *host_vregs,
                             struct CPUARMState *env);
 
 #endif /* LATA_RECOVERY_H */

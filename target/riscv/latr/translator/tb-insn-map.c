@@ -238,7 +238,9 @@ const LatrTbInsnSpan *latr_tb_recovery_resolve(uintptr_t host_pc,
  */
 bool latr_tb_recovery_apply(const LatrTbInsnSpan *span,
                             const LatrTbInsnMap *map,
-                            const uint64_t host_gprs[32], CPUArchState *env)
+                            const uint64_t host_gprs[32],
+                            const uint64_t host_fprs[32],
+                            CPUArchState *env)
 {
     if (span == NULL || env == NULL ||
         span->site == LATR_RECOV_NATIVE_INTERNAL) {
@@ -247,6 +249,13 @@ bool latr_tb_recovery_apply(const LatrTbInsnSpan *span,
     for (uint8_t i = 0; i < span->bind_cnt; i++) {
         const LatrRecoveryBinding *b = &map->binds[span->bind_first + i];
         int host_reg = b->temp;
+        if (b->is_fpr) {
+            if (host_fprs && host_reg >= 0 && host_reg < 32 &&
+                b->guest_reg < 32) {
+                env->fpr[b->guest_reg] = host_fprs[host_reg];
+            }
+            continue;
+        }
         if (host_reg >= 0 && host_reg < 32 && b->guest_reg < 32) {
             env->gpr[b->guest_reg] = host_gprs[host_reg];
         }

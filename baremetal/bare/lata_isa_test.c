@@ -572,7 +572,7 @@ static void test_tb_recovery(void)
     if (s0 != NULL) {
         check(s0->site, LATA_RECOV_NATIVE_INTERNAL,
               "pure-movz span is native-internal");
-        check(lata_tb_recovery_apply(s0, map, NULL, &env), 0,
+        check(lata_tb_recovery_apply(s0, map, NULL, NULL, &env), 0,
               "native-internal span is not applied");
     }
 
@@ -607,12 +607,35 @@ static void test_tb_recovery(void)
         }
         check(gr, 11, "binding names guest x11");
         env.xregs[11] = 0;
-        check(lata_tb_recovery_apply(sld, map, host_gprs, &env), 1,
+        check(lata_tb_recovery_apply(sld, map, host_gprs, NULL, &env), 1,
               "guest-access span applies");
         check(env.xregs[11], UINT64_C(0xdeadbeefcafe),
               "apply restores x11 from host temp");
         check(env.pc, (uint64_t)(uintptr_t)&block[1],
               "apply sets env.pc to the ldr");
+    }
+
+    /* C4: dedicated host FP/vector regs v0-v8 (arm_la_fmap[i] >= 0) are
+     * replayed from host_vregs as 16-byte lanes into env->sve.zregs. Pick a
+     * dedicated lane (v0 -> host freg arm_la_fmap[0]) and verify the lane
+     * lands. */
+    if (sld != NULL) {
+        uint64_t host_gprs2[32] = {0};
+        uint8_t host_vregs[32 * 16];
+        for (int i = 0; i < 32 * 16; i++) {
+            host_vregs[i] = (uint8_t)i;
+        }
+        memset(env.sve.zregs[0], 0, sizeof(env.sve.zregs[0]));
+        check(lata_tb_recovery_apply(sld, map, host_gprs2, host_vregs, &env),
+              1, "apply with host_vregs succeeds");
+        int lane_ok = 0;
+        int host_freg = arm_la_fmap[0];
+        for (int b = 0; b < 16; b++) {
+            if (env.sve.zregs[0][b] == (uint8_t)(host_freg * 16 + b)) {
+                lane_ok++;
+            }
+        }
+        check(lane_ok, 16, "dedicated v0 lane replayed from host_vregs");
     }
 }
 

@@ -538,6 +538,19 @@ static uint8_t latr_regcache_snapshot_gpr_binds(LatrRecoveryBinding *out)
         if (cache->gpr[r].valid && cache->gpr[r].dirty) {
             out[n].guest_reg = (uint8_t)r;
             out[n].temp = cache->gpr[r].temp;
+            out[n].is_fpr = 0;
+            out[n].reserved = 0;
+            n++;
+        }
+    }
+    /* C4: deferred FPR state rides the same span. temp is a phys freg
+     * (reg_ftemp_map pool 24..29); apply reads host_fprs[temp]. */
+    for (int r = 0; r < 32 && n < LATR_RECOVERY_MAX_BINDS_PER_SPAN; r++) {
+        if (cache->fpr[r].valid && cache->fpr[r].dirty) {
+            out[n].guest_reg = (uint8_t)r;
+            out[n].temp = cache->fpr[r].temp;
+            out[n].is_fpr = 1;
+            out[n].reserved = 0;
             n++;
         }
     }
