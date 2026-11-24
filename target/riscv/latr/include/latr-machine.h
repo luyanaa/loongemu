@@ -51,6 +51,13 @@ typedef struct LatrMachineFaultInfo {
     uint32_t cause;
     uint32_t hartid;
     bool resolved;
+    /* C1 precise recovery: fault-site classification + guest-insn retirement
+     * + how many regcache bindings were live at the fault span. `site` is a
+     * LatrRecoverySite; NATIVE_INTERNAL means the fault is a host bug and was
+     * NOT projected to a guest exception. */
+    uint8_t  site;
+    uint32_t retired_before;
+    uint8_t  bind_cnt;
 } LatrMachineFaultInfo;
 
 typedef struct LatrMachineHart {

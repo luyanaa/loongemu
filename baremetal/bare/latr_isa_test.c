@@ -69,6 +69,12 @@ extern void latr_enter_tb(void *env, void *code);
 extern bool latr_tb_insn_map_resolve(uintptr_t host_pc, uint64_t *guest_pc,
                                      uint32_t *raw_len);
 extern void latr_tb_insn_map_forget(void *code);
+extern const LatrTbInsnSpan *latr_tb_recovery_resolve(uintptr_t host_pc,
+                                                    const LatrTbInsnMap **map_out);
+extern bool latr_tb_recovery_apply(const LatrTbInsnSpan *span,
+                                   const LatrTbInsnMap *map,
+                                   const uint64_t host_gprs[32],
+                                   CPUArchState *env);
 extern bool latr_service_sbi(CPUArchState *env, LoongemuSbi *sbi);
 extern void latr_update_interrupts(CPUArchState *env);
 extern bool latr_interrupt_pending(CPUArchState *env);
@@ -2063,6 +2069,87 @@ static void test_tb_insn_map(void)
         check(seq_pc[1], (uint64_t)(uintptr_t)(mixed + 2),
               "second span starts after the RVC instruction");
         check(seq_len[1], 4, "second span records a 4-byte length");
+    }
+    latr_tb_insn_map_forget(code_buf);
+}
+static void test_tb_recovery(void)
+{
+    /* addi x5 leaves x5's value deferred in a host temp; the ld that follows
+     * is a GUEST_ACCESS span whose binding snapshot must carry x5's binding. */
+    static const uint32_t block[] = {
+        0x00700293, /* addi x5, x0, 7  */
+        0x00033183, /* ld x3, 0(x6)    */
+        0x00100113, /* addi x2, x0, 1  */
+    };
+    reset_guest_state();
+    for (size_t i = 0; i < sizeof(tb); i++) {
+        ((uint8_t *)&tb)[i] = 0;
+    }
+    cpu.env_ptr = &env;
+    env.pc = (uint64_t)(uintptr_t)block;
+    tb.pc = env.pc;
+    tb.tc.ptr = code_buf;
+    tb.cflags = 0;
+    int max_insns = 3;
+    target_disasm(&tb, &max_insns, &cpu);
+    check(tb.icount, 3, "recovery block decodes three instructions");
+    tr_init(&tb);
+    check(tr_ir2_generate(&tb), 1, "recovery block translates");
+    int words = tr_ir2_assemble(code_buf);
+    check(words > 0, 1, "recovery block assembles");
+
+    /* First insn (pure addi) is a host-internal span. */
+    const LatrTbInsnMap *map = NULL;
+    const LatrTbInsnSpan *s0 = latr_tb_recovery_resolve(
+        (uintptr_t)code_buf, &map);
+    check(s0 != NULL, 1, "recovery resolves first insn span");
+    if (s0 != NULL) {
+        check(s0->site, LATR_RECOV_NATIVE_INTERNAL,
+              "pure-addi span is native-internal");
+        check(latr_tb_recovery_apply(s0, map, NULL, &env), 0,
+              "native-internal span is not applied");
+    }
+
+    /* Walk the assembled words until the ld span turns up: its site must be
+     * GUEST_ACCESS, retired_before must be 1, and it must carry x5's binding. */
+    const LatrTbInsnSpan *sld = NULL;
+    for (int i = 0; i < words; i++) {
+        const LatrTbInsnSpan *s = latr_tb_recovery_resolve(
+            (uintptr_t)code_buf + (uintptr_t)i * 4, NULL);
+        if (s != NULL && s->site == LATR_RECOV_GUEST_ACCESS &&
+            s->guest_pc == (uint64_t)(uintptr_t)&block[1]) {
+            sld = s;
+            break;
+        }
+    }
+    check(sld != NULL, 1, "ld span is guest-access");
+    if (sld != NULL) {
+        check(sld->retired_before, 1, "ld span retires one insn before it");
+        check(sld->bind_cnt > 0, 1, "ld span carries a binding");
+        /* Reconstruct the ucontext register file: x5's deferred value sits in
+         * the temp the binding names; apply must land it on env->gpr[5]. */
+        uint64_t host_gprs[32] = {0};
+        uint8_t gr = 0xff;
+        int8_t temp = -1;
+        if (sld->bind_cnt > 0) {
+            const LatrRecoveryBinding *b =
+                &map->binds[sld->bind_first];
+            for (uint8_t i = 0; i < sld->bind_cnt; i++) {
+                if (b[i].guest_reg == 5) {
+                    gr = b[i].guest_reg;
+                    temp = b[i].temp;
+                    host_gprs[temp] = UINT64_C(0xdeadbeefcafe);
+                }
+            }
+        }
+        check(gr, 5, "binding names guest x5");
+        env.gpr[5] = 0;
+        check(latr_tb_recovery_apply(sld, map, host_gprs, &env), 1,
+              "guest-access span applies");
+        check(env.gpr[5], UINT64_C(0xdeadbeefcafe),
+              "apply restores x5 from host temp");
+        check(env.pc, (uint64_t)(uintptr_t)&block[1],
+              "apply sets env.pc to the ld");
     }
     latr_tb_insn_map_forget(code_buf);
 }
@@ -6269,6 +6356,7 @@ void kmain(void)
     test_rvv_moves_wide_fp();
     test_rvv_pvir_lsx_lasx();
     test_tb_insn_map();
+    test_tb_recovery();
     test_mmu_fetch();
     test_counters();
     latx_bare_uart_puts("latr-diff=");

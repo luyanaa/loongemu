@@ -558,14 +558,35 @@ int latr_machine_host_fault(LatrMachine *m, uint32_t hartid,
      */
     saved = latr_context_bind(h->ctx);
     latr_set_cpu_env(&h->env);
-    resolved = latr_tb_insn_map_resolve(host_pc, &guest_pc, NULL);
+    /* C1: resolve the full recovery span, not just the guest PC, so we know
+     * whether the faulting region is even projectable to a guest exception. */
+    const LatrTbInsnMap *rmap = NULL;
+    const LatrTbInsnSpan *span = latr_tb_recovery_resolve(host_pc, &rmap);
+    (void)rmap;
+    resolved = span != NULL;
     if (!resolved) {
+        latr_context_restore(saved);
+        return 0;
+    }
+    guest_pc = span->guest_pc;
+    /* A fault in a NATIVE_INTERNAL span is a translator bug, not a guest
+     * exception -- report it as such and do not fake a guest trap for it. */
+    if (span->site == LATR_RECOV_NATIVE_INTERNAL) {
+        if (info != NULL) {
+            info->guest_pc = guest_pc;
+            info->site = span->site;
+            info->retired_before = span->retired_before;
+            info->bind_cnt = span->bind_cnt;
+        }
         latr_context_restore(saved);
         return 0;
     }
     if (info != NULL) {
         info->guest_pc = guest_pc;
         info->resolved = true;
+        info->site = span->site;
+        info->retired_before = span->retired_before;
+        info->bind_cnt = span->bind_cnt;
     }
     /*
      * Instructions before the faulting one already committed their effects; the

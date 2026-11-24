@@ -655,6 +655,7 @@ LATR_BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdl
                -DCONFIG_LATX -D__WORDSIZE=64 -D__thread= \
                -I latr/compat -I target/riscv/latr/include -I . \
                -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
+               -I shared/backend/loongarch/include \
                -I latx/compat -I latx/compat/include -I latx/upstream/include \
                -I include \
                -isystem $(shell $(CLANG) -print-resource-dir)/include

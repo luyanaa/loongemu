@@ -497,6 +497,53 @@ void latr_regcache_prepare_fpr_write(IR2_OPND value)
     }
 }
 
+/* C1: classify a decoded guest insn by whether a host fault inside its span
+ * can be blamed on that guest instruction. Loads/stores/atomics fault as
+ * guest memory accesses; explicit trap/return insns fault as guest checks;
+ * everything else is a host-internal region -- a fault there is a translator
+ * bug and is never projected to a guest exception. */
+static uint8_t latr_recovery_site_of(LatrRiscvOpcode opcode)
+{
+    switch (opcode) {
+    case LATR_RV_LB: case LATR_RV_LH: case LATR_RV_LW: case LATR_RV_LD:
+    case LATR_RV_LBU: case LATR_RV_LHU: case LATR_RV_LWU:
+    case LATR_RV_SB: case LATR_RV_SH: case LATR_RV_SW: case LATR_RV_SD:
+    case LATR_RV_FLW: case LATR_RV_FLD: case LATR_RV_FSW: case LATR_RV_FSD:
+    case LATR_RV_LR_W: case LATR_RV_SC_W: case LATR_RV_LR_D: case LATR_RV_SC_D:
+    case LATR_RV_AMOSWAP_W: case LATR_RV_AMOADD_W: case LATR_RV_AMOXOR_W:
+    case LATR_RV_AMOAND_W: case LATR_RV_AMOOR_W: case LATR_RV_AMOMIN_W:
+    case LATR_RV_AMOMAX_W: case LATR_RV_AMOMINU_W: case LATR_RV_AMOMAXU_W:
+    case LATR_RV_AMOSWAP_D: case LATR_RV_AMOADD_D: case LATR_RV_AMOXOR_D:
+    case LATR_RV_AMOAND_D: case LATR_RV_AMOOR_D: case LATR_RV_AMOMIN_D:
+    case LATR_RV_AMOMAX_D: case LATR_RV_AMOMINU_D: case LATR_RV_AMOMAXU_D:
+        return LATR_RECOV_GUEST_ACCESS;
+    case LATR_RV_ECALL: case LATR_RV_EBREAK:
+    case LATR_RV_MRET: case LATR_RV_SRET:
+    case LATR_RV_WFI: case LATR_RV_SFENCE_VMA: case LATR_RV_FENCE_I:
+        return LATR_RECOV_GUEST_CHECK;
+    default:
+        return LATR_RECOV_NATIVE_INTERNAL;
+    }
+}
+
+/* C1: capture the GPR regcache bindings live right now -- each guest GPR whose
+ * newest value is sitting in a host temp and not yet written back to env->gpr.
+ * `temp` is the host phys reg number (reg_itemp_map slot already resolved by
+ * the allocator), so recovery can read it straight out of a ucontext. */
+static uint8_t latr_regcache_snapshot_gpr_binds(LatrRecoveryBinding *out)
+{
+    LatrRegCache *cache = &lsenv->tr_data->regcache;
+    uint8_t n = 0;
+    for (int r = 0; r < 32 && n < LATR_RECOVERY_MAX_BINDS_PER_SPAN; r++) {
+        if (cache->gpr[r].valid && cache->gpr[r].dirty) {
+            out[n].guest_reg = (uint8_t)r;
+            out[n].temp = cache->gpr[r].temp;
+            n++;
+        }
+    }
+    return n;
+}
+
 void tr_init(void *tb)
 {
     TRANSLATION_DATA *data = lsenv->tr_data;
@@ -783,6 +830,13 @@ bool tr_ir2_generate(TranslationBlock *tb)
         if (!latr_translate_ir1(&ctx)) {
             return false;
         }
+        /* C1: tag the fault-site kind and snapshot the GPR regcache bindings
+         * live at this guest insn, so a host fault in its span can replay the
+         * uncommitted state. Snapshot AFTER translate so the insn's own
+         * deferred result is captured too. */
+        data->tb_insn_site[i] = latr_recovery_site_of(insns[i].opcode);
+        data->tb_insn_bind_cnt[i] = latr_regcache_snapshot_gpr_binds(
+            data->tb_insn_binds[i]);
     }
 
     latr_regcache_flush();
@@ -1019,7 +1073,9 @@ int tr_ir2_assemble(const void *code_start_addr)
     latr_tb_insn_map_begin((void *)code_start_addr, (uint32_t)count * 4);
     for (int i = 0; i < data->tb_insn_count; i++) {
         latr_tb_insn_map_add(data->tb_insn_pc[i], span_off[i],
-                             span_off[i + 1], data->tb_insn_len[i]);
+                             span_off[i + 1], data->tb_insn_len[i],
+                             data->tb_insn_site[i], (uint32_t)i,
+                             data->tb_insn_binds[i], data->tb_insn_bind_cnt[i]);
     }
     loongemu_perf_record_tb((uint64_t)count,
                             (uint64_t)data->tb_insn_count);

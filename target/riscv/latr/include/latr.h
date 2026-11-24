@@ -31,12 +31,35 @@
 /* Native-offset -> guest-PC spans for precise exception attribution. */
 #define LATR_TB_MAP_SLOTS 4
 #define LATR_TB_MAP_SPANS 512
+/* Bounded binding pool per map: a guest-insn span only carries a binding set
+ * when it can fault architecturally (load/store/amo/trap) AND the regcache
+ * held uncommitted guest state there. 6 itemps cap the live set anyway. */
+#define LATR_TB_RECOVERY_BINDS 512
+#define LATR_RECOVERY_MAX_BINDS_PER_SPAN 8
+
+typedef enum LatrRecoverySite {
+    LATR_RECOV_GUEST_ACCESS = 0, /* guest load/store/amo: fault projects to guest */
+    LATR_RECOV_GUEST_CHECK,      /* explicit guest trap (ecall/break/mret/...) */
+    LATR_RECOV_HELPER,           /* helper call that may fault (reserved) */
+    LATR_RECOV_NATIVE_INTERNAL,  /* fault here = host bug; do not project */
+} LatrRecoverySite;
+
+typedef struct LatrRecoveryBinding {
+    uint8_t guest_reg;   /* guest GPR index holding an uncommitted value */
+    int8_t  temp;        /* host itemp slot (reg_itemp_map[temp] -> phys reg) */
+} LatrRecoveryBinding;
 
 typedef struct LatrTbInsnSpan {
     uint64_t guest_pc;
     uint32_t native_start;
     uint32_t native_end;
     uint32_t raw_len;
+    /* Precise-recovery metadata (C1): site kind + guest-insn-retired count +
+     * a slice of the map's binding pool for uncommitted regcache state. */
+    uint8_t  site;             /* LatrRecoverySite */
+    uint8_t  bind_cnt;
+    uint16_t bind_first;
+    uint32_t retired_before;
 } LatrTbInsnSpan;
 
 typedef struct LatrTbInsnMap {
@@ -44,8 +67,10 @@ typedef struct LatrTbInsnMap {
     uint32_t code_size;
     uint32_t count;
     uint32_t generation;
+    uint32_t bind_pool_used;
     bool valid;
     LatrTbInsnSpan spans[LATR_TB_MAP_SPANS];
+    LatrRecoveryBinding binds[LATR_TB_RECOVERY_BINDS];
 } LatrTbInsnMap;
 
 typedef struct LatrRegCacheEntry {
@@ -89,6 +114,12 @@ typedef struct TRANSLATION_DATA {
     uint64_t tb_insn_pc[LATR_TB_MAP_SPANS];
     uint32_t tb_insn_len[LATR_TB_MAP_SPANS];
     int tb_insn_label[LATR_TB_MAP_SPANS + 1];
+    /* Per-insn recovery staging (C1): site kind + regcache binding snapshot
+     * captured during translate, committed into the map at assemble. */
+    uint8_t tb_insn_site[LATR_TB_MAP_SPANS];
+    uint8_t tb_insn_bind_cnt[LATR_TB_MAP_SPANS];
+    LatrRecoveryBinding tb_insn_binds[LATR_TB_MAP_SPANS]
+                                     [LATR_RECOVERY_MAX_BINDS_PER_SPAN];
 
     /* Native-offset -> guest-PC attribution for precise exceptions. */
     LatrTbInsnMap insn_maps[LATR_TB_MAP_SLOTS];
@@ -175,7 +206,9 @@ void latr_pvir_cache_destroy(LatrPvirCache *cache);
 
 void latr_tb_insn_map_begin(void *code, uint32_t code_size);
 void latr_tb_insn_map_add(uint64_t guest_pc, uint32_t native_start,
-                          uint32_t native_end, uint32_t raw_len);
+                          uint32_t native_end, uint32_t raw_len,
+                          uint8_t site, uint32_t retired_before,
+                          const LatrRecoveryBinding *binds, uint8_t bind_cnt);
 bool latr_tb_insn_map_resolve(uintptr_t host_pc, uint64_t *guest_pc,
                               uint32_t *raw_len);
 void latr_tb_insn_map_rebase(void *old_code, void *new_code);
@@ -187,6 +220,20 @@ void latr_tb_insn_map_forget(void *code);
  * blamed on the guest PC that used to live there.
  */
 void latr_tb_insn_map_forget_range(void *base, uint32_t size);
+
+/* C1 precise recovery: extend a resolved span with its fault-site kind, the
+ * count of guest insns retired before it, and the regcache bindings that must
+ * be replayed to reconstruct architectural guest state. `latr_tb_recovery_
+ * resolve` fills `*row` with the span covering host_pc (NULL-safe outs);
+ * returns false if host_pc is not inside a mapped TB. `latr_tb_recovery_apply`
+ * replays the row's bindings from captured host GPRs (ucontext order = the
+ * host's `$r0..$r31` array) into `env`, sets env->pc, and returns false when
+ * the row's site is NATIVE_INTERNAL (a host bug, never projected). */
+const LatrTbInsnSpan *latr_tb_recovery_resolve(uintptr_t host_pc,
+                                               const LatrTbInsnMap **map_out);
+bool latr_tb_recovery_apply(const LatrTbInsnSpan *span,
+                            const LatrTbInsnMap *map,
+                            const uint64_t host_gprs[32], CPUArchState *env);
 
 void latr_tr_data_init(CPUArchState *env);
 
