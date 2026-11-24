@@ -104,17 +104,16 @@ jobs:
             CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
             QLVZ_REPO=/usr/bin/qemu-system-loongarch64
           grep -a 'latr-perf:' build/latr_sys_diff.log
-          # The LoongArch SMP boot harness is NOT gated here yet. On this qemu
-          # it reaches phys_cpus_online=4, ipi_shootdowns_ack=3 and
-          # kernel_blocks_run=0x400000, but reports fails=0xb, all downstream of
-          # "FAIL hardware trap delivered guest #PF": the x86 page-fault path
-          # (frame RIP, error code, A/D walk, retried store) and the UART/halt
-          # checks that follow it never pass. The same image on qemu 11.1.3
-          # reports fails=0, so the difference is in trap delivery, and
-          # bisecting it needs both emulators. Run it manually with:
-          #   make tb-sys-smp-run QLVZ=/usr/bin/qemu-system-loongarch64
+          # Boot tier: a translated x86 host boots on 4 LoongArch harts with IPI
+          # shootdowns, then asserts phys_cpus_online=4 and fails=0. qemu 10.0.13
+          # (trixie) fails 11 checks, all downstream of "hardware trap delivered
+          # guest #PF", while the same image passes on qemu 9.0.50 and 11.1.3 --
+          # a qemu 10 trap-delivery regression, not ours. The image is therefore
+          # sid, whose qemu is >= 11.
+          make tb-sys-smp-run QLVZ=/usr/bin/qemu-system-loongarch64 \
+            CLANG=clang AR=llvm-ar LD_LLD=ld.lld
           SCRIPT
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/src" -v /tmp/isa-gates.sh:/isa-gates.sh:ro \
             -w /src -e QEMU_DEBUG=1 -e QEMU_CPU=max \
-            debian:trixie bash /isa-gates.sh
+            debian:sid bash /isa-gates.sh
