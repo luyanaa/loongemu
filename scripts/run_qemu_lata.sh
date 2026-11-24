@@ -35,7 +35,7 @@ TRACE_FILE="${LOG_FILE%.log}.trace"
 QEMU_ARGS=()
 if [[ "${QEMU_DEBUG:-0}" != "0" ]]; then
     rm -f "$TRACE_FILE"
-    QEMU_ARGS+=(-d int,guest_errors -D "$TRACE_FILE")
+    QEMU_ARGS+=(-d in_asm,int,guest_errors -D "$TRACE_FILE")
 fi
 "$QEMU" -M virt -cpu "$CPU" -m "$MEM" -kernel "$KERNEL" \
     -display none -monitor none -nic none \
@@ -93,7 +93,7 @@ if [[ -s "$ERR_FILE" ]]; then
 fi
 if [[ -s "$TRACE_FILE" ]]; then
     echo "run_qemu_lata: qemu trace head ($TRACE_FILE):" >&2
-    head -n 12 "$TRACE_FILE" >&2
+    head -n 40 "$TRACE_FILE" >&2
     echo "run_qemu_lata: qemu trace tail ($TRACE_FILE):" >&2
     tail -n 12 "$TRACE_FILE" >&2
 fi
