@@ -843,10 +843,406 @@ static void gen_goto_tb(DisasContext *s, int n, int64_t diff)
     la_b(ir2_opnd_addr);
 }
 
+/*
+ * Software NZCV for hosts without LoongArch LBT.
+ *
+ * With LBT the port keeps two flag views: x86add/x86adc feed the register that
+ * armmove/setarmj read, while armmtflag/armmfflag form a separate ARM-layout
+ * pair used by MSR/MRS NZCV. Neither is observable from C, and the measured
+ * behaviour of the pair is that arithmetic results never reach MRS at all.
+ *
+ * The software path therefore owns env->pstate[31:28] - the field the rest of
+ * the port already treats as architectural NZCV - and replaces all four
+ * consumers. Layout and arithmetic are the reference pinned by
+ * tests/test_lata_nzcv.c: nibble = N<<3 | Z<<2 | C<<1 | V, AddWithCarry over
+ * 32/64 bits, condition test straight from the ARM pseudocode.
+ *
+ * Temporary budget: the itemp pool holds six registers (reg-alloc.c:365), and
+ * the widest helper below uses exactly six; every helper frees its temporaries
+ * before emitting the pstate store, whose own address materialisation needs one.
+ */
+#define LATA_NZCV_BIT_N 3
+#define LATA_NZCV_BIT_Z 2
+#define LATA_NZCV_BIT_C 1
+#define LATA_NZCV_BIT_V 0
+
+static void nzcv_nibble_store(IR2_OPND nib)
+{
+    IR2_OPND word = ra_alloc_itemp();
+
+    lata_env_ld_wu(word, env_offset_PSTATE());
+    la_bstrins_d(word, nib, 31, 28);
+    lata_env_st_wu(word, env_offset_PSTATE());
+    free_alloc_gpr(word);
+}
+
+static void nzcv_nibble_load(IR2_OPND dst)
+{
+    lata_env_ld_wu(dst, env_offset_PSTATE());
+    la_srli_d(dst, dst, 28);
+}
+
+/* Sign bit of a 64- or narrow-width value, into bit 0. */
+static void nzcv_sign_bit(IR2_OPND dst, IR2_OPND src, int sf)
+{
+    if (sf)
+    {
+        la_srli_d(dst, src, 63);
+    }
+    else
+    {
+        la_bstrpick_d(dst, src, 31, 31);
+    }
+}
+
+/* dst = 0/1: the AArch64 condition test over the nibble in pstate. */
+static void gen_cond_value(IR2_OPND dst, int cond)
+{
+    IR2_OPND nib = ra_alloc_itemp();
+    IR2_OPND t = ra_alloc_itemp();
+
+    nzcv_nibble_load(nib);
+    switch (cond & 0xf)
+    {
+    case 0x0: /* EQ */
+        la_bstrpick_d(dst, nib, LATA_NZCV_BIT_Z, LATA_NZCV_BIT_Z);
+        break;
+    case 0x1: /* NE */
+        la_bstrpick_d(dst, nib, LATA_NZCV_BIT_Z, LATA_NZCV_BIT_Z);
+        la_xori(dst, dst, 1);
+        break;
+    case 0x2: /* CS */
+        la_bstrpick_d(dst, nib, LATA_NZCV_BIT_C, LATA_NZCV_BIT_C);
+        break;
+    case 0x3: /* CC */
+        la_bstrpick_d(dst, nib, LATA_NZCV_BIT_C, LATA_NZCV_BIT_C);
+        la_xori(dst, dst, 1);
+        break;
+    case 0x4: /* MI */
+        la_bstrpick_d(dst, nib, LATA_NZCV_BIT_N, LATA_NZCV_BIT_N);
+        break;
+    case 0x5: /* PL */
+        la_bstrpick_d(dst, nib, LATA_NZCV_BIT_N, LATA_NZCV_BIT_N);
+        la_xori(dst, dst, 1);
+        break;
+    case 0x6: /* VS */
+        la_bstrpick_d(dst, nib, LATA_NZCV_BIT_V, LATA_NZCV_BIT_V);
+        break;
+    case 0x7: /* VC */
+        la_bstrpick_d(dst, nib, LATA_NZCV_BIT_V, LATA_NZCV_BIT_V);
+        la_xori(dst, dst, 1);
+        break;
+    case 0x8: /* HI: C && !Z */
+        la_bstrpick_d(dst, nib, LATA_NZCV_BIT_C, LATA_NZCV_BIT_C);
+        la_bstrpick_d(t, nib, LATA_NZCV_BIT_Z, LATA_NZCV_BIT_Z);
+        la_xori(t, t, 1);
+        la_and(dst, dst, t);
+        break;
+    case 0x9: /* LS: !(C && !Z) */
+        la_bstrpick_d(dst, nib, LATA_NZCV_BIT_C, LATA_NZCV_BIT_C);
+        la_bstrpick_d(t, nib, LATA_NZCV_BIT_Z, LATA_NZCV_BIT_Z);
+        la_xori(t, t, 1);
+        la_and(dst, dst, t);
+        la_xori(dst, dst, 1);
+        break;
+    case 0xa: /* GE: N == V */
+        la_srli_d(dst, nib, LATA_NZCV_BIT_N);
+        la_bstrpick_d(t, nib, LATA_NZCV_BIT_V, LATA_NZCV_BIT_V);
+        la_xor(dst, dst, t);
+        la_xori(dst, dst, 1);
+        break;
+    case 0xb: /* LT: N != V */
+        la_srli_d(dst, nib, LATA_NZCV_BIT_N);
+        la_bstrpick_d(t, nib, LATA_NZCV_BIT_V, LATA_NZCV_BIT_V);
+        la_xor(dst, dst, t);
+        break;
+    case 0xc: /* GT: !Z && N == V */
+        la_srli_d(dst, nib, LATA_NZCV_BIT_N);
+        la_bstrpick_d(t, nib, LATA_NZCV_BIT_V, LATA_NZCV_BIT_V);
+        la_xor(dst, dst, t);
+        la_xori(dst, dst, 1);
+        la_bstrpick_d(t, nib, LATA_NZCV_BIT_Z, LATA_NZCV_BIT_Z);
+        la_xori(t, t, 1);
+        la_and(dst, dst, t);
+        break;
+    default: /* 0xd LE: Z || N != V; 0xe/0xf: always */
+        if ((cond & 0xf) == 0xd)
+        {
+            la_srli_d(dst, nib, LATA_NZCV_BIT_N);
+            la_bstrpick_d(t, nib, LATA_NZCV_BIT_V, LATA_NZCV_BIT_V);
+            la_xor(dst, dst, t);
+            la_bstrpick_d(t, nib, LATA_NZCV_BIT_Z, LATA_NZCV_BIT_Z);
+            la_or(dst, dst, t);
+        }
+        else
+        {
+            la_addi_d(dst, zero_ir2_opnd, 1);
+        }
+        break;
+    }
+    free_alloc_gpr(nib);
+    free_alloc_gpr(t);
+}
+
+/*
+ * if (cond) rd = rj, keeping rd otherwise -- LBT's armmove contract, confirmed
+ * against the CSET/CSEL call sites (P0: cset decodes with the condition already
+ * inverted, so one rule serves both). Copying rj into rd unconditionally is the
+ * mistake that made an earlier attempt fail: CSET pre-sets rd = 1 and relies on
+ * it surviving when the condition does not hold.
+ */
+static void gen_cond_move(IR2_OPND rd, IR2_OPND rj, int cond)
+{
+    IR2_OPND holds = ra_alloc_itemp();
+    IR2_OPND mask;
+    IR2_OPND take;
+
+    gen_cond_value(holds, cond);
+    mask = ra_alloc_itemp();
+    la_sub_d(mask, zero_ir2_opnd, holds); /* all ones when cond holds */
+    free_alloc_gpr(holds);
+    take = ra_alloc_itemp();
+    la_and(take, rj, mask);
+    la_andn(rd, rd, mask);
+    la_or(rd, rd, take);
+    free_alloc_gpr(take);
+    free_alloc_gpr(mask);
+}
+
+/* MRS of NZCV: the nibble lands in bits 31:28 of the destination. */
+static void gen_nzcv_read(IR2_OPND rd)
+{
+    IR2_OPND nib = ra_alloc_itemp();
+
+    nzcv_nibble_load(nib);
+    la_bstrpick_d(rd, nib, 3, 0);
+    la_slli_d(rd, rd, 28);
+    free_alloc_gpr(nib);
+}
+
+/* MSR of NZCV: take bits 31:28 of the source. */
+static void gen_nzcv_write(IR2_OPND rj)
+{
+    IR2_OPND nib = ra_alloc_itemp();
+
+    la_bstrpick_d(nib, rj, 31, 28);
+    nzcv_nibble_store(nib);
+    free_alloc_gpr(nib);
+}
+
+/* Flags of a + b (is_sub: a - b), into pstate. */
+static void gen_nzcv_sw(IR2_OPND a, IR2_OPND b, int is_sub, int sf)
+{
+    IR2_OPND res = ra_alloc_itemp();
+    IR2_OPND nib = ra_alloc_itemp();
+    IR2_OPND t = ra_alloc_itemp();
+    IR2_OPND a32 = zero_ir2_opnd;
+    IR2_OPND b32 = zero_ir2_opnd;
+
+    if (!sf)
+    {
+        a32 = ra_alloc_itemp();
+        b32 = ra_alloc_itemp();
+        la_bstrpick_d(a32, a, 31, 0);
+        la_bstrpick_d(b32, b, 31, 0);
+        a = a32;
+        b = b32;
+    }
+    if (is_sub)
+    {
+        la_sub_d(res, a, b);
+    }
+    else
+    {
+        la_add_d(res, a, b);
+    }
+    if (!sf)
+    {
+        la_bstrpick_d(res, res, 31, 0);
+    }
+
+    la_addi_d(nib, zero_ir2_opnd, 0);
+
+    /* C first: it is the last use of the operands together. */
+    if (is_sub)
+    {
+        la_sltu(t, a, b);
+        la_xori(t, t, 1);
+    }
+    else
+    {
+        la_sltu(t, res, a);
+    }
+    la_bstrins_d(nib, t, LATA_NZCV_BIT_C, LATA_NZCV_BIT_C);
+
+    /* V: the operands agreed on sign and the result does not. */
+    la_xor(t, a, b);
+    if (!is_sub)
+    {
+        la_nor(t, t, zero_ir2_opnd);
+    }
+    la_xor(res, res, a);
+    la_and(t, t, res);
+    la_xor(res, res, a); /* restore the result: res ^ a ^ a */
+    nzcv_sign_bit(t, t, sf);
+    la_bstrins_d(nib, t, LATA_NZCV_BIT_V, LATA_NZCV_BIT_V);
+
+    if (!sf)
+    {
+        free_alloc_gpr(a32);
+        free_alloc_gpr(b32);
+    }
+
+    nzcv_sign_bit(t, res, sf);
+    la_bstrins_d(nib, t, LATA_NZCV_BIT_N, LATA_NZCV_BIT_N);
+    if (sf)
+    {
+        la_sltui(t, res, 1);
+    }
+    else
+    {
+        la_bstrpick_d(t, res, 31, 0);
+        la_sltui(t, t, 1);
+    }
+    la_bstrins_d(nib, t, LATA_NZCV_BIT_Z, LATA_NZCV_BIT_Z);
+
+    free_alloc_gpr(res);
+    free_alloc_gpr(t);
+    nzcv_nibble_store(nib);
+    free_alloc_gpr(nib);
+}
+
+/* Flags of a logical operation: N from the sign bit, Z, C = V = 0. */
+static void gen_logic_CC(IR2_OPND res, int sf)
+{
+    IR2_OPND acc = ra_alloc_itemp();
+    IR2_OPND t = ra_alloc_itemp();
+
+    la_addi_d(acc, zero_ir2_opnd, 0);
+    nzcv_sign_bit(t, res, sf);
+    la_bstrins_d(acc, t, LATA_NZCV_BIT_N, LATA_NZCV_BIT_N);
+    if (!sf)
+    {
+        la_bstrpick_d(t, res, 31, 0);
+        la_sltui(t, t, 1);
+    }
+    else
+    {
+        la_sltui(t, res, 1);
+    }
+    la_bstrins_d(acc, t, LATA_NZCV_BIT_Z, LATA_NZCV_BIT_Z);
+    free_alloc_gpr(t);
+    nzcv_nibble_store(acc);
+    free_alloc_gpr(acc);
+}
+
+/* Flags of (a & b): the ANDS family emits its result before or after this. */
+static void gen_logic_and_CC(IR2_OPND a, IR2_OPND b, int sf)
+{
+    IR2_OPND res = ra_alloc_itemp();
+
+    la_and(res, a, b);
+    gen_logic_CC(res, sf);
+    free_alloc_gpr(res);
+}
+
+/*
+ * ADC/SBC: dst = a + b + C (or a + NOT(b) + C) with the flags of that same
+ * AddWithCarry. A sum that wrapped once can wrap again when the carry lands on
+ * all ones, so the carry out comes from the two partial sums.
+ */
+static void gen_adc_sw(IR2_OPND dst, IR2_OPND a, IR2_OPND b, int is_sub,
+                       int setflags, int sf)
+{
+    IR2_OPND A = a;
+    IR2_OPND B = ra_alloc_itemp();
+    IR2_OPND part = ra_alloc_itemp();
+    IR2_OPND res = ra_alloc_itemp();
+    IR2_OPND t = ra_alloc_itemp();
+    IR2_OPND u = ra_alloc_itemp();
+
+    if (!sf)
+    {
+        A = ra_alloc_itemp();
+        la_bstrpick_d(A, a, 31, 0);
+    }
+    la_bstrpick_d(B, b, 31, 0);
+    if (is_sub)
+    {
+        la_orn(B, zero_ir2_opnd, B);
+        if (!sf)
+        {
+            la_bstrpick_d(B, B, 31, 0);
+        }
+    }
+
+    nzcv_nibble_load(t);
+    la_bstrpick_d(t, t, LATA_NZCV_BIT_C, LATA_NZCV_BIT_C); /* carry in */
+
+    la_add_d(part, A, B);
+    la_add_d(res, part, t);
+    if (!sf)
+    {
+        la_bstrpick_d(res, res, 31, 0);
+    }
+
+    if (setflags)
+    {
+        la_addi_d(t, zero_ir2_opnd, 0);
+        la_addi_d(u, res, 0);
+        nzcv_sign_bit(u, u, sf);
+        la_bstrins_d(t, u, LATA_NZCV_BIT_N, LATA_NZCV_BIT_N);
+        la_sltui(u, res, 1);
+        la_bstrins_d(t, u, LATA_NZCV_BIT_Z, LATA_NZCV_BIT_Z);
+
+        /* V first: last use of A and B before C reuses them. */
+        la_xor(u, A, B);
+        la_nor(u, u, zero_ir2_opnd);
+        la_add_d(B, A, zero_ir2_opnd); /* keep A for C */
+        la_xor(B, A, res);
+        la_and(u, u, B);
+        nzcv_sign_bit(u, u, sf);
+        la_bstrins_d(t, u, LATA_NZCV_BIT_V, LATA_NZCV_BIT_V);
+
+        /* C: either partial sum wrapped. */
+        la_sltu(u, part, A);
+        la_sltu(B, res, part);
+        la_or(u, u, B);
+        la_bstrins_d(t, u, LATA_NZCV_BIT_C, LATA_NZCV_BIT_C);
+        la_or(dst, res, zero_ir2_opnd);
+        free_alloc_gpr(u);
+        free_alloc_gpr(B);
+        free_alloc_gpr(part);
+        free_alloc_gpr(res);
+        if (!sf)
+        {
+            free_alloc_gpr(A);
+        }
+        nzcv_nibble_store(t);
+        free_alloc_gpr(t);
+        return;
+    }
+    la_or(dst, res, zero_ir2_opnd);
+    free_alloc_gpr(u);
+    free_alloc_gpr(B);
+    free_alloc_gpr(part);
+    free_alloc_gpr(res);
+    free_alloc_gpr(t);
+    if (!sf)
+    {
+        free_alloc_gpr(A);
+    }
+}
+
 /* dest = T0 - T1; compute C, N, V and Z flags */
 
 static void gen_add_CC(IR2_OPND *src1, IR2_OPND *src2, int sf)
 {
+    if (!lata_have_lbt)
+    {
+        gen_nzcv_sw(*src1, *src2, 0, sf);
+        return;
+    }
     if (sf)
     {
         la_x86add_d(*src1, *src2);
@@ -859,6 +1255,11 @@ static void gen_add_CC(IR2_OPND *src1, IR2_OPND *src2, int sf)
 
 static void gen_sub_CC(IR2_OPND *src1, IR2_OPND *src2, int sf)
 {
+    if (!lata_have_lbt)
+    {
+        gen_nzcv_sw(*src1, *src2, 1, sf);
+        return;
+    }
     if (sf)
     {
         /*  bits(datasize) operand1 = *src1;
@@ -1198,7 +1599,14 @@ static bool trans_B_cond(DisasContext *s)
         /* genuinely conditional branches */
         IR2_OPND label = ir2_opnd_new_type(IR2_OPND_LABEL);
         IR2_OPND reg_t = ra_alloc_itemp();
-        la_setarmj(reg_t, a->cond);
+        if (lata_have_lbt)
+        {
+            la_setarmj(reg_t, a->cond);
+        }
+        else
+        {
+            gen_cond_value(reg_t, a->cond);
+        }
         la_bnez(reg_t, label);
         gen_goto_tb(s, 0, 4);
         la_label(label);
@@ -1840,6 +2248,48 @@ static void handle_sys(DisasContext *s, bool isread,
     {
         clear_gpr_high(rt);
     }
+    /*
+     * NZCV is handled ahead of the special-case switch: that switch keys off
+     * ARM_CP_SPECIAL_MASK, which does not cover ARM_CP_NZCV's bit (see
+     * lata/compat/cpregs.h), so leaving NZCV to it made MRS/MSR NZCV fall
+     * through to the generic field path and read CPUARMState offset 0.
+     */
+    if (ri->type & ARM_CP_NZCV)
+    {
+        IR2_OPND nzcv_t;
+
+        if (isread)
+        {
+            nzcv_t = alloc_gpr_dst(rt);
+            if (lata_have_lbt)
+            {
+                /* armmfflag sign-extends the 32-bit flag word; MRS Xt, NZCV
+                 * writes it zero-extended, so mask the upper half away. */
+                la_armmfflag(nzcv_t, 0x39);
+                la_bstrpick_d(nzcv_t, nzcv_t, 31, 0);
+            }
+            else
+            {
+                gen_nzcv_read(nzcv_t);
+            }
+            store_gpr_dst(rt, nzcv_t);
+        }
+        else
+        {
+            nzcv_t = alloc_gpr_src(rt);
+            if (lata_have_lbt)
+            {
+                la_armmtflag(nzcv_t, 0x39);
+            }
+            else
+            {
+                gen_nzcv_write(nzcv_t);
+            }
+        }
+        free_alloc_gpr(nzcv_t);
+        return;
+    }
+
     /* Handle special cases first */
     switch (ri->type & ARM_CP_SPECIAL_MASK)
     {
@@ -1853,14 +2303,28 @@ static void handle_sys(DisasContext *s, bool isread,
         {
             // gen_get_nzcv(tcg_rt);
             reg_t = alloc_gpr_dst(rt);
-            la_armmfflag(reg_t, 0x39);
+            if (lata_have_lbt)
+            {
+                la_armmfflag(reg_t, 0x39);
+            }
+            else
+            {
+                gen_nzcv_read(reg_t);
+            }
 
             store_gpr_dst(rt, reg_t);
         }
         else
         {
             reg_t = alloc_gpr_src(rt);
-            la_armmtflag(reg_t, 0x39);
+            if (lata_have_lbt)
+            {
+                la_armmtflag(reg_t, 0x39);
+            }
+            else
+            {
+                gen_nzcv_write(reg_t);
+            }
         }
         free_alloc_gpr(reg_t);
         return;
@@ -6901,12 +7365,38 @@ static bool trans_ANDS_i(DisasContext *s)
     li_d(temp, imm);
     la_and(reg_d, reg_n, temp);
     if (!a->sf)
-    {
-        la_x86and_w(reg_n, temp);
+    {if (lata_have_lbt)
+
+        {
+
+            la_x86and_w(reg_n, temp);
+
+        }
+
+        else
+
+        {
+
+            gen_logic_and_CC(reg_n, temp, 1);
+
+        }
     }
     else
-    {
-        la_x86and_d(reg_n, temp);
+    {if (lata_have_lbt)
+
+        {
+
+            la_x86and_d(reg_n, temp);
+
+        }
+
+        else
+
+        {
+
+            gen_logic_and_CC(reg_n, temp, 1);
+
+        }
     }
 
     if (a->rd != 31 && arm_la_map[a->rd] >= 0 && clearGprHigh)
@@ -7479,12 +7969,38 @@ static void disas_logic_reg(DisasContext *s, uint32_t insn)
             if (opc == 3)
             {
                 if (sf)
-                {
-                    la_x86and_d(reg_n, temp);
+                {if (lata_have_lbt)
+
+                    {
+
+                        la_x86and_d(reg_n, temp);
+
+                    }
+
+                    else
+
+                    {
+
+                        gen_logic_and_CC(reg_n, temp, 1);
+
+                    }
                 }
                 else
-                {
-                    la_x86and_w(reg_n, temp);
+                {if (lata_have_lbt)
+
+                    {
+
+                        la_x86and_w(reg_n, temp);
+
+                    }
+
+                    else
+
+                    {
+
+                        gen_logic_and_CC(reg_n, temp, 1);
+
+                    }
                 }
             }
             la_and(reg_d, reg_n, temp);
@@ -7502,12 +8018,38 @@ static void disas_logic_reg(DisasContext *s, uint32_t insn)
             {
                 la_nor(temp, zero_ir2_opnd, temp);
                 if (sf)
-                {
-                    la_x86and_d(reg_n, temp);
+                {if (lata_have_lbt)
+
+                    {
+
+                        la_x86and_d(reg_n, temp);
+
+                    }
+
+                    else
+
+                    {
+
+                        gen_logic_and_CC(reg_n, temp, 1);
+
+                    }
                 }
                 else
-                {
-                    la_x86and_w(reg_n, temp);
+                {if (lata_have_lbt)
+
+                    {
+
+                        la_x86and_w(reg_n, temp);
+
+                    }
+
+                    else
+
+                    {
+
+                        gen_logic_and_CC(reg_n, temp, 1);
+
+                    }
                 }
             }
             break;
@@ -7532,12 +8074,38 @@ static void disas_logic_reg(DisasContext *s, uint32_t insn)
             if (opc == 3)
             {
                 if (sf)
-                {
-                    la_x86and_d(reg_n, reg_m);
+                {if (lata_have_lbt)
+
+                    {
+
+                        la_x86and_d(reg_n, reg_m);
+
+                    }
+
+                    else
+
+                    {
+
+                        gen_logic_and_CC(reg_n, reg_m, 1);
+
+                    }
                 }
                 else
-                {
-                    la_x86and_w(reg_n, reg_m);
+                {if (lata_have_lbt)
+
+                    {
+
+                        la_x86and_w(reg_n, reg_m);
+
+                    }
+
+                    else
+
+                    {
+
+                        gen_logic_and_CC(reg_n, reg_m, 1);
+
+                    }
                 }
             }
             la_and(reg_d, reg_n, reg_m);
@@ -7554,12 +8122,38 @@ static void disas_logic_reg(DisasContext *s, uint32_t insn)
             {
                 la_nor(temp, zero_ir2_opnd, reg_m);
                 if (sf)
-                {
-                    la_x86and_d(reg_n, temp);
+                {if (lata_have_lbt)
+
+                    {
+
+                        la_x86and_d(reg_n, temp);
+
+                    }
+
+                    else
+
+                    {
+
+                        gen_logic_and_CC(reg_n, temp, 1);
+
+                    }
                 }
                 else
-                {
-                    la_x86and_w(reg_n, temp);
+                {if (lata_have_lbt)
+
+                    {
+
+                        la_x86and_w(reg_n, temp);
+
+                    }
+
+                    else
+
+                    {
+
+                        gen_logic_and_CC(reg_n, temp, 1);
+
+                    }
                 }
             }
             la_andn(reg_d, reg_n, reg_m);
@@ -8050,7 +8644,11 @@ static void disas_adc_sbc(DisasContext *s, uint32_t insn)
         clear_gpr_high(rm);
     }
 
-    if (op)
+    if (!lata_have_lbt)
+    {
+        gen_adc_sw(reg_d, reg_n, reg_m, (int)op, (int)setflags, (int)sf);
+    }
+    else if (op)
     {
         la_orn(temp, zero_ir2_opnd, reg_m);
         if (setflags)
@@ -8180,7 +8778,14 @@ static void disas_cc(DisasContext *s, uint32_t insn)
         clear_gpr_high(rn);
     }
 
-    la_setarmj(temp, cond);
+    if (lata_have_lbt)
+    {
+        la_setarmj(temp, cond);
+    }
+    else
+    {
+        gen_cond_value(temp, cond);
+    }
     la_beqz(temp, label_false);
 
     /* TRUE */
@@ -8219,7 +8824,14 @@ static void disas_cc(DisasContext *s, uint32_t insn)
     /* FALSE */
     la_addi_w(temp, zero_ir2_opnd, nzcv);
     la_slli_w(temp, temp, 28);
-    la_armmtflag(temp, 0x39);
+    if (lata_have_lbt)
+    {
+        la_armmtflag(temp, 0x39);
+    }
+    else
+    {
+        gen_nzcv_write(temp);
+    }
 
     la_label(label_end);
 
@@ -8264,7 +8876,14 @@ static void disas_cond_select(DisasContext *s, uint32_t insn)
     {
         /* CSET & CSETM.  */
         la_addi_d(reg_d, zero_ir2_opnd, 1);
-        la_armmove(reg_d, zero_ir2_opnd, cond); // CSET: reg_d = cond ? 0 : 1
+        if (lata_have_lbt)
+        {
+            la_armmove(reg_d, zero_ir2_opnd, cond); // CSET: reg_d = cond ? 0 : 1
+        }
+        else
+        {
+            gen_cond_move(reg_d, zero_ir2_opnd, cond);
+        }
         if (else_inv)
         { // CSETM
             la_orn(reg_d, zero_ir2_opnd, reg_d);
@@ -8311,21 +8930,42 @@ static void disas_cond_select(DisasContext *s, uint32_t insn)
         }
 
         la_or(reg_d, zero_ir2_opnd, temp_m);
+        if (!lata_have_lbt)
+        {
+            /* The software select needs the itemp budget; reg_m and temp_m are
+             * both dead once reg_d holds the false value. */
+            free_alloc_gpr(temp_m);
+            free_alloc_gpr(reg_m);
+        }
 
         /* CSNEG, CNEG, CSINV, CINV, CSINC, CINC, CSEL(TRUE)*/
-        if (rd == rn)
+        if (lata_have_lbt)
         {
-            la_armmove(reg_d, temp_n, cond);
+            if (rd == rn)
+            {
+                la_armmove(reg_d, temp_n, cond);
+            }
+            else
+            {
+                la_armmove(reg_d, reg_n, cond);
+            }
+        }
+        else if (rd == rn)
+        {
+            gen_cond_move(reg_d, temp_n, cond);
         }
         else
         {
-            la_armmove(reg_d, reg_n, cond);
+            gen_cond_move(reg_d, reg_n, cond);
         }
 
         free_alloc_gpr(reg_n);
-        free_alloc_gpr(reg_m);
         free_alloc_gpr(temp_n);
-        free_alloc_gpr(temp_m);
+        if (lata_have_lbt)
+        {
+            free_alloc_gpr(reg_m);
+            free_alloc_gpr(temp_m);
+        }
     }
 
     if (rd != 31 && arm_la_map[rd] >= 0 && clearGprHigh)
@@ -9090,7 +9730,14 @@ static void handle_fp_compare(DisasContext *s, int size,
 
         la_label(l_exit);
         la_slli_d(temp, temp, 0x1c); /* 左移28位 */
-        la_armmtflag(temp, 0x39);
+        if (lata_have_lbt)
+        {
+            la_armmtflag(temp, 0x39);
+        }
+        else
+        {
+            gen_nzcv_write(temp);
+        }
     }
     else if (size == MO_32)
     {
@@ -9120,7 +9767,14 @@ static void handle_fp_compare(DisasContext *s, int size,
 
         la_label(l_exit);
         la_slli_d(temp, temp, 0x1c); /* 左移28位 */
-        la_armmtflag(temp, 0x39);
+        if (lata_have_lbt)
+        {
+            la_armmtflag(temp, 0x39);
+        }
+        else
+        {
+            gen_nzcv_write(temp);
+        }
     }
     else
     {
@@ -9242,13 +9896,27 @@ static void disas_fp_ccomp(DisasContext *s, uint32_t insn)
 
     if (cond < 0x0e)
     { /* not always */
-        la_setarmj(temp, cond);
+        if (lata_have_lbt)
+        {
+            la_setarmj(temp, cond);
+        }
+        else
+        {
+            gen_cond_value(temp, cond);
+        }
         la_bnez(temp, label_match);
 
         /* nomatch: */
         la_addi_w(temp, zero_ir2_opnd, nzcv);
         la_slli_w(temp, temp, 28);
-        la_armmtflag(temp, 0x39);
+        if (lata_have_lbt)
+        {
+            la_armmtflag(temp, 0x39);
+        }
+        else
+        {
+            gen_nzcv_write(temp);
+        }
         la_b(label_end);
 
         la_label(label_match);
@@ -9298,7 +9966,14 @@ static void disas_fp_csel(DisasContext *s, uint32_t insn)
     IR2_OPND l_false = ir2_opnd_new_type(IR2_OPND_LABEL);
     IR2_OPND l_end = ir2_opnd_new_type(IR2_OPND_LABEL);
 
-    la_setarmj(temp, cond);
+    if (lata_have_lbt)
+    {
+        la_setarmj(temp, cond);
+    }
+    else
+    {
+        gen_cond_value(temp, cond);
+    }
     la_beqz(temp, l_false);
 
     /* TRUE */

@@ -649,10 +649,18 @@ efi-lvz-probe: build/lvz_probe.efi
 	@grep -aE 'lvz-probe|probe:' build/lvz_probe.log | head -40
 
 # ---- bare-metal LoongArch execution harness ----
+# LATA_FORCE_NO_LBT=1 builds the ISA image with the software NZCV path selected,
+# so the non-LBT code can be exercised on a host that has LBT. Normal builds are
+# unaffected.
+ifeq ($(LATA_FORCE_NO_LBT),1)
+LATA_BARE_EXTRA_CFLAGS := -DLATA_FORCE_NO_LBT
+else
+LATA_BARE_EXTRA_CFLAGS :=
+endif
 LATA_BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
                -fno-builtin -O2 -mno-lsx -mno-lasx -fno-vectorize -fno-slp-vectorize \
                -DTARGET_AARCH64 -DCONFIG_LATA -DCONFIG_LATA_TU -DCONFIG_LATA_STANDALONE \
-               -D__WORDSIZE=64 -D__thread= \
+               -D__WORDSIZE=64 -D__thread= $(LATA_BARE_EXTRA_CFLAGS) \
                -I lata/compat -I . -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
                -I shared/backend/loongarch/include \
                -I latx/compat -I latx/include -I latx/upstream/include \

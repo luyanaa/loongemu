@@ -200,6 +200,7 @@ uint8_t lata_regcache_snapshot_gpr_binds(LataRecoveryBinding *out);
  * host reports, and the ISA harness prints it so a failing gate says why.
  */
 extern bool lata_have_lbt;
+void lata_force_no_lbt(void);
 
 void lata_tr_data_init(CPUArchState *env);
 void tr_init(void*);
@@ -304,6 +305,7 @@ void lata_env_xvst(IR2_OPND vector, int offset);
 void lata_env_ld_wu(IR2_OPND scalar, int offset);
 void lata_env_ld_du(IR2_OPND scalar, int offset);
 void lata_env_st_b(IR2_OPND scalar, int offset);
+void lata_env_st_wu(IR2_OPND scalar, int offset);
 
 IR2_OPND alloc_gpr_src(int i);
 IR2_OPND alloc_gpr_src_sp(int i);

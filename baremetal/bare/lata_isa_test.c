@@ -773,10 +773,15 @@ static void run_raw_flag_probes(void)
 
     latx_bare_uart_puts("lata-isa: raw flags begin\n");
     probe_raw_flags(p_adds_carry, 4, "adds-carry");
+    check(lata_result_x5, 0x60000000u, "MRS after adds: Z|C");
     probe_raw_flags(p_subs_borrow, 4, "subs-borrow");
+    check(lata_result_x5, 0x80000000u, "MRS after subs: N");
     probe_raw_flags(p_adds_overflow, 4, "adds-overflow");
+    check(lata_result_x5, 0x70000000u, "MRS after adds: Z|C|V");
     probe_raw_flags(p_ands_zero, 3, "ands-zero");
+    check(lata_result_x5, 0x40000000u, "MRS after ands: Z");
     probe_raw_flags(p_adcs_chain, 5, "adcs-chain");
+    check(lata_result_x5, 0x00000000u, "MRS after adcs: no flags");
     /* The subtract/adc path additionally sets ARM carry via armmtflag; if that
      * register were the one MRS reads, these would be non-zero while the pure
      * x86add producers above are zero. */
@@ -789,6 +794,7 @@ static void run_raw_flag_probes(void)
         };
 
         probe_raw_flags(p_subs_armcarry, 4, "subs-armcarry");
+        check(lata_result_x5, 0x60000000u, "MRS after subs: Z|C");
     }
     probe_raw_flags(p_msr_mrs, 4, "msr-mrs");
     check(lata_result_x5, 0x60000000u, "MSR/MRS NZCV round trip 0x6");
@@ -5352,6 +5358,13 @@ static __attribute__((noinline)) void run_sve_p0_p1_gap_regression_runtime(void)
 
 void kmain(void)
 {
+#ifdef LATA_FORCE_NO_LBT
+    /* Debug image: exercise the software NZCV path on a host that has LBT. */
+    {
+        extern void lata_force_no_lbt(void);
+        lata_force_no_lbt();
+    }
+#endif
     latx_bare_uart_puts("lata-isa: start\n");
     {
         /* Record the host's LBT state: NZCV lives in the LBT flag register, so a

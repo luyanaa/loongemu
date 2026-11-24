@@ -34,28 +34,26 @@ jobs:
   # `res < a` alone gets wrong) and the full 16 x 16 condition matrix -- in the
   # fast host tier.
   #
-  # Findings, reproduced by building the ISA image with the software path forced
-  # on (lbt=0) on a host that has LBT, then by reading the raw flags back through
-  # MRS NZCV once that decode existed (P0 of docs/design/lata-software-nzcv.md):
-  #   1. The flag *arithmetic* is not the open problem; the *consumers* are.
-  #   2. armmove has no documented contract in the tree, but measurement settled
-  #      it: `armmove(rd, rj, cond)` is `if (cond) rd = rj`, and `cset rd, cond`
-  #      decodes with the condition already inverted (`csinc rd, xzr, xzr, ne`
-  #      for `cset rd, eq`), so one rule serves CSET and CSEL. The reverted
-  #      software path wrote `rd = rj & mask`, dropping rd unconditionally - that
-  #      is what made every CSET read 0.
-  #   3. The port keeps *two* flag views: x86add/x86adc feed the register that
-  #      armmove/setarmj read (so CSET/CSEL/branches are correct), while
-  #      armmtflag/armmfflag form a separate ARM-layout pair used by MSR/MRS NZCV.
-  #      Measured: after adds/subs/ands/adcs, `mrs nzcv` returns 0; after
-  #      `msr nzcv, X`, `mrs` returns X. A guest reading NZCV after arithmetic
-  #      therefore sees 0 today - a port bug independent of LBT, and the reason
-  #      the software path must own env->pstate[31:28] rather than either
-  #      register.
-  #   4. Pool pressure is real: gen_cond_value (3 itemps) called from
-  #      gen_cond_move (2 more) trips ra_alloc_itemp at csel blocks, whose
-  #      dispatch already holds operands. Any implementation needs to free
-  #      before emitting the store, not after.
+  # P0/P1 of docs/design/lata-software-nzcv.md are done. What they established,
+  # each reproduced on a host with LBT:
+  #   1. MRS/MSR NZCV never worked: handle_sys() dispatched special registers on
+  #      `ri->type & ARM_CP_SPECIAL_MASK`, which is 0xf while ARM_CP_NZCV is
+  #      1<<7, so the case was unreachable and both instructions went through the
+  #      generic field path at offset 0. Fixed by handling NZCV ahead of the
+  #      switch; widening the mask would also activate ARM_CP_DC_ZVA, whose
+  #      helper this build does not link.
+  #   2. armmove is `if (cond) rd = rj`. `cset rd, eq` encodes cond=NE, so CSET
+  #      and CSEL never contradicted each other; the condition is inverted by the
+  #      encoder, not by the port.
+  #   3. Producer flags were already architecturally correct (adds/subs/ands/adcs
+  #      all read back the expected nibble). The only defect was armmfflag
+  #      sign-extending the 32-bit word; MRS Xt, NZCV zero-extends, so it is
+  #      masked after the transfer.
+  #   4. The software path (LATA_FORCE_NO_LBT=1) and the LBT path now agree bit
+  #      for bit over the whole image: 6541 checks, 0 fails, identical raw-flag
+  #      probes. The itemp pool (6) is the binding constraint on every helper:
+  #      free before emitting the pstate store, and release caller operands that
+  #      a select no longer needs.
 
   # Fast tier: everything that runs on the build host. No qemu, no bare image,
   # so a regression is reported in minutes instead of behind an emulator run.

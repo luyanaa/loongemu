@@ -83,47 +83,51 @@ sysreg table (`lata_local_sysreg`, `translate-a64.c:1766`), which is where the
 bare build serves the registers it models itself (FPCR/FPSR/SPSR/ELR/ESR).
 `mrs x5, nzcv` and `msr nzcv, x5` now decode and round-trip.
 
-### 3.4 The producers' flags are not visible through MRS: two flag views
+### 3.4 Why the raw flags first read as zero: an unreachable case, then a sign extension
 
-With MRS working, the raw probe (`run_raw_flag_probes`, same file) reports:
+The first run of the raw probe reported `mrs x5, nzcv` = 0 after every producer,
+which looked like two separate flag registers. It was not: `handle_sys()`
+dispatched special registers with
 
-| block | `mrs x5, nzcv` |
-|---|---|
-| `adds x3, x1, x2` (-1 + 1) | `0x00000000` |
-| `subs x3, x1, x2` (0 - 1) | `0x00000000` |
-| `adds` MIN+MIN | `0x00000000` |
-| `ands` | `0x00000000` |
-| `adcs` chain | `0x00000000` |
-| `subs` 5-5 (runs `armmtflag` carry setup first) | `0x00000000` |
-| `msr nzcv, 0x6000_0000; mrs` | `0x60000000` (checked) |
-| `msr nzcv, 0x9000_0000; mrs` | `0x90000000` (checked) |
+```c
+switch (ri->type & ARM_CP_SPECIAL_MASK)
+```
 
-So `armmtflag`/`armmfflag` form a consistent pair, and the arithmetic producers
-write *somewhere else*: the port's `x86add`/`x86adc` path feeds the register that
-`armmove`/`setarmj` read (which is why CSET/CSEL/branches are correct), while
-`MRS NZCV` reads the ARM-layout register that only `armmtflag` writes - and
-`x86adc` appears to leave it cleared even after `armmtflag` set the carry.
+and `lata/compat/cpregs.h` defines `ARM_CP_SPECIAL_MASK` as `0xf` while
+`ARM_CP_NZCV` is `1 << 7`. The `case ARM_CP_NZCV` was therefore unreachable for
+every register, and MRS/MSR NZCV fell through to the generic field-offset path
+with `fieldoffset == 0` - reading and writing the first eight bytes of
+`CPUARMState`. The MSR/MRS round trip that "worked" was that same wrong offset
+round-tripping through itself.
 
-Consequences for this design, and they are stronger than the earlier guess:
+Widening the mask is not a one-line fix: it also activates `ARM_CP_DC_ZVA`, whose
+case references a helper this build does not link (`ld.lld: undefined symbol:
+helper_dc_zva`). NZCV is therefore handled explicitly ahead of the switch, and the
+mask is left alone with a comment saying why.
 
-1. **Neither LBT flag register can be the software path's storage.** The design
-   already said `env->pstate[31:28]`; now it is the only choice that is
-   observable, testable and host-independent.
-2. **The ISA suite cannot see this gap** - nothing in it reads NZCV directly, so
-   a guest MRS after arithmetic silently returns 0 today. That is a port bug
-   independent of LBT availability, recorded here rather than fixed here: fixing
-   it means deciding which register is canonical, which is exactly what P1 does.
-3. **P1's consumer set is confirmed complete at four instructions** (`armmove`,
-   `setarmj`, `armmfflag`, `armmtflag`), because those are the only readers and
-   writers of the ARM-layout register.
+With that fixed, the second run measured the producer flags directly, and they
+were already architecturally correct on LBT:
 
-### 3.4 Temporary-register budget
+| block | `mrs x5, nzcv` (before the sign-extension fix) | AArch64 |
+|---|---|---|
+| `adds` -1+1 | `0x0000000060000000` | `0x60000000` (Z\|C) |
+| `subs` 0-1 | `0xffffffff80000000` | `0x80000000` (N) |
+| `adds` MIN+MIN | `0x0000000070000000` | `0x70000000` (Z\|C\|V) |
+| `ands` | `0x0000000040000000` | `0x40000000` (Z) |
+| `adcs` chain | `0x0` | `0x0` |
 
-`ra_alloc_itemp` asserts at six (`reg-alloc.c:365-366`, seen as
-`alloc itemp failed, cto_num 6`). `gen_cond_value` needs 3,
-`gen_cond_move` adds 2 more and is called with operands live from
-`disas_cond_select`, which already holds `reg_n`, `reg_m`, `temp_m`, `temp_n`.
-Any implementation must free temporaries *before* emitting the pstate store.
+One defect remained: `armmfflag` sign-extends the 32-bit flag word into 64 bits,
+while AArch64 `MRS Xt, NZCV` zero-extends. Masking the upper half after
+`armmfflag` fixes it, and both paths now agree bit for bit:
+
+* software path (`LATA_FORCE_NO_LBT=1`): `6541` checks, `0` fails;
+* LBT path: `6541` checks, `0` fails, identical per-producer values.
+
+Consequences for the design: the "two flag views" concern is retracted - the port
+has one flag model, and it was merely unobservable. The software path is still
+the right long-term owner of `pstate[31:28]` (it is the only version that runs in
+CI-less environments and that can be reasoned about without LBT), but P2's
+motivation is now a cost/benefit call rather than a correctness one.
 
 ## 4. Design
 
@@ -186,12 +190,18 @@ closes with a *narrower* P1: the software path owns `pstate[31:28]` and replaces
 the four consumers, and the port's split flag views are a separate bug (a guest
 MRS after arithmetic returns 0 today, on LBT included).
 
-**P1 - software helpers behind a switch.** Implement §4.2, wire every producer
-and consumer, keep `lata_have_lbt` as the selector. Gate: `make lata-isa-run`
-green with the switch forced on (`-DLATA_FORCE_NO_LBT`), on a host with LBT.
+**P1 - done.** Helpers in §4.2 are implemented and wired into all 28 sites, with
+`lata_have_lbt` as the selector; `LATA_FORCE_NO_LBT=1` builds the image with the
+software path forced. Both paths pass the whole ISA image (6541 checks) and the
+raw-flag probes agree bit for bit. Two defects found on the way are fixed in the
+same change: the unreachable `ARM_CP_NZCV` case (§3.4) and `armmfflag`'s sign
+extension of the 32-bit NZCV word.
 
-**P2 - retire the LBT flag path.** Delete the `if (lata_have_lbt)` blocks for
-NZCV, drop the probe to a diagnostic, measure the delta.
+**P2 - retire the LBT flag path (now a cost decision).** Both paths are correct
+and measured, so deleting the LBT branch is no longer a correctness argument; it
+buys a single code shape and costs the ~4-8 host instructions per flag-setting
+instruction on LBT hosts. Gate: PERF tick delta on the same workload, and the ISA
+image green with the branch removed.
 
 ## 6. Invariants and failure modes
 

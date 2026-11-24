@@ -356,10 +356,24 @@ void lata_context_bind(LataContext *ctx)
 }
 
 bool lata_have_lbt = true;
+static bool lata_have_lbt_probed = false;
+
+/*
+ * Force the software NZCV path. Debug builds use it to run the non-LBT code on
+ * a host that has LBT; the probe below must not overwrite the decision.
+ */
+void lata_force_no_lbt(void)
+{
+    lata_have_lbt = false;
+    lata_have_lbt_probed = true;
+}
 
 void lata_tr_data_init(CPUArchState *env)
 {
-    lata_have_lbt = latx_cpu_has_lbt() != 0;
+    if (!lata_have_lbt_probed) {
+        lata_have_lbt = latx_cpu_has_lbt() != 0;
+        lata_have_lbt_probed = true;
+    }
     LataContext *ctx = lata_context_current();
     if (!ctx->initialized) {
         bool preserve_vcache = lata_vcache_enabled();
@@ -1028,6 +1042,21 @@ void lata_env_ld_du(IR2_OPND scalar, int offset)
 
     lata_vcache_note_env_scalar_read();
     la_ld_d(scalar, base, plan.displacement);
+    if (plan.materialize_address) {
+        ra_free_temp(base);
+    }
+}
+
+void lata_env_st_wu(IR2_OPND scalar, int offset)
+{
+    if (lata_vcache_enabled() && vcache_offset_is_z(offset)) {
+        vcache_flush_dirty();
+    }
+    LataVectorAddressPlan plan;
+    IR2_OPND base = env_scalar_address(offset, &plan);
+
+    lata_vcache_note_env_scalar_write();
+    la_st_w(scalar, base, plan.displacement);
     if (plan.materialize_address) {
         ra_free_temp(base);
     }
