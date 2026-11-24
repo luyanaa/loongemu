@@ -1461,9 +1461,13 @@ tb-sys-run: build/tb_sys.elf
 	@grep -qa 'fails=0000000000000000 ok' build/tb_sys.log
 
 tb-sys-smp-run: build/tb_sys.elf
-	@rm -f build/tb_sys_smp.log
+	@rm -f build/tb_sys_smp.log build/tb_sys_smp.err
 	@timeout 90 $(QLVZ) -M virt -cpu max -smp 4 -m 512M -kernel build/tb_sys.elf \
-	     -display none -monitor none -serial file:build/tb_sys_smp.log -no-reboot 2>/dev/null || true
+	     -display none -monitor none -serial file:build/tb_sys_smp.log -no-reboot \
+	     2>build/tb_sys_smp.err || true
+	@if ! grep -qa 'tb-sys: done' build/tb_sys_smp.log 2>/dev/null; then \
+	    echo "tb-sys-smp: the harness did not reach 'tb-sys: done'; qemu stderr:"; \
+	    tail -n 10 build/tb_sys_smp.err 2>/dev/null || true; fi
 	@grep -a 'tb-sys:' build/tb_sys_smp.log | tail -12
 	@grep -qa 'tb-sys: phys_cpus_online=0000000000000004' build/tb_sys_smp.log
 	@grep -qa 'tb-sys: done' build/tb_sys_smp.log
