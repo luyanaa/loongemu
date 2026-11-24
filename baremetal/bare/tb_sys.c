@@ -8394,6 +8394,8 @@ void kmain(void)
         puthex(g_plv3_exit.reason);
         latx_bare_uart_puts(" rip=");
         puthex(env.eip);
+        latx_bare_uart_puts(" rsp=");
+        puthex(env.regs[R_ESP]);
         latx_bare_uart_puts("\n");
 #endif
     }

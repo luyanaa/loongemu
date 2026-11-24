@@ -143,9 +143,13 @@ jobs:
           # are frame slots 3 and 4. Reading them as slots 0 and 1 after
           # `add rsp,8` means the handler's rsp was 3 words (24 bytes) above the
           # frame base -- i.e. the delivery wrote the frame lower than the entry
-          # rsp. Both delivery paths (latx_x86_deliver_fault and
-          # deliver_x86_exception) compute `(rsp & ~15) - nwords*8`, so the next
-          # question is which path ran and where its rsp came from.
+          # rsp. Both delivery paths compute `(rsp & ~15) - nwords*8`.
+          # The trace now prints rsp after each dispatch, and it shows the
+          # delivery's new_rsp is lost: after the fault rsp reads back as the
+          # pre-fault 0x7fd0 (not 0x7fa0), and after the handler's iretq it is
+          # 0x80010001. So the PLV3 resume restores rsp from somewhere other
+          # than the value deliver_x86_exception wrote -- that is the bug to
+          # chase, and it is in the harness (tb_sys.c), not the translator.
           # Run it by hand with:
           #   make tb-sys-smp-run QLVZ=/usr/bin/qemu-system-loongarch64
           SCRIPT
