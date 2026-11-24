@@ -163,9 +163,14 @@ jobs:
           make -C lata all CLANG=clang AR=llvm-ar
           # LATA_FORCE_NO_LBT=1 keeps the image free of LBT instructions, which a
           # distro qemu does not decode; the software path is the one under test.
+          # On failure the guest log is the only evidence, and the make recipe
+          # only echoes its first lines, so dump the tail here.
           make lata-isa-run LATA_FORCE_NO_LBT=1 \
             CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
-            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+            QLVZ_REPO=/usr/bin/qemu-system-loongarch64 || {
+            tail -60 build/lata_isa.log
+            exit 1
+          }
           # lata-isa-run already asserts "lata-isa: PASS" (fails == 0); the
           # summary is echoed so a regression names itself in the job log.
           grep -a 'lata-isa: checks=' build/lata_isa.log
