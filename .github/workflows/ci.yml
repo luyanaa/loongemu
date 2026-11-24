@@ -81,6 +81,11 @@ jobs:
               make latr-isa-run \
                 CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
                 QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+              # End-to-end: a paged RISC-V ELF guest with MMIO and traps,
+              # executed through the machine harness.
+              make latr-sys-run \
+                CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+                QLVZ_REPO=/usr/bin/qemu-system-loongarch64
               make -C latm all CLANG=clang AR=llvm-ar
               make latm-isa-run LATM_FORCE_NO_LBT=1 \
                 CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
