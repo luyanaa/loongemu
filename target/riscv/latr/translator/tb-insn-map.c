@@ -292,6 +292,11 @@ bool latr_tb_recovery_apply(const LatrTbInsnSpan *span,
         if (b->guest_reg >= 32 || b->temp < 0 || b->temp >= 32) {
             return false;
         }
+        if (b->is_spill) {
+            /* No LATR path spills a deferred guest value today; a row that
+             * claims one has no address this function could read. */
+            return false;
+        }
         if (b->is_fpr) {
             if (host_fprs == NULL) {
                 return false;

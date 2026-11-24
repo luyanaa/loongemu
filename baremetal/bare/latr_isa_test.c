@@ -2481,6 +2481,19 @@ static void test_recovery_atomic_apply(void)
     check(latr_tb_recovery_apply(&span, &map, host, fhost, &env), 1,
           "FPR snapshot applies");
     check(env.fpr[9], UINT64_C(0x9999), "FPR binding committed");
+
+    /* A row that points at a spill slot cannot be read from the host register
+     * file, and LATR never emits one: refuse rather than read a register. */
+    map.binds[0].is_fpr = 0;
+    map.binds[0].is_spill = 1;
+    map.binds[0].temp = 2; /* would be a valid host register */
+    env.gpr[9] = UINT64_C(0xdd);
+    env.pc = UINT64_C(0xf00d);
+    check(latr_tb_recovery_apply(&span, &map, host, fhost, &env), 0,
+          "spill-slot binding is refused");
+    check(env.gpr[9], UINT64_C(0xdd), "refused spill leaves the register");
+    check(env.pc, UINT64_C(0xf00d), "refused spill leaves pc");
+    map.binds[0].is_spill = 0;
 }
 
 static void test_mmu_walk(void)
