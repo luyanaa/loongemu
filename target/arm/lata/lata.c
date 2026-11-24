@@ -628,6 +628,51 @@ void lata_regcache_flush(void)
     }
 }
 
+/* C2: fault-site kind for a guest A64 insn. Loads/stores/atomics project a host
+ * fault to the guest; explicit guest traps are checks; anything else faulting
+ * is a host bug and is never projected to a guest exception. Scalar GPR memory
+ * ops only -- vector (_v) and SVE accesses keep their own context plumbing and
+ * are treated as NATIVE_INTERNAL for now. */
+uint8_t lata_recovery_site_of(int insn_type)
+{
+    switch (insn_type) {
+    case AARCH64_A64_LDR: case AARCH64_A64_LDRA: case AARCH64_A64_LDR_i:
+    case AARCH64_A64_LDP: case AARCH64_A64_LD_lit:
+    case AARCH64_A64_LDAR: case AARCH64_A64_LDXR: case AARCH64_A64_LDXP:
+    case AARCH64_A64_STR: case AARCH64_A64_STR_i:
+    case AARCH64_A64_STP: case AARCH64_A64_STLR: case AARCH64_A64_STLR_i:
+    case AARCH64_A64_STXR: case AARCH64_A64_STXP:
+    case AARCH64_A64_CAS: case AARCH64_A64_CASP: case AARCH64_A64_SWP:
+    case AARCH64_A64_LDADD:
+        return LATA_RECOV_GUEST_ACCESS;
+    case AARCH64_A64_SVC: case AARCH64_A64_HVC: case AARCH64_A64_SMC:
+    case AARCH64_A64_BRK: case AARCH64_A64_HLT:
+        return LATA_RECOV_GUEST_CHECK;
+    default:
+        return LATA_RECOV_NATIVE_INTERNAL;
+    }
+}
+
+/* C2: capture the env-resident guest GPR bindings live right now -- each guest
+ * gpr whose newest value is deferred in a host temp and not yet written to
+ * env->xregs. Dedicated regs (arm_la_map[g] >= 0) never carry a deferred value
+ * in the regcache, so they are replayed from arm_la_map at apply time and need
+ * no binding. `temp` is the host phys reg number (la_t0..la_t5). */
+uint8_t lata_regcache_snapshot_gpr_binds(LataRecoveryBinding *out)
+{
+    LataRegCache *cache = &lsenv->tr_data->regcache;
+    uint8_t n = 0;
+    for (int r = 0; r < 32 && n < LATA_RECOVERY_MAX_BINDS_PER_SPAN; r++) {
+        if (arm_la_map[r] < 0 && cache->gpr[r].valid && cache->gpr[r].dirty) {
+            out[n].guest_reg = (uint8_t)r;
+            out[n].temp = cache->gpr[r].temp;
+            n++;
+        }
+    }
+    return n;
+}
+
+
 static void regcache_borrow(IR2_OPND value)
 {
     int slot = regcache_temp_slot(value._reg_num);
@@ -745,6 +790,9 @@ void tr_init(void* tb)
 
     /* label number */
     t->label_num = 0;
+
+    /* C2: per-insn recovery staging for this TB. */
+    t->tb_insn_count = 0;
 
     t->vreg_resident_touched = 0;
     t->vreg_resident_dirty = 0;
@@ -1379,14 +1427,27 @@ int tr_ir2_assemble(const void *code_start_addr)
     label_dispose();
 
     /* 3. assemble */
-    IR2_INST *pir2 = lsenv->tr_data->first_ir2;
+    TRANSLATION_DATA *data = lsenv->tr_data;
+    IR2_INST *pir2 = data->first_ir2;
 
     void *code_addr = (void *) code_start_addr;
     int code_nr = 0;
+    /* C2: byte offset of each guest insn's span start; tb_insn_label ids mark
+     * span boundaries among the emitted words. */
+    uint32_t span_off[LATA_TB_MAP_SPANS + 1];
+    for (int i = 0; i <= data->tb_insn_count && i <= LATA_TB_MAP_SPANS; i++) {
+        span_off[i] = 0;
+    }
 
     while (pir2 != NULL) {
-        if (ir2_opcode(pir2) != LISA_LABEL &&
-            ir2_opcode(pir2) != LISA_X86_INST) {
+        if (ir2_opcode(pir2) == LISA_LABEL) {
+            int id = ir2_opnd_label_id(&pir2->_opnd[0]);
+            for (int i = 0; i <= data->tb_insn_count; i++) {
+                if (data->tb_insn_label[i] == id) {
+                    span_off[i] = (uint32_t)(code_nr * 4);
+                }
+            }
+        } else if (ir2_opcode(pir2) != LISA_X86_INST) {
             uint32 result = ir2_assemble(pir2);
 
             if (lata_dump) {
@@ -1400,6 +1461,15 @@ int tr_ir2_assemble(const void *code_start_addr)
             code_nr += 1;
         }
         pir2 = ir2_next(pir2);
+    }
+
+    /* C2: commit the staged spans into the insn map. */
+    lata_tb_insn_map_begin((void *)code_start_addr, (uint32_t)code_nr * 4);
+    for (int i = 0; i < data->tb_insn_count; i++) {
+        lata_tb_insn_map_add(data->tb_insn_pc[i], span_off[i],
+                             span_off[i + 1], 4,
+                             data->tb_insn_site[i], (uint32_t)i,
+                             data->tb_insn_binds[i], data->tb_insn_bind_cnt[i]);
     }
 
 #if defined(LOONGEMU_PERF) && LOONGEMU_PERF

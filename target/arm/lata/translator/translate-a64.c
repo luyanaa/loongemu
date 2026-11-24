@@ -20476,6 +20476,14 @@ bool tr_ir2_generate(struct TranslationBlock *tb)
         LataIr2Snapshot ir2_snap;
         lata_ir2_snapshot_take(&ir2_snap);
         A64SVEPvirBuilder sve_snap = sve_builder;
+        /* C2: place a label marking this guest insn's native span start so
+         * tr_ir2_assemble can resolve its byte range, and stage the per-insn
+         * recovery metadata. Label ids are stored by guest-insn ordinal i. */
+        IR2_OPND insn_lbl = ir2_opnd_new_type(IR2_OPND_LABEL);
+        lsenv->tr_data->tb_insn_label[i] = ir2_opnd_label_id(&insn_lbl);
+        lsenv->tr_data->tb_insn_pc[i] = pir1->pc_curr;
+        lsenv->tr_data->tb_insn_site[i] = lata_recovery_site_of(pir1->insn_type);
+        (la_label)(insn_lbl);
         bool trans_success = false;
         if (translate_functions[pir1->insn_type] != NULL)
         {
@@ -20497,7 +20505,23 @@ bool tr_ir2_generate(struct TranslationBlock *tb)
         tcg_ctx->gen_insn_end_off[i] = (lsenv->tr_data->real_ir2_inst_num) << 2;
         tcg_ctx->gen_insn_data[i * TARGET_INSN_START_WORDS] = pir1->pc_curr;
 #endif
+        /* C2: snapshot the env-resident bindings deferred in the regcache AFTER
+         * this insn translated, so a fault in its span replays its own pending
+         * result too. */
+        lsenv->tr_data->tb_insn_bind_cnt[i] =
+            lata_regcache_snapshot_gpr_binds(lsenv->tr_data->tb_insn_binds[i]);
+        lsenv->tr_data->tb_insn_count = i + 1;
         pir1++;
+    }
+
+    /* C2: closing label marking the end of the last insn's span. */
+    {
+        IR2_OPND end_lbl = ir2_opnd_new_type(IR2_OPND_LABEL);
+        int cnt = lsenv->tr_data->tb_insn_count;
+        if (cnt <= LATA_TB_MAP_SPANS) {
+            lsenv->tr_data->tb_insn_label[cnt] = ir2_opnd_label_id(&end_lbl);
+        }
+        (la_label)(end_lbl);
     }
 
 #ifdef CONFIG_LATA_TU

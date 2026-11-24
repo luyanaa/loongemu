@@ -37,6 +37,8 @@ typedef struct LataRegCache {
     uint64_t clock;
 } LataRegCache;
 
+#include "lata-recovery.h"
+
 typedef struct TRANSLATION_DATA {
 
     void *curr_tb; /* from QEMU */
@@ -92,6 +94,23 @@ typedef struct TRANSLATION_DATA {
     /* TODO : support static translation */
     uint8 curr_ir1_skipped_eflags; /* these eflag calculation can be skipped */
                                    /* (because of flag pattern, etc) */
+
+    /* C2: per-insn recovery staging, filled by tr_ir2_generate and committed
+     * into the map by tr_ir2_assemble (LATR plan C). Each translated guest
+     * insn gets a label id so its native span bounds can be resolved at
+     * assemble time. */
+    int      tb_insn_count;
+    uint64_t tb_insn_pc[LATA_TB_MAP_SPANS];
+    int      tb_insn_label[LATA_TB_MAP_SPANS + 1];
+    uint8_t  tb_insn_site[LATA_TB_MAP_SPANS];
+    uint8_t  tb_insn_bind_cnt[LATA_TB_MAP_SPANS];
+    LataRecoveryBinding tb_insn_binds[LATA_TB_MAP_SPANS]
+                                     [LATA_RECOVERY_MAX_BINDS_PER_SPAN];
+
+    /* Native-offset -> guest-PC attribution for precise exceptions. */
+    LataTbInsnMap insn_maps[LATA_TB_MAP_SLOTS];
+    uint32_t insn_map_generation;
+    LataTbInsnMap *active_insn_map;
 } TRANSLATION_DATA;
 
 
@@ -165,6 +184,11 @@ LataContext *lata_context_new(CPUArchState *env);
 void lata_context_delete(LataContext *ctx);
 void lata_context_bind(LataContext *ctx);
 LataContext *lata_context_current(void);
+
+/* C2 precise recovery map/apply API lives in lata-recovery.h (included
+ * above). These two helpers are lata-internal, used by the translate loop. */
+uint8_t lata_recovery_site_of(int insn_type);
+uint8_t lata_regcache_snapshot_gpr_binds(LataRecoveryBinding *out);
 
 void lata_tr_data_init(CPUArchState *env);
 void tr_init(void*);

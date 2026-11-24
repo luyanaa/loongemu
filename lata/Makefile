@@ -30,6 +30,7 @@ SRCS := $(SHARED_BE)/ir2.c $(SHARED_BE)/ir2-assemble.c $(SHARED_BE)/la-append.c 
         $(LATA)/translator/reg-alloc.c $(LATA)/translator/macro-helper.c \
         $(LATA)/translator/sve-helper.c $(LATA)/translator/sve-helper-support.c \
         $(LATA)/translator/sve-lasx-lower.c \
+        $(LATA)/translator/tb-insn-map.c \
         $(LATA)/translator/translate-a64.c
 
 .PHONY: all probe clean

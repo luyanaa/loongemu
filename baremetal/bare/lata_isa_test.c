@@ -24,6 +24,7 @@
 #include "target/arm/lata/translator/sve-lasx-lower.h"
 #include "target/arm/lata/include/lata-mem.h"
 #include "target/arm/lata/include/lata-snapshot.h"
+#include "target/arm/lata/include/lata-recovery.h"
 /* Declared by the translator; lata.h cannot be included here (CPU header clash). */
 /* Translator internals used by the IR2 micro-tests. */
 void lata_env_xvld(IR2_OPND vector, int offset);
@@ -532,6 +533,87 @@ static void run_scalar_gpr_regcache_ir2_test(void)
         fails++;
     }
     tr_fini();
+}
+
+static void test_tb_recovery(void)
+{
+    /* movz x11 leaves x11's value deferred in a host itemp (x11 is
+     * env-resident: arm_la_map[11] < 0); the ldr that follows is a
+     * GUEST_ACCESS span whose binding snapshot must carry x11's binding. */
+    static const uint32_t block[] = {
+        0xd28000ebu,  /* movz x11, #7   */
+        0xf94000c3u,  /* ldr  x3, [x6]  */
+        0xd2800022u,  /* movz x2,  #1   */
+    };
+    for (size_t i = 0; i < sizeof(env); i++) { ((uint8_t *)&env)[i] = 0; }
+    for (size_t i = 0; i < sizeof(cpu); i++) { ((uint8_t *)&cpu)[i] = 0; }
+    for (size_t i = 0; i < sizeof(tb); i++)  { ((uint8_t *)&tb)[i] = 0; }
+    cpu.env_ptr = &env;
+    lata_tr_data_init(&env);
+    context_switch_native_to_bt = (uint64_t)(uintptr_t)0;
+    context_switch_native_to_bt_ret_0 = (uint64_t)(uintptr_t)0;
+    env.pc = (uint64_t)(uintptr_t)block;
+    tb.pc = env.pc;
+    tb.tc.ptr = code_buf;
+    tb.cflags = 0;
+    int max_insns = 3;
+    target_disasm(&tb, &max_insns, &cpu);
+    check(tb.icount, 3, "recovery block decodes three instructions");
+    tr_init(&tb);
+    check(tr_ir2_generate(&tb), 1, "recovery block translates");
+    int words = tr_ir2_assemble(code_buf);
+    check(words > 0, 1, "recovery block assembles");
+
+    /* First insn (pure movz) is a host-internal span. */
+    const LataTbInsnMap *map = NULL;
+    const LataTbInsnSpan *s0 = lata_tb_recovery_resolve(
+        (uintptr_t)code_buf, &map);
+    check(s0 != NULL, 1, "recovery resolves first insn span");
+    if (s0 != NULL) {
+        check(s0->site, LATA_RECOV_NATIVE_INTERNAL,
+              "pure-movz span is native-internal");
+        check(lata_tb_recovery_apply(s0, map, NULL, &env), 0,
+              "native-internal span is not applied");
+    }
+
+    /* Walk the assembled words until the ldr span turns up: GUEST_ACCESS,
+     * retired_before == 1, and it must carry x11's deferred binding. */
+    const LataTbInsnSpan *sld = NULL;
+    for (int i = 0; i < words; i++) {
+        const LataTbInsnSpan *s = lata_tb_recovery_resolve(
+            (uintptr_t)code_buf + (uintptr_t)i * 4, NULL);
+        if (s != NULL && s->site == LATA_RECOV_GUEST_ACCESS &&
+            s->guest_pc == (uint64_t)(uintptr_t)&block[1]) {
+            sld = s;
+            break;
+        }
+    }
+    check(sld != NULL, 1, "ldr span is guest-access");
+    if (sld != NULL) {
+        check(sld->retired_before, 1, "ldr span retires one insn before it");
+        check(sld->bind_cnt > 0, 1, "ldr span carries a binding");
+        /* Reconstruct the ucontext register file: x11's deferred value sits
+         * in the temp the binding names; apply must land it on env.xregs[11]. */
+        uint64_t host_gprs[32] = {0};
+        uint8_t gr = 0xff;
+        if (sld->bind_cnt > 0) {
+            const LataRecoveryBinding *b = &map->binds[sld->bind_first];
+            for (uint8_t i = 0; i < sld->bind_cnt; i++) {
+                if (b[i].guest_reg == 11) {
+                    gr = b[i].guest_reg;
+                    host_gprs[b[i].temp] = UINT64_C(0xdeadbeefcafe);
+                }
+            }
+        }
+        check(gr, 11, "binding names guest x11");
+        env.xregs[11] = 0;
+        check(lata_tb_recovery_apply(sld, map, host_gprs, &env), 1,
+              "guest-access span applies");
+        check(env.xregs[11], UINT64_C(0xdeadbeefcafe),
+              "apply restores x11 from host temp");
+        check(env.pc, (uint64_t)(uintptr_t)&block[1],
+              "apply sets env.pc to the ldr");
+    }
 }
 
 static void run_integer_nzcv_matrix(void)
@@ -5087,6 +5169,7 @@ void kmain(void)
 {
     latx_bare_uart_puts("lata-isa: start\n");
     run_scalar_gpr_regcache_ir2_test();
+    test_tb_recovery();
 
     /*
      * Every block ends with its result in x2.
