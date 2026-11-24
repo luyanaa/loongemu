@@ -193,14 +193,27 @@ range is refused, both tested. What remains is the CPU side: guest stores, AMOs
 and SC must take the same transaction before vCPUs run in parallel. Until they
 do, this orders device writes against each other only, and the code says so.
 
-### 3.3 TB recovery ABI must be one contract
+### 3.3 TB recovery ABI must be one contract - DONE (schema + decisions)
 
 All four translators recover guest state differently. The shared record must
 carry: `guest_pc`; `host_pc_range`; `register_bindings`; `flags_state`
 (EFLAGS/NZCV materialisation); `commit_state` (partially executed); `arch_payload`
 (MIPS BD, RVV `vstart`); `tb_generation` (so a mapping cannot survive arena
-reuse). This is the prerequisite for ValueVersion, chaining, the persistent
-cache and AOT regions.
+reuse). This is the prerequisite for ValueVersion, chaining, the persistent cache and
+AOT regions.
+
+Status: `shared/backend/loongarch/include/le-recovery.h` now carries every field
+in that table - `guest_pc`, `native_start/end`, `aux` (arch payload: MIPS delay
+slot/BD, RVV vstart, AArch64 raw length), `effect_id`, `site`/`phase` (commit
+state), `bind_*` (register bindings), `flags_state`
+(`LE_FLAGS_NONE/MATERIALIZED/DEFERRED`) and `tb_generation` - plus one decision
+function, `le_recovery_can_project()`, so "may this host fault become a guest
+trap?" cannot drift per port. All three ports assert at compile time that their
+span row is the shared struct (`_Static_assert`), each populates
+`tb_generation`/`flags_state` in its map insert, LATR's resolver ignores rows
+whose generation disagrees with their map, and the LATR host-fault path refuses
+deferred-flags spans it cannot replay. `tests/test_le_recovery_abi.c` pins the
+fail-closed cases (20 checks, in `make test`).
 
 ## 4.1 Modules to keep promoting
 
@@ -339,7 +352,7 @@ fault recovery cost.
 3. 2.1 LATA `translate_tb` capacity ABI, whole-TB reservation, reclaim, I-cache
    sync ownership - done; next is LATR arena lifecycle reuse, safepoint,
    cross-core invalidation and SMC.
-4. 3.3 shared recovery ABI.
+4. 3.3 shared recovery ABI - done (schema, decision function, generation guard).
 5. 2.1 LATA host-fault precise recovery.
 6. 5.1 step 3 (label/branch flush elision) on top of the measured baseline.
 7. 5.3 relocation round trip (builds on `latr_emit_code_symbol`).

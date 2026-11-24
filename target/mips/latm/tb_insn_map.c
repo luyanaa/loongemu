@@ -77,6 +77,10 @@ void latm_tb_insn_map_add(void *trd, uint64_t guest_pc, uint32_t native_start,
     span->site = site;
     span->phase = LE_PHASE_BEFORE_INSN;
     span->effect_id = 0;
+    span->tb_generation = map->generation;
+    /* MIPS has no architectural flag word (HI/LO and FP conditions are separate
+     * state); the shared field stays explicit. */
+    span->flags_state = LE_FLAGS_NONE;
     span->retired_before = retired_before;
     span->bind_first = map->bind_pool_used;
     span->bind_flags = 0;

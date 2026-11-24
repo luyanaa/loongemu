@@ -76,6 +76,10 @@ void latr_tb_insn_map_add(uint64_t guest_pc, uint32_t native_start,
     span->site = site;
     span->phase = phase;
     span->effect_id = 0;
+    span->tb_generation = map->generation;
+    /* RV64 has no architectural flag word; the field stays explicit so the
+     * shared decision function has a defined answer. */
+    span->flags_state = LE_FLAGS_NONE;
     span->retired_before = retired_before;
     span->bind_cnt = 0;
     span->bind_first = 0;
@@ -121,6 +125,12 @@ bool latr_tb_insn_map_resolve(uintptr_t host_pc, uint64_t *guest_pc,
         for (uint32_t j = 0; j < map->count; j++) {
             const LatrTbInsnSpan *span = &map->spans[j];
             if (offset < span->native_start || offset >= span->native_end) {
+                continue;
+            }
+            /* The row and the map must agree on the generation that built it:
+             * a row whose map was rewritten (or whose arena was reclaimed) is
+             * not evidence about the code now at these bytes. */
+            if (!le_recovery_span_is_live(span, map->generation)) {
                 continue;
             }
             if (best == NULL || map->generation >= best_generation) {

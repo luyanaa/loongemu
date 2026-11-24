@@ -28,6 +28,8 @@ typedef LeRecoverySiteKind LataRecoverySite;
 typedef LeRecoveryBinding LataRecoveryBinding;
 /* aux carries the guest insn raw_len (bytes). */
 typedef LeRecoverySpan    LataTbInsnSpan;
+_Static_assert(sizeof(LataTbInsnSpan) == sizeof(LeRecoverySpan),
+               "LataTbInsnSpan must stay the shared recovery row");
 #define lata_span_raw_len(s)       ((s)->aux)
 #define lata_span_set_raw_len(s,v) ((s)->aux = (v))
 

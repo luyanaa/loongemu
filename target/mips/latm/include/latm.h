@@ -34,6 +34,9 @@ typedef LeRecoveryBinding LatmRecoveryBinding;
 /* aux packs the branch-delay-slot flag in bit0; upper bits are reserved for a
  * partial-effect progress id (branch-link side-effect index). */
 typedef LeRecoverySpan    LatmTbInsnSpan;
+_Static_assert(sizeof(LatmTbInsnSpan) == sizeof(LeRecoverySpan),
+               "LatmTbInsnSpan must stay the shared recovery row");
+
 #define latm_span_delay_slot(s)      ((s)->aux & 1u)
 #define latm_span_set_delay_slot(s,v) ((s)->aux = ((v) ? 1u : 0u))
 

@@ -304,7 +304,7 @@ test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging buil
       build/test_riscv_uart build/test_riscv_fw \
       build/test_fpsr \
       build/test_sve_helper_support build/test_sve_helper_lifecycle \
-      build/test_lata_nzcv build/test_ir2_lbt_opcodes
+      build/test_lata_nzcv build/test_ir2_lbt_opcodes build/test_le_recovery_abi
 	./build/test_ir2_peephole
 	./build/test_loongbt
 	./build/test_loongbt_cpu
@@ -334,6 +334,7 @@ test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging buil
 	./build/test_lata_dispatch
 	./build/test_lata_nzcv
 	./build/test_ir2_lbt_opcodes
+	./build/test_le_recovery_abi
 
 # Back-end selection and the EFLAGS pack/unpack bridge.  Kept separate from
 # test_loongbt so a failure points at the glue rather than the semantics.
@@ -364,6 +365,13 @@ test-pci-host: build/test_pci_host
 
 # AArch64 NZCV / condition reference (see tests/test_lata_nzcv.c): the software
 # path LATA needs on hosts without LBT has to match this before it is wired in.
+# Shared recovery ABI: row schema plus the one fail-closed decision function.
+build/test_le_recovery_abi: tests/test_le_recovery_abi.c \
+                            shared/backend/loongarch/include/le-recovery.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -I shared/backend/loongarch/include \
+	      tests/test_le_recovery_abi.c -o $@
+
 # LBT-opcode classifier + drift check against the enum it is generated from.
 IR2_BACKEND_INC := shared/backend/loongarch/include
 build/test_ir2_lbt_opcodes: tests/test_ir2_lbt_opcodes.c $(IR2_BACKEND_INC)/ir2-lbt-opcodes.h $(IR2_BACKEND_INC)/ir2-opcode.h

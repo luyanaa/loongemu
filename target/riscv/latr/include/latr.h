@@ -49,6 +49,9 @@ typedef LeRecoverySiteKind LatrRecoverySite;
 
 typedef LeRecoveryBinding LatrRecoveryBinding;
 typedef LeRecoverySpan    LatrTbInsnSpan;
+_Static_assert(sizeof(LatrTbInsnSpan) == sizeof(LeRecoverySpan),
+               "LatrTbInsnSpan must stay the shared recovery row");
+
 
 #define latr_span_raw_len(s)      ((s)->aux)
 #define latr_span_set_raw_len(s,v) ((s)->aux = (v))

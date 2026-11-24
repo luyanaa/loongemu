@@ -618,6 +618,26 @@ int latr_machine_host_fault(LatrMachine *m, uint32_t hartid,
      * Report the unresolved snapshot and return 0 (caller aborts dispatch)
      * rather than let `applied=false` continue into take_guest_trap.
      */
+    /*
+     * Flags are guest state too: a span that left NZCV/EFLAGS in a host register
+     * (LE_FLAGS_DEFERRED) is as unreplayable as one that binds GPRs, and the
+     * shared predicate is the single place that knowledge lives. LATR records
+     * LE_FLAGS_NONE today (RV64 has no flag word), so this guard is dormant
+     * until a port starts recording deferred flags -- it is here so the ABI is
+     * actually used rather than merely defined.
+     */
+    if (le_recovery_flags_need_snapshot(span) && host_gprs == NULL) {
+        if (info != NULL) {
+            info->guest_pc = guest_pc;
+            info->resolved = true;
+            info->site = span->site;
+            info->retired_before = span->retired_before;
+            info->bind_cnt = span->bind_cnt;
+            info->applied = false;
+        }
+        latr_context_restore(saved);
+        return 0;
+    }
     bool applied = false;
     if (span->bind_cnt != 0 || (span->bind_flags & LE_BIND_OVERFLOW)) {
         if (host_gprs == NULL) {

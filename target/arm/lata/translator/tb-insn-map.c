@@ -74,6 +74,10 @@ void lata_tb_insn_map_add(uint64_t guest_pc, uint32_t native_start,
     span->site = site;
     span->phase = LE_PHASE_BEFORE_INSN;
     span->effect_id = 0;
+    span->tb_generation = map->generation;
+    /* LATA records flags through the shared field but has no span that writes
+     * NZCV today: its spans are guest accesses and traps. */
+    span->flags_state = LE_FLAGS_NONE;
     span->retired_before = retired_before;
     span->bind_cnt = 0;
     span->bind_first = 0;
