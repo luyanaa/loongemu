@@ -67,18 +67,16 @@ jobs:
   # dies on the first subs/cset block there. Run it locally with
   # `make lata-isa-run`. Giving LATA a software NZCV path for non-LBT hosts is
   # the change that would let this gate return.
-  isa-gates:
+  isa-latr:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: ISA gates (qemu 10)
+      - name: LATR ISA + guest boot + PERF
         run: |
-          # The container script lives in its own heredoc: an apostrophe inside a
-          # single-quoted `bash -c '...'` string terminates it and silently moves
-          # the rest onto the host shell, which is exactly how a build step once
-          # ran outside the container.
-          cat > /tmp/isa-gates.sh <<'SCRIPT'
+          # Script via a quoted heredoc: an apostrophe inside `bash -c '...'`
+          # would terminate the string and move the rest onto the host shell.
+          cat > /tmp/gate.sh <<'SCRIPT'
           set -e
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends \
@@ -92,45 +90,82 @@ jobs:
           make latr-sys-run \
             CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
             QLVZ_REPO=/usr/bin/qemu-system-loongarch64
-          # LATM ISA on the plain jirl chain path: qemu advertises LBT in CPUCFG
-          # but cannot decode gr2scr/jiscr0, so the fallback is what runs, and the
-          # harness prints "chain-jiscr1 skipped (no LBT)".
-          make -C latm all CLANG=clang AR=llvm-ar
-          make latm-isa-run LATM_FORCE_NO_LBT=1 \
-            CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
-            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
-          # LATM board harness: FDT handoff plus the first system TB.
-          make latm-board-run \
-            CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
-            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
-          # The PERF build must be compiled from a clean tree: make does not
-          # track the -DLOONGEMU_PERF change and would relink stale objects.
+          # PERF build from a clean tree: make does not track the -DLOONGEMU_PERF
+          # change and would relink stale objects.
           make -C latr clean CLANG=clang AR=llvm-ar
           make latr-sys-run PERF=1 \
             CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
             QLVZ_REPO=/usr/bin/qemu-system-loongarch64
           grep -a 'latr-perf:' build/latr_sys_diff.log
-          # Boot tier: a translated x86 host boots on 4 LoongArch harts with IPI
-          # shootdowns, then asserts phys_cpus_online=4, `tb-sys: done` and
-          # fails=0. The initramfs it embeds is gitignored, but the Makefile
-          # generates a valid kernel-only one when it is absent, so a fresh
-          # checkout builds it, and -nic none keeps qemu from needing an option
-          # ROM. It ends through the rule 90s timeout by design.
-          #
-          # This gate used to fail 11 checks for one reason, now fixed: the PLV0
-          # trap stub saved its 256-byte register frame on the interrupted
-          # (guest) stack, right on top of the 48-byte exception frame that
-          # delivery pushes, so sync_env_to_trap_regs() overwrote CR2/RIP/EC and
-          # the handler read EFLAGS as the error code (0x100) and the saved RSP
-          # as RIP. Whether the windows collided depended on the fault-time guest
-          # rsp, which is why a clang-23 image passed and a clang-19 image failed
-          # while the emulator, host arch and optimisation level made no
-          # difference. The stub now keeps its frame 48 bytes lower
-          # (`addi.d $sp, $sp, -304`), and both toolchains report 117/0.
-          make tb-sys-smp-run QLVZ=/usr/bin/qemu-system-loongarch64 \
-            CLANG=clang AR=llvm-ar LD_LLD=ld.lld
+
           SCRIPT
           docker run --rm \
-            -v "$GITHUB_WORKSPACE:/src" -v /tmp/isa-gates.sh:/isa-gates.sh:ro \
+            -v "$GITHUB_WORKSPACE:/src" -v /tmp/gate.sh:/gate.sh:ro \
             -w /src -e QEMU_DEBUG=1 -e QEMU_CPU=max \
-            debian:sid bash /isa-gates.sh
+            debian:sid bash /gate.sh
+
+  isa-latm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: LATM ISA + board
+        run: |
+          # Script via a quoted heredoc: an apostrophe inside `bash -c '...'`
+          # would terminate the string and move the rest onto the host shell.
+          cat > /tmp/gate.sh <<'SCRIPT'
+          set -e
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            clang lld llvm qemu-system-misc make python3 ca-certificates
+          qemu-system-loongarch64 --version | head -1
+          make -C latm all CLANG=clang AR=llvm-ar
+          # qemu advertises CPUCFG.2[22] (LBT) but cannot decode gr2scr/jiscr0,
+          # so the plain jirl chain path is what the gate exercises.
+          make latm-isa-run LATM_FORCE_NO_LBT=1 \
+            CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+          # Board harness: FDT handoff plus the first system TB.
+          make latm-board-run \
+            CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+
+          SCRIPT
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" -v /tmp/gate.sh:/gate.sh:ro \
+            -w /src -e QEMU_DEBUG=1 -e QEMU_CPU=max \
+            debian:sid bash /gate.sh
+
+  boot-smp:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: LoongArch SMP boot harness
+        run: |
+          # Script via a quoted heredoc: an apostrophe inside `bash -c '...'`
+          # would terminate the string and move the rest onto the host shell.
+          cat > /tmp/gate.sh <<'SCRIPT'
+          set -e
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            clang lld llvm qemu-system-misc make python3 ca-certificates
+          qemu-system-loongarch64 --version | head -1
+          # Boot tier: a translated x86 host boots on 4 LoongArch harts with IPI
+          # shootdowns, then asserts phys_cpus_online=4, `tb-sys: done` and
+          # fails=0. The embedded initramfs is gitignored and generated on
+          # demand; -nic none keeps qemu from needing an option ROM. It ends
+          # through the rule 90s timeout by design.
+          #
+          # This gate failed 11 checks until the PLV0 trap stub stopped saving
+          # its register frame on top of the 48-byte guest #PF frame; both
+          # toolchains now report 117/0.
+          make tb-sys-smp-run QLVZ=/usr/bin/qemu-system-loongarch64 \
+            CLANG=clang AR=llvm-ar LD_LLD=ld.lld
+
+          SCRIPT
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" -v /tmp/gate.sh:/gate.sh:ro \
+            -w /src -e QEMU_DEBUG=1 -e QEMU_CPU=max \
+            debian:sid bash /gate.sh
+
