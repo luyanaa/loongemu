@@ -32,6 +32,21 @@ uint64_t loongemu_perf_read(unsigned counter)
     return __atomic_load_n(&perf_counters[counter], __ATOMIC_RELAXED);
 }
 
+uint64_t loongemu_perf_now(void)
+{
+#if defined(__loongarch__)
+    uint64_t tick;
+
+    /* rdtime.d: the stable counter. Frequency is unknown here on purpose; the
+     * timing counters are compared against a baseline run, not converted to
+     * seconds. */
+    __asm__ volatile("rdtime.d %0, $zero" : "=r"(tick)::"memory");
+    return tick;
+#else
+    return 0;
+#endif
+}
+
 void loongemu_perf_record_tb(uint64_t host_insns, uint64_t guest_insns)
 {
     if (guest_insns == 0) {

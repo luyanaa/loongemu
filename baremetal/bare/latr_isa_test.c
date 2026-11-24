@@ -6377,6 +6377,12 @@ void kmain(void)
 {
     uint64_t euen;
     __asm__ volatile("csrrd %0, 0x2" : "=r"(euen));
+#ifdef LOONGEMU_PERF
+    /* Whole-suite tick span: the ISA harness executes blocks directly, so
+     * run_hart's per-TB split does not apply here. This is the comparable
+     * number to diff against a baseline build. */
+    const uint64_t perf_suite_start = loongemu_perf_now();
+#endif
     euen |= 1u; /* EUEN.FPE: bare QEMU resets with native FP disabled. */
     if (latx_cpu_has_lsx()) {
         euen |= 2u; /* EUEN.SXE */
@@ -6464,19 +6470,24 @@ void kmain(void)
     putdec((unsigned)checks);
 #ifdef LOONGEMU_PERF
     {
-        /* `make latr-isa-run PERF=1` reports the guest-access event mix; the
-         * default build has no counters and prints nothing. */
-        static const char *const names[LOONGEMU_PERF_COUNTERS] = {
+        /* `make latr-isa-run PERF=1` reports the guest-access event mix for
+         * this direct-execution harness plus the whole-suite tick span. The
+         * per-TB compile/exec split is counted in run_hart, which this harness
+         * does not drive, so those counters stay out of this line. */
+        static const char *const names[] = {
             "tlb-hit", "tlb-miss", "mmio", "mem-fault", "plan-hit",
         };
+        const unsigned report = (unsigned)(sizeof(names) / sizeof(names[0]));
 
         latx_bare_uart_puts("\nlatr-perf:");
-        for (unsigned i = 0; i < LOONGEMU_PERF_COUNTERS; i++) {
+        for (unsigned i = 0; i < report; i++) {
             latx_bare_uart_putc(' ');
             latx_bare_uart_puts(names[i]);
             latx_bare_uart_putc('=');
             putdec((unsigned)loongemu_perf_read(i));
         }
+        latx_bare_uart_puts(" suite-ticks=");
+        puthex(loongemu_perf_now() - perf_suite_start);
     }
 #endif
     latx_bare_uart_puts("\nlatr-isa: done\n");

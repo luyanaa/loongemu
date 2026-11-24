@@ -15,6 +15,8 @@ enum {
     LOONGEMU_PERF_MMIO_ACCESS,
     LOONGEMU_PERF_MEM_FAULT,
     LOONGEMU_PERF_PLAN_HIT, /* TLB hit that also reused the cached map plan */
+    LOONGEMU_PERF_TB_COMPILE_TICKS, /* translate+assemble time per TB */
+    LOONGEMU_PERF_TB_EXEC_TICKS,    /* time spent inside generated code */
     LOONGEMU_PERF_COUNTERS
 };
 
@@ -27,6 +29,13 @@ uint64_t loongemu_perf_guest_insns(void);
 double loongemu_perf_host_insns_per_guest_insn(void);
 void loongemu_perf_count(unsigned counter, uint64_t delta);
 uint64_t loongemu_perf_read(unsigned counter);
+/*
+ * Monotonic tick source for the timing counters. On a LoongArch host this is
+ * the architectural stable counter; elsewhere it reports 0 so callers can
+ * treat the timing counters as unavailable instead of fabricating numbers.
+ */
+uint64_t loongemu_perf_now(void);
+#define LOONGEMU_PERF_HAS_CLOCK 1
 #else
 static inline void loongemu_perf_reset(void) {}
 static inline void loongemu_perf_record_tb(uint64_t host_insns,
@@ -52,6 +61,7 @@ static inline uint64_t loongemu_perf_read(unsigned counter)
     (void)counter;
     return 0;
 }
+static inline uint64_t loongemu_perf_now(void) { return 0; }
 #endif
 
 #endif

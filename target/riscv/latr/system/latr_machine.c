@@ -3,6 +3,7 @@
 #include "latr-fdt.h"
 #include "mmu.h"
 #include "translate.h"
+#include "loongemu-perf.h"
 
 #define PLIC_PHANDLE (1u + LATR_MACHINE_MAX_HARTS)
 #define TEST_PHANDLE (2u + LATR_MACHINE_MAX_HARTS)
@@ -736,6 +737,9 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
 
     key = latr_tb_cache_key(&h->env);
     pc_before = h->env.pc;
+#ifdef LOONGEMU_PERF
+    uint64_t perf_start = loongemu_perf_now();
+#endif
     entry = latr_tb_cache_lookup(&h->tb_cache, h->env.pc, key);
     if (entry == NULL) {
         if (m->translate_tb != NULL) {
@@ -789,7 +793,19 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
     if (m->enter_tb == NULL) {
         return 0;
     }
+#ifdef LOONGEMU_PERF
+    {
+        uint64_t mid = loongemu_perf_now();
+
+        loongemu_perf_count(LOONGEMU_PERF_TB_COMPILE_TICKS, mid - perf_start);
+        perf_start = mid;
+    }
+#endif
     m->enter_tb(&h->env, (void *)(uintptr_t)code);
+#ifdef LOONGEMU_PERF
+    loongemu_perf_count(LOONGEMU_PERF_TB_EXEC_TICKS,
+                        loongemu_perf_now() - perf_start);
+#endif
     if (h->env.wfi_pending) {
         latr_idle_advance(&h->env);
         h->env.wfi_pending = 0;

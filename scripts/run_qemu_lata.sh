@@ -95,9 +95,20 @@ if [[ -s "$ERR_FILE" ]]; then
     tail -n 20 "$ERR_FILE" >&2
 fi
 if [[ -s "$TRACE_FILE" ]]; then
+    first_exc=$(grep -n 'do_raise_exception' "$TRACE_FILE" 2>/dev/null |
+                head -1 | cut -d: -f1)
+    if [[ -n "$first_exc" ]]; then
+        emit_from=$(( first_exc > 30 ? first_exc - 30 : 1 ))
+        echo "run_qemu_lata: first exception context ($TRACE_FILE):" >&2
+        sed -n "${emit_from},$(( first_exc + 2 ))p" "$TRACE_FILE" >&2
+    fi
     echo "run_qemu_lata: qemu trace head ($TRACE_FILE):" >&2
     head -n 40 "$TRACE_FILE" >&2
     echo "run_qemu_lata: qemu trace tail ($TRACE_FILE):" >&2
     tail -n 12 "$TRACE_FILE" >&2
+fi
+if [[ -s "$LOG_FILE" ]]; then
+    echo "run_qemu_lata: serial text ($LOG_FILE):" >&2
+    cat -v "$LOG_FILE" | tail -n 5 >&2
 fi
 exit "$status"
