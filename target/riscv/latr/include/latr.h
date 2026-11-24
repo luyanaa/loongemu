@@ -109,6 +109,7 @@ typedef struct TRANSLATION_DATA {
     /* Per-insn recovery staging (C1): site kind + regcache binding snapshot
      * captured during translate, committed into the map at assemble. */
     uint8_t tb_insn_site[LATR_TB_MAP_SPANS];
+    uint8_t tb_insn_phase[LATR_TB_MAP_SPANS];
     uint8_t tb_insn_bind_cnt[LATR_TB_MAP_SPANS];
     LatrRecoveryBinding tb_insn_binds[LATR_TB_MAP_SPANS]
                                      [LATR_RECOVERY_MAX_BINDS_PER_SPAN];
@@ -203,7 +204,7 @@ void latr_pvir_cache_destroy(LatrPvirCache *cache);
 void latr_tb_insn_map_begin(void *code, uint32_t code_size);
 void latr_tb_insn_map_add(uint64_t guest_pc, uint32_t native_start,
                           uint32_t native_end, uint32_t raw_len,
-                          uint8_t site, uint32_t retired_before,
+                          uint8_t site, uint8_t phase, uint32_t retired_before,
                           const LatrRecoveryBinding *binds, uint8_t bind_cnt);
 bool latr_tb_insn_map_resolve(uintptr_t host_pc, uint64_t *guest_pc,
                               uint32_t *raw_len);

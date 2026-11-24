@@ -2335,8 +2335,73 @@ static void test_tb_recovery(void)
         }
         check(env.pc, (uint64_t)(uintptr_t)&block[1],
               "apply sets env.pc to the ld");
+        check(sld->phase, LE_PHASE_BEFORE_INSN,
+              "scalar load commits nothing before the fault");
     }
     latr_tb_insn_map_forget(code_buf);
+
+    /*
+     * Phase classification: a trap retires into the vector (AFTER_FALLTHROUGH),
+     * while an RVV element store can leave a committed prefix (PARTIAL_EFFECT,
+     * which the machine's host-fault path refuses to project).
+     */
+    {
+        static const uint32_t ecall_block[] = { 0x00000073 }; /* ecall */
+        const LatrTbInsnSpan *s;
+
+        reset_guest_state();
+        for (size_t i = 0; i < sizeof(tb); i++) {
+            ((uint8_t *)&tb)[i] = 0;
+        }
+        cpu.env_ptr = &env;
+        env.pc = (uint64_t)(uintptr_t)ecall_block;
+        tb.pc = env.pc;
+        tb.tc.ptr = code_buf;
+        tb.cflags = 0;
+        int once = 1;
+        target_disasm(&tb, &once, &cpu);
+        tr_init(&tb);
+        check(tr_ir2_generate(&tb), 1, "ecall block translates");
+        check(tr_ir2_assemble(code_buf) > 0, 1, "ecall block assembles");
+        s = latr_tb_recovery_resolve((uintptr_t)code_buf, NULL);
+        check(s != NULL, 1, "ecall span resolves");
+        if (s != NULL) {
+            check(s->site, LATR_RECOV_GUEST_CHECK, "ecall span is a guest check");
+            check(s->phase, LE_PHASE_AFTER_FALLTHROUGH,
+                  "ecall span retires into the vector");
+        }
+        latr_tb_insn_map_forget(code_buf);
+    }
+    {
+        /* vse32.v v1, (x6): element store, commit order per element. */
+        static const uint32_t vstore_block[] = { 0x020860a7 };
+        const LatrTbInsnSpan *s;
+
+        reset_guest_state();
+        for (size_t i = 0; i < sizeof(tb); i++) {
+            ((uint8_t *)&tb)[i] = 0;
+        }
+        cpu.env_ptr = &env;
+        env.pc = (uint64_t)(uintptr_t)vstore_block;
+        tb.pc = env.pc;
+        tb.tc.ptr = code_buf;
+        tb.cflags = 0;
+        int once = 1;
+        target_disasm(&tb, &once, &cpu);
+        check(tb.icount, 1, "vector store decodes");
+        tr_init(&tb);
+        check(tr_ir2_generate(&tb), 1, "vector store translates");
+        check(tr_ir2_assemble(code_buf) > 0, 1, "vector store assembles");
+        s = latr_tb_recovery_resolve((uintptr_t)code_buf, NULL);
+        check(s != NULL, 1, "vector store span resolves");
+        if (s != NULL) {
+            check(s->site, LATR_RECOV_GUEST_ACCESS,
+                  "vector store is a guest access");
+            check(s->phase, LE_PHASE_PARTIAL_EFFECT,
+                  "vector store can commit a prefix");
+        }
+        latr_tb_insn_map_forget(code_buf);
+    }
 }
 
 static void test_mmu_walk(void)

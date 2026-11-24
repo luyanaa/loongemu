@@ -589,8 +589,23 @@ int latr_machine_host_fault(LatrMachine *m, uint32_t hartid,
         info->guest_pc = guest_pc;
         info->resolved = true;
         info->site = span->site;
+        info->phase = span->phase;
         info->retired_before = span->retired_before;
         info->bind_cnt = span->bind_cnt;
+    }
+    /*
+     * PARTIAL_EFFECT spans are element-wise accesses (RVV element loads/stores)
+     * whose committed prefix cannot be described by the register bindings: the
+     * guest would observe a half-applied instruction that hardware never
+     * produces. There is no precise projection to make, so abort dispatch
+     * instead of guessing.
+     */
+    if (span->phase == LE_PHASE_PARTIAL_EFFECT) {
+        if (info != NULL) {
+            info->applied = false;
+        }
+        latr_context_restore(saved);
+        return 0;
     }
     /*
      * Replay the span's bindings into env BEFORE entering the guest trap, so

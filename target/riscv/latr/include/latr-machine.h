@@ -56,6 +56,7 @@ typedef struct LatrMachineFaultInfo {
      * LatrRecoverySite; NATIVE_INTERNAL means the fault is a host bug and was
      * NOT projected to a guest exception. */
     uint8_t  site;
+    uint8_t  phase; /* LeRecoveryPhase: how much of the span may have landed */
     uint32_t retired_before;
     uint8_t  bind_cnt;
     /* C1-followup: 1 when the fault-time host register snapshot was supplied

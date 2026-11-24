@@ -58,7 +58,7 @@ void latr_tb_insn_map_begin(void *code, uint32_t code_size)
 
 void latr_tb_insn_map_add(uint64_t guest_pc, uint32_t native_start,
                           uint32_t native_end, uint32_t raw_len,
-                          uint8_t site, uint32_t retired_before,
+                          uint8_t site, uint8_t phase, uint32_t retired_before,
                           const LatrRecoveryBinding *binds, uint8_t bind_cnt)
 {
     LatrTbInsnMap *map = lsenv && lsenv->tr_data
@@ -74,7 +74,7 @@ void latr_tb_insn_map_add(uint64_t guest_pc, uint32_t native_start,
     span->native_end = native_end;
     latr_span_set_raw_len(span, raw_len);
     span->site = site;
-    span->phase = LE_PHASE_BEFORE_INSN;
+    span->phase = phase;
     span->effect_id = 0;
     span->retired_before = retired_before;
     span->bind_cnt = 0;

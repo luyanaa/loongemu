@@ -516,6 +516,21 @@ static uint8_t latr_recovery_site_of(LatrRiscvOpcode opcode)
     case LATR_RV_LBU: case LATR_RV_LHU: case LATR_RV_LWU:
     case LATR_RV_SB: case LATR_RV_SH: case LATR_RV_SW: case LATR_RV_SD:
     case LATR_RV_FLW: case LATR_RV_FLD: case LATR_RV_FSW: case LATR_RV_FSD:
+    case LATR_RV_VLE8_V: case LATR_RV_VLE16_V:
+    case LATR_RV_VLE32_V: case LATR_RV_VLE64_V:
+    case LATR_RV_VLE8FF_V: case LATR_RV_VLE16FF_V:
+    case LATR_RV_VLE32FF_V: case LATR_RV_VLE64FF_V:
+    case LATR_RV_VSE8_V: case LATR_RV_VSE16_V:
+    case LATR_RV_VSE32_V: case LATR_RV_VSE64_V:
+    case LATR_RV_VLSE8_V: case LATR_RV_VLSE16_V:
+    case LATR_RV_VLSE32_V: case LATR_RV_VLSE64_V:
+    case LATR_RV_VSSE8_V: case LATR_RV_VSSE16_V:
+    case LATR_RV_VSSE32_V: case LATR_RV_VSSE64_V:
+    case LATR_RV_VLXEI8_V: case LATR_RV_VLXEI16_V:
+    case LATR_RV_VLXEI32_V: case LATR_RV_VLXEI64_V:
+    case LATR_RV_VSXEI8_V: case LATR_RV_VSXEI16_V:
+    case LATR_RV_VSXEI32_V: case LATR_RV_VSXEI64_V:
+    case LATR_RV_VLM_V: case LATR_RV_VSM_V:
     case LATR_RV_LR_W: case LATR_RV_SC_W: case LATR_RV_LR_D: case LATR_RV_SC_D:
     case LATR_RV_AMOSWAP_W: case LATR_RV_AMOADD_W: case LATR_RV_AMOXOR_W:
     case LATR_RV_AMOAND_W: case LATR_RV_AMOOR_W: case LATR_RV_AMOMIN_W:
@@ -530,6 +545,49 @@ static uint8_t latr_recovery_site_of(LatrRiscvOpcode opcode)
         return LATR_RECOV_GUEST_CHECK;
     default:
         return LATR_RECOV_NATIVE_INTERNAL;
+    }
+}
+
+/*
+ * How much of a guest instruction may already have landed when the host takes
+ * a fault inside its span:
+ *
+ *   BEFORE_INSN      nothing committed; the guest can re-execute it (scalar
+ *                    loads/stores either complete or fault as one host access)
+ *   AFTER_FALLTHROUGH the trap is the instruction's effect; pc already points
+ *                    at the vector, so the guest must not see it re-executed
+ *   PARTIAL_EFFECT   element-wise state (RVV element loads/stores) may hold
+ *                    committed prefixes; recovery cannot project that
+ */
+static uint8_t latr_recovery_phase_of(LatrRiscvOpcode opcode)
+{
+    switch (opcode) {
+    case LATR_RV_ECALL:
+    case LATR_RV_EBREAK:
+    case LATR_RV_MRET:
+    case LATR_RV_SRET:
+    case LATR_RV_WFI:
+    case LATR_RV_SFENCE_VMA:
+    case LATR_RV_FENCE_I:
+        return LE_PHASE_AFTER_FALLTHROUGH;
+    case LATR_RV_VLE8_V: case LATR_RV_VLE16_V:
+    case LATR_RV_VLE32_V: case LATR_RV_VLE64_V:
+    case LATR_RV_VLE8FF_V: case LATR_RV_VLE16FF_V:
+    case LATR_RV_VLE32FF_V: case LATR_RV_VLE64FF_V:
+    case LATR_RV_VSE8_V: case LATR_RV_VSE16_V:
+    case LATR_RV_VSE32_V: case LATR_RV_VSE64_V:
+    case LATR_RV_VLSE8_V: case LATR_RV_VLSE16_V:
+    case LATR_RV_VLSE32_V: case LATR_RV_VLSE64_V:
+    case LATR_RV_VSSE8_V: case LATR_RV_VSSE16_V:
+    case LATR_RV_VSSE32_V: case LATR_RV_VSSE64_V:
+    case LATR_RV_VLXEI8_V: case LATR_RV_VLXEI16_V:
+    case LATR_RV_VLXEI32_V: case LATR_RV_VLXEI64_V:
+    case LATR_RV_VSXEI8_V: case LATR_RV_VSXEI16_V:
+    case LATR_RV_VSXEI32_V: case LATR_RV_VSXEI64_V:
+    case LATR_RV_VLM_V: case LATR_RV_VSM_V:
+        return LE_PHASE_PARTIAL_EFFECT;
+    default:
+        return LE_PHASE_BEFORE_INSN;
     }
 }
 
@@ -850,6 +908,7 @@ bool tr_ir2_generate(TranslationBlock *tb)
          * opens this guest insn's span. Snapshot BEFORE translate so the
          * insn's own results postdate the fault and are never replayed. */
         data->tb_insn_site[i] = latr_recovery_site_of(insns[i].opcode);
+        data->tb_insn_phase[i] = latr_recovery_phase_of(insns[i].opcode);
         data->tb_insn_bind_cnt[i] = latr_regcache_snapshot_gpr_binds(
             data->tb_insn_binds[i]);
         (la_label)(labels[i]);
@@ -1093,7 +1152,8 @@ int tr_ir2_assemble(const void *code_start_addr)
     for (int i = 0; i < data->tb_insn_count; i++) {
         latr_tb_insn_map_add(data->tb_insn_pc[i], span_off[i],
                              span_off[i + 1], data->tb_insn_len[i],
-                             data->tb_insn_site[i], (uint32_t)i,
+                             data->tb_insn_site[i], data->tb_insn_phase[i],
+                             (uint32_t)i,
                              data->tb_insn_binds[i], data->tb_insn_bind_cnt[i]);
     }
     loongemu_perf_record_tb((uint64_t)count,
