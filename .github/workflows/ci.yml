@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Nightly: the same two tiers, so emulator- or scheduler-dependent flakes
+  # (SMP invalidation, MTTCG timing, host-test races) get caught without
+  # re-running everything on every push.
+  schedule:
+    - cron: '17 18 * * *'
+  workflow_dispatch:
 
 jobs:
   # Fast tier: everything that runs on the build host. No qemu, no bare image,
