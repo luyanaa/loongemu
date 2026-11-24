@@ -90,4 +90,12 @@ jobs:
               make latm-isa-run LATM_FORCE_NO_LBT=1 \
                 CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
                 QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+              # Compile and run the PERF build once, from a clean tree: make
+              # does not track the -DLOONGEMU_PERF change, so without the clean
+              # it would relink stale objects and silently skip the counters.
+              make -C latr clean CLANG=clang AR=llvm-ar
+              make latr-sys-run PERF=1 \
+                CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+                QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+              grep -a 'latr-perf:' build/latr_sys_diff.log
             '
