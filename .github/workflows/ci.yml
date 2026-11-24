@@ -26,6 +26,14 @@ jobs:
   # nibble in env->pstate between instructions, and turn armmove into
   # predicate-from-nibble + select. Four helpers, ~14 emission sites. Until
   # that lands, `make lata-isa-run` locally (6525 checks) is the gate.
+  #
+  # An attempt at that path reached 6504/6525 before being reverted: the
+  # residual mismatches were flag nibbles off by one condition, so the emitted
+  # arithmetic still disagrees with AArch64. tests/test_lata_nzcv.c now pins the
+  # reference semantics -- add-with-carry over 32/64 bits (including the
+  # carry-in rule that `res < a` alone gets wrong) and the full 16 x 16
+  # condition matrix -- in the fast host tier, so the next attempt starts from
+  # verified ground truth instead of a 6525-check round trip.
 
   # Fast tier: everything that runs on the build host. No qemu, no bare image,
   # so a regression is reported in minutes instead of behind an emulator run.

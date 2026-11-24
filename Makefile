@@ -303,7 +303,8 @@ test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging buil
       build/test_riscv_sbi build/test_riscv_acpi build/test_riscv_plic \
       build/test_riscv_uart build/test_riscv_fw \
       build/test_fpsr \
-      build/test_sve_helper_support build/test_sve_helper_lifecycle
+      build/test_sve_helper_support build/test_sve_helper_lifecycle \
+      build/test_lata_nzcv
 	./build/test_ir2_peephole
 	./build/test_loongbt
 	./build/test_loongbt_cpu
@@ -331,6 +332,7 @@ test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging buil
 	./build/test_latm_decode
 	./build/test_latm_insn_map
 	./build/test_lata_dispatch
+	./build/test_lata_nzcv
 
 # Back-end selection and the EFLAGS pack/unpack bridge.  Kept separate from
 # test_loongbt so a failure points at the glue rather than the semantics.
@@ -358,6 +360,12 @@ build/test_pci_host: tests/test_pci_host.c src/pci_host.c src/phys_mem.c \
 
 test-pci-host: build/test_pci_host
 	./build/test_pci_host
+
+# AArch64 NZCV / condition reference (see tests/test_lata_nzcv.c): the software
+# path LATA needs on hosts without LBT has to match this before it is wired in.
+build/test_lata_nzcv: tests/test_lata_nzcv.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) tests/test_lata_nzcv.c -o $@
 
 build/test_hyperv: tests/test_hyperv.c src/hyperv.c include/loongemu/hyperv.h
 	@mkdir -p build
