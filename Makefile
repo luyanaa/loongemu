@@ -1420,6 +1420,14 @@ build/vmlinux_text.o: baremetal/bare/vmlinux_text.S firmware/vmlinux-x86_64-text
 	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib -c $< -o $@
 
 INITRAMFS ?= firmware/initramfs.cpio.gz
+# firmware/initramfs.cpio.gz is gitignored (a test asset, not source), so a
+# fresh checkout had no way to build the SMP/boot images. The boot smoke only
+# needs a *valid* archive -- it asserts translation counters and reaches its
+# stop marker with a kernel-only boot -- so a missing file is generated with the
+# root entry only. A real image placed there is never overwritten.
+$(INITRAMFS):
+	@python3 scripts/mk_initramfs.py $@
+
 build/vmlinux_segs.o: baremetal/bare/vmlinux_segs.S firmware/vmlinux-x86_64-seg1.bin firmware/vmlinux-x86_64-seg2.bin firmware/vmlinux-x86_64-seg3.bin $(INITRAMFS)
 	@mkdir -p build
 	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
