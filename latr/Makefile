@@ -19,6 +19,14 @@ INCS := -I$(LATR)/include -I$(BUILD) -Icompat -I.. \
 RESINC := $(shell $(CLANG) -print-resource-dir)/include
 DEFS := -DTARGET_RISCV64 -DCONFIG_LATR -DCONFIG_LATR_STANDALONE \
         -DCONFIG_LATX -D__WORDSIZE=64 -D__thread=
+
+# `make PERF=1` turns on the shared perf counters (TB compile/execute and
+# guest access events) so a change can be compared against a build with them
+# off. Off by default: the counters are atomics on the hot path.
+PERF ?= 0
+ifeq ($(PERF),1)
+DEFS += -DLOONGEMU_PERF
+endif
 BASE := --target=$(TARGET) -ffreestanding -nostdinc -fno-builtin \
         -fno-stack-protector -O2 -g -mno-lsx -mno-lasx -fno-vectorize \
         -fno-slp-vectorize -Wno-unused-parameter -Wno-unused-variable

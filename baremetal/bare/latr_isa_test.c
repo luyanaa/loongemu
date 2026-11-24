@@ -15,6 +15,7 @@
 #include "loongemu/vclock.h"
 #include "loongemu/mmio_bus.h"
 #include "loongemu/uart16550.h"
+#include "loongemu-perf.h"
 #include "qemu/cpu-features.h"
 #include "tests/latr_isa_diff_vectors.h"
 
@@ -6384,5 +6385,22 @@ void kmain(void)
         latx_bare_uart_puts("latr-isa: FAIL checks=");
     }
     putdec((unsigned)checks);
+#ifdef LOONGEMU_PERF
+    {
+        /* `make latr-isa-run PERF=1` reports the guest-access event mix; the
+         * default build has no counters and prints nothing. */
+        static const char *const names[LOONGEMU_PERF_COUNTERS] = {
+            "tlb-hit", "tlb-miss", "mmio", "mem-fault",
+        };
+
+        latx_bare_uart_puts("\nlatr-perf:");
+        for (unsigned i = 0; i < LOONGEMU_PERF_COUNTERS; i++) {
+            latx_bare_uart_putc(' ');
+            latx_bare_uart_puts(names[i]);
+            latx_bare_uart_putc('=');
+            putdec((unsigned)loongemu_perf_read(i));
+        }
+    }
+#endif
     latx_bare_uart_puts("\nlatr-isa: done\n");
 }

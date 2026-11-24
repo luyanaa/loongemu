@@ -658,9 +658,13 @@ LATR_BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdl
                -I latr/compat -I target/riscv/latr/include -I . \
                -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
                -I shared/backend/loongarch/include \
+               -I shared/perf/include \
                -I latx/compat -I latx/compat/include -I latx/upstream/include \
                -I include \
                -isystem $(shell $(CLANG) -print-resource-dir)/include
+ifeq ($(PERF),1)
+LATR_BARE_CFLAGS += -DLOONGEMU_PERF
+endif
 
 build/latr_isa_test.o: baremetal/bare/latr_isa_test.c \
                        target/riscv/latr/include/riscv-env.h \
@@ -680,7 +684,7 @@ build/latr_libc_min.o: latx/compat/libc_min.c
 	$(CLANG) $(LATR_BARE_CFLAGS) -c $< -o $@
 
 latr-core:
-	$(MAKE) -C latr all
+	$(MAKE) -C latr all PERF=$(PERF)
 
 build/bare_latr_isa.elf: build/latr_isa_test.o build/latr_miniglib.o \
                          build/latr_libc_min.o latr-core baremetal/bare/bare.lds
