@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-isa-gates:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm qemu-system-misc python3 make
+
+      - name: Toolchain versions
+        run: |
+          clang --version | head -1
+          llvm-ar --version | head -1
+          ld.lld --version | head -1
+          qemu-system-loongarch64 --version | head -1
+          python3 --version
+
+      - name: Host unit tests
+        run: make test
+
+      # Port core archives are prerequisites of the bare ISA images but have
+      # no rule in the top-level Makefile; build them first. CLANG/AR are
+      # passed as command-line vars so they propagate into the $(MAKE) -C
+      # port sub-makes via MAKEFLAGS.
+      - name: Build LATA core
+        working-directory: lata
+        run: make CLANG=clang AR=llvm-ar
+
+      - name: Build LATR core
+        working-directory: latr
+        run: make CLANG=clang AR=llvm-ar
+
+      - name: Build LATM core
+        working-directory: latm
+        run: make CLANG=clang AR=llvm-ar
+
+      # QLVZ_REPO default points at a checked-in macOS qemu binary; the ISA
+      # gates only need a generic virt+la464 machine, which stock
+      # qemu-system-loongarch64 (qemu-system-misc) provides. run_qemu_lata.sh
+      # resolves bios/keymaps via `dirname $QEMU_BIN`/../share/qemu, which
+      # lands on /usr/share/qemu for the distro package.
+      - name: LATA ISA gate
+        run: |
+          make lata-isa-run \
+            CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+
+      - name: LATR ISA gate
+        run: |
+          make latr-isa-run \
+            CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+
+      - name: LATM ISA gate
+        run: |
+          make latm-isa-run \
+            CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
