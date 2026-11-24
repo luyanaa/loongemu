@@ -39,23 +39,27 @@ jobs:
         working-directory: latr
         run: make all test-legality test-elf test-tb-smp CLANG=clang AR=llvm-ar
 
-  # ISA tier: build every port core and boot the three bare ISA images.
+  # ISA tier: build the port cores and boot the LATR/LATM bare ISA images.
   #
-  # The gates run inside a container because the generated code uses instructions
-  # the distro qemu 8.2 does not decode: LATA lowers AArch64 NZCV through the
-  # LoongArch binary-translation `armmtflag`, and LATR's RVV lowering emits
-  # LSX/LASX lanes. Both are fatal "Instruction Non-Existent" faults there. Debian
-  # trixie ships qemu 10, whose decoder covers them.
+  # Runner image: Debian trixie ships qemu 10, which decodes the LSX/LASX lanes
+  # that LATR's RVV lowering emits and that Ubuntu 24.04's qemu 8.2 rejects with
+  # "Instruction Non-Existent". QEMU_CPU=max exercises every implemented
+  # feature; QEMU_DEBUG=1 makes a failing gate print qemu's stderr, the first
+  # exception with 30 lines of traceback, and the serial text.
   #
-  # QEMU_CPU=max exercises every implemented feature; QEMU_DEBUG=1 makes a
-  # failing gate print qemu's stderr, the first exception with its traceback,
-  # and the serial text, instead of an empty log.
+  # The LATA gate is not here on purpose: LATA lowers AArch64 NZCV through the
+  # LoongArch binary-translation instruction `armmtflag` (translate-a64.c:870,
+  # 883, 1848, 8207, 9078; sve-lasx-lower.c; insts-pattern.c). QEMU-LVZ
+  # implements LBT, every distro qemu (8.2 through 10.0) does not, so the image
+  # dies on the first subs/cset block there. Run it locally with
+  # `make lata-isa-run`. Giving LATA a software NZCV path for non-LBT hosts is
+  # the change that would let this gate return.
   isa-gates:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: ISA gates (qemu with LBT/LSX)
+      - name: ISA gates (qemu 10)
         run: |
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/src" -w /src \
@@ -66,12 +70,8 @@ jobs:
               apt-get install -y -qq --no-install-recommends \
                 clang lld llvm qemu-system-misc make python3 ca-certificates
               qemu-system-loongarch64 --version | head -1
-              make -C lata all CLANG=clang AR=llvm-ar
               make -C latr all CLANG=clang AR=llvm-ar
               make -C latm all CLANG=clang AR=llvm-ar
-              make lata-isa-run \
-                CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
-                QLVZ_REPO=/usr/bin/qemu-system-loongarch64
               make latr-isa-run \
                 CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
                 QLVZ_REPO=/usr/bin/qemu-system-loongarch64
