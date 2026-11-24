@@ -565,13 +565,13 @@ IR2_INST *ir2_allocate(void)
  * Endpoints are recorded as Ir2Id so a snapshot survives ir2_inst_array
  * relocation inside ir2_allocate(). */
 
-static void (*ir2_dirty_flush_fn)(void *);
-static void *ir2_dirty_flush_opaque;
-
 void ir2_stream_set_dirty_flush(void (*fn)(void *opaque), void *opaque)
 {
-    ir2_dirty_flush_fn = fn;
-    ir2_dirty_flush_opaque = opaque;
+    if (lsenv == NULL) {
+        return;
+    }
+    lsenv->ir2_dirty_flush_fn = fn;
+    lsenv->ir2_dirty_flush_opaque = opaque;
 }
 
 void ir2_stream_snapshot(Ir2StreamSnap *snap)
@@ -607,8 +607,8 @@ void ir2_stream_rollback(const Ir2StreamSnap *snap)
         t->last_ir2->_next = snap->last_next;
     }
 
-    if (ir2_dirty_flush_fn != NULL) {
-        ir2_dirty_flush_fn(ir2_dirty_flush_opaque);
+    if (lsenv->ir2_dirty_flush_fn != NULL) {
+        lsenv->ir2_dirty_flush_fn(lsenv->ir2_dirty_flush_opaque);
     }
 }
 

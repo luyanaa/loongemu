@@ -98,6 +98,9 @@ typedef struct TRANSLATION_DATA {
 typedef struct ENV {
     void *cpu_state;            /* from QEMU,CPUArchState */
     TRANSLATION_DATA *tr_data;  /* from LATR */
+    /* Per-context dirty-flush hook for ir2_stream_rollback(). */
+    void (*ir2_dirty_flush_fn)(void *opaque);
+    void *ir2_dirty_flush_opaque;
 } ENV;
 
 struct LataGuestMemOps;

@@ -302,6 +302,7 @@ test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging buil
       build/test_latm_decode build/test_riscv_virtio_blk build/test_lata_dispatch \
       build/test_riscv_sbi build/test_riscv_acpi build/test_riscv_plic \
       build/test_riscv_uart build/test_riscv_fw \
+      build/test_fpsr \
       build/test_sve_helper_support build/test_sve_helper_lifecycle
 	./build/test_ir2_peephole
 	./build/test_loongbt

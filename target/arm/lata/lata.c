@@ -1256,6 +1256,15 @@ int lata_gen_epilogue(TCGContext *tcg_ctx)
 
 void label_dispose(void)
 {
+#if defined(LOONGEMU_IR2_PEEPHOLE) && LOONGEMU_IR2_PEEPHOLE
+    /* Run before label positions are recorded: peephole may rewrite the
+     * first/last pointers and the real-instruction count. Off by default —
+     * enable only after boundary/clobber/side-effect legality is verified. */
+    (void)ir2_peephole_optimize(
+        lsenv->tr_data->ir2_inst_array, &lsenv->tr_data->first_ir2,
+        &lsenv->tr_data->last_ir2, &lsenv->tr_data->real_ir2_inst_num,
+        env_ir2_opnd);
+#endif
     /* 1. record the positions of label */
     int *label_num_to_ir2_num =
         (int *)alloca(lsenv->tr_data->label_num * 4 + 20);

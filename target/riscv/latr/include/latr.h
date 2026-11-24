@@ -99,6 +99,9 @@ typedef struct TRANSLATION_DATA {
 typedef struct ENV {
     void *cpu_state;
     TRANSLATION_DATA *tr_data;
+    /* Per-context dirty-flush hook for ir2_stream_rollback(). */
+    void (*ir2_dirty_flush_fn)(void *opaque);
+    void *ir2_dirty_flush_opaque;
 } ENV;
 
 struct LatrTbCache;

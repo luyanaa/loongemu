@@ -88,6 +88,11 @@ typedef struct TRANSLATION_DATA {
 typedef struct ENV {
     void *cpu_state;
     TRANSLATION_DATA *tr_data;
+    /* Per-context dirty-flush hook for ir2_stream_rollback(). Owned by the
+     * translation context (per-vCPU), not a process-global — so multiple
+     * translators/vCPUs do not share one static pointer. */
+    void (*ir2_dirty_flush_fn)(void *opaque);
+    void *ir2_dirty_flush_opaque;
 } ENV;
 
 /* The shared IR2 backend (shared/backend/loongarch/ir2.c) tags its dump

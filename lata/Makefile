@@ -20,6 +20,7 @@ BASE := --target=$(TARGET) -ffreestanding -nostdinc -fno-builtin \
 CFLAGS := $(BASE) $(INCS) $(DEFS)
 
 SRCS := $(SHARED_BE)/ir2.c $(SHARED_BE)/ir2-assemble.c $(SHARED_BE)/la-append.c \
+        $(SHARED_BE)/ir2-peephole.c ../shared/perf/src/perf.c \
         $(LATA)/mem.c ../shared/pvir/src/pvir.c ../shared/pvir/src/pvir-plan.c $(LATA)/lata.c \
         $(LATA)/ftemp-snapshot.c $(LATA)/fpsr.c runtime.c \
         $(LATA)/optimization/clear-high.c $(LATA)/optimization/insts-pattern.c \
