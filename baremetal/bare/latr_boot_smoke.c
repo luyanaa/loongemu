@@ -593,7 +593,7 @@ static int run_machine_phase(void)
 
         if (!latr_machine_host_fault(&machine, 0,
                                      (uintptr_t)machine.harts[0].last_code,
-                                     13, UINT64_C(0xdead), &fault) ||
+                                     13, UINT64_C(0xdead), NULL, NULL, &fault) ||
             !fault.resolved || fault.guest_pc != expected_pc ||
             hart->env.csr[0x141] != expected_pc ||          /* sepc */
             hart->env.csr[0x142] != 13 ||                   /* scause */

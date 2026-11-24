@@ -529,7 +529,10 @@ int latr_machine_build_dtb(LatrMachine *m)
 
 int latr_machine_host_fault(LatrMachine *m, uint32_t hartid,
                             uintptr_t host_pc, uint32_t cause,
-                            uint64_t badaddr, LatrMachineFaultInfo *info)
+                            uint64_t badaddr,
+                            const uint64_t host_gprs[32],
+                            const uint64_t host_fprs[32],
+                            LatrMachineFaultInfo *info)
 {
     LatrMachineHart *h;
     LatrTranslatorContext *saved;
@@ -589,12 +592,30 @@ int latr_machine_host_fault(LatrMachine *m, uint32_t hartid,
         info->bind_cnt = span->bind_cnt;
     }
     /*
+     * Replay the span's bindings into env BEFORE entering the guest trap, so
+     * the guest handler sees the architectural register state at the fault
+     * point -- not whatever stale value env happened to hold. Precise replay
+     * requires the fault-time host register snapshot: if the span carries
+     * bindings and no snapshot was supplied, we refuse to claim a precise
+     * recovery (applied stays 0) but still hand the trap to the guest.
+     */
+    bool applied = false;
+    if (host_gprs != NULL) {
+        applied = latr_tb_recovery_apply(span, rmap, host_gprs, host_fprs,
+                                         &h->env);
+    }
+    if (info != NULL) {
+        info->applied = applied;
+    }
+    /*
      * Instructions before the faulting one already committed their effects; the
      * faulting instruction itself did not. Enter the guest's own trap handler
      * at the faulting PC -- the same entry the generated transfer_exception()
      * performs for guest-internal traps -- so the guest (firmware or kernel)
      * decides what to do instead of the fault being silently dropped. The
      * shootdown then makes the next dispatch re-translate from the vector.
+     * apply() already set env.pc; keep the explicit assignment for the
+     * empty-binding path where apply returned without touching pc.
      */
     h->env.pc = guest_pc;
     latr_take_guest_trap(&h->env, cause, badaddr);

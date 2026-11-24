@@ -299,7 +299,7 @@ build/test_ir2_peephole: tests/test_ir2_peephole.c \
 
 test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging build/test_x86_64_paging \
       build/test_ir2_peephole build/test_pci_host build/test_hyperv build/test_tb_cache build/test_soft_ras build/test_pvir build/test_sve_decode build/test_sve_pvir build/test_vcache build/test_arm_state build/test_lata_context \
-      build/test_latm_decode build/test_riscv_virtio_blk build/test_lata_dispatch \
+      build/test_latm_decode build/test_latm_insn_map build/test_riscv_virtio_blk build/test_lata_dispatch \
       build/test_riscv_sbi build/test_riscv_acpi build/test_riscv_plic \
       build/test_riscv_uart build/test_riscv_fw \
       build/test_fpsr \
@@ -329,6 +329,7 @@ test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging buil
 	./build/test_arm_state
 	./build/test_lata_context
 	./build/test_latm_decode
+	./build/test_latm_insn_map
 	./build/test_lata_dispatch
 
 # Back-end selection and the EFLAGS pack/unpack bridge.  Kept separate from
@@ -1147,8 +1148,9 @@ build/test_latm_insn_map: tests/test_latm_insn_map.c \
                           target/mips/latm/tb_insn_map.c
 	@mkdir -p build
 	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
-	      -I target/mips -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
-	      -I latx/compat -I latx/upstream/include -I . \
+      -I target/mips -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
+      -I shared/backend/loongarch/include \
+      -I latx/compat -I latx/upstream/include -I . \
 	      $(CFLAGS) -Wno-gnu-empty-struct \
 	      tests/test_latm_insn_map.c target/mips/latm/tb_insn_map.c -o $@
 

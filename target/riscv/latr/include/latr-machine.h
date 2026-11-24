@@ -58,6 +58,11 @@ typedef struct LatrMachineFaultInfo {
     uint8_t  site;
     uint32_t retired_before;
     uint8_t  bind_cnt;
+    /* C1-followup: 1 when the fault-time host register snapshot was supplied
+     * and latr_tb_recovery_apply() replayed the span's bindings (including the
+     * empty-binding case -- architectural state was already committed). 0 when
+     * the snapshot was missing, so the recovery must NOT be claimed precise. */
+    uint8_t  applied;
 } LatrMachineFaultInfo;
 
 typedef struct LatrMachineHart {
@@ -146,7 +151,10 @@ int latr_machine_set_bootargs(LatrMachine *m, const char *args);
  */
 int latr_machine_host_fault(LatrMachine *m, uint32_t hartid,
                             uintptr_t host_pc, uint32_t cause,
-                            uint64_t badaddr, LatrMachineFaultInfo *info);
+                            uint64_t badaddr,
+                            const uint64_t host_gprs[32],
+                            const uint64_t host_fprs[32],
+                            LatrMachineFaultInfo *info);
 void latr_machine_set_enter_tb(LatrMachine *m, LatrMachineEnterTb fn);
 void latr_machine_set_translate_tb(LatrMachine *m, LatrMachineTranslateTb fn);
 void latr_machine_set_translated_tb(LatrMachine *m, LatrMachineTranslatedTb fn);
