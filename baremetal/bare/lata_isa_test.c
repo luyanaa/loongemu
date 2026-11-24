@@ -276,9 +276,24 @@ static void run_block(uint32_t *guest, int insns, const char *name)
         tr_fini();
         return;
     }
-    tr_ir2_assemble(code_buf);
+    int words = tr_ir2_assemble(code_buf);
+    const uint32_t *words_out = (const uint32_t *)code_buf;
+
     tr_fini();
     __asm__ volatile("ibar 0" ::: "memory");
+
+    /* Report the assembled size and the first word past the end. The buffer is
+     * reused between blocks, so a block that stops short of its own terminator
+     * shows up as a size that disagrees with the jump the traceback executes. */
+    latx_bare_uart_puts("lata-isa: ");
+    latx_bare_uart_puts(name);
+    latx_bare_uart_puts(" words=");
+    putdec((unsigned)words);
+    latx_bare_uart_puts(" last=");
+    puthex(words > 0 ? words_out[words - 1] : 0);
+    latx_bare_uart_puts(" past=");
+    puthex(words > 0 ? words_out[words] : 0);
+    latx_bare_uart_puts("\n");
 
     lata_enter_tb(&env, code_buf);
     latx_bare_uart_puts("lata-isa: ");

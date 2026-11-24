@@ -39,7 +39,8 @@ jobs:
         working-directory: latr
         run: make all test-legality test-elf test-tb-smp CLANG=clang AR=llvm-ar
 
-  # ISA tier: build every port core and boot each bare ISA image under qemu.
+  # ISA tier: build every port core and boot the LATR/LATM bare ISA images.
+  # These two need only base LA64, which the distro qemu implements.
   isa-gates:
     runs-on: ubuntu-24.04
     steps:
@@ -61,10 +62,6 @@ jobs:
       # no rule in the top-level Makefile; build them first. CLANG/AR are
       # passed as command-line vars so they propagate into the $(MAKE) -C
       # port sub-makes via MAKEFLAGS.
-      - name: Build LATA core
-        working-directory: lata
-        run: make CLANG=clang AR=llvm-ar
-
       - name: Build LATR core
         working-directory: latr
         run: make CLANG=clang AR=llvm-ar
@@ -79,20 +76,9 @@ jobs:
       # resolves bios/keymaps via `dirname $QEMU_BIN`/../share/qemu, which
       # lands on /usr/share/qemu for the distro package.
       #
-      # QEMU_CPU=max: distro la464 does not decode every instruction the
-      # translator emits (LSX lanes appear in generated code).
-      # QEMU_DEBUG=1: print qemu's stderr, execution trace and serial byte
-      # count when a gate fails, because a distro qemu can die before the
-      # guest writes its first byte.
-      - name: LATA ISA gate
-        run: |
-          make lata-isa-run \
-            CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
-            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
-        env:
-          QEMU_DEBUG: 1
-          QEMU_CPU: max
-
+      # QEMU_DEBUG=1: print qemu's stderr, execution trace and serial text
+      # when a gate fails, because a distro qemu can die before the guest
+      # writes its first byte.
       - name: LATR ISA gate
         run: |
           make latr-isa-run \
@@ -110,3 +96,28 @@ jobs:
         env:
           QEMU_DEBUG: 1
           QEMU_CPU: max
+
+  # LATA lowers AArch64 NZCV through the LoongArch binary-translation (LBT)
+  # instruction `armmtflag`, which qemu 8.2 (Ubuntu 24.04) does not decode —
+  # the gate died with "Instruction Non-Existent" on the first subs/cset
+  # block. Run it on a distro whose qemu implements LBT.
+  lata-gate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: LATA ISA gate (qemu with LBT)
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" -w /src \
+            -e QEMU_DEBUG=1 -e QEMU_CPU=max \
+            debian:trixie bash -c '
+              set -e
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends \
+                clang lld llvm qemu-system-misc make python3 ca-certificates
+              qemu-system-loongarch64 --version | head -1
+              make lata-isa-run \
+                CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+                QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+            '
