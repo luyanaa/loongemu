@@ -78,7 +78,7 @@ Rest of the LATA route:
 |---|---|
 | P0 | arena bounds, reclaim, SMC, I-cache sync ownership |
 | P0 | host fault -> precise guest PC / register recovery - **done**: `lata_host_fault()` resolves, decides with the shared rule, replays bindings and sets `env->pc` |
-| P1 | AArch64 Linux boot contract: EL1, GIC, generic timer |
+| P1 | AArch64 Linux boot contract: EL1, GIC, generic timer - **EL/vector delivery done** (`lata_take_exception`: ESR/ELR/SPSR/PSTATE latched, VBAR+0x400 from EL0 and +0x200 from EL1, DAIF masked); GIC and generic timer still open |
 | P1 | exclusive monitor, LSE atomics, SMP validation |
 | P1 | SVE, FPCR/FPSR, exception and rounding semantics |
 | P2 | lazy NZCV, CSEL/B.cond fusion |
@@ -368,9 +368,10 @@ fault recovery cost.
 4. 3.3 shared recovery ABI - done (schema, decision function, generation guard).
 5. 2.1 LATA host-fault precise recovery - done (`lata_host_fault` uses the shared
    decision, a generation guard and binding replay; the tests cover projection,
-   a missing snapshot, a stale generation and a native-internal fault). Entering
-   the guest's own trap vector still needs the EL/exception plumbing from the
-   next item.
+   a missing snapshot, a stale generation and a native-internal fault), together
+   with EL/vector delivery (`lata_take_exception`), so a projected fault can now
+   land in the guest's own EL1 handler. What remains for a full boot contract is
+   GIC and the generic timer.
 6. 5.1 step 3 (flush elision) - done: per-bank dirty/resident counts let a clean
    bank skip its writeback scan and an empty bank skip its release loop
    (entries visited per flush 128 -> 1.9 on the ISA image, 128 -> 4.9 on the

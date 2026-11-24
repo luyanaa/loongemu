@@ -1057,6 +1057,62 @@ void lata_env_ld_du(IR2_OPND scalar, int offset)
  * translator (the SVE lowering path has four); it lives here so those files do
  * not each carry their own pstate sequence.
  */
+/*
+ * Exception delivery (AArch64 -> the EL1 vector table).
+ *
+ * The generated-code FP-trap path already writes ELR/ESR/SPSR/VBAR by hand; this
+ * is the same delivery as a runtime helper so the host-fault path can use it and
+ * so the rules live in one place:
+ *
+ *   ESR_EL1  = caller's syndrome (EC | ISS)
+ *   ELR_EL1  = the guest PC to resume at (the faulting instruction)
+ *   SPSR_EL1 = PSTATE as it was, so ERET restores EL/DAIF/NZCV
+ *   PSTATE   = target EL, SP_ELx, DAIF masked (an exception handler never runs
+ *              with interrupts unmasked into a half-built frame)
+ *   PC       = VBAR_EL1 + vector offset
+ *
+ * Vector offsets follow the AArch64 layout: 0x200 + {0,0x80,0x100,0x180} for an
+ * exception taken from the current EL with SP_ELx, 0x400 + ... for one taken
+ * from a lower EL. The port models EL0 and EL1 only; anything above is treated
+ * as EL1 (fail closed, and visible in the returned target EL).
+ */
+unsigned lata_take_exception(struct CPUARMState *env, unsigned vector_index,
+                             uint32_t esr, uint64_t elr, uint64_t far)
+{
+    unsigned current_el;
+    unsigned target_el = 1;
+    unsigned base;
+    uint32_t pstate;
+    uint32_t target_pstate;
+
+    if (env == NULL || vector_index > 3) {
+        return 0;
+    }
+    pstate = (uint32_t)env->pstate;
+    /* PSTATE.M[3:2] is the exception level, matching the translator's own
+     * dc->current_el derivation (translate-a64.c:20681). */
+    current_el = (pstate >> 2) & 3u;
+    if (current_el > 1) {
+        current_el = 1;
+    }
+    base = current_el == target_el ? 0x200u : 0x400u;
+
+    env->esr_el1 = esr;
+    env->elr_el1 = elr;
+    env->spsr_el1 = pstate;
+    if (far != 0) {
+        env->sve_ctrl.last_fault_va = far;
+    }
+    /* Target EL1h, DAIF masked, NZCV/other PSTATE bits cleared: the handler
+     * starts from a defined state. */
+    target_pstate = (target_el << 2) | 0x5u;   /* M = 0b0101 = EL1h */
+    target_pstate |= 0x3c0u;                   /* D,A,I,F */
+    env->pstate = target_pstate;
+    env->pc = (env->vbar_el1 & ~UINT64_C(0x7ff)) + base +
+              (unsigned)vector_index * 0x80u;
+    return target_el;
+}
+
 void lata_emit_nzcv_write(IR2_OPND rj)
 {
     IR2_OPND nib = ra_alloc_itemp();

@@ -740,6 +740,46 @@ static void test_tb_recovery(void)
               "span generation mismatch is refused by the shared rule");
     }
 
+    /*
+     * Exception delivery: the host-fault path ends by entering the guest's own
+     * handler, so the EL1 vector rules are checked here (VBAR + 0x400 from EL0,
+     * +0x200 from EL1, ESR/ELR/SPSR latched, PSTATE switches to EL1h with DAIF
+     * masked).
+     */
+    {
+        extern unsigned lata_take_exception(struct CPUARMState *env,
+                                            unsigned vector_index, uint32_t esr,
+                                            uint64_t elr, uint64_t far);
+        struct CPUARMState saved = env;
+        uint32_t old_pstate = (uint32_t)env.pstate;
+
+        env.vbar_el1 = UINT64_C(0x12345000);   /* low alignment bits ignored */
+        env.pstate = 0;                        /* EL0t */
+        check(lata_take_exception(&env, 0, UINT32_C(0x96000007), UINT64_C(0x4000),
+                                  UINT64_C(0x8000)) == 1,
+              1, "lower-EL exception targets EL1");
+        check(env.pc, UINT64_C(0x12345400), "lower-EL sync vector is VBAR+0x400");
+        check(env.elr_el1, UINT64_C(0x4000), "ELR_EL1 holds the guest PC");
+        check(env.esr_el1, UINT32_C(0x96000007), "ESR_EL1 holds the syndrome");
+        check(env.spsr_el1, old_pstate, "SPSR_EL1 holds the pre-exception PSTATE");
+        check((uint32_t)env.pstate & 0xfu, 0x5u, "PSTATE.M is EL1h");
+        check(((uint32_t)env.pstate >> 6) & 0xfu, 0xfu, "PSTATE.DAIF is masked");
+        check(env.sve_ctrl.last_fault_va, UINT64_C(0x8000), "FAR latched");
+
+        /* From EL1 the same-EL block (0x200) is used, and an IRQ vector lands
+         * one 0x80 slot later. */
+        env.pstate = 0x5u;                     /* EL1h */
+        check(lata_take_exception(&env, 1, UINT32_C(0x0), UINT64_C(0x5000), 0) == 1,
+              1, "same-EL exception targets EL1");
+        check(env.pc, UINT64_C(0x12345280), "same-EL IRQ vector is VBAR+0x280");
+        check(env.elr_el1, UINT64_C(0x5000), "ELR_EL1 updated for IRQ");
+
+        /* Out-of-range vector index is refused, not wrapped. */
+        check(lata_take_exception(&env, 4, 0, 0, 0) == 0, 1,
+              "invalid vector index is refused");
+        env = saved;
+    }
+
     /* A host-internal span must never be dressed up as a guest exception. */
     check(lata_host_fault(&env, (uintptr_t)code_buf, NULL, NULL, NULL), 0,
           "native-internal host fault is refused");

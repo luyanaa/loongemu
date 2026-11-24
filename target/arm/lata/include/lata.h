@@ -309,6 +309,15 @@ void lata_env_st_wu(IR2_OPND scalar, int offset);
 /* Software-path flag write: rj bits 31:28 -> env->pstate. */
 void lata_emit_nzcv_write(IR2_OPND rj);
 
+/*
+ * Deliver an exception to the EL1 vector table and return the target EL (0 when
+ * the arguments are invalid). vector_index is 0 (synchronous), 1 (IRQ), 2 (FIQ)
+ * or 3 (SError) within the current-EL or lower-EL block.
+ */
+struct CPUARMState;
+unsigned lata_take_exception(struct CPUARMState *env, unsigned vector_index,
+                             uint32_t esr, uint64_t elr, uint64_t far);
+
 IR2_OPND alloc_gpr_src(int i);
 IR2_OPND alloc_gpr_src_sp(int i);
 IR2_OPND alloc_gpr_dst(int i);
