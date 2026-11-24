@@ -1481,6 +1481,9 @@ tb-sys-smp-run: build/tb_sys.elf
 	@if ! grep -qa 'tb-sys: done' build/tb_sys_smp.log 2>/dev/null; then \
 	    echo "tb-sys-smp: the harness did not reach 'tb-sys: done'; qemu stderr:"; \
 	    tail -n 10 build/tb_sys_smp.err 2>/dev/null || true; fi
+	@if ! grep -qa 'fails=0000000000000000 ok' build/tb_sys_smp.log 2>/dev/null; then \
+	    echo "tb-sys-smp: failing checks:"; \
+	    grep -a 'FAIL ' build/tb_sys_smp.log | head -20 || true; fi
 	@grep -a 'tb-sys:' build/tb_sys_smp.log | tail -12
 	@grep -qa 'tb-sys: phys_cpus_online=0000000000000004' build/tb_sys_smp.log
 	@grep -qa 'tb-sys: done' build/tb_sys_smp.log
