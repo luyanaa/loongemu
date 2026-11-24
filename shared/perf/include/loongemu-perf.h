@@ -20,6 +20,7 @@ enum {
     LOONGEMU_PERF_TB_EXEC_TICKS,    /* time spent inside generated code */
     LOONGEMU_PERF_MMIO_TICKS,       /* ticks inside the MMIO dispatch helpers */
     LOONGEMU_PERF_RECOVERY_TICKS,   /* ticks spent replaying recovery bindings */
+    LOONGEMU_PERF_HELPER_CALLS,     /* emitted-code calls into a runtime helper */
     LOONGEMU_PERF_COUNTERS
 };
 

@@ -1000,6 +1000,11 @@ uint64_t latr_resolve_guest_address(CPUArchState *env, uint64_t va,
 {
     uint64_t host = 0;
     uint64_t phys = 0;
+#ifdef LOONGEMU_PERF
+    /* Every guest load/store the emitter cannot serve inline lands here, so
+     * this counter over guest_insns is the helper-per-instruction ratio. */
+    loongemu_perf_count(LOONGEMU_PERF_HELPER_CALLS, 1);
+#endif
     int cause = latr_translate(env, va, access, size, &host, &phys);
 
     env->mem_fault_cause = cause ? (uint64_t)cause : 0;

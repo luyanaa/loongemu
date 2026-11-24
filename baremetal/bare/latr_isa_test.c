@@ -6749,6 +6749,8 @@ void kmain(void)
             latx_bare_uart_putc('=');
             putdec((unsigned)loongemu_perf_read(i));
         }
+        latx_bare_uart_puts(" helper-calls=");
+        puthex(loongemu_perf_read(LOONGEMU_PERF_HELPER_CALLS));
         latx_bare_uart_puts(" suite-ticks=");
         puthex(loongemu_perf_now() - perf_suite_start);
     }

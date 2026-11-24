@@ -157,6 +157,8 @@ void kmain(void)
             latx_bare_uart_putc('=');
             perf_put_hex(loongemu_perf_read(i));
         }
+        latx_bare_uart_puts(" helper-calls=");
+        perf_put_hex(loongemu_perf_read(LOONGEMU_PERF_HELPER_CALLS));
         latx_bare_uart_puts(" mmio-ticks=");
         perf_put_hex(loongemu_perf_read(LOONGEMU_PERF_MMIO_TICKS));
         latx_bare_uart_puts(" recovery-ticks=");
