@@ -2056,34 +2056,6 @@ static void lata_helper_set_sysReg(DisasContext *ctx, uint32_t key, int rt, void
     return;
 }
 
-static void lata_helper_dc_zva(DisasContext *s, int rt)
-{
-    IR2_OPND temp = ra_alloc_itemp();
-    li_d(temp, s->base->pc_next);
-    la_st_d(temp, env_ir2_opnd, env_offset_pc());
-    lata_gen_call_helper_prologue(tcg_ctx);
-
-    if (s->mte_active[0])
-    {
-        lata_unallocated_encoding(s);
-        return;
-    }
-    else
-    {
-        la_ld_d(temp, env_ir2_opnd, env_offset_gpr(rt));
-        lata_clean_data_tbi(s, &temp, &temp, s->tbid);
-    }
-
-    la_mov64(a0_ir2_opnd, env_ir2_opnd);
-    la_mov64(a1_ir2_opnd, temp);
-    li_d(temp, (uint64_t)helper_dc_zva);
-    la_jirl(ra_ir2_opnd, temp, 0);
-
-    lata_gen_call_helper_epilogue(tcg_ctx);
-    free_alloc_gpr(temp);
-    return;
-}
-
 static G_NORETURN void never_reach(const char *msg)
 {
     lsassertm(0, "%s\n", msg);
@@ -2335,9 +2307,9 @@ static void handle_sys(DisasContext *s, bool isread,
          * guaranteed to be constant by the tb flags.
          */
         return;
-    case ARM_CP_DC_ZVA:
-        lata_helper_dc_zva(s, rt);
-        return;
+    /* ARM_CP_DC_ZVA is deliberately absent: the special-case mask above does
+     * not include its bit, so this path is unreachable, and its TCG helper is
+     * not linked in this build. Re-adding it means linking helper_dc_zva. */
     case ARM_CP_DC_GVA:
     {
         lata_unallocated_encoding(s);

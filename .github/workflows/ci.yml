@@ -12,48 +12,21 @@ on:
   workflow_dispatch:
 
 jobs:
-  # The LATA gate is not here on purpose: LATA keeps AArch64 NZCV in the
-  # LoongArch binary-translation flag register, and no distro qemu implements
-  # LBT. The dependency is small enough to enumerate (checked against the tree):
-  #   flag generation  x86add_d/w (gen_add_CC), armmtflag + x86adc_d/w
-  #                    (gen_sub_CC), the same pair in insts-pattern.c and
-  #                    sve-lasx-lower.c
-  #   flag consumption armmove x3 (csel/cset, translate-a64.c:8252/8303/8307),
-  #                    armmfflag x1 (MRS NZCV, :1841), x86adc/sbc carry chains
-  #   flag transfer    armmtflag x7 (carry=1 for subs: 870, 883; MSR NZCV 1848;
-  #                    ccmp FALSE 8207; fp compare 9078, 9108, 9236)
-  # A software path therefore means: compute NZCV for add/sub in GPRs, keep the
-  # nibble in env->pstate between instructions, and turn armmove/setarmj into
-  # predicate-from-nibble + select. Six helpers over 28 instruction sites (see
-  # docs/design/lata-software-nzcv.md for the counted table). Until that lands,
-  # `make lata-isa-run` locally is the gate.
+  # The LATA gate used to be local-only: LATA kept AArch64 NZCV in the LoongArch
+  # binary-translation flag register, and no distro qemu implements LBT. That is
+  # no longer true - the port now has a software NZCV path over
+  # env->pstate[31:28] (docs/design/lata-software-nzcv.md, P0/P1), selected with
+  # LATA_FORCE_NO_LBT=1, and the job below runs the whole ISA image through it
+  # under qemu-system-misc. The LBT path still exists and is what a hardware
+  # host uses; it is validated locally, not here.
   #
-  # A software path was implemented and reverted; what it proved is below, so
-  # nobody repeats the blind part. tests/test_lata_nzcv.c pins the reference
-  # semantics -- AddWithCarry over 32/64 bits (including the carry-in rule that
-  # `res < a` alone gets wrong) and the full 16 x 16 condition matrix -- in the
-  # fast host tier.
-  #
-  # P0/P1 of docs/design/lata-software-nzcv.md are done. What they established,
-  # each reproduced on a host with LBT:
-  #   1. MRS/MSR NZCV never worked: handle_sys() dispatched special registers on
-  #      `ri->type & ARM_CP_SPECIAL_MASK`, which is 0xf while ARM_CP_NZCV is
-  #      1<<7, so the case was unreachable and both instructions went through the
-  #      generic field path at offset 0. Fixed by handling NZCV ahead of the
-  #      switch; widening the mask would also activate ARM_CP_DC_ZVA, whose
-  #      helper this build does not link.
-  #   2. armmove is `if (cond) rd = rj`. `cset rd, eq` encodes cond=NE, so CSET
-  #      and CSEL never contradicted each other; the condition is inverted by the
-  #      encoder, not by the port.
-  #   3. Producer flags were already architecturally correct (adds/subs/ands/adcs
-  #      all read back the expected nibble). The only defect was armmfflag
-  #      sign-extending the 32-bit word; MRS Xt, NZCV zero-extends, so it is
-  #      masked after the transfer.
-  #   4. The software path (LATA_FORCE_NO_LBT=1) and the LBT path now agree bit
-  #      for bit over the whole image: 6541 checks, 0 fails, identical raw-flag
-  #      probes. The itemp pool (6) is the binding constraint on every helper:
-  #      free before emitting the pstate store, and release caller operands that
-  #      a select no longer needs.
+  # What the two paths share is now measured rather than assumed: both produce
+  # 6549 checks with 0 fails, and the raw-flag probes (MRS NZCV after each
+  # producer, plus all 14 encodable conditions over two flag states) agree bit
+  # for bit. Defects this work fixed: the unreachable ARM_CP_NZCV case (the
+  # special-case mask covers 0xf while the flag is 1<<7), armmfflag's sign
+  # extension of the 32-bit word, and an armmove implementation that dropped rd
+  # instead of preserving it.
 
   # Fast tier: everything that runs on the build host. No qemu, no bare image,
   # so a regression is reported in minutes instead of behind an emulator run.
@@ -171,6 +144,33 @@ jobs:
             -v "$GITHUB_WORKSPACE:/src" -v /tmp/gate.sh:/gate.sh:ro \
             -w /src -e QEMU_DEBUG=1 -e QEMU_CPU=max \
             debian:sid bash /gate.sh
+
+  isa-lata:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: LATA ISA (software NZCV path)
+        run: |
+          # Script via a quoted heredoc: an apostrophe inside `bash -c '...'`
+          # would terminate the string and move the rest onto the host shell.
+          cat > /tmp/gate.sh <<'SCRIPT'
+          set -e
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            clang lld llvm qemu-system-misc make python3 ca-certificates
+          qemu-system-loongarch64 --version | head -1
+          make -C lata all CLANG=clang AR=llvm-ar
+          # LATA_FORCE_NO_LBT=1 keeps the image free of LBT instructions, which a
+          # distro qemu does not decode; the software path is the one under test.
+          QEMU_CPU=max make lata-isa-run LATA_FORCE_NO_LBT=1 \
+            CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+          # lata-isa-run already asserts "lata-isa: PASS" (fails == 0); the
+          # summary is echoed so a regression names itself in the job log.
+          grep -a 'lata-isa: checks=' build/lata_isa.log
+          SCRIPT
+          bash /tmp/gate.sh
 
   boot-smp:
     runs-on: ubuntu-24.04
