@@ -31,8 +31,27 @@ typedef struct LoongemuMmioDevice {
     int valid;
 } LoongemuMmioDevice;
 
+/*
+ * Direct-mapped route cache. Guest MMIO traffic is dominated by a handful of
+ * doorbell/status registers polled or written over and over, so remembering
+ * which window answered the last access at an address skips the device scan.
+ * `generation` moves on init/add/remove; a route that does not carry the
+ * current generation is ignored, so stale slots can never redirect an access.
+ */
+#define LOONGEMU_MMIO_ROUTE_SLOTS 8
+
+typedef struct LoongemuMmioRoute {
+    uint64_t pa;
+    uint32_t size;
+    uint32_t device; /* index into devices[] */
+    uint32_t generation;
+    int valid;
+} LoongemuMmioRoute;
+
 typedef struct LoongemuMmioBus {
     LoongemuMmioDevice devices[LOONGEMU_MMIO_MAX_DEVICES];
+    LoongemuMmioRoute routes[LOONGEMU_MMIO_ROUTE_SLOTS];
+    uint32_t generation;
 } LoongemuMmioBus;
 
 void loongemu_mmio_bus_init(LoongemuMmioBus *bus);

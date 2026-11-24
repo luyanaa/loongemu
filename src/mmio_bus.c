@@ -9,6 +9,10 @@ void loongemu_mmio_bus_init(LoongemuMmioBus *bus)
     for (int i = 0; i < LOONGEMU_MMIO_MAX_DEVICES; i++) {
         bus->devices[i].valid = 0;
     }
+    for (int i = 0; i < LOONGEMU_MMIO_ROUTE_SLOTS; i++) {
+        bus->routes[i].valid = 0;
+    }
+    bus->generation++;
 }
 
 static int overlaps(uint64_t a_base, uint64_t a_size, uint64_t b_base,
@@ -40,6 +44,7 @@ int loongemu_mmio_bus_add(LoongemuMmioBus *bus, uint64_t base, uint64_t size,
             bus->devices[i].opaque = opaque;
             bus->devices[i].name = name;
             bus->devices[i].valid = 1;
+            bus->generation++;
             return 1;
         }
     }
@@ -54,6 +59,7 @@ int loongemu_mmio_bus_remove(LoongemuMmioBus *bus, uint64_t base)
     for (int i = 0; i < LOONGEMU_MMIO_MAX_DEVICES; i++) {
         if (bus->devices[i].valid && bus->devices[i].base == base) {
             bus->devices[i].valid = 0;
+            bus->generation++;
             return 1;
         }
     }
@@ -63,8 +69,18 @@ int loongemu_mmio_bus_remove(LoongemuMmioBus *bus, uint64_t base)
 static LoongemuMmioDevice *find_device(LoongemuMmioBus *bus, uint64_t pa,
                                        unsigned size)
 {
+    LoongemuMmioRoute *route;
+
     if (bus == 0 || size == 0 || size > 8) {
         return 0;
+    }
+    /* Same address and width as the last access through this slot, and the
+     * registry has not changed since: the device index still answers it. */
+    route = &bus->routes[(pa >> 2) & (LOONGEMU_MMIO_ROUTE_SLOTS - 1)];
+    if (route->valid && route->pa == pa && route->size == size &&
+        route->generation == bus->generation &&
+        bus->devices[route->device].valid) {
+        return &bus->devices[route->device];
     }
     for (int i = 0; i < LOONGEMU_MMIO_MAX_DEVICES; i++) {
         LoongemuMmioDevice *dev = &bus->devices[i];
@@ -72,9 +88,15 @@ static LoongemuMmioDevice *find_device(LoongemuMmioBus *bus, uint64_t pa,
             continue;
         }
         if (pa >= dev->base && pa + size <= dev->base + dev->size) {
+            route->pa = pa;
+            route->size = size;
+            route->device = (uint32_t)i;
+            route->generation = bus->generation;
+            route->valid = 1;
             return dev;
         }
     }
+    route->valid = 0;
     return 0;
 }
 

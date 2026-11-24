@@ -56,6 +56,8 @@ jobs:
           make lata-isa-run \
             CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
             QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+        env:
+          QEMU_DEBUG: 1
 
       - name: LATR ISA gate
         run: |

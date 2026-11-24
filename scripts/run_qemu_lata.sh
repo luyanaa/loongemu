@@ -28,10 +28,20 @@ MEM="${QEMU_MEM:-1G}"
 
 ERR_FILE="${LOG_FILE%.log}.err"
 rm -f "$LOG_FILE" "$ERR_FILE"
+# QEMU_DEBUG=1 adds the executor trace (-d int) to <log>.trace. It is how a
+# distro qemu that dies without a serial byte can be told apart from one whose
+# guest never got scheduled at all.
+TRACE_FILE="${LOG_FILE%.log}.trace"
+QEMU_ARGS=()
+if [[ "${QEMU_DEBUG:-0}" != "0" ]]; then
+    rm -f "$TRACE_FILE"
+    QEMU_ARGS+=(-d int,guest_errors -D "$TRACE_FILE")
+fi
 "$QEMU" -M virt -cpu "$CPU" -m "$MEM" -kernel "$KERNEL" \
     -display none -monitor none -nic none \
     -L "$(dirname "$QEMU")/../share/qemu" \
-    -serial "file:$LOG_FILE" -no-reboot >/dev/null 2>"$ERR_FILE" &
+    -serial "file:$LOG_FILE" -no-reboot "${QEMU_ARGS[@]}" \
+    >/dev/null 2>>"$ERR_FILE" &
 QEMU_PID=$!
 
 # Watchdog: nothing here may leave a QEMU behind.  It records that it fired so a
@@ -79,5 +89,9 @@ tail -n 20 "$LOG_FILE" 2>/dev/null >&2
 if [[ -s "$ERR_FILE" ]]; then
     echo "run_qemu_lata: qemu stderr ($ERR_FILE):" >&2
     tail -n 20 "$ERR_FILE" >&2
+fi
+if [[ -s "$TRACE_FILE" ]]; then
+    echo "run_qemu_lata: qemu trace tail ($TRACE_FILE):" >&2
+    tail -n 20 "$TRACE_FILE" >&2
 fi
 exit "$status"
