@@ -18,10 +18,13 @@ register. Every flag producer and consumer is an LBT instruction:
 | consume (sysreg) | `armmfflag` x1 | MRS NZCV 1841 |
 | transfer | `armmtflag` x7 | `gen_sub_CC` 870/883 (carry=1), MSR 1848, CCMP FALSE 8207, fp 9078/9108/9236 |
 
-A host without LBT cannot run any translated AArch64 code, which is why the CI
-matrix has no LATA gate (`ci.yml`, "the LATA gate is not here on purpose").
-The port already probes the host (`lata_have_lbt`, `lata.c:358`,
-`latx_cpu_has_lbt()`), so the switch exists; the software side does not.
+A host without LBT used to be unable to run any translated AArch64 code, which is
+why the CI matrix had no LATA gate. That is now historical: the software path
+below is complete enough that the `isa-lata` job runs the whole image under
+`qemu-system-misc` (which cannot decode LBT) with `LATA_FORCE_NO_LBT=1`, and it
+is green. The port probes the host (`lata_have_lbt`, `lata.c:358`,
+`latx_cpu_has_lbt()`) and the switch remains, because an LBT host still takes the
+cheaper branch.
 
 ## 2. Reference semantics (already in the tree)
 
@@ -189,12 +192,16 @@ the unreachable `ARM_CP_NZCV` case; once fixed it showed the producers were
 already correct, and the only defect was `armmfflag`'s sign extension (§3.4).
 Both are fixed, and the probes are now assertions on the AArch64 nibbles.
 
-**P1 - done.** Helpers in §4.2 are implemented and wired into all 28 sites, with
-`lata_have_lbt` as the selector; `LATA_FORCE_NO_LBT=1` builds the image with the
-software path forced. Both paths pass the whole ISA image (6541 checks) and the
-raw-flag probes agree bit for bit. Two defects found on the way are fixed in the
-same change: the unreachable `ARM_CP_NZCV` case (§3.4) and `armmfflag`'s sign
-extension of the 32-bit NZCV word.
+**P1 - done.** Helpers in §4.2 are implemented and wired into all 28 sites of
+`translate-a64.c`, plus the four `armmtflag` sites the SVE lowering emits (a gap
+the CI job found: they were outside the original site count, and a distro qemu
+trapped on them). Shared emitter `lata_emit_nzcv_write()` serves the SVE path;
+`lata_force_no_lbt()` also clears `latx_cpu_set_lbt_feature` so every capability
+query agrees. `lata_have_lbt` stays the selector and `LATA_FORCE_NO_LBT=1` builds
+the image with the software path forced. Both paths pass the whole ISA image
+(6549 checks) and the raw-flag probes agree bit for bit. Defects fixed along the
+way: the unreachable `ARM_CP_NZCV` case (§3.4), `armmfflag`'s sign extension of
+the 32-bit NZCV word, and the SVE lowering's four ungated `armmtflag` sites.
 
 **P2 - retire the LBT flag path (now a cost decision).** Both paths are correct
 and measured, so deleting the LBT branch is no longer a correctness argument.
@@ -236,8 +243,8 @@ on a native LBT host, or keep both branches". Keeping both is the default.
 |---|---|
 | semantics | `tests/test_lata_nzcv.c` (host, ms) |
 | emitted code | ISA-suite blocks: producer x consumer matrix; every encodable condition (EQ..VC, HI..LE - 14; AL/NV are aliases the assembler rejects for CSET and are covered by the always-taken branch fixtures) packed into two bytes, over two flag states (N only, Z\|C), on both paths |
-| integration | `make lata-isa-run` (6525 checks) on both paths during P1 |
-| conformance | review of finding §3.2: the CSET expectation is either fixed in LATA or in the suite, with the AArch64 pseudocode quoted in the commit |
+| integration | `make lata-isa-run` on both paths (6549 checks each); CI job `isa-lata` runs the software path under a distro qemu that cannot decode LBT |
+| conformance | finding §3.2 resolved by measurement: `cset` decodes with the condition inverted, so no port change was needed |
 | cost | PERF tick delta on the same guest workload |
 
 ## 8. Self-review
