@@ -29,7 +29,6 @@
 
 
 /* Native-offset -> guest-PC spans for precise exception attribution. */
-#define LATR_TB_MAP_SLOTS 4
 #define LATR_TB_MAP_SPANS 512
 /* Bounded binding pool per map: a guest-insn span only carries a binding set
  * when it can fault architecturally (load/store/amo/trap) AND the regcache
@@ -71,6 +70,7 @@ typedef struct LatrTbInsnMap {
     uint32_t generation;
     uint32_t bind_pool_used;
     bool valid;
+    struct LatrTbInsnMap *next;
     LatrTbInsnSpan spans[LATR_TB_MAP_SPANS];
     LatrRecoveryBinding binds[LATR_TB_RECOVERY_BINDS];
 } LatrTbInsnMap;
@@ -123,8 +123,12 @@ typedef struct TRANSLATION_DATA {
     LatrRecoveryBinding tb_insn_binds[LATR_TB_MAP_SPANS]
                                      [LATR_RECOVERY_MAX_BINDS_PER_SPAN];
 
-    /* Native-offset -> guest-PC attribution for precise exceptions. */
-    LatrTbInsnMap insn_maps[LATR_TB_MAP_SLOTS];
+    /* Native-offset -> guest-PC attribution for precise exceptions. Maps are
+     * owned by the TB code range they describe (a live LatrTbEntry's arena
+     * slot), NOT an LRU pool: a map lives in insn_map_list until its code is
+     * forgotten/rebased away, so an old still-executing TB always resolves. */
+    LatrTbInsnMap *insn_map_list;
+    uint32_t insn_map_count;
     uint32_t insn_map_generation;
     LatrTbInsnMap *active_insn_map;
 } TRANSLATION_DATA;

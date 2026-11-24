@@ -107,8 +107,12 @@ typedef struct TRANSLATION_DATA {
     LataRecoveryBinding tb_insn_binds[LATA_TB_MAP_SPANS]
                                      [LATA_RECOVERY_MAX_BINDS_PER_SPAN];
 
-    /* Native-offset -> guest-PC attribution for precise exceptions. */
-    LataTbInsnMap insn_maps[LATA_TB_MAP_SLOTS];
+    /* Native-offset -> guest-PC attribution for precise exceptions. Maps are
+     * owned by the TB code range they describe (the TCG code-buffer block),
+     * NOT an LRU pool: a map lives in insn_map_list until the buffer block is
+     * reused or the context is destroyed, so a still-live TB always resolves. */
+    LataTbInsnMap *insn_map_list;
+    uint32_t insn_map_count;
     uint32_t insn_map_generation;
     LataTbInsnMap *active_insn_map;
 } TRANSLATION_DATA;

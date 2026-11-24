@@ -175,6 +175,13 @@ void latr_context_destroy(LatrTranslatorContext *ctx)
     if (ctx->tr_data.ir2_inst_array != NULL) {
         mm_free(ctx->tr_data.ir2_inst_array);
     }
+    /* TB-owned recovery maps are heap-allocated per assembled block; free the
+     * whole list so a destroyed context cannot leak them. */
+    while (ctx->tr_data.insn_map_list != NULL) {
+        LatrTbInsnMap *dead = ctx->tr_data.insn_map_list;
+        ctx->tr_data.insn_map_list = dead->next;
+        mm_free(dead);
+    }
     latr_pvir_cache_destroy(ctx->pvir_cache);
     mm_free(ctx);
 }

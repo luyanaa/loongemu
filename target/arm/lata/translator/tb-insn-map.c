@@ -13,28 +13,38 @@
 
 #include "lata.h"
 #include "env.h"
+#include "mem.h"
+
+static LataTbInsnMap *find_map(TRANSLATION_DATA *t, uintptr_t code)
+{
+    for (LataTbInsnMap *map = t->insn_map_list; map != NULL;
+         map = map->next) {
+        if (map->valid && map->code_base == code) {
+            return map;
+        }
+    }
+    return NULL;
+}
 
 void lata_tb_insn_map_begin(void *code, uint32_t code_size)
 {
     TRANSLATION_DATA *t = lsenv ? lsenv->tr_data : NULL;
     LataTbInsnMap *map;
-    uint32_t oldest_gen = 0;
-    int slot = -1;
 
     if (t == NULL) {
         return;
     }
-    for (int i = 0; i < LATA_TB_MAP_SLOTS; i++) {
-        if (!t->insn_maps[i].valid) {
-            slot = i;
-            break;
+    map = find_map(t, (uintptr_t)code);
+    if (map == NULL) {
+        map = mm_calloc(1, sizeof(*map));
+        if (map == NULL) {
+            t->active_insn_map = NULL;
+            return;
         }
-        if (slot < 0 || t->insn_maps[i].generation < oldest_gen) {
-            oldest_gen = t->insn_maps[i].generation;
-            slot = i;
-        }
+        map->next = t->insn_map_list;
+        t->insn_map_list = map;
+        t->insn_map_count++;
     }
-    map = &t->insn_maps[slot < 0 ? 0 : slot];
     map->code_base = (uintptr_t)code;
     map->code_size = code_size;
     map->count = 0;
@@ -88,12 +98,13 @@ const LataTbInsnSpan *lata_tb_recovery_resolve(uintptr_t host_pc,
     if (t == NULL) {
         return NULL;
     }
-    for (int i = 0; i < LATA_TB_MAP_SLOTS; i++) {
-        const LataTbInsnMap *map = &t->insn_maps[i];
+    for (const LataTbInsnMap *map = t->insn_map_list; map != NULL;
+         map = map->next) {
         if (!map->valid || host_pc < map->code_base ||
             host_pc >= map->code_base + map->code_size) {
             continue;
         }
+
         uint32_t offset = (uint32_t)(host_pc - map->code_base);
         for (uint32_t j = 0; j < map->count; j++) {
             const LataTbInsnSpan *span = &map->spans[j];

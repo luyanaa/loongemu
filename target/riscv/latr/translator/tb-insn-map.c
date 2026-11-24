@@ -3,24 +3,26 @@
  * attribution. A host fault (for example an address error raised by a
  * misaligned LoongArch access) can be blamed on the exact guest instruction
  * that produced it.
- *
- * Storage is a fixed pool inside TRANSLATION_DATA: the freestanding core has
- * no general allocator and TBs are small. Slots are keyed by code range so a
- * reassembled TB replaces its previous entry, and the oldest slot is recycled
- * once the pool is full.
+ * Storage is a per-translation-data list of heap-allocated maps owned by the
+ * TB code range they describe. A map is created on latr_tb_insn_map_begin()
+ * (once per assembled block) and removed only when that block's code is
+ * forgotten or rebased away, so an old still-executing TB always resolves --
+ * no fixed LRU cap can drop a map whose machine code is still live.
  */
 #include "latr.h"
+#include "mem.h"
 
-static LatrTbInsnMap *find_slot(uintptr_t code)
+static LatrTbInsnMap *find_map(uintptr_t code)
 {
     TRANSLATION_DATA *t = lsenv ? lsenv->tr_data : NULL;
 
     if (t == NULL) {
         return NULL;
     }
-    for (int i = 0; i < LATR_TB_MAP_SLOTS; i++) {
-        if (t->insn_maps[i].valid && t->insn_maps[i].code_base == code) {
-            return &t->insn_maps[i];
+    for (LatrTbInsnMap *map = t->insn_map_list; map != NULL;
+         map = map->next) {
+        if (map->valid && map->code_base == code) {
+            return map;
         }
     }
     return NULL;
@@ -34,18 +36,16 @@ void latr_tb_insn_map_begin(void *code, uint32_t code_size)
     if (t == NULL) {
         return;
     }
-    map = find_slot((uintptr_t)code);
+    map = find_map((uintptr_t)code);
     if (map == NULL) {
-        map = &t->insn_maps[0];
-        for (int i = 0; i < LATR_TB_MAP_SLOTS; i++) {
-            if (!t->insn_maps[i].valid) {
-                map = &t->insn_maps[i];
-                break;
-            }
-            if (t->insn_maps[i].generation < map->generation) {
-                map = &t->insn_maps[i];
-            }
+        map = mm_calloc(1, sizeof(*map));
+        if (map == NULL) {
+            t->active_insn_map = NULL;
+            return;
         }
+        map->next = t->insn_map_list;
+        t->insn_map_list = map;
+        t->insn_map_count++;
     }
     map->code_base = (uintptr_t)code;
     map->code_size = code_size;
@@ -99,8 +99,7 @@ bool latr_tb_insn_map_resolve(uintptr_t host_pc, uint64_t *guest_pc,
     if (t == NULL) {
         return false;
     }
-    for (int i = 0; i < LATR_TB_MAP_SLOTS; i++) {
-        const LatrTbInsnMap *map = &t->insn_maps[i];
+    for (LatrTbInsnMap *map = t->insn_map_list; map != NULL; map = map->next) {
         if (!map->valid || host_pc < map->code_base ||
             host_pc >= map->code_base + map->code_size) {
             continue;
@@ -131,22 +130,42 @@ bool latr_tb_insn_map_resolve(uintptr_t host_pc, uint64_t *guest_pc,
 
 void latr_tb_insn_map_rebase(void *old_code, void *new_code)
 {
-    LatrTbInsnMap *map = find_slot((uintptr_t)old_code);
+    LatrTbInsnMap *map = find_map((uintptr_t)old_code);
 
     if (map != NULL) {
         map->code_base = (uintptr_t)new_code;
     }
 }
 
+/* Remove a map from the list and free it -- the TB it described no longer
+ * owns that code range, so keeping it would attribute faults to dead code. */
+static void drop_map(TRANSLATION_DATA *t, LatrTbInsnMap *map)
+{
+    if (t->active_insn_map == map) {
+        t->active_insn_map = NULL;
+    }
+    if (t->insn_map_list == map) {
+        t->insn_map_list = map->next;
+    } else {
+        for (LatrTbInsnMap *prev = t->insn_map_list;
+             prev != NULL && prev->next != NULL; prev = prev->next) {
+            if (prev->next == map) {
+                prev->next = map->next;
+                break;
+            }
+        }
+    }
+    t->insn_map_count--;
+    mm_free(map);
+}
+
 void latr_tb_insn_map_forget(void *code)
 {
-    LatrTbInsnMap *map = find_slot((uintptr_t)code);
+    TRANSLATION_DATA *t = lsenv ? lsenv->tr_data : NULL;
+    LatrTbInsnMap *map = t != NULL ? find_map((uintptr_t)code) : NULL;
 
     if (map != NULL) {
-        map->valid = false;
-        if (lsenv && lsenv->tr_data && lsenv->tr_data->active_insn_map == map) {
-            lsenv->tr_data->active_insn_map = NULL;
-        }
+        drop_map(t, map);
     }
 }
 
@@ -159,22 +178,16 @@ void latr_tb_insn_map_forget_range(void *base, uint32_t size)
     if (t == NULL || size == 0) {
         return;
     }
-    for (int i = 0; i < LATR_TB_MAP_SLOTS; i++) {
-        LatrTbInsnMap *map = &t->insn_maps[i];
-
-        if (!map->valid) {
-            continue;
+    LatrTbInsnMap *map = t->insn_map_list;
+    while (map != NULL) {
+        LatrTbInsnMap *next = map->next;
+        if (map->valid &&
+            (map->code_base == start ||
+             (map->code_base < end &&
+              start < map->code_base + map->code_size))) {
+            drop_map(t, map);
         }
-        /* Empty ranges are not produced by the assembler, but tolerate one so
-         * a zero-length TB cannot pin a map forever. */
-        if (map->code_base == start ||
-            (map->code_base < end &&
-             start < map->code_base + map->code_size)) {
-            map->valid = false;
-            if (t->active_insn_map == map) {
-                t->active_insn_map = NULL;
-            }
-        }
+        map = next;
     }
 }
 
@@ -200,8 +213,8 @@ const LatrTbInsnSpan *latr_tb_recovery_resolve(uintptr_t host_pc,
     if (t == NULL) {
         return NULL;
     }
-    for (int i = 0; i < LATR_TB_MAP_SLOTS; i++) {
-        const LatrTbInsnMap *map = &t->insn_maps[i];
+    for (const LatrTbInsnMap *map = t->insn_map_list; map != NULL;
+         map = map->next) {
         if (!map->valid || host_pc < map->code_base ||
             host_pc >= map->code_base + map->code_size) {
             continue;

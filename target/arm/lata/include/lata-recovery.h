@@ -10,7 +10,6 @@
  * resolve/apply against a fabricated host register file.
  */
 
-#define LATA_TB_MAP_SLOTS 4
 #define LATA_TB_MAP_SPANS 512
 /* Bounded binding pool per map: only env-resident guest GPRs (arm_la_map<0)
  * can hold a deferred value in a host temp, and the itemp pool caps the live
@@ -48,6 +47,7 @@ typedef struct LataTbInsnMap {
     uint32_t generation;
     uint32_t bind_pool_used;
     bool valid;
+    struct LataTbInsnMap *next;
     LataTbInsnSpan spans[LATA_TB_MAP_SPANS];
     LataRecoveryBinding binds[LATA_TB_RECOVERY_BINDS];
 } LataTbInsnMap;

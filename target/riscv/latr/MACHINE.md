@@ -26,7 +26,7 @@ LoongArch 宿主           生成的代码 + latr_enter_tb trampoline
 | `CPUArchState` | `LatrMachineHart.env` | CSR/PC/privilege/向量状态全在 hart 内 |
 | `TRANSLATION_DATA` + IR2 缓冲 | `LatrTranslatorContext.tr_data` | 两条 hart 绝不共享标签、IR 链表、寄存器分配 |
 | TB 索引 + 代码 arena | `LatrTbCache`（per hart） | 代码不跨 hart 复用；arena 只由 owner 回收 |
-| 宿主 PC→guest PC 映射 | `LatrTranslatorContext.tr_data.insn_maps` | 回收 arena 时同步失效，避免陈旧归因 |
+| 宿主 PC→guest PC 映射 | `LatrTranslatorContext.tr_data.insn_map_list` | 每 TB 一张堆上 map；回收 arena 时同步 `forget_range` 释放，避免陈旧归因 |
 | PVIR 描述符缓存 | `LatrPvirCache`（per hart） | 自带自旋锁，覆盖 vCPU 迁移与共享 fallback |
 | CLINT MTIMECMP / MSIP | `LoongemuClint`（按 hart 索引） | 每 hart 独立比较器；tick 时写入**本 hart** 的 MIP |
 

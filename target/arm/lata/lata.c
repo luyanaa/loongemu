@@ -288,6 +288,14 @@ void lata_context_destroy(LataContext *ctx)
         ctx->tr_data.ir2_inst_array = NULL;
     }
     ctx->tr_data.ir2_inst_num_max = 0;
+    /* TB-owned recovery maps are heap-allocated per assembled block; free the
+     * whole list so a destroyed context cannot leak them. */
+    while (ctx->tr_data.insn_map_list != NULL) {
+        LataTbInsnMap *dead = ctx->tr_data.insn_map_list;
+        ctx->tr_data.insn_map_list = dead->next;
+        mm_free(dead);
+    }
+    ctx->tr_data.active_insn_map = NULL;
     if (ctx->ir1_list != NULL) {
         mm_free(ctx->ir1_list);
         ctx->ir1_list = NULL;
