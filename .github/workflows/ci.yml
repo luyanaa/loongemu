@@ -68,57 +68,49 @@ jobs:
 
       - name: ISA gates (qemu 10)
         run: |
+          # The container script lives in its own heredoc: an apostrophe inside a
+          # single-quoted `bash -c '...'` string terminates it and silently moves
+          # the rest onto the host shell, which is exactly how a build step once
+          # ran outside the container.
+          cat > /tmp/isa-gates.sh <<'SCRIPT'
+          set -e
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            clang lld llvm qemu-system-misc make python3 ca-certificates
+          qemu-system-loongarch64 --version | head -1
+          make -C latr all CLANG=clang AR=llvm-ar
+          make latr-isa-run \
+            CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+          # End-to-end: a paged RISC-V ELF guest with MMIO and traps.
+          make latr-sys-run \
+            CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+          # LATM ISA on the plain jirl chain path: qemu advertises LBT in CPUCFG
+          # but cannot decode gr2scr/jiscr0, so the fallback is what runs, and the
+          # harness prints "chain-jiscr1 skipped (no LBT)".
+          make -C latm all CLANG=clang AR=llvm-ar
+          make latm-isa-run LATM_FORCE_NO_LBT=1 \
+            CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+          # LATM board harness: FDT handoff plus the first system TB.
+          make latm-board-run \
+            CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+          # The PERF build must be compiled from a clean tree: make does not
+          # track the -DLOONGEMU_PERF change and would relink stale objects.
+          make -C latr clean CLANG=clang AR=llvm-ar
+          make latr-sys-run PERF=1 \
+            CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+          grep -a 'latr-perf:' build/latr_sys_diff.log
+          # Boot tier: a translated x86 host boots on 4 LoongArch harts with IPI
+          # shootdowns, then asserts phys_cpus_online=4 and fails=0. It ends
+          # through the rule 90s timeout by design, because qemu runs until killed.
+          make tb-sys-smp-run QLVZ=/usr/bin/qemu-system-loongarch64 \
+            CLANG=clang AR=llvm-ar LD_LLD=ld.lld
+          SCRIPT
           docker run --rm \
-            -v "$GITHUB_WORKSPACE:/src" -w /src \
-            -e QEMU_DEBUG=1 -e QEMU_CPU=max \
-            debian:trixie bash -c '
-              set -e
-              apt-get update -qq
-              apt-get install -y -qq --no-install-recommends \
-                clang lld llvm qemu-system-misc make python3 ca-certificates
-              qemu-system-loongarch64 --version | head -1
-              make -C latr all CLANG=clang AR=llvm-ar
-              make latr-isa-run \
-                CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
-                QLVZ_REPO=/usr/bin/qemu-system-loongarch64
-              # End-to-end: a paged RISC-V ELF guest with MMIO and traps,
-              # executed through the machine harness.
-              make latr-sys-run \
-                CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
-                QLVZ_REPO=/usr/bin/qemu-system-loongarch64
-              make -C latm all CLANG=clang AR=llvm-ar
-              make latm-isa-run LATM_FORCE_NO_LBT=1 \
-                CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
-                QLVZ_REPO=/usr/bin/qemu-system-loongarch64
-              # LATM board harness: FDT handoff plus the first system TB, i.e.
-              # the path a real firmware takes. Verified on qemu 11.1.3.
-              make latm-board-run \
-                CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
-                QLVZ_REPO=/usr/bin/qemu-system-loongarch64
-              # Compile and run the PERF build once, from a clean tree: make
-              # does not track the -DLOONGEMU_PERF change, so without the clean
-              # it would relink stale objects and silently skip the counters.
-              make -C latr clean CLANG=clang AR=llvm-ar
-              make latr-sys-run PERF=1 \
-                CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
-                QLVZ_REPO=/usr/bin/qemu-system-loongarch64
-              grep -a 'latr-perf:' build/latr_sys_diff.log
-              # Boot tier: a translated x86 host boots on 4 LoongArch harts
-              # with IPI shootdowns, then asserts phys_cpus_online=4 and
-              # fails=0. The initramfs it embeds is gitignored, but the
-              # Makefile generates a valid kernel-only one when it is absent, so
-              # a fresh checkout builds it. It ends through the rule's 90s
-              # timeout by design (qemu runs until killed).
-              # Built in a scratch copy: the harness compiles the whole bare-metal
-              # tree, and writing into the mounted workspace hit
-              # `build/tb_sys.o: Permission denied` there. The probes below make
-              # the reason visible if it happens again.
-              id; df -h /src /tmp | tail -2
-              ls -ld /src/build 2>/dev/null || true
-              ( touch /src/build/.probe && rm -f /src/build/.probe ) \
-                && echo "src/build writable" || echo "src/build NOT writable"
-              rm -rf /tmp/smp && mkdir -p /tmp/smp && cp -a /src/. /tmp/smp/
-              cd /tmp/smp && make tb-sys-smp-run \
-                QLVZ=/usr/bin/qemu-system-loongarch64 \
-                CLANG=clang AR=llvm-ar LD_LLD=ld.lld
-            '
+            -v "$GITHUB_WORKSPACE:/src" -v /tmp/isa-gates.sh:/isa-gates.sh:ro \
+            -w /src -e QEMU_DEBUG=1 -e QEMU_CPU=max \
+            debian:trixie bash /isa-gates.sh
