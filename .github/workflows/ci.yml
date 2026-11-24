@@ -48,11 +48,12 @@ jobs:
   # feature; QEMU_DEBUG=1 makes a failing gate print qemu's stderr, the first
   # exception with 30 lines of traceback, and the serial text.
   #
-  # The LATM gate is not here either: its chaining test (run_chain) assembles
-  # a prologue/epilogue pair and jumps through LBT `gr2scr`/`jiscr0`, which
-  # distro qemu does not decode. Reproduced on qemu 11.1.3 as well as 10.0.13:
-  # the image stops right after `fpu-bc-likely done`, i.e. when
-  # `chain-jiscr0` starts. `make latm-isa-run` passes 60/0 on QEMU-LVZ 9.0.50.
+  # The LATM gate is not here either. It stops right after `fpu-bc-likely
+  # done`, i.e. when `chain-jiscr0` starts, taking a guest exception inside
+  # the code-fetch path and jumping to PC 0. Reproduced on qemu 11.1.3 as well
+  # as 10.0.13. Not LBT: forcing the plain `jirl` chain path still fails there,
+  # while `make latm-isa-run` passes 60/0 on QEMU-LVZ 9.0.50, so it is a
+  # code-fetch/exception-path difference to bisect.
   #
   # The LATA gate is not here on purpose: LATA lowers AArch64 NZCV through the
   # LoongArch binary-translation instruction `armmtflag` (translate-a64.c:870,
