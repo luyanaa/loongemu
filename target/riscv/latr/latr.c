@@ -280,6 +280,18 @@ void latr_tr_data_init(CPUArchState *env)
     env_ir2_opnd = ir2_opnd_new(IR2_OPND_GPR, la_s8);
 }
 
+static LatrRegCacheStats latr_regcache_stats_counters;
+
+void latr_regcache_stats_reset(void)
+{
+    latr_regcache_stats_counters = (LatrRegCacheStats){0};
+}
+
+LatrRegCacheStats latr_regcache_stats(void)
+{
+    return latr_regcache_stats_counters;
+}
+
 static int regcache_temp_slot(int reg, bool is_fpr)
 {
     if (reg < 0 || reg >= 32) {
@@ -322,6 +334,7 @@ static void regcache_writeback(LatrRegCacheEntry *entry, bool is_fpr)
 {
     IR2_OPND value = ir2_opnd_new(is_fpr ? IR2_OPND_FPR : IR2_OPND_GPR,
                                   entry->temp);
+    latr_regcache_stats_counters.writebacks++;
     if (is_fpr) {
         la_fst_d(value, env_ir2_opnd, env_offset_fpr(
             (int)(entry - lsenv->tr_data->regcache.fpr)));
@@ -383,6 +396,7 @@ static bool regcache_evict(bool is_fpr)
     if (victim == NULL) {
         return false;
     }
+    latr_regcache_stats_counters.evictions++;
     regcache_release(victim, is_fpr, victim_dirty);
     return true;
 }
@@ -400,6 +414,8 @@ void latr_regcache_reset(void)
 void latr_regcache_flush(void)
 {
     LatrRegCacheEntry *gpr = regcache_entries(false);
+
+    latr_regcache_stats_counters.flushes++;
     LatrRegCacheEntry *fpr = regcache_entries(true);
 
     for (int i = 0; i < 32; i++) {
@@ -469,6 +485,8 @@ static void regcache_free_borrow(IR2_OPND value, bool is_fpr)
 static void regcache_store(int reg, IR2_OPND value, bool is_fpr)
 {
     LatrRegCacheEntry *entries = regcache_entries(is_fpr);
+
+    latr_regcache_stats_counters.stores++;
     LatrRegCacheEntry *entry = &entries[reg];
     int slot = regcache_temp_slot(value._reg_num, is_fpr);
     lsassertm(slot >= 0, "guest register writeback requires a temporary operand");
@@ -707,6 +725,7 @@ IR2_OPND alloc_gpr_src(int reg)
     entry->valid = 1;
     entry->dirty = 0;
     regcache_touch(entry);
+    latr_regcache_stats_counters.reloads++;
     la_ld_d(value, env_ir2_opnd, env_offset_gpr(reg));
     return value;
 }
@@ -755,6 +774,7 @@ IR2_OPND alloc_fpr_src(int reg)
     entry->valid = 1;
     entry->dirty = 0;
     regcache_touch(entry);
+    latr_regcache_stats_counters.reloads++;
     la_fld_d(value, env_ir2_opnd, env_offset_fpr(reg));
     return value;
 }

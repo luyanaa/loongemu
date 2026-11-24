@@ -272,6 +272,27 @@ void store_fpr_dst(int reg, IR2_OPND opnd);
 
 /* TB-local guest register cache hooks. */
 void latr_regcache_reset(void);
+/*
+ * Register-cache accounting (design: docs/design/ir2-value-version.md, P0).
+ *
+ * Pure bookkeeping for deciding whether the versioned-state work is worth
+ * building: how often the cache is flushed, how many guest-state stores that
+ * emits, how often a value has to be reloaded from env, and how often a resident
+ * value is dropped to free a slot. Nothing here may change translation, and the
+ * counters live outside LatrRegCache so latr_regcache_reset() does not clear
+ * them per block.
+ */
+typedef struct LatrRegCacheStats {
+    uint64_t flushes;    /* latr_regcache_flush() calls */
+    uint64_t writebacks; /* guest-state stores emitted (flush and eviction) */
+    uint64_t reloads;    /* env loads because the value was not resident */
+    uint64_t stores;     /* guest-register writes taken by store_gpr_dst() */
+    uint64_t evictions;  /* resident entries dropped to free a slot */
+} LatrRegCacheStats;
+
+void latr_regcache_stats_reset(void);
+LatrRegCacheStats latr_regcache_stats(void);
+
 void latr_regcache_flush(void);
 bool latr_regcache_evict_itemp(void);
 bool latr_regcache_evict_ftemp(void);

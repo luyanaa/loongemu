@@ -6755,5 +6755,21 @@ void kmain(void)
         puthex(loongemu_perf_now() - perf_suite_start);
     }
 #endif
+    {
+        /* Register-cache accounting for design P0 (ir2-value-version.md): the
+         * numbers that decide whether versioned state is worth building. */
+        LatrRegCacheStats rc = latr_regcache_stats();
+
+        latx_bare_uart_puts("\nlatr-regcache: flushes=");
+        putdec((unsigned)rc.flushes);
+        latx_bare_uart_puts(" writebacks=");
+        putdec((unsigned)rc.writebacks);
+        latx_bare_uart_puts(" reloads=");
+        putdec((unsigned)rc.reloads);
+        latx_bare_uart_puts(" stores=");
+        putdec((unsigned)rc.stores);
+        latx_bare_uart_puts(" evictions=");
+        putdec((unsigned)rc.evictions);
+    }
     latx_bare_uart_puts("\nlatr-isa: done\n");
 }

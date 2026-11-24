@@ -35,7 +35,21 @@ void latx_bare_uart_puts(const char *s)
 }
 
 
+static void putdec(unsigned v)
+{
+    char b[11];
+    int i = 10;
+
+    b[i] = 0;
+    do {
+        b[--i] = (char)('0' + (v % 10u));
+        v /= 10u;
+    } while (v != 0 && i > 0);
+    latx_bare_uart_puts(&b[i]);
+}
+
 void kmain(void);
+
 __asm__(".text\n.globl _start\n_start:\n  pcalau12i $sp, %pc_hi20(latr_sys_stack)\n  addi.d $sp, $sp, %pc_lo12(latr_sys_stack)\n"
         "  lu12i.w $t0, 128\n  add.d $sp, $sp, $t0\n  bl kmain\n1: b 1b\n");
 static uint8_t latr_sys_stack[512u << 10] __attribute__((aligned(16), used));
@@ -140,6 +154,23 @@ void kmain(void)
     latx_bare_uart_puts(" latr-sys: guest=");
     latx_bare_uart_puts(latr_system_uart_log(&sys));
     latx_bare_uart_puts(halted ? "\nlatr-sys: PASS\n" : "\nlatr-sys: FAIL\n");
+    {
+        /* Same accounting as the ISA harness, on a guest that boots: the
+         * translation-time cost of the register cache for design P0. */
+        LatrRegCacheStats rc = latr_regcache_stats();
+
+        latx_bare_uart_puts("latr-regcache: flushes=");
+        putdec((unsigned)rc.flushes);
+        latx_bare_uart_puts(" writebacks=");
+        putdec((unsigned)rc.writebacks);
+        latx_bare_uart_puts(" reloads=");
+        putdec((unsigned)rc.reloads);
+        latx_bare_uart_puts(" stores=");
+        putdec((unsigned)rc.stores);
+        latx_bare_uart_puts(" evictions=");
+        putdec((unsigned)rc.evictions);
+        latx_bare_uart_puts("\n");
+    }
 #ifdef LOONGEMU_PERF
     {
         /* A paged workload with real MMIO and traps: the numbers the P1

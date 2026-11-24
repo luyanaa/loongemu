@@ -34,44 +34,47 @@ mean "avoid the writeback of a dead register" in the general case (every guest
 register is live out of a TB). The real opportunities are narrower and must be
 stated as such.
 
-## 2. Measured cost model (to be confirmed in P0)
+## 2. Measured cost model (P0, done)
 
-For a straight-line block with `B` branches and `L` labels, the current shape is
-`2 x (B + L)` flushes, each writing back up to 32 dirty entries. Three costs
-follow:
+`LatrRegCacheStats` counts flushes, writebacks, reloads, stores and evictions at
+translation time; the LATR ISA image and the guest-boot harnesses print them.
+Measured:
 
-1. **Redundant writebacks**: a register written back at a branch, then reloaded
-   and written back again at a later label, is written twice for one value.
-2. **Redundant flushes**: a label reached only by fallthrough needs no
-   canonicalisation at all.
-3. **Reload-after-flush**: the entry stays valid across flush, so no reload; the
-   cost is only the store. (This is why 3.1 in the LATA note - "the flag
-   consumers read 0" - is not a regcache symptom.)
+| workload | flushes | writebacks | reloads | stores | evictions |
+|---|---|---|---|---|---|
+| ISA image (1607 checks) | 12801 | 282 | 319 | 282 | 0 |
+| guest boot (`latr-sys`) | 10022 | 605 | 776 | 605 | 0 |
+
+Three conclusions, two of which retire parts of this design:
+
+1. **There is no double writeback to remove.** `writebacks == stores` in both
+   workloads: every guest-register write is written back exactly once. The
+   `dirty` bit already achieves what §3.1's version counters were introduced to
+   guarantee, so a `version`/`env_version` pair buys nothing here.
+2. **Almost every flush is a no-op, and the cost is the scan.** 94-98% of
+   `latr_regcache_flush()` calls find nothing dirty (282/12801, 605/10022). Each
+   call still walks 64 entries at *translation* time. The cheap win is therefore
+   not versioning but a per-bank dirty counter: if it is zero, return without
+   scanning. That is ~10 lines and does not touch semantics.
+3. **The pool is not under pressure.** `evictions == 0` in both workloads, so
+   residency bookkeeping beyond the existing `valid`/`dirty`/`age` has no work
+   to do here.
+
+What survives: the flush fast path (2) and, if it still shows up after that, the
+label-flush elision of §3.2. What does not: the version counters of §3.1, and the
+"redundant writeback" motivation in the original cost model - both refuted by
+measurement. This is the outcome P0 existed to produce.
 
 ## 3. Design
 
-### 3.1 Versioned entries (shared header, per-port state)
+### 3.1 Versioned entries - dropped
 
-New header `shared/backend/loongarch/include/ir2-value-state.h`:
-
-```c
-typedef struct Ir2GuestValueState {
-    uint32_t version[32];      /* bumped on every write to the value */
-    uint32_t env_version[32];  /* version currently mirrored in env */
-    uint8_t  resident[32];     /* temp slot index, or 0xff */
-    uint8_t  dirty[32];
-} Ir2GuestValueState;
-
-/* Called by the port's regcache on store/flush/writeback. */
-void ir2_value_written(Ir2GuestValueState *s, int reg);
-bool ir2_value_needs_writeback(const Ir2GuestValueState *s, int reg);
-void ir2_value_flushed(Ir2GuestValueState *s, int reg);
-```
-
-`dirty` becomes derived (`version != env_version`), which makes double writeback
-of one value impossible by construction rather than by discipline. This is the
-part worth sharing: LATR and LATM get identical semantics from one file, and a
-host unit test can drive the state machine without a translator.
+The original proposal was a shared `Ir2GuestValueState` with `version[]` /
+`env_version[]` so a writeback could be skipped when env already held the value.
+P0 refuted the premise (`writebacks == stores`, so no value is ever written
+twice), and the header would therefore have no work to do. Removed rather than
+kept: a shared abstraction with no consumer is a maintenance cost paid for an
+argument nobody can measure.
 
 ### 3.2 Flush elision at labels (structural, not speculative)
 
@@ -108,10 +111,11 @@ regcache is therefore *not* an implementation detail: it is evidence.
    register (`regcache_borrow`), and the binding must be captured by the port's
    snapshot function at the same point (LATM: `latm_regcache_snapshot_gpr_binds`;
    LATR: `tb_insn_binds[]` staging in `TRANSLATION_DATA`, `latr.h:114`).
-2. Version-based writeback elision must never change *when* env becomes
-   canonical relative to a span with `phase == LE_PHASE_PARTIAL_EFFECT`; if it
-   does, the span must be dropped (mark unusable) rather than left claiming a
-   value that env does not hold.
+2. The flush fast path may skip the *scan* only when no entry in the bank is
+   dirty, which leaves the set of writebacks identical; anything that changes
+   *when* env becomes canonical relative to a span with
+   `phase == LE_PHASE_PARTIAL_EFFECT` must drop the span (mark unusable) rather
+   than leave it claiming a value env does not hold.
 3. Fail closed exactly as `latr_machine_host_fault` does (`latr_machine.c`):
    a span with bindings and no usable snapshot returns 0 instead of reporting a
    partial state.
@@ -120,11 +124,11 @@ regcache is therefore *not* an implementation detail: it is evidence.
 
 | phase | change | gate |
 |---|---|---|
-| P0 | counters only: flushes, writebacks, per-reg writeback count, reload misses | `latr-isa` + boot unchanged; numbers recorded in the commit |
-| P1 | `ir2-value-state.h` + LATR wiring, `dirty` derived from versions | `latr-isa 1607`, boot smoke, host unit test |
-| P2 | label flush elision (3.2) | same, plus counters show flush count down and no regression in boot |
-| P3 | load hoisting (3.3), only if P0-P2 data justifies it | same |
-| P4 | LATM wiring of the same shared header | `latm-isa 60`, board smoke |
+| P0 | done: `LatrRegCacheStats` counters, printed by both LATR harnesses | `latr-isa 1607`, `latr-sys`, numbers in §2 |
+| P1 | dirty-counter fast path in `latr_regcache_flush` (return before the scan when the bank is clean); drop the version counters from §3.1 | `latr-isa 1607`, `latr-sys`, flush cost visible in the same counters; no semantic change, so no new test beyond the existing gates |
+| P2 | label flush elision (3.2), only if the counters still show flushes dominating after P1 | same |
+| P3 | load hoisting (3.3), only if the data justifies it | same |
+| P4 | LATM parity for the fast path (LATM has the same flush shape) | `latm-isa 60`, board smoke |
 
 ## 6. Failure modes to design against
 
@@ -156,14 +160,14 @@ regcache is therefore *not* an implementation detail: it is evidence.
 
 ## 8. Self-review
 
-**Objection 1: this is a 5-phase plan for an optimisation with no measured
-baseline; the roadmap called it "value version / next-use" as if it were the
-core win, but the load half already exists.**
-Correct, and the design says so in §1 rather than pretending otherwise. P0 is
-instrumentation only and may well show the win is < 1%, in which case P2/P3
-should be dropped and only the shared state header (which buys the LATM parity
-and the double-writeback proof) is worth keeping. That is a legitimate outcome
-and is written into the table as a decision point.
+**Objection 1 (resolved by P0): is versioning worth building, given that the
+load half already exists?**
+No. P0 measured `writebacks == stores`, so the double-writeback case the version
+counters were meant to prevent does not occur; and `evictions == 0`, so residency
+tracking has nothing to track. The plan is now the flush fast path (a dirty
+counter) plus, conditionally, label elision. The shared `ir2-value-state.h`
+header in §3.1 is dropped rather than kept "for LATM parity" - a header with no
+consumer is exactly the abstraction this measurement was supposed to rule out.
 
 **Objection 2: label flush elision is unsafe if a branch inside the block
 targets that label.**
