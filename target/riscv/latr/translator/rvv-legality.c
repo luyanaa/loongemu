@@ -174,6 +174,13 @@ static void rvv_shape(unsigned opcode, RvvShape *shape)
     V(VFMADD_VF) V(VFNMADD_VF) V(VFMSUB_VF) V(VFNMSSUB_VF)
         shape->form = FORM_SS;
         break;
+    /* Widening FMA: 2*SEW destination, SEW sources. */
+    V(VFWMACC_VV) V(VFWNMACC_VV) V(VFWMSAC_VV) V(VFWNMSAC_VV)
+        shape->form = FORM_DSS;
+        break;
+    V(VFWMACC_VF) V(VFWNMACC_VF) V(VFWMSAC_VF) V(VFWNMSAC_VF)
+        shape->form = FORM_DS;
+        break;
 
     /* Merge and move. */
     V(VMERGE_VVM)
@@ -937,6 +944,10 @@ LatrRvvLegality latr_rvv_check_operands(const RiscvIR1 *insn,
 bool latr_rvv_uses_frm(unsigned opcode)
 {
     switch (opcode) {
+    case LATR_RV_VFWMACC_VV: case LATR_RV_VFWMACC_VF:
+    case LATR_RV_VFWNMACC_VV: case LATR_RV_VFWNMACC_VF:
+    case LATR_RV_VFWMSAC_VV: case LATR_RV_VFWMSAC_VF:
+    case LATR_RV_VFWNMSAC_VV: case LATR_RV_VFWNMSAC_VF:
     case LATR_RV_VFMACC_VV: case LATR_RV_VFMACC_VF:
     case LATR_RV_VFNMACC_VV: case LATR_RV_VFNMACC_VF:
     case LATR_RV_VFMSAC_VV: case LATR_RV_VFMSAC_VF:

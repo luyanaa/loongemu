@@ -133,6 +133,13 @@ enum {
     LATR_RVV_FMA_MSAC, LATR_RVV_FMA_NMSAC,
     LATR_RVV_FMA_MADD, LATR_RVV_FMA_NMADD,
     LATR_RVV_FMA_MSUB, LATR_RVV_FMA_NMSUB,
+    /*
+     * Widening forms: the product is SEW x SEW, the accumulator 2*SEW, and only
+     * the four acc/acc-negate variants exist (there is no vfwmadd). Values 8..11
+     * carry the same sign rules as 0..3.
+     */
+    LATR_RVV_FWMA_MACC = 8, LATR_RVV_FWMA_NMACC,
+    LATR_RVV_FWMA_MSAC, LATR_RVV_FWMA_NMSAC,
 };
 void latr_rvv_fma(CPUArchState *env);
 enum {

@@ -561,3 +561,13 @@ LATR_RV_INSN(VFMSUB_VV, vfmsub_vv)
 LATR_RV_INSN(VFMSUB_VF, vfmsub_vf)
 LATR_RV_INSN(VFNMSSUB_VV, vfnmsub_vv)
 LATR_RV_INSN(VFNMSSUB_VF, vfnmsub_vf)
+
+/* 2.2 batch 5: widening fused multiply-add (SEW inputs, 2*SEW accumulator). */
+LATR_RV_INSN(VFWMACC_VV, vfwmacc_vv)
+LATR_RV_INSN(VFWMACC_VF, vfwmacc_vf)
+LATR_RV_INSN(VFWNMACC_VV, vfwnmacc_vv)
+LATR_RV_INSN(VFWNMACC_VF, vfwnmacc_vf)
+LATR_RV_INSN(VFWMSAC_VV, vfwmsac_vv)
+LATR_RV_INSN(VFWMSAC_VF, vfwmsac_vf)
+LATR_RV_INSN(VFWNMSAC_VV, vfwnmsac_vv)
+LATR_RV_INSN(VFWNMSAC_VF, vfwnmsac_vf)

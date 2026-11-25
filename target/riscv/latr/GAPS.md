@@ -52,9 +52,11 @@
 - [x] **软件 TLB**：数据/取指共用 64 项直接映射 TLB；条目按 satp+VA 页校验并回读叶 PTE，SFENCE.VMA（全量/ASID）与 FENCE.I 失效；`sfence_pending` 被 runtime 清零后仍有 `tlb_flush_seq` 序号兜底；PMP/SUM/MXR/A/D 在命中路径重新检查。
 - [x] **RVV 差分**：`Makefile` 使用 `-march=rv64gcv`，`tests/latr_isa_qemu_ref.S` / `latr_isa_diff_vectors.h` / `baremetal/bare/latr_isa_test.c` 已接入 RVV 差分序列并与 `qemu-system-riscv64 -cpu max` 对齐（`latr-diff` 通过）。
 - [x] **系统差分**：Sv39/48/57、timer、PLIC/UART 的 QEMU 差分（`latr-sys-diff` 的 SYS 行逐字节相同）；riscv-tests/arch-test/vector-tests 仍未接入。
-- [~] **RVV FP FMA**：16 条非 widening 已落地并验证（`vfmacc/vfmsac/vfnmacc/vfnmsac`、
-  `vfmadd/vfmsub/vfnmadd/vfnmsub` × `.vv/.vf`），走 `latr_rvv_fma` C helper + `float*_muladd`；
-  **仍缺 8 条 widening**（`vfw{m,n}macc/msac` × `.vv/.vf`）。
+- [x] **RVV FP FMA（24 条）**：16 条非 widening + 8 条 widening（`vfwmacc/vfwnmacc/vfwmsac/vfwnmsac` × `.vv/.vf`）
+  全部落地并验证：widening 走同一 `latr_rvv_fma` 的 2·SEW 分支——乘积在 f32 上精确、累加器在 f64 上，
+  单次舍入发生在 2·SEW 处；精度用例 `(1+2^-23)^2 + 2^30` 保留 `2^-22` 尾数（`0x41d0000000400001`）。
+  非 widening 的 16 条为 `vfmacc/vfmsac/vfnmacc/vfnmsac`、
+  `vfmadd/vfmsub/vfnmadd/vfnmsub` × `.vv/.vf`，与 widening 共用 `latr_rvv_fma`（`float*_muladd`）。
   两处语义陷阱已固化在实现里：取反组合是 `product ^ addend`（不是简单 bit1），
   且必须先 `rvv_build_mask(env, !vm)` 否则所有 lane 读到 inactive。
   过程记录（值得保留）：曾判断"softfloat 的 muladd 非融合"并回退这批编码，
@@ -63,7 +65,7 @@
   `(1+2^-13)(1-2^-13) = 1-2^-26` 这种"乘积本身需超精度、单独会舍入到 1.0"的判别用例后，
   f32/f64 全部正确。`tests/test_softfloat_fma.c`（8 checks）现在全绿，用于防止把这类
   "期望值算错"再次误判成库缺陷。
-- [~] **RVV 1.0 指令补齐**：已登记 334 条（+3 条 `vset*`），**仍缺 40 条编码**（逐名比对 `insn32.decode:340-760`，明细见 [`RVV_P1_LEGALITY.md`](RVV_P1_LEGALITY.md) §2.1）：carry/borrow 10、整数 MAC 8、FP FMA（widening）8、`vfrsub/vfrdiv/vfrec7/vfrsqrt7/vfslide1*.vf` 6。
+- [~] **RVV 1.0 指令补齐**：已登记 342 条（+3 条 `vset*`），**仍缺 32 条编码**（逐名比对 `insn32.decode:340-760`，明细见 [`RVV_P1_LEGALITY.md`](RVV_P1_LEGALITY.md) §2.1）：carry/borrow 10、整数 MAC 8、`vfrsub/vfrdiv/vfrec7/vfrsqrt7/vfslide1*.vf` 6。
   本轮落地 `vrsub.vx/vi` 与 `vmulh/vmulhu/vmulhsu` 的 `.vv/.vx`（共 8 条），走 `latr_rvv_arith_extra` 的 C 路径；
   高位乘在 2·SEW 上求出乘积再右移 SEW，`mulhsu` 按 vs2 有符号、vs1/x 无符号混合。
   **登记位置有陷阱**：把新编码插到 `rv64gc-opcodes.def` 中部（`vmul.vx` 之后）会让 16 项既有 FP 检查（RMM/NaN-box）

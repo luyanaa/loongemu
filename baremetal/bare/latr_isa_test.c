@@ -5843,6 +5843,94 @@ static void test_rvv_pvir_lsx_lasx(void)
         check(vec_read32(22, 0), 0xbf000000u, "vfnmsub.vf -(0.5*2)+0.5 = -0.5");
     }
 
+    /*
+     * 2f. Widening FMA: SEW inputs, 2*SEW accumulator, single rounding at 2*SEW.
+     * e32 with vd in 64-bit lanes: vd = 2.0, v1 = 1.5, v2 = 2.0 -> 3.0 + 2.0.
+     */
+    {
+        static const uint32_t fwma_vv_ops[] = {
+            0xf2209457, /* vfwmacc.vv  v8,  v1, v2 */
+            0xf6209557, /* vfwnmacc.vv v10, v1, v2 */
+            0xfa209657, /* vfwmsac.vv  v12, v1, v2 */
+            0xfe209757, /* vfwnmsac.vv v14, v1, v2 */
+        };
+        static const uint32_t fwma_vf_ops[] = {
+            0xf220d857, /* vfwmacc.vf  v16, f1, v2 */
+            0xf620d957, /* vfwnmacc.vf v18, f1, v2 */
+            0xfa20da57, /* vfwmsac.vf  v20, f1, v2 */
+            0xfe20db57, /* vfwnmsac.vf v22, f1, v2 */
+        };
+
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10; /* e32, m1, tu, mu */
+        env.vl = 4;
+        for (int lane = 0; lane < 4; lane++) {
+            vec_store32(1, lane, 0x3fc00000u); /* 1.5 */
+            vec_store32(2, lane, 0x40000000u); /* 2.0 */
+            vec_store64(8, lane, UINT64_C(0x4000000000000000)); /* 2.0 */
+            vec_store64(10, lane, UINT64_C(0x4000000000000000));
+            vec_store64(12, lane, UINT64_C(0x4000000000000000));
+            vec_store64(14, lane, UINT64_C(0x4000000000000000));
+        }
+        check(latr_execute_block(fwma_vv_ops, 4), 1, "widening FMA .vv translates");
+        check(vec_read64(8, 0), UINT64_C(0x4014000000000000),
+              "vfwmacc.vv 1.5*2.0 + 2.0 = 5.0");
+        check(vec_read64(10, 0), UINT64_C(0xc014000000000000),
+              "vfwnmacc.vv -(1.5*2.0) - 2.0 = -5.0");
+        check(vec_read64(12, 0), UINT64_C(0x3ff0000000000000),
+              "vfwmsac.vv 1.5*2.0 - 2.0 = 1.0");
+        check(vec_read64(14, 0), UINT64_C(0xbff0000000000000),
+              "vfwnmsac.vv -(1.5*2.0) + 2.0 = -1.0");
+
+        /* .vf: f1 = 1.5 (low half, NaN-boxed), same numbers via the scalar. */
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10;
+        env.vl = 4;
+        env.fpr[1] = UINT64_C(0xffffffff3fc00000);
+        for (int lane = 0; lane < 4; lane++) {
+            vec_store32(2, lane, 0x40000000u);
+            vec_store64(16, lane, UINT64_C(0x4000000000000000));
+            vec_store64(18, lane, UINT64_C(0x4000000000000000));
+            vec_store64(20, lane, UINT64_C(0x4000000000000000));
+            vec_store64(22, lane, UINT64_C(0x4000000000000000));
+        }
+        check(latr_execute_block(fwma_vf_ops, 4), 1, "widening FMA .vf translates");
+        check(vec_read64(16, 0), UINT64_C(0x4014000000000000),
+              "vfwmacc.vf 1.5*2.0 + 2.0 = 5.0");
+        check(vec_read64(18, 0), UINT64_C(0xc014000000000000),
+              "vfwnmacc.vf = -5.0");
+        check(vec_read64(20, 0), UINT64_C(0x3ff0000000000000),
+              "vfwmsac.vf = 1.0");
+        check(vec_read64(22, 0), UINT64_C(0xbff0000000000000),
+              "vfwnmsac.vf = -1.0");
+
+        /*
+         * The accumulator is 2*SEW, so a product tail far below the f32 range
+         * must survive: (1+2^-23)^2 = 1+2^-22+2^-46, added to 2^30.
+         */
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10;
+        env.vl = 4;
+        for (int lane = 0; lane < 4; lane++) {
+            vec_store32(1, lane, 0x3f800001u);
+            vec_store32(2, lane, 0x3f800001u);
+            vec_store64(24, lane, UINT64_C(0x41d0000000000000)); /* 2^30 */
+        }
+        {
+            static const uint32_t fwma_precision[] = {
+                0xf2209c57, /* vfwmacc.vv v24, v1, v2 */
+            };
+
+            check(latr_execute_block(fwma_precision, 1), 1,
+                  "widening FMA precision case translates");
+            check(vec_read64(24, 0), UINT64_C(0x41d0000000400001),
+                  "vfwmacc.vv keeps the 2^-22 tail in the 2*SEW accumulator");
+        }
+    }
+
     /* 3. vmsgt / vmsgtu + unsigned shift immediate >= 16. */
     reset_guest_state();
     env.csr[0x300] = 0x600;

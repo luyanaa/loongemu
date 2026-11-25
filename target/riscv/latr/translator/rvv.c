@@ -1961,17 +1961,27 @@ void latr_rvv_fma(CPUArchState *env)
     unsigned kind = (unsigned)env->rvv_args[4];
     int vm = (int)env->rvv_args[6];
     unsigned sew = rvv_sew(env);
-    int accumulate_into_vd = variant < LATR_RVV_FMA_MADD;
+    int widening = variant >= LATR_RVV_FWMA_MACC;
+    int accumulate_into_vd;
     int flags = 0;
     unsigned i;
     float_status status;
+
+    if (widening) {
+        variant -= LATR_RVV_FWMA_MACC;
+        /* Only the four accumulate variants exist; the product is exact in
+         * 2*SEW, so the single rounding at 2*SEW is the whole point. */
+        accumulate_into_vd = 1;
+    } else {
+        accumulate_into_vd = variant < LATR_RVV_FMA_MADD;
+    }
 
     if (env->vstart >= env->vl) {
         env->vstart = 0;
         return;
     }
-    if (sew != 32 && sew != 64) {
-        /* RVV 1.0 vector FP covers e32/e64 only. */
+    if (widening ? (sew != 32) : (sew != 32 && sew != 64)) {
+        /* Widening needs 2*SEW = 64 for an f32 product; base RVV FLEN is 64. */
         env->vstart = 0;
         return;
     }
@@ -1985,6 +1995,41 @@ void latr_rvv_fma(CPUArchState *env)
         flags |= float_muladd_negate_c;
     }
     latr_fp_status_begin(env, &status, 0);
+    if (widening) {
+        unsigned dw = sew * 2u;
+
+        for (i = (unsigned)env->vstart; i < (unsigned)env->vl; i++) {
+            uint64_t acc;
+            float64 a;
+            float64 b;
+            uint64_t out;
+
+            if (!rvv_mask_bit(env, i)) {
+                if (RVV_VTYPE_VMA(env->vtype)) {
+                    latr_rvv_write_elem(env, vd, i, dw, rvv_sew_mask(dw));
+                }
+                continue;
+            }
+            a = float32_to_float64(
+                (float32)(kind == LATR_RVV_SRC_VECTOR
+                              ? latr_rvv_read_elem(env, op2, i, sew)
+                              : rvv_fp_scalar32(env, op2)),
+                &status);
+            b = float32_to_float64(
+                (float32)latr_rvv_read_elem(env, vs2, i, sew), &status);
+            acc = latr_rvv_read_elem(env, vd, i, dw);
+            out = (uint64_t)float64_muladd(a, b, (float64)acc, flags, &status);
+            latr_rvv_write_elem(env, vd, i, dw, out);
+        }
+        latr_fp_status_end(env, &status);
+        env->vstart = 0;
+        if (RVV_VTYPE_VTA(env->vtype)) {
+            for (i = (unsigned)env->vl; i < rvv_vlmax(env); i++) {
+                latr_rvv_write_elem(env, vd, i, dw, rvv_sew_mask(dw));
+            }
+        }
+        return;
+    }
     for (i = (unsigned)env->vstart; i < (unsigned)env->vl; i++) {
         uint64_t vd_old;
         uint64_t a_bits, b_bits, c_bits;
