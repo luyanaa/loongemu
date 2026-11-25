@@ -13,6 +13,8 @@
  *   0x28 h0_result    hart 0's call after fence.i      expect 2
  *   0x30 h1_result    hart 1's call after fence.i      expect 2
  *   0x38 exit_marker  copy of h1_result, published before the exit write
+ *   0x40 xpage_before  hart 0's call of the page-straddling target (expect 1)
+ *   0x48 xpage_after   hart 0's call after the rewrite + fence.i (expect 3)
  *
  * The interesting part is the order: hart 1 must translate the OLD `target`
  * before hart 0 rewrites it and executes FENCE.I, and after the IPI its call
@@ -58,6 +60,32 @@ lrsc_loop:
 wait_early:
     ld    t1, 24(t0)
     beqz  t1, wait_early
+
+    /*
+     * SMC across a 4 KiB page boundary: the instruction at 0x80000FFE has two
+     * bytes in each page. Only the first instruction of a block may cross a
+     * page (target_disasm refuses for later ones), so this exercises exactly
+     * that rule plus fetch and fence handling. The rewrite uses two halfword
+     * stores because a word store there would be misaligned.
+     */
+    li    t1, 0x80000ffe
+    jalr  ra, t1, 0
+    sd    a0, 64(t0)               /* xpage_before: 1 */
+    li    t1, 0x80000ffe
+    /* Little-endian: the *low* half of each word sits at the lower address, so
+     * the straddling word's low half is at 0xFFE and its high half at 0x1000. */
+    li    t2, 0x0513               /* `addi a0, zero, 3` low half  @ 0xFFE */
+    sh    t2, 0(t1)
+    li    t2, 0x0030               /* high half                    @ 0x1000 */
+    sh    t2, 2(t1)
+    li    t2, 0x8067               /* `ret` low half               @ 0x1002 */
+    sh    t2, 4(t1)
+    li    t2, 0x0000               /* high half                    @ 0x1004 */
+    sh    t2, 6(t1)
+    fence.i
+    li    t1, 0x80000ffe
+    jalr  ra, t1, 0
+    sd    a0, 72(t0)               /* xpage_after: 3 */
 
     /* Replace target with `li a0, 2; ret` and publish it to instruction
      * fetch. The old target was `li a0, 1; ret`. */
@@ -118,6 +146,12 @@ h1_handler:
     jalr  ra, t1, 0
     sd    a0, 48(t0)
     mret
+
+/* --------------- instruction straddling a 4 KiB page ------------------ */
+    .org 0x0ffe
+xpage_target:
+    li    a0, 1
+    jalr  zero, ra, 0
 
 /* ------------------------- rewritten code ----------------------------- */
     .org 0x2000

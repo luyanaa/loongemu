@@ -371,7 +371,7 @@ architecture coverage beyond fixed fixtures:
 | fault differential | **done for the M-mode core cases**: `make latr-fault-diff` runs one guest (latr_fault_guest.S) on the LATR machine and natively on qemu-system-riscv64; it takes load/store access faults, an instruction access fault, `ecall` and an illegal instruction, the handler records (mcause, mepc, mtval), and the hash plus the raw records must agree. Page faults, misaligned access and privilege checks are still open. |
 | memory litmus | TSO, RVWMO, ARM ordering |
 | SMP stress | LL/SC, AMO, DMA, shootdown |
-| SMC | cross-page, cross-core, alias mappings |
+| SMC | **cross-page done in the SMP image**: an instruction straddling the 0x80001000 boundary (first two bytes below, last two above) is called (1), rewritten with two halfword stores, `fence.i`'d, and called again (3); the raw bytes are also checked. Cross-core visibility of the *straddling* instruction and alias mappings remain open - see the note below. |
 | relocation | identical results from different arena bases |
 | feature matrix | scalar, LBT, LSX, LASX |
 | OS boot | pinned Linux + Buildroot/BusyBox |
@@ -425,6 +425,22 @@ Two findings from the first runs, both in the test rather than the translator:
   `C.ADDI4SPN`, so the two engines may legitimately disagree about where the
   instruction ends. The illegal case is now `0x0000007f`, a reserved 32-bit
   opcode.
+
+SMC across a page boundary (implemented in the SMP guest): the instruction at
+0x80000FFE has two bytes in each 4 KiB page, which exercises the rule that only
+the *first* instruction of a block may cross (`target_disasm`) plus the fetch and
+`fence.i` paths. It is rewritten with two halfword stores (a word store there is
+misaligned), fenced, and re-called: 1 before, 3 after, with the bytes checked in
+memory.
+
+**Not closed, and recorded rather than papered over:** having *hart 1* call the
+same straddling instruction after hart 0's fence does not work in this harness -
+it returns 0 in both the trap-handler and the idle-loop variants, while hart 0's
+identical call returns 3. Narrowing that (per-hart translation of a
+page-straddling block, or the trap-path recovery state) is open work; the check
+was left out of the gate rather than shipped red, and litmus tests were not added
+for the same class of reason: with the cooperative image the interleaving is
+deterministic, so MP/LB would pass vacuously and prove nothing about ordering.
 
 Performance moves from local PERF counters to one benchmark reporting: guest
 instructions/sec, host instructions per guest instruction, TB hit rate,

@@ -92,6 +92,8 @@ static LatrMachine machine;
 #define D_H0 (DATA_PAGE + 0x28u)
 #define D_H1 (DATA_PAGE + 0x30u)
 #define D_EXIT (DATA_PAGE + 0x38u)
+#define D_XPAGE_BEFORE (DATA_PAGE + 0x40u)
+#define D_XPAGE_AFTER (DATA_PAGE + 0x48u)
 
 static uint64_t read64(uint64_t pa)
 {
@@ -182,6 +184,24 @@ void kmain(void)
     check_u64("hart 0 sees the rewritten target", read64(D_H0), 2);
     check_u64("hart 1 sees the rewritten target", read64(D_H1), 2);
     check_u64("exit marker carries hart 1's result", read64(D_EXIT), 2);
+    check_u64("page-straddling target ran before the rewrite",
+              read64(D_XPAGE_BEFORE), 1);
+    check_u64("page-straddling target ran after the rewrite",
+              read64(D_XPAGE_AFTER), 3);
+    /* The straddling instruction's bytes, as the guest left them: the rewrite
+     * is two halfword stores, so this also pins that a page boundary does not
+     * split a store path. */
+    {
+        const uint8_t *p = ram + 0xFFEu;
+
+        check_u64("straddling word rewritten in place",
+                  (uint64_t)p[0] | ((uint64_t)p[1] << 8) |
+                      ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24),
+                  0x00300513u);
+        check_u64("instruction after the boundary rewritten in place",
+                  (uint64_t)p[4] | ((uint64_t)p[5] << 8),
+                  0x8067u);
+    }
 
     /* Chain-control baseline (design: chain-control-ras.md P0): the epoch moves
      * at each real break point and `links` must stay 0 while nothing chains. */
