@@ -147,7 +147,7 @@ HOST_STRICT_CFLAGS := $(HOST_CORE_CFLAGS) -Werror
 # qemu/osdep.h, and __FAST_MATH__ must not leak into any other file.
 $(HOST_BUILD)/softfloat-host.o: $(LATX)/upstream/fpu/softfloat.c | $(HOST_BUILD)
 	$(HOST_CC) $(HOST_CORE_CFLAGS) -DTARGET_RISCV -D__FAST_MATH__ \
-		-Wno-error=#warnings -fno-strict-aliasing -c $< -o $@
+		-fno-strict-aliasing -c $< -o $@
 
 $(HOST_BUILD)/latr_host_smp.o: ../baremetal/host/latr_host_smp.c | $(HOST_BUILD)
 	$(HOST_CC) $(HOST_STRICT_CFLAGS) -c $< -o $@
