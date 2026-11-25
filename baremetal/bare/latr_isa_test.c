@@ -5634,6 +5634,58 @@ static void test_rvv_pvir_lsx_lasx(void)
     check(vec_read32(11, 1), 7u, "vmaxu.vv(7, 0) -> 7");
     check(vec_read32(12, 0), 0xffffffffu, "vmax.vv(-2^31, -1) -> -1");
 
+    /*
+     * 2b. Reverse subtract and the three high-half multiplies (2.2 batch).
+     * v1 = {INT32_MIN, 7, -15, 20}, v2 = {-1, 0, 4, -6}, t0 = 3, vl = 4.
+     */
+    {
+        static const uint32_t vrsub_mulh_ops[] = {
+            0x0e12c1d7, /* vrsub.vx  v3, v1, t0 */
+            0x0e1fb257, /* vrsub.vi  v4, v1, -1 */
+            0x9e1122d7, /* vmulh.vv  v5, v1, v2 */
+            0x9e12e357, /* vmulh.vx  v6, v1, t0 */
+            0x921123d7, /* vmulhu.vv v7, v1, v2 */
+            0x9212e457, /* vmulhu.vx v8, v1, t0 */
+            0x9a1124d7, /* vmulhsu.vv v9, v1, v2 */
+            0x9a12e557, /* vmulhsu.vx v10, v1, t0 */
+        };
+
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10; /* SEW=32, LMUL=1, tu, mu */
+        env.vl = 4;
+        env.gpr[5] = 3;
+        vec_store32(1, 0, 0x80000000u);
+        vec_store32(1, 1, 7u);
+        vec_store32(1, 2, (uint32_t)-15);
+        vec_store32(1, 3, 20u);
+        vec_store32(2, 0, 0xffffffffu);
+        vec_store32(2, 1, 0u);
+        vec_store32(2, 2, 4u);
+        vec_store32(2, 3, (uint32_t)-6);
+        check(latr_execute_block(vrsub_mulh_ops, 8), 1,
+              "vrsub / vmulh family translates");
+        /* scalar - element, both .vx and .vi (imm sign-extended). */
+        check(vec_read32(3, 0), 0x80000003u, "vrsub.vx(3, INT32_MIN) wraps");
+        check(vec_read32(3, 2), 18u, "vrsub.vx(3, -15) = 18");
+        check(vec_read32(4, 0), 0x7fffffffu, "vrsub.vi(-1, INT32_MIN)");
+        check(vec_read32(4, 3), (uint32_t)-21, "vrsub.vi(-1, 20) = -21");
+        /* Signed high half: INT32_MIN * -1 has a zero high word. */
+        check(vec_read32(5, 0), 0u, "vmulh.vv INT32_MIN * -1 high = 0");
+        check(vec_read32(5, 2), 0xffffffffu, "vmulh.vv -15 * 4 high = -1");
+        check(vec_read32(6, 0), 0xfffffffeu, "vmulh.vx INT32_MIN * 3 high");
+        check(vec_read32(6, 3), 0u, "vmulh.vx 20 * 3 high = 0");
+        /* Unsigned high half. */
+        check(vec_read32(7, 0), 0x7fffffffu, "vmulhu.vv 0x80000000 * 0xffffffff");
+        check(vec_read32(7, 2), 3u, "vmulhu.vv 0xfffffff1 * 4 high");
+        check(vec_read32(8, 0), 1u, "vmulhu.vx 0x80000000 * 3 high");
+        /* Mixed: vs2 signed, vs1/x unsigned. */
+        check(vec_read32(9, 0), 0x80000000u, "vmulhsu.vv INT32_MIN * 0xffffffff");
+        check(vec_read32(9, 3), 0x13u, "vmulhsu.vv 20 * 0xfffffffa high");
+        check(vec_read32(10, 0), 0xfffffffeu, "vmulhsu.vx INT32_MIN * 3 high");
+        check(vec_read32(10, 1), 0u, "vmulhsu.vx 7 * 3 high = 0");
+    }
+
     /* 3. vmsgt / vmsgtu + unsigned shift immediate >= 16. */
     reset_guest_state();
     env.csr[0x300] = 0x600;

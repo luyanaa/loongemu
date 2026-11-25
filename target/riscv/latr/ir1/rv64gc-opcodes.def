@@ -518,3 +518,14 @@ LATR_RV_ALIAS(FSD, c_fsd)
 
 /* Pseudo-opcode produced when an instruction fetch traps. */
 LATR_RV_INSN(FETCH_FAULT, fetch_fault)
+
+/* 2.2 batch: reverse subtract and the high-half multiplies. Appended at the end
+ * so existing LATR_RV_* values (and anything keyed by them) do not shift. */
+LATR_RV_INSN(VRSUB_VX, vrsub_vx)
+LATR_RV_INSN(VRSUB_VI, vrsub_vi)
+LATR_RV_INSN(VMULH_VV, vmulh_vv)
+LATR_RV_INSN(VMULH_VX, vmulh_vx)
+LATR_RV_INSN(VMULHU_VV, vmulhu_vv)
+LATR_RV_INSN(VMULHU_VX, vmulhu_vx)
+LATR_RV_INSN(VMULHSU_VV, vmulhsu_vv)
+LATR_RV_INSN(VMULHSU_VX, vmulhsu_vx)

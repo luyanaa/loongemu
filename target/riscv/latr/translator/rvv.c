@@ -1748,6 +1748,54 @@ void latr_rvv_arith_extra(CPUArchState *env)
             continue;
         }
 
+        /*
+         * vrsub: the scalar is the minuend (scalar - element), which is the one
+         * place where operand roles are reversed relative to the general ALU
+         * path. The subtraction is modulo 2^SEW for both the .vx and .vi forms,
+         * so the raw scalar bits are used as-is.
+         */
+        if (op == LATR_RVV_X_RSUB) {
+            uint64_t elem = latr_rvv_read_elem(env, vs2, i, sew);
+            uint64_t scalar = rvv_extra_scalar(env, kind, imm, sew, 0);
+
+            out = (scalar - elem) & rvv_sew_mask(sew);
+            latr_rvv_write_elem(env, vd, i, sew, out);
+            continue;
+        }
+        /*
+         * High-half multiply. The product is formed at 2*SEW and shifted down:
+         * taking the host's own high word would be wrong for SEW < 64, and
+         * mulhsu mixes signedness per operand (vs2 signed, vs1/x unsigned).
+         */
+        if (op == LATR_RVV_X_MULH || op == LATR_RVV_X_MULHU ||
+            op == LATR_RVV_X_MULHSU) {
+            int a_signed = op != LATR_RVV_X_MULHU;
+            int b_signed = op == LATR_RVV_X_MULH;
+            uint64_t a_bits = latr_rvv_read_elem(env, vs2, i, sew);
+            __int128 a = a_signed
+                             ? (__int128)rvv_sext(a_bits, sew)
+                             : (__int128)(unsigned __int128)
+                                   (a_bits & rvv_sew_mask(sew));
+            __int128 b;
+            __int128 prod;
+
+            if (kind == LATR_RVV_SRC_VECTOR) {
+                uint64_t b_bits = latr_rvv_read_elem(env, vs1, i, sew);
+                b = b_signed
+                        ? (__int128)rvv_sext(b_bits, sew)
+                        : (__int128)(unsigned __int128)(b_bits & rvv_sew_mask(sew));
+            } else {
+                uint64_t sv = rvv_extra_scalar(env, kind, imm, sew, 0);
+                b = b_signed ? (__int128)rvv_sext(sv, sew)
+                             : (__int128)(unsigned __int128)
+                                   (sv & rvv_sew_mask(sew));
+            }
+            prod = a * b;
+            out = (uint64_t)((unsigned __int128)prod >> sew) & rvv_sew_mask(sew);
+            latr_rvv_write_elem(env, vd, i, sew, out);
+            continue;
+        }
+
         if (is_narrow) {
             uint64_t wide = latr_rvv_read_elem(env, vs2, i, dw);
             uint64_t sh;
