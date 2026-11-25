@@ -162,20 +162,31 @@ board image drives exactly one `CPUMIPSState` through one dispatch loop, so no
 second vCPU ever runs and nothing cross-CPU can be observed. The next step is the
 LATR-shaped piece for LATM, and its acceptance test can be stated now:
 
-1. a per-CPU context (`CPUMIPSState` + translator context + TB cache per CPU) and
-   a cooperative `step_cpu(sys, cpu)` that does fetch/translate/run and then
-   applies the after-block duties (TLB shootdown, interrupt delivery, WFI);
-2. two CPUs boot from the same ELF with `a0 = cpuid`, run their own blocks, and
-   the board test asserts both PCs advanced;
+**Items 1-2 are in** (`baremetal/bare/latm_board.c`, gate `latm-board-run`):
+`run_one_tb_of(env, cache, buf, next, size)` takes the CPU explicitly, and
+`board_run_host_of()` rebinds `lsenv`/`tr_data` to that CPU before every dispatch
+(LATM already carries `latm_env`/`latm_tr_data` per `CPUMIPSState`, so the bind is
+`lata_tr_data_init(cpu)` and the context needs no new type). A second CPU context,
+TLB, TB cache, host code buffer and prologue/epilogue pair are created next to
+CPU 0's, and both run the same guest with `a0 = cpuid`, each incrementing its own
+word: measured `c0=16 c1=16 pc0=pc1=0xffffffff80004014`, `latm-smp: PASS`.
+Mutation-tested: making CPU 1 dispatch through CPU 0's context gives
+`c0=18 c1=14` and FAIL, so the per-CPU bind is what the test is measuring.
+
+Two trap worth keeping from this step: the guest is linked at 0 but runs in
+kseg0, so `j` (which takes its region bits from PC) jumped nowhere - a
+PC-relative `b` is the right loop. And the board's instruction words are stored
+as host words holding big-endian encodings, e.g. `lui $t0,0x8000` is `0x3c0c8000`.
+
+**Remaining:**
+
 3. CPU 0 writes IOCSR 0x1040 targeting CPU 1; CPU 1's `cpu_ip` gains the vector,
-   and CPU 1's handler runs and clears it - the register half of this is already
-   covered by `latm-uncore`, so the new assertion is that *execution* crosses;
+   and CPU 1's handler runs and clears it - the register half is already covered
+   by `latm-uncore`, so the new assertion is that *execution* crosses (needs CP0
+   Status.IE / Cause.IP setup in the guest and a handler at the exception base);
 4. an LL/SC pair on CPU 1 is invalidated by a plain store from CPU 0 (reservation
    coherence), which needs a shared reservation table the uncore does not have
-   yet.
-
-Items 1-3 are the first slice; 4 is its own step because it changes the memory
-path.
+   yet; this changes the memory path, so it is its own step.
 
 | module | remaining work | priority |
 |---|---|---|

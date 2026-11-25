@@ -485,26 +485,71 @@ static uint32_t kernel_code[] = {
 };
 
 static uint8_t code_buf[65536] __attribute__((aligned(4096)));
+#define BOARD_TB_CACHE_CAP 128u
+
+/* ---------------------------------------------------------------- two vCPUs
+ *
+ * The same guest runs on both CPUs; a0 carries the hart id, exactly the MIPS
+ * boot convention. Each hart increments its own word and loops forever, so the
+ * only thing under test is that two independent CPU contexts translate and
+ * execute through one thread: per-CPU translator state
+ * (latm_env/latm_tr_data), per-CPU TB cache and per-CPU host code buffer.
+ *
+ *   lui   $t0, 0x8000        ; kseg0 base, sign-extended
+ *   dsll  $t1, $a0, 3        ; hart id -> 8-byte slot
+ *   daddu $t0, $t0, $t1
+ *   daddiu $t1, $zero, 0x1000
+ *   daddu $t0, $t0, $t1      ; 0xffffffff80001000 + hart*8
+ * 1: ld    $t2, 0($t0)
+ *   daddiu $t2, $t2, 1
+ *   sd    $t2, 0($t0)
+ *   j     1b
+ *   nop
+ */
+static const uint32_t smp_guest[] = {
+    0x3c0c8000, /* lui    $t0, 0x8000 */
+    0x000468f8, /* dsll   $t1, $a0, 3 */
+    0x018d602d, /* daddu  $t0, $t0, $t1 */
+    0x640d1000, /* daddiu $t1, $zero, 0x1000 */
+    0x018d602d, /* daddu  $t0, $t0, $t1 */
+    0xdd8e0000, /* ld     $t2, 0($t0) */
+    0x65ce0001, /* daddiu $t2, $t2, 1 */
+    0xfd8e0000, /* sd     $t2, 0($t0) */
+    0x1000fffc, /* b      0x14 (PC-relative: the guest is linked at 0 but runs
+                 * in kseg0, and `j` would take its region bits from PC) */
+    0x00000000, /* nop */
+};
+#define SMP_GUEST_GPA 0x4000u
+#define SMP_COUNTER_GPA 0x1000u
+static CPUMIPSState env1;
+static CPUMIPSTLBContext tlb1;
+static uint8_t code_buf1[65536] __attribute__((aligned(4096)));
+static uint32_t board_tb_next1 = 0x5000u;
+static TbCache board_tb_cache1;
+static TbCacheEntry board_tb_entries1[BOARD_TB_CACHE_CAP];
+static uint32_t board_tb_buckets1[BOARD_TB_CACHE_CAP];
 #define BOARD_TB_START 0x5000u
 #define BOARD_TB_SLOT  0x2000u
 static uint32_t board_tb_next = BOARD_TB_START;
 static TranslationBlock tb;
 static CPUMIPSState env;
 static CPUMIPSTLBContext tlb;
-#define BOARD_TB_CACHE_CAP 128u
 static TbCacheEntry board_tb_entries[BOARD_TB_CACHE_CAP];
 static uint32_t board_tb_buckets[BOARD_TB_CACHE_CAP];
 
-static uint64_t board_asid(void)
+static uint64_t board_asid_of(const CPUMIPSState *e)
 {
-    return env.CP0_EntryHi & env.CP0_EntryHi_ASID_mask;
+    return e->CP0_EntryHi & e->CP0_EntryHi_ASID_mask;
 }
 
-static uint8_t board_mode(void)
+static uint8_t board_mode_of(const CPUMIPSState *e)
 {
-    return (uint8_t)(env.hflags &
+    return (uint8_t)(e->hflags &
                      (MIPS_HFLAG_UM | MIPS_HFLAG_SM | MIPS_HFLAG_M16));
 }
+
+static uint64_t board_asid(void) { return board_asid_of(&env); }
+static uint8_t board_mode(void) { return board_mode_of(&env); }
 
 static void board_cache_invalidate(uint64_t start, uint64_t end)
 {
@@ -539,65 +584,79 @@ static void board_poll(void)
     latm_check_interrupts(&env);
 }
 
-static void board_run_host(uint8_t *host)
+static void board_run_host_of(CPUMIPSState *e, uint8_t *host)
 {
+    /*
+     * Rebind the translator globals to this CPU before anything is emitted or
+     * run: lsenv/tr_data point at per-CPU objects (latm_env/latm_tr_data on the
+     * CPU state), and tr_data holds the register-allocation state, the IR2
+     * lists and the instruction map. One bind per dispatch is what makes two
+     * vCPUs share this thread safely.
+     */
+    lata_tr_data_init(e);
     if (board_setjmp(board_exit_jmp) == 0) {
         board_exit_active = 1;
         ((void (*)(void *, void *))(uintptr_t)
-         ((TRANSLATION_DATA *)env.latm_tr_data)->cs_bt_to_native)(&env, host);
+         ((TRANSLATION_DATA *)e->latm_tr_data)->cs_bt_to_native)(e, host);
         board_exit_active = 0;
     } else {
         board_exit_active = 0;
     }
 }
 
-static int run_one_tb(void)
+static void board_run_host(uint8_t *host) { board_run_host_of(&env, host); }
+
+static int run_one_tb_of(CPUMIPSState *e, TbCache *cache, uint8_t *buf,
+                         uint32_t *next, uint32_t buf_size)
 {
-    uint64_t asid = board_asid();
-    uint8_t mode = board_mode();
-    TbCacheEntry *cached = tbc_lookup_mips(&board_tb_cache,
-                                            env.active_tc.PC, (uint32_t)asid,
-                                            mode);
+    uint64_t asid = board_asid_of(e);
+    uint8_t mode = board_mode_of(e);
+    TbCacheEntry *cached = tbc_lookup_mips(cache, e->active_tc.PC,
+                                           (uint32_t)asid, mode);
     if (cached && cached->code) {
         board_tb_hits++;
-        board_run_host((uint8_t *)(uintptr_t)cached->code);
+        board_run_host_of(e, (uint8_t *)(uintptr_t)cached->code);
         return 1;
     }
-    if (board_tb_next + BOARD_TB_SLOT > sizeof(code_buf)) {
-        board_tb_next = BOARD_TB_START;
-        latm_tb_insn_map_flush(env.latm_tr_data);
-        tbc_flush_all(&board_tb_cache);
+    if (*next + BOARD_TB_SLOT > buf_size) {
+        *next = BOARD_TB_START;
+        latm_tb_insn_map_flush(e->latm_tr_data);
+        tbc_flush_all(cache);
     }
-    uint8_t *host = code_buf + board_tb_next;
-    board_tb_next += BOARD_TB_SLOT;
+    uint8_t *host = buf + *next;
+    *next += BOARD_TB_SLOT;
     memset(&tb, 0, sizeof(tb));
-    tb.pc = env.active_tc.PC;
+    tb.pc = e->active_tc.PC;
     tb.tc.ptr = host;
     tb.jmp_reset_offset[0] = 0xffff;
     tb.jmp_reset_offset[1] = 0xffff;
     tcg_ctx->code_ptr = host;
     tcg_ctx->gen_insn_data = latx_tcg_gen_insn_data;
     int max = 16;
-    target_disasm(&tb, &max, &env);
+    target_disasm(&tb, &max, e);
     if (!tb.icount || !tr_ir2_generate(&tb)) { tr_fini(); return 0; }
     int n = tr_ir2_assemble(host);
     tr_fini();
     __asm__ volatile("ibar 0" ::: "memory");
     if (n <= 0) return 0;
-    TbCacheEntry *entry = tbc_insert_mips(&board_tb_cache, tb.pc,
-                                          (uint32_t)asid, mode);
+    TbCacheEntry *entry = tbc_insert_mips(cache, tb.pc, (uint32_t)asid, mode);
     if (!entry) {
-        tbc_flush_all(&board_tb_cache);
-        entry = tbc_insert_mips(&board_tb_cache, tb.pc, (uint32_t)asid,
-                                mode);
+        tbc_flush_all(cache);
+        entry = tbc_insert_mips(cache, tb.pc, (uint32_t)asid, mode);
     }
     if (entry) {
         entry->code = (uintptr_t)host;
         entry->code_size = (uint32_t)n;
         entry->guest_size = tb.size;
     }
-    board_run_host(host);
+    board_run_host_of(e, host);
     return 1;
+}
+
+static int run_one_tb(void)
+{
+    return run_one_tb_of(&env, &board_tb_cache, code_buf, &board_tb_next,
+                         (uint32_t)sizeof(code_buf));
 }
 
 static void board_put32(uint8_t *p, uint32_t v)
@@ -696,6 +755,57 @@ void kmain(void)
     lata_gen_prologue_env(&env, tcg_ctx);
     tcg_ctx->code_ptr = code_buf + 0x3000;
     lata_gen_epilogue_env(&env, tcg_ctx);
+    /* ---------------------------------------------------------- two vCPUs --
+     * Two CPU contexts, each with its own translator state, TB cache and host
+     * code buffer, driven alternately through one thread. Everything below the
+     * loop is asserted, not printed for a human.
+     */
+    if (tbc_init(&board_tb_cache1, board_tb_entries1, board_tb_buckets1,
+                 BOARD_TB_CACHE_CAP)) {
+        memcpy(ram + SMP_GUEST_GPA, smp_guest, sizeof(smp_guest));
+        memset(ram + SMP_COUNTER_GPA, 0, 16);
+        memset(&env1, 0, sizeof(env1));
+        env1.SEGBITS = env.SEGBITS;
+        env1.PABITS = env.PABITS;
+        latm_tlb_init(&env1, &tlb1, 16);
+        env1.exception_base = env.exception_base;
+        env1.CP0_IntCtl = env.CP0_IntCtl;
+        lata_tr_data_init(&env1);
+        tcg_ctx->code_ptr = code_buf1 + 0x1000;
+        lata_gen_prologue_env(&env1, tcg_ctx);
+        tcg_ctx->code_ptr = code_buf1 + 0x3000;
+        lata_gen_epilogue_env(&env1, tcg_ctx);
+        env1.active_tc.PC = 0xffffffff80004000ull;
+        env1.active_tc.gpr[4] = 1;
+        env.active_tc.PC = 0xffffffff80004000ull;
+        env.active_tc.gpr[4] = 0;
+        env1.active_tc.CP0_TCHalt = 0;
+        env.active_tc.CP0_TCHalt = 0;
+        for (int i = 0; i < 16; i++) {
+            run_one_tb();
+            run_one_tb_of(&env1, &board_tb_cache1, code_buf1, &board_tb_next1,
+                          (uint32_t)sizeof(code_buf1));
+        }
+        uint64_t c0 = 0, c1 = 0;
+        memcpy(&c0, ram + SMP_COUNTER_GPA, 8);
+        memcpy(&c1, ram + SMP_COUNTER_GPA + 8, 8);
+        latx_bare_uart_puts("latm-smp: pc0=");
+        puthex(env.active_tc.PC);
+        latx_bare_uart_puts(" pc1=");
+        puthex(env1.active_tc.PC);
+        latx_bare_uart_puts(" c0=");
+        puthex(c0);
+        latx_bare_uart_puts(" c1=");
+        puthex(c1);
+        latx_bare_uart_puts("\n");
+        int ok = c0 == 16 && c1 == 16 &&
+                 env.active_tc.PC >= 0xffffffff80004014ull &&
+                 env.active_tc.PC <= 0xffffffff80004020ull &&
+                 env1.active_tc.PC >= 0xffffffff80004014ull &&
+                 env1.active_tc.PC <= 0xffffffff80004020ull;
+        latx_bare_uart_puts(ok ? "latm-smp: PASS\n" : "latm-smp: FAIL\n");
+    }
+
     for (int i = 0; i < 8 && !board_exit_code; i++) {
         board_poll();
         if (board_exit_code) break;
