@@ -110,6 +110,7 @@ int latr_machine_init(LatrMachine *m, uint8_t *ram, uint64_t ram_size,
         h->code_buf = work + (size_t)(nharts + i) * per;
         h->code_buf_size = per;
         latr_hart_sync_init(&h->park);
+        latr_chain_init(&h->chain, 0); /* 0 = chaining disabled in P0 */
         latr_hart_set_command(&h->park, LATR_HART_PARKED);
         latr_tb_cache_init(&h->tb_cache, h->arena, h->arena_size);
         latr_tb_cache_set_park(&h->tb_cache, &h->park);
@@ -148,6 +149,14 @@ void latr_machine_wake_hart(LatrMachine *m, uint32_t hartid)
 uint64_t latr_machine_wake_events(const LatrMachine *m)
 {
     return m == NULL ? 0 : m->wake_events;
+}
+
+const LatrChainControl *latr_machine_chain(const LatrMachine *m, uint32_t hartid)
+{
+    if (m == NULL || hartid >= m->nharts) {
+        return NULL;
+    }
+    return &m->harts[hartid].chain;
 }
 
 void latr_machine_fini(LatrMachine *m)
@@ -829,6 +838,7 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
      */
     latr_system_update_hart(&m->sys, &h->env, h->hartid);
     if (h->env.sfence_pending) {
+        latr_chain_break(&h->chain, LATR_CHAIN_BREAK_SFENCE);
         /* SFENCE.VMA on one hart must shoot down translated code keyed by that
          * ASID on *every* registered hart's cache: each hart may hold blocks
          * translated under the same guest address space, and letting another
@@ -845,6 +855,7 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
         h->env.sfence_pending = 0;
     }
     if (h->env.fence_i_pending) {
+        latr_chain_break(&h->chain, LATR_CHAIN_BREAK_FENCE_I);
         /* FENCE.I is the guest's SMC notification; every hart's cache may
          * contain translations of the overwritten page. */
         uint64_t seq = latr_tb_fence_begin(0, 1);
@@ -872,6 +883,7 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
     }
     if (latr_deliver_interrupt(&h->env)) {
         h->env.exception = 0;
+        latr_chain_break(&h->chain, LATR_CHAIN_BREAK_INTERRUPT);
     }
 
     key = latr_tb_cache_key(&h->env);
@@ -881,6 +893,7 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
 #endif
     entry = latr_tb_cache_lookup(&h->tb_cache, h->env.pc, key);
     if (entry == NULL) {
+        latr_chain_break(&h->chain, LATR_CHAIN_BREAK_MISS);
         if (m->translate_tb != NULL) {
             m->translate_tb(&h->env, h->env.pc);
         }
@@ -904,6 +917,7 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
         }
         entry = latr_tb_cache_insert(&h->tb_cache, tb.pc, key, h->code_buf,
                                      (uint32_t)words * 4u, tb.icount);
+        latr_chain_tb_changed(&h->chain);
         if (entry == NULL) {
             /* Between TBs on the owning hart: safe to recycle the arena. */
             latr_tb_cache_reclaim_all(&h->tb_cache);
@@ -948,12 +962,16 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
                         loongemu_perf_now() - perf_start);
 #endif
     if (h->env.wfi_pending) {
+        latr_chain_break(&h->chain, LATR_CHAIN_BREAK_WFI);
         latr_idle_advance(&h->env);
         h->env.wfi_pending = 0;
     }
     /* Guest traps are normal: the translator already redirected PC to the
      * trap vector, so just clear the latched indicators. Keep the first one
      * for diagnostics. */
+    if (h->env.exception || h->env.mem_fault_cause || h->env.fetch_faulted) {
+        latr_chain_break(&h->chain, LATR_CHAIN_BREAK_EXCEPTION);
+    }
     if ((h->env.exception || h->env.mem_fault_cause ||
          h->env.fetch_faulted) && !m->trapped) {
         m->first_trap_pc = pc_before;

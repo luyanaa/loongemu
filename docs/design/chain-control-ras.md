@@ -1,8 +1,10 @@
 # Chain control and RAS: design
 
-Status: no chaining exists; the RAS primitive exists but is unbound to the
-LATR machine. The design is therefore mostly about *what must stay true* when
-dispatch stops returning to C.
+Status: P0 is in (`target/riscv/latr/chain.c`, `latr-chain.h`): the state
+machine, the six break points and `tb_generation` are live, `links` is pinned at
+0, and the counters are printed by the SMP image. No chaining exists yet; the
+RAS primitive exists but is unbound to the LATR machine. The design is therefore
+mostly about *what must stay true* when dispatch stops returning to C.
 
 ## 1. Current dispatch, exactly
 
@@ -150,17 +152,47 @@ counters answering "why did dispatch go back to C". Plus:
 
 | phase | change | gate |
 |---|---|---|
-| P0 | `LatrChainControl` with counters only; `links` stays 0 | boot smoke, `latr-isa` unchanged |
+| P0 | `LatrChainControl` with counters only; `links` stays 0 - **done** | `test-latr-chain` (40 checks), `latr-isa` unchanged, `latr-smp` prints the baseline |
 | P1 | Phase A re-dispatch + `breaks[]` | boot smoke, `latr-isa 1607`, counters recorded |
 | P2 | exit stub (Phase B) + epoch compare, chain cap | same, plus forced-break tests |
 | P3 | RAS-keyed prediction feeding `chain_next_code` | same, plus hit-rate counters |
 | P4 | SMP: epochs are per-hart; broadcast only where a duty is cross-core (shootdown) | boot-smp CI job |
 
+### 3.1 P0 baseline (measured)
+
+`make latr-smp-run` prints one line per hart; the two-hart guest from the SMP
+scenario gives:
+
+| hart | epoch | tb_generation | links | miss | wfi | interrupt | fence-i |
+|---|---|---|---|---|---|---|---|
+| 0 | 12 | 11 | 0 | 11 | 0 | 0 | 1 |
+| 1 | 43 | 9 | 0 | 9 | 33 | 1 | 0 |
+
+Every break is a real dispatcher duty in that run: hart 1 sits in WFI (33), and
+both harts miss on their first block(s). The identity `epoch == sum(breaks)` is
+asserted, so a break point that forgets to bump (or bumps twice) fails the image
+rather than skewing the counter.
+
+Two facts this baseline already settles for P1:
+
+- `tb_generation` moves on nearly every block here (11 inserts vs 12 blocks for
+  hart 0), so a chain that requires "generation unchanged" will be broken by
+  translation before it can be measured. P1 must compare generation *at chain
+  entry* against the successor's own insert, not a global "no insert yet" rule,
+  or it will link nothing. The intended reading is: a chain survives as long as
+  the *target's* entry is the one that was looked up, which is exactly what the
+  Phase A check does.
+- WFI dominates the break counts on an idle hart (33/43). That is the expected
+  shape and the reason the design puts WFI in the break table rather than
+  special-casing it.
+
 ## 4. Tests
 
-* `tests/test_latr_chain.c` (host, new): drive the state machine directly - each
-  of the six break events must clear `chain_next_code` and increment its
-  `breaks[]` bucket; a chain may not survive `tb_generation` change.
+* `tests/test_latr_chain.c` (host, in `latr check`): drives the state machine
+  directly - each break event moves the epoch by exactly one and lands in its
+  own bucket, reads are inert, generation is a separate word, an out-of-range
+  reason is ignored rather than corrupting the array, and the length histogram
+  buckets are right. 40 checks.
 * `baremetal/bare/tb_loop.c` exists and already documents a label-dispose
   hazard on branch-heavy blocks; extend it with a chain-eligible loop so the
   generated-code path is exercised deterministically.

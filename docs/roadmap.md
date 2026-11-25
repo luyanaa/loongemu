@@ -456,7 +456,12 @@ fault recovery cost.
    for vfrec7/vfrsqrt7.
 9. 2.3 LATM: vmlinux boot, then SMP, then 3A4000 platform alignment.
 10. 2.4 LATX: LAPIC/IOAPIC/time, virtio-PCI or AHCI, and the `tb_sys.c` split.
-11. 5.2 chaining tiers (only after 3.3 and 5.1 step 3).
+11. 5.2 chaining tiers (only after 3.3 and 5.1 step 3).  P0 is in: the chain
+    state machine (six break points + `tb_generation`), `links` pinned at 0, and
+    `test-latr-chain` (40 checks). Baseline on the two-hart SMP guest: hart 0
+    epoch 12 (11 miss + 1 fence-i), hart 1 epoch 43 (33 wfi + 9 miss + 1
+    interrupt). That baseline already shows P1 must not key on "no insert since
+    entry" - inserts rival blocks - and that WFI dominates an idle hart.
 12. 5.4 MSI-X/IMSIC and virtio-PCI transport; DMA domains.
 13. 4.1 shared modules (arena, recovery, regcache, IRQ sink, DMA domain).
 14. 6.1 passthrough manager, only with an IOMMU or an explicit trusted-guest

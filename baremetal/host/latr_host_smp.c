@@ -66,7 +66,6 @@ static const uint32_t firmware_words[] = {
 static volatile uint64_t vclock_start;
 static volatile int hart0_ipi_sent;
 static volatile int hart1_woke;
-static volatile int hart1_ready;   /* hart 1 is dispatching, not parked */
 static volatile int hart1_wants_wfi; /* scripted WFI: the thread parks */
 static volatile int timer_fired;   /* hart 1 took a timer interrupt */
 static volatile int timer_armed;
@@ -84,15 +83,17 @@ static void scripted_enter_tb(void *envp, void *code)
 {
     CPUArchState *env = (CPUArchState *)envp;
 
+
     (void)code;
     if (env->hartid == 0) {
         if (!hart0_ipi_sent && send_ipi) {
-            /* Only in threaded mode does it pay to wait for the other hart: in
-             * the cooperative pass it cannot progress while this block runs. */
-            if (send_fence) {
-                while (!hart1_ready) {
-                }
-            }
+            /*
+             * No wait on the other hart here: publishing the fence below is
+             * itself a wake event (latr_tb_fence_begin wakes every registered
+             * hart), so a parked hart comes back and acknowledges on its own.
+             * Waiting for a specific other-thread progress point is how this
+             * harness deadlocked once - the scheduler must not depend on it.
+             */
             /* What generated code does for `sd zero, 0(clint+4)`: an IPI. */
             guest_write(LATR_SYSTEM_CLINT_BASE + 4u, 4, 1);
             hart0_ipi_sent = 1;
@@ -128,7 +129,6 @@ static void scripted_enter_tb(void *envp, void *code)
         env->pc = HART1_DISC;
         return;
     }
-    hart1_ready = 1;
     env->pc = FW_PC;
     /* WFI: report it to the runtime (clock fast-forward) and tell this
      * harness's hart thread to park until a wake arrives. */
@@ -172,7 +172,6 @@ static void reset_scenario(void)
     exit_value = 0;
     hart0_ipi_sent = 0;
     hart1_woke = 0;
-    hart1_ready = 0;
     hart1_wants_wfi = 0;
     send_ipi = 0;
     send_fence = 0;

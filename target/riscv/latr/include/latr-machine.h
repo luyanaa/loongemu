@@ -4,6 +4,7 @@
 #include "latr-system.h"
 #include "latr.h"
 #include "latr-hart-sync.h"
+#include "latr-chain.h"
 #include "loongemu/riscv_virtio_blk.h"
 
 /*
@@ -81,6 +82,9 @@ typedef struct LatrMachineHart {
     CPUArchState env;
     /* Run/wake/exit handshake with the scheduler (and, later, other harts). */
     LatrHartSync park;
+    /* Chain-control state machine (design: chain-control-ras.md). P0 counts
+     * breaks and never links; the epoch is bumped at each real break point. */
+    LatrChainControl chain;
     CPUState cpu;
     LatrTbCache tb_cache;
     LatrTranslatorContext *ctx;
@@ -204,5 +208,7 @@ void latr_machine_tick(LatrMachine *m, uint64_t ns);
 void latr_machine_wake_hart(LatrMachine *m, uint32_t hartid);
 /* Total wake events delivered to harts; diagnostics for "did the IPI arrive". */
 uint64_t latr_machine_wake_events(const LatrMachine *m);
+/* Chain-control counters for one hart (P0: links must stay 0). */
+const LatrChainControl *latr_machine_chain(const LatrMachine *m, uint32_t hartid);
 
 #endif

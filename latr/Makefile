@@ -82,6 +82,8 @@ HOST_CORE_SRCS := \
             ../target/riscv/latr/tb-cache.c \
             ../target/riscv/latr/translator/tb-insn-map.c \
             ../target/riscv/latr/hart-sync.c \
+            ../target/riscv/latr/chain.c \
+            ../src/soft_ras.c \
             ../src/phys_mem.c \
             ../src/mmio_bus.c \
             ../src/guest_dma.c \
@@ -109,7 +111,7 @@ CORE_OBJS := $(BUILD)/ir2.o $(BUILD)/ir2-peephole.o $(BUILD)/ir2-assemble.o $(BU
              $(BUILD)/reg-alloc.o $(BUILD)/translate-riscv.o \
              $(BUILD)/translate-riscv-csr.o $(BUILD)/translate-riscv-fp.o \
              $(BUILD)/translate-riscv-fp-helper.o $(BUILD)/softfloat.o \
-             $(BUILD)/decode-riscv.o $(BUILD)/pvir.o $(BUILD)/pvir-plan.o $(BUILD)/pvir-exec.o $(BUILD)/pvir-lower-lsx.o $(BUILD)/cpu_features.o $(BUILD)/mmu.o $(BUILD)/interrupt.o $(BUILD)/mmio.o $(BUILD)/rvv.o $(BUILD)/rvv-legality.o $(BUILD)/translate-riscv-rvv.o $(BUILD)/tb-cache.o $(BUILD)/tb-insn-map.o $(BUILD)/hart-sync.o \
+             $(BUILD)/decode-riscv.o $(BUILD)/pvir.o $(BUILD)/pvir-plan.o $(BUILD)/pvir-exec.o $(BUILD)/pvir-lower-lsx.o $(BUILD)/cpu_features.o $(BUILD)/mmu.o $(BUILD)/interrupt.o $(BUILD)/mmio.o $(BUILD)/rvv.o $(BUILD)/rvv-legality.o $(BUILD)/translate-riscv-rvv.o $(BUILD)/tb-cache.o $(BUILD)/tb-insn-map.o $(BUILD)/hart-sync.o $(BUILD)/chain.o $(BUILD)/soft_ras.o \
              $(BUILD)/phys_mem.o $(BUILD)/mmio_bus.o $(BUILD)/guest_dma.o $(BUILD)/riscv_virtio_blk.o $(BUILD)/latr_system.o $(BUILD)/latr_elf.o $(BUILD)/latr_fdt.o $(BUILD)/latr_machine.o $(BUILD)/uart16550.o $(BUILD)/riscv_clint.o $(BUILD)/riscv_plic.o $(BUILD)/riscv_acpi.o $(BUILD)/riscv_fw.o $(BUILD)/ovmf_board.o $(BUILD)/riscv_sbi.o \
              $(BUILD)/runtime.o \
              $(BUILD)/vclock.o $(BUILD)/compiler-rt.o
@@ -168,10 +170,13 @@ test-fence-ack: $(BUILD)/test-latr-fence-ack
 test-hart-sync: $(BUILD)/test-latr-hart-sync
 	./$(BUILD)/test-latr-hart-sync
 
+test-chain: $(BUILD)/test-latr-chain
+	./$(BUILD)/test-latr-chain
+
 test-machine-trap: $(BUILD)/test-latr-machine-trap
 	./$(BUILD)/test-latr-machine-trap
 
-check: all test-legality test-elf test-tb-smp test-fence-ack test-hart-sync test-host-machine test-machine-trap
+check: all test-legality test-elf test-tb-smp test-fence-ack test-hart-sync test-chain test-host-machine test-machine-trap
 	NM="$(NM)" sh ../tools/check_lata_symbols.sh $(BUILD)/liblatr_core.a $(CURDIR)/latr_externals.allowlist
 
 probe: $(CORE_OBJS)
@@ -377,6 +382,13 @@ $(BUILD)/latr_machine.o: $(LATR)/system/latr_machine.c \
 $(BUILD)/hart-sync.o: $(LATR)/hart-sync.c $(LATR)/include/latr-hart-sync.h | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
+$(BUILD)/chain.o: $(LATR)/chain.c $(LATR)/include/latr-chain.h \
+                  ../include/loongemu/soft_ras.h | $(BUILD)
+	$(CLANG) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/soft_ras.o: ../src/soft_ras.c ../include/loongemu/soft_ras.h | $(BUILD)
+	$(CLANG) $(CFLAGS) -c $< -o $@
+
 $(BUILD)/tb-cache.o: $(LATR)/tb-cache.c $(LATR)/include/latr-tb-cache.h | $(BUILD)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
@@ -416,6 +428,12 @@ $(BUILD)/test-latr-rvv-legality: ../tests/test_latr_rvv_legality.c \
                            $(DECODE32) $(DECODE16) $(TRANS_STUBS) | $(BUILD)
 	$(HOST_CC) $(HOST_CFLAGS) $(LATR)/translator/rvv-legality.c \
 		$(LATR)/ir1/decode-riscv.c ../tests/test_latr_rvv_legality.c -o $@
+
+$(BUILD)/test-latr-chain: ../tests/test_latr_chain.c \
+                          $(LATR)/chain.c $(LATR)/include/latr-chain.h \
+                          ../src/soft_ras.c ../include/loongemu/soft_ras.h | $(BUILD)
+	$(HOST_CC) $(HOST_CFLAGS) $(LATR)/chain.c ../src/soft_ras.c \
+		../tests/test_latr_chain.c -o $@
 
 $(BUILD)/test-latr-hart-sync: ../tests/test_latr_hart_sync.c \
                            $(LATR)/hart-sync.c $(LATR)/include/latr-hart-sync.h | $(BUILD)

@@ -182,6 +182,31 @@ void kmain(void)
     check_u64("hart 1 sees the rewritten target", read64(D_H1), 2);
     check_u64("exit marker carries hart 1's result", read64(D_EXIT), 2);
 
+    /* Chain-control baseline (design: chain-control-ras.md P0): the epoch moves
+     * at each real break point and `links` must stay 0 while nothing chains. */
+    for (uint32_t i = 0; i < 2; i++) {
+        const LatrChainControl *c = latr_machine_chain(&machine, i);
+
+        uart_puts("latr-chain: h");
+        uart_dec(i);
+        uart_puts(" epoch=");
+        uart_dec(latr_chain_epoch(c));
+        uart_puts(" gen=");
+        uart_dec(latr_chain_tb_generation(c));
+        uart_puts(" links=");
+        uart_dec(latr_chain_links(c));
+        for (unsigned r = 0; r < LATR_CHAIN_BREAK_COUNT; r++) {
+            uart_puts(" ");
+            uart_puts(latr_chain_break_name((LatrChainBreak)r));
+            uart_puts("=");
+            uart_dec(latr_chain_breaks(c, (LatrChainBreak)r));
+        }
+        uart_puts("\n");
+        check_u64("no chained dispatch in P0", latr_chain_links(c), 0);
+        check_u64("chain epoch equals the sum of its breaks",
+                  latr_chain_epoch(c), latr_chain_total_breaks(c));
+    }
+
     uart_puts(failures == 0 ? "latr-smp: PASS checks=" : "latr-smp: FAIL checks=");
     uart_dec((uint64_t)checks);
     uart_puts(" fails=");
