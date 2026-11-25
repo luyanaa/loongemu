@@ -1478,6 +1478,8 @@ test-latm: test-latm-decode test-latm-tlb test-latm-vclock test-latm-interrupts 
 # The kernel is a Debian artifact, so it is supplied by path and never committed:
 #   make latm-linux-run LOONGSON_KERNEL=/path/to/vmlinuz-6.1.0-50-loongson-3
 LOONGSON_KERNEL ?=
+# One BSS clear is ~4.9M three-instruction blocks, so a real attempt needs minutes.
+LINUX_TIMEOUT ?= 900
 
 build/vmlinuz-loongson-3: $(LOONGSON_KERNEL)
 	@test -n "$(LOONGSON_KERNEL)" || { \
@@ -1510,7 +1512,7 @@ build/bare_latm_linux.elf: baremetal/bare/latm_linux.c build/latm_linux_blob.o \
 latm-linux-run: build/bare_latm_linux.elf
 	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_latm_linux.elf" \
 	     QEMU_LOG="build/latm_linux.log" QEMU_DONE="latm-linux: done" \
-	     QEMU_TIMEOUT=120 CPU=la464 QEMU_MEM=1G \
+	     QEMU_TIMEOUT=$(LINUX_TIMEOUT) CPU=la464 QEMU_MEM=1G \
 	     bash scripts/run_qemu_lata.sh || true
 	@grep -a 'latm-linux' build/latm_linux.log | tail -20
 

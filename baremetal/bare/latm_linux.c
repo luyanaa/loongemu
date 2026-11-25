@@ -28,7 +28,7 @@ extern const uint8_t latm_linux_elf[];
 extern const uint8_t latm_linux_elf_end[];
 #include "translate.h"
 
-#define LINUX_TB_BUDGET 200000u
+#define LINUX_TB_BUDGET 5000000u
 #define UART0_THR ((volatile unsigned char *)0x1fe001e0)
 void latx_bare_uart_putc(int c) { *UART0_THR = (unsigned char)c; }
 void latx_bare_uart_puts(const char *s)
@@ -47,6 +47,13 @@ static uint64_t tb_ran;
 static uint64_t linux_entry;
 static uint64_t stop_pc;
 static uint64_t stop_cause;
+/* Last dispatch, to skip the hash lookup when a block branches to itself - the
+ * common case in a tight loop and the entire cost driver for a 3-instruction
+ * block. */
+static uint64_t last_pc;
+static uint64_t last_asid;
+static uint8_t *last_host;
+static uint8_t last_mode;
 static uint8_t code_buf[65536] __attribute__((aligned(4096)));
 static CPUMIPSTLBContext tlb;
 static uint8_t dtb[8192], dtb_struct[8192], dtb_strings[4096];
@@ -203,6 +210,13 @@ void kmain(void)
 
     for (unsigned i = 0; i < LINUX_TB_BUDGET; i++) {
         stop_pc = env.active_tc.PC;
+        if (tb_ran && (tb_ran % 1000000u) == 0) {
+            latx_bare_uart_puts("latm-linux: progress tbs=");
+            { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(tb_ran>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" pc=");
+            { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(env.active_tc.PC>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_putc('\n');
+        }
         if (!linux_run_one(&env)) {
             latx_bare_uart_puts("latm-linux: translation refused at pc=");
             { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(stop_pc>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
@@ -231,9 +245,15 @@ static int linux_run_one(CPUMIPSState *env)
     uint64_t asid = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
     uint8_t mode = (uint8_t)(env->hflags &
                              (MIPS_HFLAG_UM | MIPS_HFLAG_SM | MIPS_HFLAG_M16));
-    TbCacheEntry *ent = tbc_lookup_mips(&tb_cache, env->active_tc.PC,
-                                        (uint32_t)asid, mode);
+    TbCacheEntry *ent;
     uint8_t *host;
+
+    if (last_host && env->active_tc.PC == last_pc && asid == last_asid &&
+        mode == last_mode) {
+        host = last_host;
+        goto run;
+    }
+    ent = tbc_lookup_mips(&tb_cache, env->active_tc.PC, (uint32_t)asid, mode);
 
     if (tb_next + 0x2000u > sizeof(tb_pool)) {
         tb_next = 0;
@@ -241,6 +261,7 @@ static int linux_run_one(CPUMIPSState *env)
     }
     if (ent && ent->code) {
         host = (uint8_t *)(uintptr_t)ent->code;
+        goto have_host;
     } else {
         int max = 32;
         int n;
@@ -271,6 +292,12 @@ static int linux_run_one(CPUMIPSState *env)
             ent->guest_size = tb_live.size;
         }
     }
+have_host:
+    last_pc = env->active_tc.PC;
+    last_asid = asid;
+    last_mode = mode;
+    last_host = host;
+run:
     exit_active = 1;
     if (smoke_setjmp(exit_jmp) == 0) {
         ((void (*)(void *, void *))(uintptr_t)
