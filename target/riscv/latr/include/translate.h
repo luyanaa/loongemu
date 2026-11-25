@@ -126,8 +126,16 @@ enum {
      * (a*vd +/- b), so the operands cannot be shared with the wide MAC path.
      */
     LATR_RVV_X_MACC, LATR_RVV_X_NMSAC, LATR_RVV_X_MADD, LATR_RVV_X_NMSUB,
+    /*
+     * Carry/borrow. v0 is a carry-in, never a mask: vadc/vsbc write elements
+     * back for every body lane, vmadc/vmsbc write a mask register and are
+     * unmaskable. The vm bit selects whether the carry/borrow-in is added for
+     * the vmadc/vmsbc forms (vm=0 means with carry-in).
+     */
+    LATR_RVV_X_VADC, LATR_RVV_X_VSBC, LATR_RVV_X_VMADC, LATR_RVV_X_VMSBC,
 };
 void latr_rvv_arith_extra(CPUArchState *env);
+void latr_rvv_carry(CPUArchState *env);
 
 /*
  * RVV fused multiply-add. Variant index encodes the sign rules: bit0 negates

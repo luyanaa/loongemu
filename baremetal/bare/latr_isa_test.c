@@ -6030,6 +6030,180 @@ static void test_rvv_pvir_lsx_lasx(void)
         }
     }
 
+    /*
+     * 2h. Carry/borrow. v0 carries the carry-in bits (lane 0 and 2 set here) and
+     * is not a predicate: vadc/vsbc still write every body element.
+     */
+    {
+        static const uint32_t carry_elem_ops[] = {
+            0x40208457, /* vadc.vvm v8,  v2, v1, v0 */
+            0x48208657, /* vsbc.vvm v12, v2, v1, v0 */
+        };
+
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10; /* e32, m1, tu, mu */
+        env.vl = 4;
+        for (int lane = 0; lane < 4; lane++) {
+            vec_store32(1, lane, 1u);
+            vec_store32(2, lane, 0x0fffffffu);
+        }
+        env.vreg[0][0] = 0x5; /* carry-in on lanes 0 and 2 only */
+        check(latr_execute_block(carry_elem_ops, 2), 1,
+              "vadc/vsbc .vvm translate");
+        check(vec_read32(8, 0), 0x10000001u, "vadc.vvm adds the v0 carry bit");
+        check(vec_read32(8, 1), 0x10000000u, "vadc.vvm without carry-in");
+        check(vec_read32(12, 0), 0x0ffffffdu, "vsbc.vvm subtracts the borrow-in");
+        check(vec_read32(12, 1), 0x0ffffffeu, "vsbc.vvm without borrow-in");
+
+        /* vadc wraps at SEW; vd may not be v0 (checked below as illegal). */
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10;
+        env.vl = 4;
+        for (int lane = 0; lane < 4; lane++) {
+            vec_store32(1, lane, 1u);
+            vec_store32(2, lane, 0xffffffffu);
+        }
+        env.vreg[0][0] = 0x1;
+        {
+            static const uint32_t carry_wrap[] = { 0x40208457 };
+
+            check(latr_execute_block(carry_wrap, 1), 1,
+                  "vadc wrap case translates");
+            check(vec_read32(8, 0), 0x1u,
+                  "vadc.vvm wraps the sum at SEW (0xffffffff + 1 + 1)");
+        }
+
+        /* vmadc/vmsbc: mask destination, all body elements written. */
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10;
+        env.vl = 4;
+        for (int lane = 0; lane < 4; lane++) {
+            vec_store32(1, lane, 1u);
+            vec_store32(2, lane, 0xfffffffeu);
+        }
+        env.vreg[0][0] = 0x1; /* carry-in on lane 0 */
+        env.vreg[10][0] = 0xff;
+        env.vreg[14][0] = 0xff;
+        {
+            static const uint32_t mask_carry[] = {
+                0x44208557, /* vmadc.vvm v10, v2, v1, v0 */
+                0x4c208757, /* vmsbc.vvm v14, v2, v1, v0 */
+            };
+
+            check(latr_execute_block(mask_carry, 2), 1,
+                  "vmadc/vmsbc .vvm translate");
+            check(env.vreg[10][0] & 0x1u, 1u,
+                  "vmadc.vvm carries out 0xfffffffe+1+1");
+            check((env.vreg[10][0] >> 1) & 1u, 0u,
+                  "vmadc.vvm no carry 0xfffffffe+1");
+            check(env.vreg[14][0] & 0x1u, 0u,
+                  "vmsbc.vvm no borrow (0xfffffffe-1-1)");
+        }
+
+        /* Non-carry encodings (vm=1): vmadc.vv / vmsbc.vv. */
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10;
+        env.vl = 4;
+        for (int lane = 0; lane < 4; lane++) {
+            vec_store32(1, lane, 1u);
+            vec_store32(2, lane, 0xffffffffu);
+        }
+        env.vreg[0][0] = 0xff; /* must be ignored by the vm=1 forms */
+        {
+            static const uint32_t mask_plain[] = {
+                0x46208857, /* vmadc.vv v16, v2, v1 */
+                0x4e208957, /* vmsbc.vv v18, v2, v1 */
+            };
+
+            check(latr_execute_block(mask_plain, 2), 1,
+                  "vmadc.vv/vmsbc.vv translate");
+            check(env.vreg[16][0] & 1u, 1u, "vmadc.vv carries out 2^32");
+            check(env.vreg[18][0] & 1u, 0u, "vmsbc.vv borrows 0");
+        }
+
+        /* .vxm with a0 = 1 and .vim with imm = -1 (sign-extended). */
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10;
+        env.vl = 4;
+        env.gpr[10] = 1;
+        for (int lane = 0; lane < 4; lane++) {
+            vec_store32(2, lane, 0x10000000u);
+        }
+        env.vreg[0][0] = 0x0;
+        {
+            static const uint32_t carry_imm[] = {
+                0x402fbb57, /* vadc.vim v22, v2, -1, v0 */
+            };
+            static const uint32_t carry_vx[] = {
+                0x40254a57, /* vadc.vxm v20, v2, a0, v0 */
+            };
+
+            check(latr_execute_block(carry_vx, 1), 1, "vadc.vxm translates");
+            check(vec_read32(20, 0), 0x10000001u, "vadc.vxm adds x[a0]");
+            check(latr_execute_block(carry_imm, 1), 1, "vadc.vim translates");
+            check(vec_read32(22, 0), 0x0fffffffu,
+                  "vadc.vim sign-extends imm=-1");
+        }
+
+        /* Remaining .vxm/.vim forms, plus the mask tail-agnostic rule. */
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10;
+        env.vl = 2; /* vlmax is 4: bits 2 and 3 are tail */
+        env.gpr[10] = 1;
+        for (int lane = 0; lane < 4; lane++) {
+            /* Lane 1 is the .vim operand; lane 0 the .vxm one. */
+            vec_store32(2, lane, lane == 1 ? 0x80000000u : 0xffffffffu);
+            vec_store32(4, lane, 0u); /* vmsbc: 0 - 1 borrows */
+        }
+        env.vreg[0][0] = 0x0;
+        env.vreg[24][0] = 0x0;
+        env.vreg[26][0] = 0x0;
+        env.vreg[30][0] = 0x0;
+        {
+            static const uint32_t mask_more[] = {
+                0x44254c57, /* vmadc.vxm v24, v2, a0, v0 */
+                0x442fbd57, /* vmadc.vim v26, v2, -1, v0 */
+                0x4c454f57, /* vmsbc.vxm v30, v4, a0, v0 */
+            };
+
+            check(latr_execute_block(mask_more, 3), 1,
+                  "vmadc.vxm/.vim and vmsbc.vxm translate");
+            check(env.vreg[24][0] & 1u, 1u, "vmadc.vxm carries 0xffffffff+1");
+            /* imm = -1 sign-extends to 0xffffffff, so 0x80000000 + it carries
+             * out; zero-extension (0x1f) would not. */
+            check((env.vreg[26][0] >> 1) & 1u, 1u,
+                  "vmadc.vim sign-extends imm=-1 (carry-out of 0x17fffffff)");
+            check(env.vreg[30][0] & 1u, 1u, "vmsbc.vxm borrows 0-1");
+            check((env.vreg[24][0] >> 2) & 1u, 1u,
+                  "mask tail is agnostic: bits >= vl read as 1");
+        }
+
+        /* vd == v0 is reserved for vadc (the vm=0 encoding rule). */
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10;
+        env.vl = 4;
+        for (int lane = 0; lane < 4; lane++) {
+            vec_store32(1, lane, 1u);
+            vec_store32(2, lane, 1u);
+        }
+        env.exception = 0;
+        {
+            static const uint32_t vadc_to_v0[] = { 0x40208457 - (8u << 7) };
+
+            check(latr_execute_block(vadc_to_v0, 1), 1,
+                  "vadc.vvm with vd == v0 is a trap block, not a translation");
+            check(env.exception, 2u,
+                  "vd == v0 raises illegal instruction, not a silent write");
+        }
+    }
+
     /* 3. vmsgt / vmsgtu + unsigned shift immediate >= 16. */
     reset_guest_state();
     env.csr[0x300] = 0x600;

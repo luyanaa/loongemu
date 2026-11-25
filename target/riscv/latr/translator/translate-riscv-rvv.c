@@ -271,6 +271,27 @@ static bool rvv_mask_scan_op(int opcode, unsigned *op)
     case LATR_RV_##tag: *fma = variant; *kind = kindv; return true
 
 /* Fused multiply-add: variant index carries the sign rules (see translate.h). */
+/*
+ * Carry/borrow. The vm bit is not a predicate here: for vmadc/vmsbc it selects
+ * the carry-in form, and vadc/vsbc only exist in the with-carry encoding.
+ */
+static bool rvv_carry_op(int opcode, unsigned *op, unsigned *kind)
+{
+    switch (opcode) {
+    case LATR_RV_VADC_VVM: *op = LATR_RVV_X_VADC; *kind = LATR_RVV_SRC_VECTOR; return true;
+    case LATR_RV_VADC_VXM: *op = LATR_RVV_X_VADC; *kind = LATR_RVV_SRC_SCALAR; return true;
+    case LATR_RV_VADC_VIM: *op = LATR_RVV_X_VADC; *kind = LATR_RVV_SRC_IMM; return true;
+    case LATR_RV_VSBC_VVM: *op = LATR_RVV_X_VSBC; *kind = LATR_RVV_SRC_VECTOR; return true;
+    case LATR_RV_VSBC_VXM: *op = LATR_RVV_X_VSBC; *kind = LATR_RVV_SRC_SCALAR; return true;
+    case LATR_RV_VMADC_VVM: *op = LATR_RVV_X_VMADC; *kind = LATR_RVV_SRC_VECTOR; return true;
+    case LATR_RV_VMADC_VXM: *op = LATR_RVV_X_VMADC; *kind = LATR_RVV_SRC_SCALAR; return true;
+    case LATR_RV_VMADC_VIM: *op = LATR_RVV_X_VMADC; *kind = LATR_RVV_SRC_IMM; return true;
+    case LATR_RV_VMSBC_VVM: *op = LATR_RVV_X_VMSBC; *kind = LATR_RVV_SRC_VECTOR; return true;
+    case LATR_RV_VMSBC_VXM: *op = LATR_RVV_X_VMSBC; *kind = LATR_RVV_SRC_SCALAR; return true;
+    default: return false;
+    }
+}
+
 static bool rvv_fma_op(int opcode, unsigned *fma, unsigned *kind)
 {
     switch (opcode) {
@@ -633,6 +654,9 @@ static bool translate_vector_op(const RiscvIR1 *ir1)
     unsigned fma_variant = 0;
     unsigned fma_kind = LATR_RVV_SRC_VECTOR;
     bool is_fma = rvv_fma_op(ir1->opcode, &fma_variant, &fma_kind);
+    unsigned carry_op = 0;
+    unsigned carry_kind = LATR_RVV_SRC_VECTOR;
+    bool is_carry = rvv_carry_op(ir1->opcode, &carry_op, &carry_kind);
     unsigned fp_op = 0;
     unsigned fp_kind = 0;
     unsigned cvt_op = 0;
@@ -650,7 +674,7 @@ static bool translate_vector_op(const RiscvIR1 *ir1)
 
     if (!is_alu && !is_cmp && !is_merge && !is_mv && !is_mv_scalar &&
         !is_mask_logic && !is_mask_scan && !is_reduce && !is_perm &&
-        !is_extra && !is_fma && !is_fp && !is_cvt && !is_mem &&
+        !is_extra && !is_fma && !is_carry && !is_fp && !is_cvt && !is_mem &&
         whole == LATR_RVV_WHOLE_NONE) {
         return false;
     }
@@ -776,6 +800,22 @@ static bool translate_vector_op(const RiscvIR1 *ir1)
                                           ir1->opcode == LATR_RV_VFWSUB_WV)
                                              ? 1 : 0));
         emit_rvv_call((uintptr_t)&latr_rvv_fp);
+    } else if (is_carry) {
+        /* .vi immediates are sign-extended to SEW (spec 5.4, no exception for
+         * the carry forms). */
+        uint64_t imm = (uint64_t)((int64_t)((uint64_t)ir1->arg.rs1 << 59) >> 59);
+
+        emit_rvv_arg_const(0, (uint64_t)carry_op);
+        emit_rvv_arg_const(1, (uint64_t)ir1->arg.rd);
+        emit_rvv_arg_const(2, (uint64_t)ir1->arg.rs2);
+        emit_rvv_arg_const(3, (uint64_t)ir1->arg.rs1);
+        emit_rvv_arg_const(4, (uint64_t)carry_kind);
+        emit_rvv_arg_const(5, carry_kind == LATR_RVV_SRC_IMM
+                                  ? imm
+                                  : (uint64_t)ir1->arg.rs1);
+        emit_rvv_arg_const(6, (uint64_t)vm);
+        emit_rvv_arg_const(7, 0);
+        emit_rvv_call((uintptr_t)&latr_rvv_carry);
     } else if (is_fma) {
         emit_rvv_arg_const(0, (uint64_t)fma_variant);
         emit_rvv_arg_const(1, (uint64_t)ir1->arg.rd);

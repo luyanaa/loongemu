@@ -65,7 +65,7 @@
   `(1+2^-13)(1-2^-13) = 1-2^-26` 这种"乘积本身需超精度、单独会舍入到 1.0"的判别用例后，
   f32/f64 全部正确。`tests/test_softfloat_fma.c`（8 checks）现在全绿，用于防止把这类
   "期望值算错"再次误判成库缺陷。
-- [~] **RVV 1.0 指令补齐**：已登记 350 条（+3 条 `vset*`），**仍缺 24 条编码**（逐名比对 `insn32.decode:340-760`，明细见 [`RVV_P1_LEGALITY.md`](RVV_P1_LEGALITY.md) §2.1）：carry/borrow 10、`vfrsub/vfrdiv/vfrec7/vfrsqrt7/vfslide1*.vf` 6。
+- [~] **RVV 1.0 指令补齐**：已登记 360 条（+3 条 `vset*`），**仍缺 14 条编码**（逐名比对 `insn32.decode:340-760`，明细见 [`RVV_P1_LEGALITY.md`](RVV_P1_LEGALITY.md) §2.1）：`vfrsub/vfrdiv/vfrec7/vfrsqrt7/vfslide1*.vf` 6。
   本轮落地 `vrsub.vx/vi` 与 `vmulh/vmulhu/vmulhsu` 的 `.vv/.vx`（共 8 条），走 `latr_rvv_arith_extra` 的 C 路径；
   高位乘在 2·SEW 上求出乘积再右移 SEW，`mulhsu` 按 vs2 有符号、vs1/x 无符号混合。
   **登记位置有陷阱**：把新编码插到 `rv64gc-opcodes.def` 中部（`vmul.vx` 之后）会让 16 项既有 FP 检查（RMM/NaN-box）
@@ -142,7 +142,8 @@ ELF 装载器已抽成不依赖机器模型的 `system/latr_elf.c`（`include/la
 - [x] 每 vCPU context/TLS/TB cache/PVIR cache 隔离与 2-hart 机器调度（`latr-boot`）；
   TB arena 回收时同步失效宿主 PC 映射；PVIR 缓存加锁；`bind/restore` 供 fault dispatcher 借用。
 - [x] virtio-mmio block 设备模型（MMIO/描述符/DMA/IRQ）与 DTB 节点。
-- [~] 剩余 RVV 1.0 指令（`vadc/vmadc/vmacc`/FP FMA/`vmulh*`/`vsmul`/`vrsub`/`vw*.w`/`vfr*`）；`vleff`、`segment`、`whole-reg` 已完成，组对齐与重叠合规已完成。
+- [~] 剩余 RVV 1.0 指令（`vfrsub/vfrdiv/vfrec7/vfrsqrt7/vfslide1*`）；`vleff`、`segment`、`whole-reg` 已完成，组对齐与重叠合规已完成。
+  carry/borrow 的陷阱：`vadc/vsbc` 走 `@r_vm_1`，解码出的 `arg.vm` 恒为 1——这既是通用掩码规则漏掉 `vd==v0` 保留编码的原因，也意味着进位输入是否生效不能用 `!vm` 判断；`vmadc/vmsbc` 才用原始 vm 位（vm=0 表示带进位），且掩码目的地的尾部恒为 tail-agnostic。
 
 ### 部分无 blocker — 可先做局部，完整闭环仍缺外部件
 

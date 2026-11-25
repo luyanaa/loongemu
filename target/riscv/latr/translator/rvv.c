@@ -1984,6 +1984,92 @@ static uint64_t rvv_fp_class(uint64_t bits, unsigned width)
  * both, msac: addend only, nmsac: product only); variants 0..3 accumulate with
  * vd as the multiplicand, 4..7 use vd as the addend.
  */
+/*
+ * RVV carry/borrow (vadc/vsbc/vmadc/vmsbc).
+ *
+ * v0 holds the carry-in, one bit per element, and is not a predicate: vadc and
+ * vsbc write every body element back regardless of v0, and vmadc/vmsbc are
+ * unmaskable. The vm bit therefore only selects whether a carry-in is added,
+ * which is why this cannot reuse the ALU path's rvv_build_mask() preamble
+ * (vm=0 there would prune lanes instead of feeding the carry).
+ *
+ * vadc/vsbc are reserved when vd is v0; the shared legality form rejects that
+ * through the mask rule (vm=0 requires vd != 0).
+ */
+void latr_rvv_carry(CPUArchState *env)
+{
+    unsigned op = (unsigned)env->rvv_args[0];
+    unsigned vd = (unsigned)env->rvv_args[1];
+    unsigned vs2 = (unsigned)env->rvv_args[2];
+    unsigned vs1 = (unsigned)env->rvv_args[3];
+    unsigned kind = (unsigned)env->rvv_args[4];
+    uint64_t imm = env->rvv_args[5];
+    int vm = (int)env->rvv_args[6];
+    unsigned sew = rvv_sew(env);
+    uint64_t mask = rvv_sew_mask(sew);
+    int mask_dest = op == LATR_RVV_X_VMADC || op == LATR_RVV_X_VMSBC;
+    /*
+     * For vmadc/vmsbc the raw vm bit selects the carry-in form (vm=0 adds it).
+     * vadc/vsbc are decoded through @r_vm_1, which forces arg.vm to 1 so that
+     * the generic mask rule does not apply; their encoding is always vm=0 and
+     * they always add the carry-in.
+     */
+    int with_carry = (op == LATR_RVV_X_VADC || op == LATR_RVV_X_VSBC) ? 1 : !vm;
+    unsigned i;
+
+    if (env->vstart >= env->vl) {
+        env->vstart = 0;
+        return;
+    }
+    for (i = (unsigned)env->vstart; i < (unsigned)env->vl; i++) {
+        uint64_t a = latr_rvv_read_elem(env, vs2, i, sew) & mask;
+        uint64_t b;
+        unsigned cin = with_carry ? rvv_v0_bit(env, i) : 0u;
+
+        if (kind == LATR_RVV_SRC_VECTOR) {
+            b = latr_rvv_read_elem(env, vs1, i, sew) & mask;
+        } else if (kind == LATR_RVV_SRC_SCALAR) {
+            b = env->gpr[vs1 & 31u] & mask;
+        } else {
+            b = imm & mask;
+        }
+        if (!mask_dest) {
+            uint64_t out = op == LATR_RVV_X_VADC
+                               ? (a + b + cin) & mask
+                               : (a - b - cin) & mask;
+
+            latr_rvv_write_elem(env, vd, i, sew, out);
+        } else {
+            unsigned bit;
+
+            if (op == LATR_RVV_X_VMADC) {
+                bit = (unsigned)((((unsigned __int128)a + b + cin) >> sew) & 1u);
+            } else {
+                /* Borrow iff the difference before truncation is negative. */
+                bit = ((unsigned __int128)a < (unsigned __int128)b + cin) ? 1u
+                                                                          : 0u;
+            }
+            if (bit) {
+                env->vreg[vd & 31u][i >> 3] |= (uint8_t)(1u << (i & 7u));
+            } else {
+                env->vreg[vd & 31u][i >> 3] &= (uint8_t)~(1u << (i & 7u));
+            }
+        }
+    }
+    if (!mask_dest) {
+        /* vma is ignored: there is no masking, only the tail policy applies. */
+        rvv_tail_ones(env, vd, sew);
+    } else {
+        /* Mask destinations are always tail-agnostic, regardless of vta. */
+        unsigned vlmax = rvv_vlmax(env);
+
+        for (i = (unsigned)env->vl; i < vlmax; i++) {
+            env->vreg[vd & 31u][i >> 3] |= (uint8_t)(1u << (i & 7u));
+        }
+    }
+    env->vstart = 0;
+}
+
 void latr_rvv_fma(CPUArchState *env)
 {
     unsigned variant = (unsigned)env->rvv_args[0];

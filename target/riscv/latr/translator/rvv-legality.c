@@ -170,6 +170,23 @@ static void rvv_shape(unsigned opcode, RvvShape *shape)
     V(VFMADD_VV) V(VFNMADD_VV) V(VFMSUB_VV) V(VFNMSSUB_VV)
         shape->form = FORM_SSS;
         break;
+    /*
+     * Carry/borrow. vadc/vsbc write elements: the vm=0 encoding is why the
+     * spec reserves vd == v0, and check_ss's mask rule enforces exactly that.
+     * vmadc/vmsbc write a mask and are unmaskable, so they use the mask form.
+     */
+    V(VADC_VVM) V(VSBC_VVM)
+        shape->form = FORM_SSS;
+        break;
+    V(VADC_VXM) V(VADC_VIM) V(VSBC_VXM)
+        shape->form = FORM_SS;
+        break;
+    V(VMADC_VVM) V(VMSBC_VVM)
+        shape->form = FORM_MSS;
+        break;
+    V(VMADC_VXM) V(VMADC_VIM) V(VMSBC_VXM)
+        shape->form = FORM_MS;
+        break;
     /* Integer multiply-accumulate, same-width all three operands. */
     V(VMACC_VV) V(VNMSAC_VV) V(VMADD_VV) V(VNMSUB_VV)
         shape->form = FORM_SSS;
@@ -769,6 +786,25 @@ LatrRvvLegality latr_rvv_check_operands(const RiscvIR1 *insn,
     vd = insn->arg.rd;
     vs1 = insn->arg.rs1;
     vs2 = insn->arg.rs2;
+
+    /*
+     * vadc/vsbc are decoded through @r_vm_1 (arg.vm reads 1), so the generic
+     * "vm=0 requires vd != v0" rule cannot catch the reserved case the spec
+     * states outright: the encoding is reserved if vd is v0.
+     */
+    switch ((unsigned)insn->opcode) {
+    case LATR_RV_VADC_VVM:
+    case LATR_RV_VADC_VXM:
+    case LATR_RV_VADC_VIM:
+    case LATR_RV_VSBC_VVM:
+    case LATR_RV_VSBC_VXM:
+        if (vd == 0) {
+            return LATR_RVV_ILLEGAL_OVERLAP;
+        }
+        break;
+    default:
+        break;
+    }
 
     switch (shape.form) {
     case FORM_NONE:
