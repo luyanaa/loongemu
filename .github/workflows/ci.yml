@@ -90,6 +90,12 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends \
             clang lld llvm qemu-system-misc make python3 ca-certificates
+          # The riscv targets moved out of qemu-system-misc on some Debian
+          # releases; try both names, then assert the binary the differential
+          # needs actually exists instead of failing later with Error 127.
+          apt-get install -y -qq --no-install-recommends qemu-system-riscv || true
+          command -v qemu-system-riscv64 || {
+              echo "gate: qemu-system-riscv64 is required by latr-rand-diff"; exit 1; }
           qemu-system-loongarch64 --version | head -1
           make -C latr all CLANG=clang AR=llvm-ar
           make latr-isa-run \
