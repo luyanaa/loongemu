@@ -180,10 +180,21 @@ as host words holding big-endian encodings, e.g. `lui $t0,0x8000` is `0x3c0c8000
 
 **Remaining:**
 
-3. CPU 0 writes IOCSR 0x1040 targeting CPU 1; CPU 1's `cpu_ip` gains the vector,
-   and CPU 1's handler runs and clears it - the register half is already covered
-   by `latm-uncore`, so the new assertion is that *execution* crosses (needs CP0
-   Status.IE / Cause.IP setup in the guest and a handler at the exception base);
+3. **in**: the board now wires `platform.iocsr_read/write` to a single
+   `LatmUncore` instance with the dispatching CPU id, CPU 0's guest executes
+   `iocsrwr` (major opcode 0x32) to 0x1040 with target=1, the driver maps the
+   mailbox bit to IP4 and delivers it to CPU 1, and CPU 1 enters a handler at
+   `exception_base + 0x180` that counts the interrupt and clears the mailbox
+   through IOCSR 0x100c. Measured: `mailbox=1 vector-pc=0xffffffff80000180
+   status=0`, `latm-ipi: PASS`, `EPC` back at the interrupted instruction.
+   Mutation-tested: removing the handler's clear makes it FAIL. Two encoding
+   facts worth keeping: `iocsrwr` needs major opcode 0x32 (my first attempt
+   omitted it and the instruction decoded as something harmless, so the hook was
+   never called), and the handler's count reads 6 for one interrupt - the six
+   steps re-enter it even though EPC is right and the loop never runs, so the
+   count is not yet a per-interrupt measure and the assertion is "ran and
+   cleared" instead of "ran exactly once". That re-entry is the next thing to
+   pin;
 4. an LL/SC pair on CPU 1 is invalidated by a plain store from CPU 0 (reservation
    coherence), which needs a shared reservation table the uncore does not have
    yet; this changes the memory path, so it is its own step.

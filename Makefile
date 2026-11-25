@@ -1623,6 +1623,9 @@ latm-board-run: latm-board-image
 	# Two vCPUs through one thread, each with its own translator state, TB cache
 	# and host code buffer: both counters advance to the step count.
 	@grep -qa 'latm-smp: PASS' build/latm_board.log
+	# Cross-core IPI: the guest's IOCSR write reaches the uncore, CPU 1's
+	# handler runs at vector 0x180 and clears the mailbox through IOCSR.
+	@grep -qa 'latm-ipi: PASS' build/latm_board.log
 
 latm-isa-run: latm-isa-image
 	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_latm_isa.elf" \
