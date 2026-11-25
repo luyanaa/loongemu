@@ -12,6 +12,11 @@ void loongemu_mmio_bus_init(LoongemuMmioBus *bus)
     for (int i = 0; i < LOONGEMU_MMIO_ROUTE_SLOTS; i++) {
         bus->routes[i].valid = 0;
     }
+    /* Unlocked by default: a bus on the stack with garbage hook pointers would
+     * call them on the first access (seen as a segfault on Linux only). */
+    bus->lock = 0;
+    bus->unlock = 0;
+    bus->lock_opaque = 0;
     bus->generation++;
 }
 
