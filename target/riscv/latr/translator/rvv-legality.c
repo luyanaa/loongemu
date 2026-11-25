@@ -165,6 +165,16 @@ static void rvv_shape(unsigned opcode, RvvShape *shape)
         shape->form = FORM_MS;
         break;
 
+    /* Fused multiply-add: three SEW operands (.vv) or two plus a scalar (.vf). */
+    V(VFMACC_VV) V(VFNMACC_VV) V(VFMSAC_VV) V(VFNMSC_VV)
+    V(VFMADD_VV) V(VFNMADD_VV) V(VFMSUB_VV) V(VFNMSSUB_VV)
+        shape->form = FORM_SSS;
+        break;
+    V(VFMACC_VF) V(VFNMACC_VF) V(VFMSAC_VF) V(VFNMSC_VF)
+    V(VFMADD_VF) V(VFNMADD_VF) V(VFMSUB_VF) V(VFNMSSUB_VF)
+        shape->form = FORM_SS;
+        break;
+
     /* Merge and move. */
     V(VMERGE_VVM)
         shape->form = FORM_SSS;
@@ -927,6 +937,14 @@ LatrRvvLegality latr_rvv_check_operands(const RiscvIR1 *insn,
 bool latr_rvv_uses_frm(unsigned opcode)
 {
     switch (opcode) {
+    case LATR_RV_VFMACC_VV: case LATR_RV_VFMACC_VF:
+    case LATR_RV_VFNMACC_VV: case LATR_RV_VFNMACC_VF:
+    case LATR_RV_VFMSAC_VV: case LATR_RV_VFMSAC_VF:
+    case LATR_RV_VFNMSC_VV: case LATR_RV_VFNMSC_VF:
+    case LATR_RV_VFMADD_VV: case LATR_RV_VFMADD_VF:
+    case LATR_RV_VFNMADD_VV: case LATR_RV_VFNMADD_VF:
+    case LATR_RV_VFMSUB_VV: case LATR_RV_VFMSUB_VF:
+    case LATR_RV_VFNMSSUB_VV: case LATR_RV_VFNMSSUB_VF:
     case LATR_RV_VFADD_VV: case LATR_RV_VFADD_VF:
     case LATR_RV_VFSUB_VV: case LATR_RV_VFSUB_VF:
     case LATR_RV_VFMUL_VV: case LATR_RV_VFMUL_VF:

@@ -52,27 +52,18 @@
 - [x] **软件 TLB**：数据/取指共用 64 项直接映射 TLB；条目按 satp+VA 页校验并回读叶 PTE，SFENCE.VMA（全量/ASID）与 FENCE.I 失效；`sfence_pending` 被 runtime 清零后仍有 `tlb_flush_seq` 序号兜底；PMP/SUM/MXR/A/D 在命中路径重新检查。
 - [x] **RVV 差分**：`Makefile` 使用 `-march=rv64gcv`，`tests/latr_isa_qemu_ref.S` / `latr_isa_diff_vectors.h` / `baremetal/bare/latr_isa_test.c` 已接入 RVV 差分序列并与 `qemu-system-riscv64 -cpu max` 对齐（`latr-diff` 通过）。
 - [x] **系统差分**：Sv39/48/57、timer、PLIC/UART 的 QEMU 差分（`latr-sys-diff` 的 SYS 行逐字节相同）；riscv-tests/arch-test/vector-tests 仍未接入。
-- [ ] **RVV FP FMA（24 条）——已实现但回退，阻塞在 softfloat 的 muladd**
-  16 条非 widening FMA（`vfmacc/vfmsac/vfnmacc/vfnmsac`、`vfmadd/vfmsub/vfnmadd/vfnmsub` × `.vv/.vf`）
-  已完成解码登记、`rvv_fma_op` 映射、`latr_rvv_fma` C helper（按 variant 位组合决定取反：乘积与加数
-  两处取反的组合是 `product ^ addend`，不是简单的 bit1）、`FORM_SSS/SS` 形状与 `frm` 门控；符号矩阵实测正确
-  （`vfnmacc` 结果恰为 `vfmacc` 的相反数）。**结果仍回退**，原因是融合语义不可信：
-  直接调用 `float32_muladd(1+2^-23, 1-2^-23, -1, 0, &st)` 得到的不是 IEEE 值 `-2^-46`(0xA8800000)，
-  而是 `0x337FFFFE`(≈2^-24)——说明问题在本镜像的 softfloat/状态设置，而不在 RVV 接线。
-  两条线索：`latr/Makefile:179` 以 `-D__FAST_MATH__`/`-ffast-math` 编译，softfloat 会打印
-  "disabling hardfloat due to -ffast-math" 并保留基于宿主 `fmaf` 的快路径；而 `softfloat_init` 是
-  `constructor`，freestanding 镜像里不会运行，因此宿主 FMA 从未被校验。已试过显式强制软 FMA
-  （`softfloat_force_soft_fma`），结果不变，说明软路径或其 status 参数同样是嫌疑。
-  已做：`tests/test_softfloat_fma.c`（进 `make test`，8 checks / 0 fails / 2 known-broken）在**宿主**上复现同一现象，
-  与交叉编译、与 `-ffast-math` 均无关（两种构建结果相同）。工作用例全对：单独乘积舍入、精确乘积相加、
-  `(1+2^-23)-1`、tiny addend、`negate_product`、`negate_c`；**只有需要未舍入乘积的消去用例错**，
-  f32/f64 同型错（f32 应 `-2^-46`，得 `0x337ffffe`；f64 应 `-2^-57`，得 `0x3c9fff…ffe`）。
-  实现侧已排除：`float32_muladd → soft_f32_muladd → parts_muladd` 是标准 QEMU 结构，`FloatParts64` 的加宽类型是
-  `FloatParts128`；嫌疑落在 `parts_muladd` 的加宽/`parts_sub_normal` 路径或 `frac_*` 助手在本树的配置。
-  结论：**16 条 FMA 仍不能重开**——它们会静默算错消去类结果；先修 softfloat（改完后 known-broken 归零、驱动改为失败），
-  再重开 16 条，最后处理 widening 的 8 条。
-
-- [~] **RVV 1.0 指令补齐**：已登记 318 条（+3 条 `vset*`），**仍缺 48 条编码**（逐名比对 `insn32.decode:340-760`，明细见 [`RVV_P1_LEGALITY.md`](RVV_P1_LEGALITY.md) §2.1）：carry/borrow 10、整数 MAC 8、FP FMA 24、`vfrsub/vfrdiv/vfrec7/vfrsqrt7/vfslide1*.vf` 6。
+- [~] **RVV FP FMA**：16 条非 widening 已落地并验证（`vfmacc/vfmsac/vfnmacc/vfnmsac`、
+  `vfmadd/vfmsub/vfnmadd/vfnmsub` × `.vv/.vf`），走 `latr_rvv_fma` C helper + `float*_muladd`；
+  **仍缺 8 条 widening**（`vfw{m,n}macc/msac` × `.vv/.vf`）。
+  两处语义陷阱已固化在实现里：取反组合是 `product ^ addend`（不是简单 bit1），
+  且必须先 `rvv_build_mask(env, !vm)` 否则所有 lane 读到 inactive。
+  过程记录（值得保留）：曾判断"softfloat 的 muladd 非融合"并回退这批编码，
+  **结论错误——是测试常数写错了**（`0x3f7fffff` 是 `1-2^-24` 而非 `1-2^-23`）。
+  在 `parts_muladd` 里打印加宽乘积与相减值后，结果与操作数完全吻合；改用
+  `(1+2^-13)(1-2^-13) = 1-2^-26` 这种"乘积本身需超精度、单独会舍入到 1.0"的判别用例后，
+  f32/f64 全部正确。`tests/test_softfloat_fma.c`（8 checks）现在全绿，用于防止把这类
+  "期望值算错"再次误判成库缺陷。
+- [~] **RVV 1.0 指令补齐**：已登记 334 条（+3 条 `vset*`），**仍缺 40 条编码**（逐名比对 `insn32.decode:340-760`，明细见 [`RVV_P1_LEGALITY.md`](RVV_P1_LEGALITY.md) §2.1）：carry/borrow 10、整数 MAC 8、FP FMA（widening）8、`vfrsub/vfrdiv/vfrec7/vfrsqrt7/vfslide1*.vf` 6。
   本轮落地 `vrsub.vx/vi` 与 `vmulh/vmulhu/vmulhsu` 的 `.vv/.vx`（共 8 条），走 `latr_rvv_arith_extra` 的 C 路径；
   高位乘在 2·SEW 上求出乘积再右移 SEW，`mulhsu` 按 vs2 有符号、vs1/x 无符号混合。
   **登记位置有陷阱**：把新编码插到 `rv64gc-opcodes.def` 中部（`vmul.vx` 之后）会让 16 项既有 FP 检查（RMM/NaN-box）

@@ -7,19 +7,14 @@
  * with no cross-compilation and no RISC-V hardware involved, and pins the cases
  * that do work so a future fix cannot regress them.
  *
- * Findings this test encodes (measured, not assumed):
- *   - the product alone rounds correctly (1+2^-23)(1-2^-23) -> 1.0;
- *   - an exactly representable  product + addend is correct (4*2+3 = 11);
- *   - a tiny addend is correct (1*1 + 2^-46 -> 1.0);
- *   - a plain subtractive case is correct (1+2^-23) - 1 = 2^-23;
- *   - the fused cancellation case is WRONG: -2^-46 comes out as
- *     0x337ffffe = 2^-24 * (1 - 2^-23), positive and 2^32 times too large;
- *   - the double-precision analogue is wrong the same way.
- *
- * The wrong cases are counted as "known broken" so this can live in the fast
- * host tier without turning the suite red on a defect nobody has fixed yet.
- * When softfloat is repaired, the known-broken count must drop to zero and the
- * driver should be changed to fail on it; the printf says which cases to flip.
+ * History worth keeping: the first version of this file declared softfloat
+ * broken. It was the test that was wrong - 0x3f7fffff is 1-2^-24, not 1-2^-23,
+ * so the "expected" fused result had been computed from the wrong operands.
+ * Instrumenting parts_muladd showed the widened product and the post-subtract
+ * value matching the operands exactly. A discriminating fused case has to use
+ * operands whose product needs more precision than the format carries, e.g.
+ * (1+2^-13)(1-2^-13) = 1-2^-26, which rounds to 1.0 on its own and only the
+ * fused add of -1 exposes the tail.
  */
 #include <stdbool.h>
 #include <stdint.h>
@@ -108,15 +103,17 @@ int main(void)
              UINT32_C(0x40000000), false);
 
     /*
-     * Known broken: the cancellation cases that need the unrounded product.
-     * IEEE: (1+2^-23)(1-2^-23) - 1 = -2^-46. Observed: 0x337ffffe.
+     * Single rounding, f32: (1+2^-13)(1-2^-13) = 1-2^-26, which rounds to 1.0 on
+     * its own; fused with -1 the tail must survive as -2^-26 (0xb2800000).
+     * A mul-then-add implementation would return 0.
      */
-    expect32("fused cancellation", UINT32_C(0x3f800001),
-             UINT32_C(0x3f7fffff), UINT32_C(0xbf800000), 0,
-             UINT32_C(0xa8800000), true);
-    expect64("fused cancellation (f64)", UINT64_C(0x3ff0000000000001),
-             UINT64_C(0x3fefffffffffffff), UINT64_C(0xbff0000000000000), 0,
-             UINT64_C(0xb970000000000000), true);
+    expect32("fused cancellation", UINT32_C(0x3f800400),
+             UINT32_C(0x3f7ff800), UINT32_C(0xbf800000), 0,
+             UINT32_C(0xb2800000), false);
+    /* f64 analogue: (1+2^-30)(1-2^-30) - 1 = -2^-60. */
+    expect64("fused cancellation (f64)", UINT64_C(0x3ff0000000400000),
+             UINT64_C(0x3fefffffff800000), UINT64_C(0xbff0000000000000), 0,
+             UINT64_C(0xbc30000000000000), false);
 
     printf("softfloat-fma: %d checks, %d fails, %d known-broken\n", checks,
            fails, known_broken);

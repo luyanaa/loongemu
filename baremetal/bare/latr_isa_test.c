@@ -5782,6 +5782,67 @@ static void test_rvv_pvir_lsx_lasx(void)
         check(vec_read32(10, 3), 0xfffffffdu, "vsmul.vx INT32_MIN * 3 -> -3");
     }
 
+    /*
+     * 2e. Fused multiply-add. Single rounding is the point: (1+2^-13)(1-2^-13)
+     * rounds to 1.0 on its own, so only the fused add of -1 keeps the -2^-26
+     * tail. vd = 1+2^-13 (0x3f800400), v1 = 1-2^-13 (0x3f7ff800), v2 = -1.
+     */
+    {
+        static const uint32_t fma_vv_ops[] = {
+            0xb2209457, /* vfmacc.vv  v8,  v1, v2 */
+            0xb6209657, /* vfnmacc.vv v12, v1, v2 */
+            0xa2209857, /* vfmadd.vv  v16, v1, v2 */
+            0xa6209a57, /* vfnmadd.vv v20, v1, v2 */
+        };
+        static const uint32_t fma_vf_ops[] = {
+            0xb220d557, /* vfmacc.vf  v10, f1, v2 */
+            0xbe20d757, /* vfnmsac.vf v14, f1, v2 */
+            0xaa20d957, /* vfmsub.vf  v18, f1, v2 */
+            0xae20db57, /* vfnmsub.vf v22, f1, v2 */
+        };
+
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10; /* e32, m1, tu, mu */
+        env.vl = 4;
+        for (int lane = 0; lane < 4; lane++) {
+            vec_store32(1, lane, 0x3f7ff800u); /* 1 - 2^-13 */
+            vec_store32(2, lane, 0xbf800000u); /* -1 */
+            vec_store32(8, lane, 0x3f800400u); /* vfmacc: vd = 1 + 2^-13 */
+            vec_store32(12, lane, 0x3f800400u);
+            vec_store32(16, lane, 0x3f800400u); /* vfmadd: vd is the addend */
+            vec_store32(20, lane, 0x3f800400u);
+        }
+        check(latr_execute_block(fma_vv_ops, 4), 1, "FMA .vv family translates");
+        check(vec_read32(8, 0), 0xb2800000u,
+              "vfmacc.vv keeps the -2^-26 tail (single rounding)");
+        check(vec_read32(12, 0), 0x32800000u,
+              "vfnmacc.vv negates product and addend");
+        check(vec_read32(16, 0), 0x39800000u,
+              "vfmadd.vv uses vd as the addend (+2^-12)");
+        check(vec_read32(20, 0), 0xb9800000u,
+              "vfnmadd.vv negates product and addend");
+
+        /* .vf: scalar broadcast from f1 = 0.5 (low half, NaN-boxed). */
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10;
+        env.vl = 4;
+        env.fpr[1] = UINT64_C(0xffffffff3f000000);
+        for (int lane = 0; lane < 4; lane++) {
+            vec_store32(2, lane, 0x40000000u); /* 2.0 */
+            vec_store32(10, lane, 0x41000000u); /* vfmacc: vd = 8.0 */
+            vec_store32(14, lane, 0x41000000u);
+            vec_store32(18, lane, 0x3f000000u); /* vfmsub: vd = 0.5 */
+            vec_store32(22, lane, 0x3f000000u);
+        }
+        check(latr_execute_block(fma_vf_ops, 4), 1, "FMA .vf family translates");
+        check(vec_read32(10, 0), 0x40c00000u, "vfmacc.vf 8*0.5+2 = 6");
+        check(vec_read32(14, 0), 0xc0000000u, "vfnmsac.vf -(8*0.5)+2 = -2");
+        check(vec_read32(18, 0), 0x3f000000u, "vfmsub.vf 0.5*2-0.5 = 0.5");
+        check(vec_read32(22, 0), 0xbf000000u, "vfnmsub.vf -(0.5*2)+0.5 = -0.5");
+    }
+
     /* 3. vmsgt / vmsgtu + unsigned shift immediate >= 16. */
     reset_guest_state();
     env.csr[0x300] = 0x600;

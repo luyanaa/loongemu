@@ -122,6 +122,19 @@ enum {
     LATR_RVV_X_MULHSU, LATR_RVV_X_SMUL,
 };
 void latr_rvv_arith_extra(CPUArchState *env);
+
+/*
+ * RVV fused multiply-add. Variant index encodes the sign rules: bit0 negates
+ * the product and the addend negates as `product_bit ^ addend_bit`; variants
+ * 0..3 accumulate into vd (macc/msac), 4..7 take vd as the addend (madd/msub).
+ */
+enum {
+    LATR_RVV_FMA_MACC = 0, LATR_RVV_FMA_NMACC,
+    LATR_RVV_FMA_MSAC, LATR_RVV_FMA_NMSAC,
+    LATR_RVV_FMA_MADD, LATR_RVV_FMA_NMADD,
+    LATR_RVV_FMA_MSUB, LATR_RVV_FMA_NMSUB,
+};
+void latr_rvv_fma(CPUArchState *env);
 enum {
     LATR_RVV_FP_ADD = 0, LATR_RVV_FP_SUB, LATR_RVV_FP_MUL,
     LATR_RVV_FP_DIV, LATR_RVV_FP_MIN, LATR_RVV_FP_MAX,

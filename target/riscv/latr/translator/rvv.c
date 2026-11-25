@@ -1938,6 +1938,107 @@ static uint64_t rvv_fp_class(uint64_t bits, unsigned width)
     return sign ? (UINT64_C(1) << 1) : (UINT64_C(1) << 6);
 }
 
+/*
+ * RVV fused multiply-add (vfmacc/vfmsac/vfnmacc/vfnmsac and the madd/msub
+ * family, .vv and .vf).
+ *
+ * One rounding: the product and the addend are combined before rounding. A
+ * mul-then-add sequence differs whenever the product needs more precision than
+ * the destination format carries - e.g. (1+2^-13)(1-2^-13) rounds to 1.0 on its
+ * own, so only the fused add of -1 exposes the -2^-26 tail.
+ *
+ * Sign rules come from the variant index: bit0 negates the product, and the
+ * addend is negated by `product ^ addend` over bits 0/1 (macc: none, nmacc:
+ * both, msac: addend only, nmsac: product only); variants 0..3 accumulate with
+ * vd as the multiplicand, 4..7 use vd as the addend.
+ */
+void latr_rvv_fma(CPUArchState *env)
+{
+    unsigned variant = (unsigned)env->rvv_args[0];
+    unsigned vd = (unsigned)env->rvv_args[1];
+    unsigned op2 = (unsigned)env->rvv_args[2];
+    unsigned vs2 = (unsigned)env->rvv_args[3];
+    unsigned kind = (unsigned)env->rvv_args[4];
+    int vm = (int)env->rvv_args[6];
+    unsigned sew = rvv_sew(env);
+    int accumulate_into_vd = variant < LATR_RVV_FMA_MADD;
+    int flags = 0;
+    unsigned i;
+    float_status status;
+
+    if (env->vstart >= env->vl) {
+        env->vstart = 0;
+        return;
+    }
+    if (sew != 32 && sew != 64) {
+        /* RVV 1.0 vector FP covers e32/e64 only. */
+        env->vstart = 0;
+        return;
+    }
+    /* Expand the mask (or all-ones when unmasked) before rvv_mask_bit is used;
+     * without this every lane reads as inactive. */
+    rvv_build_mask(env, !vm);
+    if (variant & 1u) {
+        flags |= float_muladd_negate_product;
+    }
+    if ((variant ^ (variant >> 1)) & 1u) {
+        flags |= float_muladd_negate_c;
+    }
+    latr_fp_status_begin(env, &status, 0);
+    for (i = (unsigned)env->vstart; i < (unsigned)env->vl; i++) {
+        uint64_t vd_old;
+        uint64_t a_bits, b_bits, c_bits;
+        uint64_t out;
+
+        if (!rvv_mask_bit(env, i)) {
+            if (RVV_VTYPE_VMA(env->vtype)) {
+                latr_rvv_write_elem(env, vd, i, sew, rvv_sew_mask(sew));
+            }
+            continue;
+        }
+        vd_old = latr_rvv_read_elem(env, vd, i, sew);
+        if (kind == LATR_RVV_SRC_VECTOR) {
+            a_bits = accumulate_into_vd
+                         ? vd_old
+                         : latr_rvv_read_elem(env, op2, i, sew);
+            b_bits = accumulate_into_vd
+                         ? latr_rvv_read_elem(env, op2, i, sew)
+                         : latr_rvv_read_elem(env, vs2, i, sew);
+            c_bits = accumulate_into_vd
+                         ? latr_rvv_read_elem(env, vs2, i, sew)
+                         : vd_old;
+        } else {
+            uint64_t scalar = sew == 32
+                                  ? (uint64_t)rvv_fp_scalar32(env, op2)
+                                  : rvv_fp_scalar64(env, op2);
+
+            a_bits = accumulate_into_vd ? vd_old : scalar;
+            b_bits = accumulate_into_vd ? scalar
+                                        : latr_rvv_read_elem(env, vs2, i, sew);
+            c_bits = accumulate_into_vd
+                         ? latr_rvv_read_elem(env, vs2, i, sew)
+                         : vd_old;
+        }
+        if (sew == 32) {
+            out = (uint64_t)float32_muladd((float32)a_bits, (float32)b_bits,
+                                           (float32)c_bits, flags, &status);
+        } else {
+            out = (uint64_t)float64_muladd((float64)a_bits, (float64)b_bits,
+                                           (float64)c_bits, flags, &status);
+        }
+        latr_rvv_write_elem(env, vd, i, sew, out);
+    }
+    latr_fp_status_end(env, &status);
+    env->vstart = 0;
+    if (RVV_VTYPE_VTA(env->vtype)) {
+        unsigned i2;
+
+        for (i2 = (unsigned)env->vl; i2 < rvv_vlmax(env); i2++) {
+            latr_rvv_write_elem(env, vd, i2, sew, rvv_sew_mask(sew));
+        }
+    }
+}
+
 void latr_rvv_fp(CPUArchState *env)
 {
     unsigned op = (unsigned)env->rvv_args[0];

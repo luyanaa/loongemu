@@ -267,6 +267,33 @@ static bool rvv_mask_scan_op(int opcode, unsigned *op)
 #define RVV_X_WX(tag, opv, sgn) RVV_X_ENTRY(tag##_WX, opv, LATR_RVV_SRC_SCALAR, 1, sgn)
 #define RVV_X_WI(tag, opv, sgn) RVV_X_ENTRY(tag##_WI, opv, LATR_RVV_SRC_IMM, 0, sgn)
 
+#define RVV_FMA_ENTRY(tag, variant, kindv) \
+    case LATR_RV_##tag: *fma = variant; *kind = kindv; return true
+
+/* Fused multiply-add: variant index carries the sign rules (see translate.h). */
+static bool rvv_fma_op(int opcode, unsigned *fma, unsigned *kind)
+{
+    switch (opcode) {
+    RVV_FMA_ENTRY(VFMACC_VV, LATR_RVV_FMA_MACC, LATR_RVV_SRC_VECTOR);
+    RVV_FMA_ENTRY(VFMACC_VF, LATR_RVV_FMA_MACC, LATR_RVV_SRC_SCALAR);
+    RVV_FMA_ENTRY(VFNMACC_VV, LATR_RVV_FMA_NMACC, LATR_RVV_SRC_VECTOR);
+    RVV_FMA_ENTRY(VFNMACC_VF, LATR_RVV_FMA_NMACC, LATR_RVV_SRC_SCALAR);
+    RVV_FMA_ENTRY(VFMSAC_VV, LATR_RVV_FMA_MSAC, LATR_RVV_SRC_VECTOR);
+    RVV_FMA_ENTRY(VFMSAC_VF, LATR_RVV_FMA_MSAC, LATR_RVV_SRC_SCALAR);
+    RVV_FMA_ENTRY(VFNMSC_VV, LATR_RVV_FMA_NMSAC, LATR_RVV_SRC_VECTOR);
+    RVV_FMA_ENTRY(VFNMSC_VF, LATR_RVV_FMA_NMSAC, LATR_RVV_SRC_SCALAR);
+    RVV_FMA_ENTRY(VFMADD_VV, LATR_RVV_FMA_MADD, LATR_RVV_SRC_VECTOR);
+    RVV_FMA_ENTRY(VFMADD_VF, LATR_RVV_FMA_MADD, LATR_RVV_SRC_SCALAR);
+    RVV_FMA_ENTRY(VFNMADD_VV, LATR_RVV_FMA_NMADD, LATR_RVV_SRC_VECTOR);
+    RVV_FMA_ENTRY(VFNMADD_VF, LATR_RVV_FMA_NMADD, LATR_RVV_SRC_SCALAR);
+    RVV_FMA_ENTRY(VFMSUB_VV, LATR_RVV_FMA_MSUB, LATR_RVV_SRC_VECTOR);
+    RVV_FMA_ENTRY(VFMSUB_VF, LATR_RVV_FMA_MSUB, LATR_RVV_SRC_SCALAR);
+    RVV_FMA_ENTRY(VFNMSSUB_VV, LATR_RVV_FMA_NMSUB, LATR_RVV_SRC_VECTOR);
+    RVV_FMA_ENTRY(VFNMSSUB_VF, LATR_RVV_FMA_NMSUB, LATR_RVV_SRC_SCALAR);
+    default: return false;
+    }
+}
+
 static bool rvv_fp_op(int opcode, unsigned *op, unsigned *kind)
 {
     *kind = LATR_RVV_SRC_VECTOR;
@@ -586,6 +613,9 @@ static bool translate_vector_op(const RiscvIR1 *ir1)
     int extra_signed = 1;
     bool is_extra = rvv_extra_op(ir1->opcode, &extra_op, &extra_kind,
                                  &extra_wide, &extra_signed);
+    unsigned fma_variant = 0;
+    unsigned fma_kind = LATR_RVV_SRC_VECTOR;
+    bool is_fma = rvv_fma_op(ir1->opcode, &fma_variant, &fma_kind);
     unsigned fp_op = 0;
     unsigned fp_kind = 0;
     unsigned cvt_op = 0;
@@ -603,7 +633,7 @@ static bool translate_vector_op(const RiscvIR1 *ir1)
 
     if (!is_alu && !is_cmp && !is_merge && !is_mv && !is_mv_scalar &&
         !is_mask_logic && !is_mask_scan && !is_reduce && !is_perm &&
-        !is_extra && !is_fp && !is_cvt && !is_mem &&
+        !is_extra && !is_fma && !is_fp && !is_cvt && !is_mem &&
         whole == LATR_RVV_WHOLE_NONE) {
         return false;
     }
@@ -729,6 +759,15 @@ static bool translate_vector_op(const RiscvIR1 *ir1)
                                           ir1->opcode == LATR_RV_VFWSUB_WV)
                                              ? 1 : 0));
         emit_rvv_call((uintptr_t)&latr_rvv_fp);
+    } else if (is_fma) {
+        emit_rvv_arg_const(0, (uint64_t)fma_variant);
+        emit_rvv_arg_const(1, (uint64_t)ir1->arg.rd);
+        emit_rvv_arg_const(2, (uint64_t)ir1->arg.rs1);
+        emit_rvv_arg_const(3, (uint64_t)ir1->arg.rs2);
+        emit_rvv_arg_const(4, (uint64_t)fma_kind);
+        emit_rvv_arg_const(5, 0);
+        emit_rvv_arg_const(6, (uint64_t)vm);
+        emit_rvv_call((uintptr_t)&latr_rvv_fma);
     } else if (is_extra) {
         uint64_t imm = (uint64_t)ir1->arg.rs1;
         if (extra_kind == LATR_RVV_SRC_IMM && extra_signed) {

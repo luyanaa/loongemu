@@ -384,7 +384,7 @@ fault recovery cost.
    all four spans change width at an ASLR-scale delta (0 do at +64 KiB). P2 must
    either pad relocation sites to a fixed width or re-assemble from serialised
    IR2.
-8. 2.2 LATR: remaining RVV encodings, then real SMP. Progress: 66 -> 48
+8. 2.2 LATR: remaining RVV encodings, then real SMP. Progress: 66 -> 40
    (vrsub.vx/vi, vmulh/vmulhu/vmulhsu .vv/.vx landed through the arith_extra C
    path, each with hand-computed lane checks in the ISA image), then the widening
    `.wv/.wx` eight (vd and, for `.wv`, vs1 are 2*SEW; `.wx` takes a scalar, so its
@@ -392,15 +392,14 @@ fault recovery cost.
    one-line validator fix: PVIR already implemented SAT_MUL with vxrm rounding and
    vxsat but the validator forced ROUND_DEFAULT on it, so the instruction could not
    execute at all.
-   FP FMA (24) was implemented and reverted: the 16 non-widening forms translate
-   with the correct sign matrix, but the vendored softfloat's muladd does not
-   return the IEEE fused value for cancellation inputs. `tests/test_softfloat_fma.c`
-   (in `make test`) reproduces it on the host with no cross-compilation - six
-   rounding/flag cases pass, both fused-cancellation cases fail identically in f32
-   and f64, and the result is the same with and without `-ffast-math`, so neither
-   the host `fmaf` nor the flag is the cause. Remaining suspects are inside
-   `parts_muladd`'s widening/subtract path. Fix softfloat first; the encodings then
-   need no rework beyond restoring them, followed by the widening eight.
+   FP FMA: the 16 non-widening forms are in (vv/vf, macc/msac/madd/msub with both
+   negations), verified with a discriminating single-rounding case. One episode is
+   worth recording: they were first reverted as "softfloat is not fusing", which
+   was wrong - the test constants were (0x3f7fffff is 1-2^-24, not 1-2^-23).
+   Instrumenting parts_muladd showed the widened product and the post-subtract
+   value matching the operands, and tests/test_softfloat_fma.c now pins six
+   rounding/flag cases plus two fused-cancellation cases so that mistake cannot
+   recur. Remaining in this family: the 8 widening forms (vfw{m,n}macc/msac).
    Next after that: carry/borrow and the MAC family need the multi-destination
    helper, and the six remaining FP ops need helpers plus the 7-bit approximations
    for vfrec7/vfrsqrt7.
