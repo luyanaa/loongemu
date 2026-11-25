@@ -433,37 +433,39 @@ the *first* instruction of a block may cross (`target_disasm`) plus the fetch an
 misaligned), fenced, and re-called: 1 before, 3 after, with the bytes checked in
 memory.
 
-**Not closed. What is solid:** a trap handler's second call of a
-*never-executed* block returns its own value (5 in the run that measured it), and
-the same second call after a `fence.i` in the handler returns the rewritten value
-(2). Both numbers can only come from a call that actually ran, so those two runs
-are real. Dumping `LatrTbEntry.code` from the `enter_tb` hook (after translation)
-showed, 320 bytes each:
+**Closed as a non-defect, with the measurement that does it.** With a probe guest
+whose disassembly was verified first (the handler really contains both `jalr`:
+`0x80000188` is the second call, `0x8000018c`/`0x80000190` store `a0`/`ra`,
+`0x8000019c` publishes the done flag), the joint dump `(entry->code, env->gpr[10])`
+per entry gives:
 
-| observation | result |
-|---|---|
-| distinct translations of 0x80002000 in one run | **two** |
-| bytes differing between them | **one word**, offset 0x40: `0c04c002` vs `0c08c002` |
-| translation set with vs without hart 1's own `fence.i` | **identical** |
+```
+X h1 code=...ce8 a0=1 ra=0x8000014c   pre-rewrite call, old body
+X h1 code=...de8 a0=1 ra=0x8000017c   handler call 1, retranslated body
+X h1 code=...de8 a0=2 ra=0x8000018c   handler call 2, same body
+P second=2 ra=0x8000018c flag=0x1234
+```
 
-So the emitted body is a function of the caching state, not of which hart
-invalidated. **What is withdrawn:** every "the second call returns 0" row. Those
-zeros sit in words the probe never proved were written, and the last attempt to
-re-measure them mangled the probe's own guest - an edit loop left the two-call
-block out and a stray `nop` before `mret`, so the word was simply never stored and
-the check read a fresh zero (`[probe] second=0`). That is the fourth probe error
-in this hunt and the same class as the third.
+The second call returns 2, its `ra` is right, and the done flag is set. The two
+distinct bodies of `0x80002000` are the **old translation and its retranslation**
+- they differ in exactly one word because the only difference in the guest code is
+the `li a0, N` constant - which is what invalidation plus retranslation is supposed
+to produce, not a defect. So the second call through a trap handler into a
+re-translated block works, and the whole "returns 0" line is withdrawn rather than
+left as an open bug.
 
-The rule that follows is procedural, not architectural: **disassemble the probe
-guest before trusting a probe run.** A done flag only proves hart 0 waited; it
-does not prove the instruction that writes the word exists. `llvm-objdump -d
-build/latr_smp_guest.elf` is one command and would have caught all four errors.
+What is still not explained is the origination of that hunt: the very first
+observed 0 came from a probe whose guest was never disassembly-checked, and no
+verified probe has reproduced it. If it resurfaces, it should be treated as a new
+observation with the rule below applied from the start.
 
-Next run, in this order: (1) patch the guest, (2) disassemble 0x8000016c and
-confirm the second `jalr` is there, (3) dump `entry->code` beside
-`env->gpr[10]` at every entry of the callee, (4) only then read the result word.
-The joint dump is written and ready; it printed the pair per entry in the run
-that had no second call, so it needs no further work - only a verified guest.
+**The rule, which is the durable output of this hunt:** disassemble the probe guest
+before trusting a probe run. A done flag proves hart 0 waited; it does not prove
+the instruction that writes the result word exists. `llvm-objdump -d
+build/latr_smp_guest.elf` is one command and would have caught all four probe
+errors: the data page overwriting the page-straddling instruction, the two
+register mix-ups, hart 0 powering off before the store, and the edit loop that
+deleted the two-call block.
 
 Litmus tests were considered and deliberately not added: with the cooperative
 image the interleaving is deterministic, so MP/LB would pass vacuously and say
