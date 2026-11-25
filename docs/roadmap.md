@@ -368,7 +368,7 @@ architecture coverage beyond fixed fixtures:
 |---|---|
 | ISA differential | four guest ISAs against QEMU |
 | random instruction | **done for RV64 integer**: `make latr-rand-diff` (fixed seed) and `latr-rand-sweep` (3 more seeds) run one generated R-type stream on LATR and on qemu-system-riscv64 and compare a 64-bit hash of x5..x31. FP/vector streams and illegal-encoding fuzzing are still open. |
-| fault differential | page fault, unaligned, privilege, delay slot |
+| fault differential | **done for the M-mode core cases**: `make latr-fault-diff` runs one guest (latr_fault_guest.S) on the LATR machine and natively on qemu-system-riscv64; it takes load/store access faults, an instruction access fault, `ecall` and an illegal instruction, the handler records (mcause, mepc, mtval), and the hash plus the raw records must agree. Page faults, misaligned access and privilege checks are still open. |
 | memory litmus | TSO, RVWMO, ARM ordering |
 | SMP stress | LL/SC, AMO, DMA, shootdown |
 | SMC | cross-page, cross-core, alias mappings |
@@ -400,6 +400,31 @@ wastes an afternoon:
   ones that happened to be legal. The differential found its own generator bug
   before it found any translator bug - which is exactly what a differential is
   for.
+
+Fault differential (implemented): the guest installs an M-mode `mtvec`, parks the
+resume PC in s0 before each faulting instruction, and the handler records
+(mcause, mepc, mtval), steps mepc to s0 and `mret`s. Both engines execute the
+*same* flat image (LATR loads it as firmware at 0x80000000 and runs it through the
+translator; QEMU takes it as `-kernel` at the same address), and both print the
+hash and the five raw records, so a mismatch is diagnosable from either log.
+
+What is compared is what the spec pins: cause and mepc for every case, and mtval
+only for the three access faults (the faulting address). mtval for
+illegal-instruction is explicitly allowed to be the instruction or zero, so
+hashing it would flag a permitted difference - the kind of gate that gets
+disabled rather than read.
+
+Two findings from the first runs, both in the test rather than the translator:
+
+* **0x40000000 is mapped on QEMU virt.** The "unmapped" load case silently
+  succeeded there and turned into a fetch of garbage, while LATR (which maps only
+  RAM plus its device windows) faulted correctly - so the differential's first
+  mismatch was its own address choice. It now uses 0x90000000, above RAM on both
+  engines.
+* **An all-zero `.word` is two RVC halfwords**, and 0x0000 is the reserved
+  `C.ADDI4SPN`, so the two engines may legitimately disagree about where the
+  instruction ends. The illegal case is now `0x0000007f`, a reserved 32-bit
+  opcode.
 
 Performance moves from local PERF counters to one benchmark reporting: guest
 instructions/sec, host instructions per guest instruction, TB hit rate,

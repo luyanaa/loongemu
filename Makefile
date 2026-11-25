@@ -778,6 +778,69 @@ latr-sys-ref: build/latr_system_guest.elf
 # Two-hart guest-level SMP scenario: real machine, real generated code, real
 # CLINT/WFI/FENCE.I. Takes the place of the guest-level half the host harness
 # cannot run (it has no LoongArch execution).
+# Fault differential: one guest image, two engines (LATR machine vs QEMU).
+latr-fault-image: build/bare_latr_fault.elf
+
+build/latr_fault_guest.elf: baremetal/bare/latr_fault_guest.S
+	@mkdir -p build
+	$(CLANG) --target=riscv64-unknown-elf -march=rv64imac -mabi=lp64 \
+	         -mno-relax -ffreestanding -nostdlib -fuse-ld=lld \
+	         -Wl,--no-relax -Wl,-Ttext=0x80000000 $< -o $@
+
+build/latr_fault_guest.bin: build/latr_fault_guest.elf
+	$(OBJCOPY) -O binary $< $@
+
+build/latr_fault_blob.o: baremetal/bare/latr_fault_blob.S build/latr_fault_guest.bin
+	@mkdir -p build
+	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
+	         -fno-builtin -O2 -c $< -o $@
+
+build/bare_latr_fault.elf: baremetal/bare/latr_fault_test.c \
+                           build/latr_fault_blob.o latr-core \
+                           build/latr_miniglib.o build/latr_libc_min.o \
+                           baremetal/bare/bare.lds
+	@mkdir -p build
+	$(CLANG) $(LATR_BARE_CFLAGS) -c $< -o build/latr_fault_test.o
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	   build/latr_fault_test.o build/latr_fault_blob.o \
+	   build/latr_miniglib.o build/latr_libc_min.o \
+	   latr/build/liblatr_core.a -o $@
+
+latr-fault-run: latr-fault-image
+	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_latr_fault.elf" \
+	     QEMU_LOG="build/latr_fault.log" QEMU_DONE="latr-fault: done" \
+	     QEMU_TIMEOUT=60 CPU=la464 \
+	     bash scripts/run_qemu_lata.sh
+	@grep -a "latr-fault" build/latr_fault.log | head -6
+	@grep -qa "latr-fault: PASS" build/latr_fault.log
+
+latr-fault-ref: build/latr_fault_guest.elf
+	@command -v $(QEMU_RISCV64) >/dev/null 2>&1 || { \
+	     echo "latr-fault-ref: $(QEMU_RISCV64) is not installed or not on PATH"; \
+	     exit 1; }
+	rm -f build/latr_fault_ref.log
+	$(if $(TIMEOUT),$(TIMEOUT) 20,) $(QEMU_RISCV64) -M virt -cpu max -m 128M \
+	     -bios none -kernel $< -display none -monitor none \
+	     -serial file:build/latr_fault_ref.log -no-reboot 2>/dev/null || true
+	grep -aE 'latr-fault-diff=' build/latr_fault_ref.log
+
+latr-fault-diff:
+	@rm -f build/latr_fault.log build/latr_fault_ref.log
+	@$(MAKE) --no-print-directory latr-fault-run latr-fault-ref \
+	     CLANG=$(CLANG) AR=$(AR) LD_LLD=$(LD_LLD) QLVZ_REPO=$(QLVZ_REPO) \
+	     >/dev/null
+	@latr_sig=$$(grep -aho 'latr-fault-diff=[0-9a-f]*' build/latr_fault.log | tail -1); \
+	 qemu_sig=$$(grep -aho 'latr-fault-diff=[0-9a-f]*' build/latr_fault_ref.log | tail -1); \
+	 if [ -z "$$latr_sig" ] || [ -z "$$qemu_sig" ]; then \
+	     echo "latr-fault-diff: missing signature (latr='$$latr_sig' qemu='$$qemu_sig')"; \
+	     exit 1; \
+	 fi; \
+	 if [ "$$latr_sig" != "$$qemu_sig" ]; then \
+	     echo "latr-fault-diff: MISMATCH latr=$$latr_sig qemu=$$qemu_sig"; \
+	     exit 1; \
+	 fi; \
+	 echo "latr-fault-diff: PASS $$latr_sig"
+
 latr-smp-image: build/bare_latr_smp.elf
 
 build/latr_smp_guest.elf: baremetal/bare/latr_smp_guest.S
@@ -1054,9 +1117,17 @@ latr-rand-sweep:
 	         CLANG=$(CLANG) AR=$(AR) LD_LLD=$(LD_LLD) \
 	         QLVZ_REPO=$(QLVZ_REPO) | tail -1; \
 	 done; \
-	 $(PYTHON) $(LATR_RAND_GEN) >/dev/null
+	 $(PYTHON) $(LATR_RAND_GEN) >/dev/null; \
+	 rm -f build/latr_isa_test.o build/bare_latr_isa.elf \
+	       build/latr_riscv_ref.elf
 
-latr-rand-diff: latr-isa-run latr-riscv-ref
+# Delete both logs first: a stale log left by an earlier seed would otherwise be
+# compared and "pass". A missing signature is then a hard error.
+latr-rand-diff:
+	@rm -f build/latr_isa.log build/latr_riscv_ref.log
+	@$(MAKE) --no-print-directory latr-isa-run latr-riscv-ref \
+	     CLANG=$(CLANG) AR=$(AR) LD_LLD=$(LD_LLD) QLVZ_REPO=$(QLVZ_REPO) \
+	     >/dev/null
 	@latr_sig=$$(grep -aho 'latr-rand-diff=[0-9a-f]*' build/latr_isa.log | tail -1); \
 	 qemu_sig=$$(grep -aho 'latr-rand-diff=[0-9a-f]*' build/latr_riscv_ref.log | tail -1); \
 	 if [ -z "$$latr_sig" ] || [ -z "$$qemu_sig" ]; then \
