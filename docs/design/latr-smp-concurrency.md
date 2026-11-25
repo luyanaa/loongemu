@@ -213,12 +213,13 @@ Two rules that are easy to get wrong and are therefore stated as requirements:
 
 ## 7. Device model and clock
 
-- One machine lock guards: `LatrSystem` mutable fields, the MMIO bus, CLINT,
-  PLIC, UART, virtio descriptors, ACPI tables, and the `LatrMachine`
-  diagnostics (`trapped`, `first_trap_*`, counters). It is a spinlock for
-  short sections and a mutex for sections that call into a device; the
-  distinction is a performance knob, not a semantic one, so start with one
-  mutex.
+- **Implemented (P2):** one bounded spin lock in `LatrSystem` guards its
+  mutable state and every device window. Guest MMIO reaches the bus directly
+  from translated code, so the bus itself carries the lock hook
+  (`loongemu_mmio_bus_set_lock`) and takes it around exactly one routed access;
+  `latr_system_tick` and `latr_system_update_hart` take the same lock directly.
+  Acquisition is bounded (`LATR_SYSTEM_LOCK_SPINS`, 1e24 default) and failures
+  are counted in `device_lock_failures` rather than ignored.
 - **Never translate or execute guest code while holding it.** A hart takes the
   lock for one MMIO access or one device step and releases it.
 - CLINT `MSIP` writes from another hart are atomic stores into the target's
@@ -226,11 +227,20 @@ Two rules that are easy to get wrong and are therefore stated as requirements:
   (`latr_system.h:77`) or at its next safepoint. An IPI does not need to
   interrupt a running block *immediately* - RVWMO allows the delay - but it does
   need to be visible at the next safepoint, which is what the `wake` word is for.
-- The virtual clock has one writer: the ticker (hart 0's thread or a dedicated
-  one) advances it by a fixed step and publishes it with a release store; harts
-  read a coherent value with an acquire load. Per-hart timer delivery then
-  latches that value, which keeps `mtime` monotonic across harts without every
-  hart writing it.
+- The virtual clock has one writer: `latr_machine_tick()` (called by the
+  embedder's ticker thread, and by the cooperative loop). It advances the clock
+  under the device lock and then wakes every online hart whose MTIP or STIP
+  comparator has become due (`latr_system_timer_due`): a hart parked in WFI
+  cannot sample its own comparator, so without that wake a timer never fires.
+- **Measured trap:** the wake must be `latr_hart_wake`, not
+  `latr_machine_wake_hart`. The latter also requests a dispatch exit, which is
+  right for an IPI but catastrophic for a timer, because `stimecmp` resets to 0
+  (always "due"): every cooperative step then became a yield, `run_hart` never
+  dispatched, and `latr_machine_run` spun forever. Timers only wake; IPIs and
+  fences ask for an exit.
+- Belt and braces: `latr_machine_run` now returns "no progress" (2) when a
+  whole pass of online harts yielded without dispatching, so a pent-up exit
+  request can never livelock a caller.
 - Stopping: the ticker stops first, then harts are asked to exit at their next
   safepoint, then joined. Nothing frees `LatrSystem` until every hart has
   acknowledged.
@@ -313,7 +323,7 @@ pthreads do not exist.
 | **P0** | `LatrShootdownAck` sequence + safepoint ack + bounded wait, single-threaded build drives it through the deterministic harness | host test 9.1 (first two items), existing ISA/sys images unchanged |
 | **P1a** | exit request at the safe point; park/wake/command primitives; MSIP write notifies the machine; `next_action` decision point | `test-latr-hart-sync` (pthread) + CLINT notify test; ISA/sys images unchanged |
 | **P1b** | hart threads, join, TLS-gated build, on the hosted harness | done: `latr_machine_run_hart` + one pthread per hart, 21 checks including the threaded fence completing with no ack timeout |
-| **P2** | machine lock around `LatrSystem`; ticker ownership; DMA/store lock order | lock-order host test; threaded sys run with 2 harts |
+| **P2** | machine lock around `LatrSystem`; ticker ownership; DMA/store lock order | done for the device layer: bus lock hook, bounded system lock with counted failures, ticker thread and timer wake, two-thread MMIO-vs-DMA hammer asserting no failed acquisition, no held writer lock, and an advanced reservation epoch. Guest-level 9.3 stays blocked on LoongArch execution. |
 | **P3** | guest-level 9.3 tests, AES/fence stress, `make latr-sys-smp-run` in CI | all 9.3 green, threaded run reproducible over 100 iterations |
 
 Each phase lands with its tests and without changing the single-threaded

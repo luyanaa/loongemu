@@ -26,12 +26,14 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <time.h>
+
 /* The translator headers pull in QEMU-style shims whose stdio lacks
  * setvbuf/stderr, so the harness keeps its output to a single printf at the
  * end (flushed at exit). */
 #include <string.h>
 #include <stdint.h>
 #include "latr-machine.h"
+#include "mmu.h"
 
 static int checks;
 static int failures;
@@ -66,6 +68,8 @@ static volatile int hart0_ipi_sent;
 static volatile int hart1_woke;
 static volatile int hart1_ready;   /* hart 1 is dispatching, not parked */
 static volatile int hart1_wants_wfi; /* scripted WFI: the thread parks */
+static volatile int timer_fired;   /* hart 1 took a timer interrupt */
+static volatile int timer_armed;
 static volatile int send_ipi;      /* hart 0 sends MSIP to hart 1 */
 static volatile int send_fence;    /* hart 0 also emits SFENCE.VMA (threads) */
 static volatile uint32_t exit_value;
@@ -113,6 +117,14 @@ static void scripted_enter_tb(void *envp, void *code)
     if (env->csr[0x344] & (UINT64_C(1) << 3)) {
         hart1_woke = 1;
         guest_write(LATR_SYSTEM_CLINT_BASE + 4u, 4, 0); /* clear MSIP */
+        env->pc = HART1_DISC;
+        return;
+    }
+    if (env->csr[0x344] & (UINT64_C(1) << 7)) {
+        /* MTIP: the ticker woke a parked hart whose comparator came due. A real
+         * guest would disable the timer here; this one records it and re-arms
+         * so the next comparator also fires. */
+        timer_fired = 1;
         env->pc = HART1_DISC;
         return;
     }
@@ -164,6 +176,7 @@ static void reset_scenario(void)
     hart1_wants_wfi = 0;
     send_ipi = 0;
     send_fence = 0;
+    timer_fired = 0;
     vclock_start = loongemu_vclock_now_ns(&machine.sys.vclock);
 }
 
@@ -248,6 +261,25 @@ static void *hart_main(void *arg)
     return NULL;
 }
 
+typedef struct Ticker {
+    LatrMachine *m;
+    pthread_t thread;
+    volatile int stop;
+} Ticker;
+
+static void *ticker_main(void *arg)
+{
+    Ticker *t = (Ticker *)arg;
+
+    while (!t->stop) {
+        latr_machine_tick(t->m, UINT64_C(1000));
+        struct timespec ts = {0, 100000}; /* 0.1 ms */
+
+        nanosleep(&ts, 0);
+    }
+    return 0;
+}
+
 static void scenario_threaded(void)
 {
     HartThread hts[2];
@@ -321,6 +353,151 @@ static void scenario_threaded(void)
           "threaded: a guest exit request is not a hart stop");
 }
 
+/*
+ * A hart parked in WFI is woken by its own timer: the ticker thread advances the
+ * clock, sees the comparator has come due, and wakes that hart. Without the
+ * ticker's wake this hart would sleep through its interrupt forever.
+ */
+static void scenario_timer_wake(void)
+{
+    Ticker ticker;
+    HartThread ht1;
+    uint64_t mtime_before;
+
+    reset_scenario();
+    send_ipi = 0;
+    send_fence = 0;
+    /* Restart both harts: the threaded scenario stopped them. */
+    for (uint32_t i = 0; i < 2; i++) {
+        machine.harts[i].online = 1;
+        latr_hart_set_command(&machine.harts[i].park, LATR_HART_RUN);
+    }
+    latr_hart_sync_set_waiter(&machine.harts[1].park, 0, 0);
+    memset(&ht1, 0, sizeof(ht1));
+    ht1.m = &machine;
+    ht1.id = 1;
+    mtime_before = machine.sys.clint.mtime;
+
+    /* Hart 1: enable MTIE + MIE and arm a comparator just ahead of the clock. */
+    machine.harts[1].env.csr[0x304] |= (UINT64_C(1) << 7);
+    machine.harts[1].env.csr[0x300] |= (UINT64_C(1) << 3);
+    machine.harts[1].env.csr[0x305] = HART1_DISC;
+    machine.sys.clint.mtimecmp[1] =
+        loongemu_vclock_now_ns(&machine.sys.vclock) + 2000;
+
+    memset(&ticker, 0, sizeof(ticker));
+    ticker.m = &machine;
+    CHECK(pthread_create(&ht1.thread, 0, hart_main, &ht1) == 0,
+          "timer: hart 1 thread");
+    CHECK(pthread_create(&ticker.thread, 0, ticker_main, &ticker) == 0,
+          "timer: ticker thread");
+
+    for (int spin = 0; spin < 2000 && !timer_fired; spin++) {
+        struct timespec ts = {0, 1000000};
+
+        nanosleep(&ts, 0);
+    }
+    CHECK(timer_fired == 1,
+          "timer: a parked hart is woken by its own timer comparator");
+    CHECK(machine.sys.clint.mtime > mtime_before, "timer: mtime advanced");
+    CHECK(latr_system_lock_failures(&machine.sys) == 0,
+          "timer: no device-lock acquisition failed");
+
+    latr_hart_set_command(&machine.harts[1].park, LATR_HART_STOP);
+    latr_hart_wake(&machine.harts[1].park);
+    pthread_join(ht1.thread, 0);
+    ticker.stop = 1;
+    pthread_join(ticker.thread, 0);
+}
+
+/*
+ * Lock order (design section 6): device lock -> DMA lock -> reservation epoch,
+ * and a device step may call the DMA path while the reverse never happens.
+ * Two threads hammer both sides; the bounded acquisition turns any inversion
+ * into a counted failure rather than a hang.
+ */
+typedef struct LockHammer {
+    LatrMachine *m;
+    uint32_t iterations;
+    volatile int done;
+} LockHammer;
+
+static void *mmio_hammer(void *arg)
+{
+    LockHammer *h = (LockHammer *)arg;
+
+    for (uint32_t i = 0; i < h->iterations; i++) {
+        latr_system_mmio_write(&h->m->sys, LATR_SYSTEM_CLINT_BASE + 4u, 4,
+                               (i & 1u));
+        latr_system_mmio_write(&h->m->sys, LATR_SYSTEM_CLINT_BASE + 4u, 4, 0);
+    }
+    h->done++;
+    return 0;
+}
+
+static void *dma_hammer(void *arg)
+{
+    LockHammer *h = (LockHammer *)arg;
+    uint8_t payload[16];
+
+    memset(payload, 0xa5, sizeof(payload));
+    for (uint32_t i = 0; i < h->iterations; i++) {
+        loongemu_guest_dma_write(&h->m->sys.dma,
+                                 LATR_SYSTEM_RAM_BASE + 0x2000u, payload,
+                                 sizeof(payload));
+    }
+    h->done++;
+    return 0;
+}
+
+static void scenario_lock_order(void)
+{
+    LockHammer bus = {&machine, 5000, 0};
+    LockHammer dev = {&machine, 5000, 0};
+    pthread_t t_bus;
+    pthread_t t_dev;
+    uint64_t epoch_before;
+    uint64_t acquisitions_before;
+
+    /* No harts: this is the device layer alone, so a failure here cannot be
+     * blamed on the dispatcher. */
+    for (uint32_t i = 0; i < 2; i++) {
+        latr_hart_set_command(&machine.harts[i].park, LATR_HART_STOP);
+    }
+    epoch_before = __atomic_load_n(&latr_guest_store_lock, __ATOMIC_ACQUIRE);
+    acquisitions_before = machine.sys.device_lock_acquisitions;
+    machine.sys.device_lock_failures = 0;
+
+    {
+        int ok_bus = pthread_create(&t_bus, 0, mmio_hammer, &bus) == 0;
+        int ok_dev = pthread_create(&t_dev, 0, dma_hammer, &dev) == 0;
+
+        CHECK(ok_bus && ok_dev, "lock order: two hammer threads");
+        if (!ok_bus || !ok_dev) {
+            return;
+        }
+    }
+    pthread_join(t_bus, 0);
+    pthread_join(t_dev, 0);
+
+    CHECK(bus.done == 1 && dev.done == 1, "lock order: both threads finished");
+    CHECK(machine.sys.device_lock_failures == 0,
+          "lock order: no bounded acquisition failed");
+    CHECK(__atomic_load_n(&machine.sys.device_lock, __ATOMIC_ACQUIRE) == 0,
+          "lock order: the device lock is released");
+    CHECK(machine.sys.device_lock_acquisitions > acquisitions_before,
+          "lock order: MMIO actually took the device lock");
+    {
+        /* DMA stores advance the reservation epoch; a writer lock left behind
+         * would make the epoch odd forever. */
+        uint64_t epoch = __atomic_load_n(&latr_guest_store_lock,
+                                         __ATOMIC_ACQUIRE);
+
+        CHECK((epoch & 1u) == 0, "lock order: no writer lock left held");
+        CHECK(epoch > epoch_before, "lock order: DMA advanced the epoch");
+    }
+}
+
 static void scenario_stop_cooperative(void)
 {
     int rc;
@@ -351,6 +528,8 @@ int main(void)
     CHECK(setup_machine(), "machine init on the host");
     scenario_cooperative();
     scenario_threaded();
+    scenario_timer_wake();
+    scenario_lock_order();
     scenario_stop_cooperative();
     scenario_fini();
 

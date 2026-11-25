@@ -1009,6 +1009,29 @@ int latr_machine_run_hart(LatrMachine *m, uint32_t hartid, uint32_t max_tbs)
     return last;
 }
 
+void latr_machine_tick(LatrMachine *m, uint64_t ns)
+{
+    if (m == NULL) {
+        return;
+    }
+    latr_system_tick(&m->sys, ns);
+    /*
+     * A hart parked in WFI must be woken when its own timer becomes due: the
+     * parked hart cannot sample the comparator itself. A stale read here only
+     * causes a spurious wake; the hart re-samples under its own update.
+     */
+    for (uint32_t i = 0; i < m->nharts; i++) {
+        if (m->harts[i].online &&
+            latr_system_timer_due(&m->sys, &m->harts[i].env, i)) {
+            /* A timer only has to wake a parked hart; it must not force a
+             * dispatch to yield. Invisible timer comparators (stimecmp resets
+             * to 0, so "due" is true from reset) would otherwise make every
+             * step a yield and livelock the cooperative scheduler. */
+            latr_hart_wake(&m->harts[i].park);
+        }
+    }
+}
+
 int latr_machine_run(LatrMachine *m, uint32_t max_tbs)
 {
     uint32_t executed = 0;
@@ -1018,10 +1041,11 @@ int latr_machine_run(LatrMachine *m, uint32_t max_tbs)
     }
     while (executed < max_tbs) {
         bool online = false;
+        uint32_t dispatched = 0;
 
         /* The virtual clock is global: advance it once, then let every hart
          * latch its own CLINT comparators against it. */
-        latr_system_tick(&m->sys, UINT64_C(1000));
+        latr_machine_tick(m, UINT64_C(1000));
         for (uint32_t i = 0; i < m->nharts; i++) {
             int ran;
 
@@ -1033,9 +1057,13 @@ int latr_machine_run(LatrMachine *m, uint32_t max_tbs)
             if (ran == 0) {
                 return 0;
             }
-            if (ran == 3 || ran == 2) {
+            if (ran == 3) {
                 continue;
             }
+            if (ran == 2) {
+                continue;
+            }
+            dispatched++;
             executed++;
             if (m->sys.exit_request != 0) {
                 return 1;
@@ -1046,6 +1074,12 @@ int latr_machine_run(LatrMachine *m, uint32_t max_tbs)
         }
         if (!online) {
             return 1;
+        }
+        if (dispatched == 0) {
+            /* Every online hart yielded. With a pent-up exit request and no
+             * clock or interrupt to clear it this would spin forever, so report
+             * "no progress" instead of hanging the caller. */
+            return 2;
         }
     }
     return 2;

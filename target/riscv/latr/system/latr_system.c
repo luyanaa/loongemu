@@ -6,6 +6,8 @@
 #include "loongemu/ovmf_board.h"
 
 #include "latr-elf.h"
+static void sys_bus_lock(void *opaque);
+static void sys_bus_unlock(void *opaque);
 
 static void sys_uart_tx(void *opaque, uint8_t byte)
 {
@@ -189,13 +191,67 @@ static int system_init(LatrSystem *sys, uint8_t *ram, uint64_t ram_size,
     sys->env.mem_map = &sys->map;
     sys->env.mmio = &sys->bus;
     sys->env.vclock = &sys->vclock;
+    sys->device_lock = 0;
+    sys->device_lock_acquisitions = 0;
+    sys->device_lock_failures = 0;
     sys->env.plic = &sys->plic;
     sys->env.plic_context = UINT64_C(2) * boot_hart;
     sys->env.csr[0x3a0] = 0x0f;
     sys->env.csr[0x3b0] = (UINT64_C(1) << 54) - 1;
     sys->env.csr[0x30a] = UINT64_C(1) << 61; /* ADUE */
     sys->env.pc = LATR_SYSTEM_RAM_BASE;
+    /* Guest MMIO reaches the bus directly from translated code, so the bus
+     * itself takes the device lock around one access. */
+    loongemu_mmio_bus_set_lock(&sys->bus, sys_bus_lock, sys_bus_unlock, sys);
     return 1;
+}
+
+/*
+ * Device-model lock. Bounded on purpose: a store that never releases must make
+ * the machine fail (design invariant I6) instead of freezing every hart. The
+ * count of failures is published so the dispatcher can notice.
+ */
+static void sys_lock(LatrSystem *sys)
+{
+    uint64_t spins = LATR_SYSTEM_LOCK_SPINS;
+
+    while (__atomic_exchange_n(&sys->device_lock, 1, __ATOMIC_ACQUIRE)) {
+        if (spins-- == 0) {
+            __atomic_add_fetch(&sys->device_lock_failures, 1,
+                               __ATOMIC_RELAXED);
+            return;
+        }
+        while (__atomic_load_n(&sys->device_lock, __ATOMIC_RELAXED) != 0) {
+            if (spins-- == 0) {
+                __atomic_add_fetch(&sys->device_lock_failures, 1,
+                                   __ATOMIC_RELAXED);
+                return;
+            }
+        }
+    }
+    __atomic_add_fetch(&sys->device_lock_acquisitions, 1, __ATOMIC_RELAXED);
+}
+
+static void sys_unlock(LatrSystem *sys)
+{
+    __atomic_store_n(&sys->device_lock, 0, __ATOMIC_RELEASE);
+}
+
+static void sys_bus_lock(void *opaque)
+{
+    sys_lock((LatrSystem *)opaque);
+}
+
+static void sys_bus_unlock(void *opaque)
+{
+    sys_unlock((LatrSystem *)opaque);
+}
+
+uint64_t latr_system_lock_failures(const LatrSystem *sys)
+{
+    return sys == 0 ? 0
+                    : __atomic_load_n(&sys->device_lock_failures,
+                                      __ATOMIC_RELAXED);
 }
 
 int latr_system_init(LatrSystem *sys, uint8_t *ram, uint64_t ram_size,
@@ -235,7 +291,32 @@ void latr_system_tick(LatrSystem *sys, uint64_t ns)
     if (sys == NULL) {
         return;
     }
+    sys_lock(sys);
     loongemu_vclock_advance_ns(&sys->vclock, ns);
+    sys_unlock(sys);
+}
+
+/*
+ * Timer due-ness for one hart: MTIP from the CLINT comparator and STIP from
+ * stimecmp. `env` fields are read atomically because the hart may be dispatching
+ * on another thread while the ticker samples them; a stale sample only costs a
+ * spurious or delayed wake, and the hart re-samples at its own safe point.
+ */
+int latr_system_timer_due(LatrSystem *sys, const CPUArchState *env,
+                          uint32_t hartid)
+{
+    uint64_t now;
+    uint64_t mtimecmp;
+    uint64_t stimecmp;
+
+    if (sys == NULL || env == NULL || hartid >= sys->clint.hart_count) {
+        return 0;
+    }
+    now = loongemu_vclock_now_ns(&sys->vclock);
+    mtimecmp = __atomic_load_n(&sys->clint.mtimecmp[hartid], __ATOMIC_ACQUIRE);
+    stimecmp = __atomic_load_n(&env->csr[LATR_RISCV_CSR_STIMECMP],
+                               __ATOMIC_ACQUIRE);
+    return now >= mtimecmp || now >= stimecmp ? 1 : 0;
 }
 
 /*
@@ -248,8 +329,12 @@ void latr_system_update_hart(LatrSystem *sys, CPUArchState *env, uint32_t hartid
     if (sys == NULL || env == NULL) {
         return;
     }
+    /* Another hart may be walking a device right now, and this reads the CLINT
+     * and the PLIC for this hart's context. */
+    sys_lock(sys);
     loongemu_clint_tick(&sys->clint, loongemu_vclock_now_ns(&sys->vclock),
                         &env->csr[0x344], hartid);
+    sys_unlock(sys);
     latr_update_interrupts(env);
 }
 

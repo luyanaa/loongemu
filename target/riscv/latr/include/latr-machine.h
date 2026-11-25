@@ -189,6 +189,13 @@ int latr_machine_run(LatrMachine *m, uint32_t max_tbs);
  */
 int latr_machine_run_hart(LatrMachine *m, uint32_t hartid, uint32_t max_tbs);
 /*
+ * The ticker's job, for a machine whose harts run on their own threads: advance
+ * the shared clock and wake every hart whose timer has become due (a hart
+ * parked in WFI cannot sample its own comparator). Exactly one thread calls
+ * this; it is also what latr_machine_run uses per cooperative step.
+ */
+void latr_machine_tick(LatrMachine *m, uint64_t ns);
+/*
  * Makes progress possible on a parked hart: bumps its wake counter and asks it
  * to return to the dispatcher after the block it is in. Called from the CLINT
  * MSIP write path (an IPI is the only thing that can wake a WFI hart) and from

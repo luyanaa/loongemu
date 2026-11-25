@@ -402,8 +402,15 @@ fault recovery cost.
    fence wait included the issuer's own stale sequence (self-ack before waiting),
    and a parked hart could never ack because publication did not wake it. The
    host build also needs LATR_ENABLE_TLS: without it tr_data/lsenv are shared
-   globals and concurrent translation aborts (~1 in 10 runs). Next: P2, the
-   machine lock around the device model and ticker ownership.
+   globals and concurrent translation aborts (~1 in 10 runs).
+   P2 is in for the device layer: a bounded spin lock in LatrSystem (with the
+   MMIO bus taking it around one routed access, since generated code calls the
+   bus directly), a single ticker owner that wakes harts whose timer came due,
+   and a two-thread MMIO-vs-DMA hammer in the harness (no failed acquisition,
+   no held writer lock, epoch advanced). A trap worth keeping: the ticker must
+   wake (not request an exit) because stimecmp resets to 0, so "always due"
+   plus exit-request livelocked the cooperative loop; run_machine also returns
+   "no progress" after a fully-yielded pass.
    (vrsub.vx/vi, vmulh/vmulhu/vmulhsu .vv/.vx landed through the arith_extra C
    path, each with hand-computed lane checks in the ISA image), then the widening
    `.wv/.wx` eight (vd and, for `.wv`, vs1 are 2*SEW; `.wx` takes a scalar, so its

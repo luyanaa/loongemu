@@ -48,13 +48,30 @@ typedef struct LoongemuMmioRoute {
     int valid;
 } LoongemuMmioRoute;
 
+/*
+ * Optional serialisation for a machine whose harts run on separate host
+ * threads. Device windows are shared mutable state, and the emitter calls the
+ * bus directly from translated code, so the lock hook has to live on the bus
+ * rather than in the caller. A single-threaded runtime leaves them NULL.
+ */
+typedef void (*LoongemuMmioLockFn)(void *opaque);
+
 typedef struct LoongemuMmioBus {
     LoongemuMmioDevice devices[LOONGEMU_MMIO_MAX_DEVICES];
     LoongemuMmioRoute routes[LOONGEMU_MMIO_ROUTE_SLOTS];
     uint32_t generation;
+    LoongemuMmioLockFn lock;
+    LoongemuMmioLockFn unlock;
+    void *lock_opaque;
 } LoongemuMmioBus;
 
 void loongemu_mmio_bus_init(LoongemuMmioBus *bus);
+/*
+ * Installs the lock used around every routed access (NULL disables). The lock
+ * must not be held across a guest instruction, only across one device access.
+ */
+void loongemu_mmio_bus_set_lock(LoongemuMmioBus *bus, LoongemuMmioLockFn lock,
+                                LoongemuMmioLockFn unlock, void *opaque);
 
 /* Registers a device window; overlapping/zero-sized/out-of-slots fail. */
 int loongemu_mmio_bus_add(LoongemuMmioBus *bus, uint64_t base, uint64_t size,

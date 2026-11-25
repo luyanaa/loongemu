@@ -100,16 +100,35 @@ static LoongemuMmioDevice *find_device(LoongemuMmioBus *bus, uint64_t pa,
     return 0;
 }
 
+void loongemu_mmio_bus_set_lock(LoongemuMmioBus *bus, LoongemuMmioLockFn lock,
+                                LoongemuMmioLockFn unlock, void *opaque)
+{
+    if (bus == 0) {
+        return;
+    }
+    bus->lock = lock;
+    bus->unlock = unlock;
+    bus->lock_opaque = opaque;
+}
+
 int loongemu_mmio_bus_read(LoongemuMmioBus *bus, uint64_t pa, unsigned size,
                            uint64_t *value)
 {
     LoongemuMmioDevice *dev = find_device(bus, pa, size);
+    uint64_t result;
 
     if (dev == 0 || dev->read == 0) {
         return -1;
     }
+    if (bus->lock != 0) {
+        bus->lock(bus->lock_opaque);
+    }
+    result = dev->read(dev->opaque, pa - dev->base, size);
+    if (bus->unlock != 0) {
+        bus->unlock(bus->lock_opaque);
+    }
     if (value != 0) {
-        *value = dev->read(dev->opaque, pa - dev->base, size);
+        *value = result;
     }
     return 0;
 }
@@ -122,6 +141,12 @@ int loongemu_mmio_bus_write(LoongemuMmioBus *bus, uint64_t pa, unsigned size,
     if (dev == 0 || dev->write == 0) {
         return -1;
     }
+    if (bus->lock != 0) {
+        bus->lock(bus->lock_opaque);
+    }
     dev->write(dev->opaque, pa - dev->base, value, size);
+    if (bus->unlock != 0) {
+        bus->unlock(bus->lock_opaque);
+    }
     return 0;
 }

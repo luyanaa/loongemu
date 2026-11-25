@@ -27,6 +27,23 @@
 #define LATR_SYSTEM_PFLASH_CODE_SIZE (1u << 20)
 #define LATR_SYSTEM_PFLASH_VARS_SIZE (1u << 16)
 
+/*
+ * Device-model serialisation (design: latr-smp-concurrency.md section 7).
+ *
+ * All of LatrSystem's mutable state (MMIO windows, CLINT, PLIC, UART, virtio,
+ * ACPI tables) and the bus behind them are guarded by one spin lock. Guest RAM
+ * is not: it is ordinary shared memory accessed by plain host loads/stores and
+ * host atomics. The lock is never held across a translated block, only across
+ * one device access or one bookkeeping update, so the failure mode is a lost
+ * wake-up rather than a stalled hart.
+ *
+ * Ordering rule (section 6): device lock -> DMA lock -> reservation epoch. A
+ * device step may call the DMA path, never the other way round.
+ */
+#ifndef LATR_SYSTEM_LOCK_SPINS
+#define LATR_SYSTEM_LOCK_SPINS UINT64_C(1) << 24
+#endif
+
 typedef struct LatrSystem {
     CPUArchState env;
     LoongemuMemMap map;
@@ -62,6 +79,10 @@ typedef struct LatrSystem {
     LoongemuRiscvPflash pflash;
     uint8_t pflash_code[LATR_SYSTEM_PFLASH_CODE_SIZE];
     uint8_t pflash_vars[LATR_SYSTEM_PFLASH_VARS_SIZE];
+    /* Guarded-state lock; failures are counted, never silently ignored. */
+    volatile int device_lock;
+    volatile uint64_t device_lock_acquisitions;
+    volatile uint64_t device_lock_failures;
 } LatrSystem;
 
 int latr_system_init(LatrSystem *sys, uint8_t *ram, uint64_t ram_size,
@@ -73,6 +94,11 @@ int latr_system_load_elf(LatrSystem *sys, const uint8_t *elf, uint64_t len,
                          uint64_t *entry);
 /* Advances the shared virtual clock once per machine step. */
 void latr_system_tick(LatrSystem *sys, uint64_t ns);
+/* Timer comparator due now? Used by the machine's ticker to wake parked harts;
+ * reads the hart state atomically so a concurrently dispatching hart is safe. */
+int latr_system_timer_due(LatrSystem *sys, const CPUArchState *env,
+                          uint32_t hartid);
+uint64_t latr_system_lock_failures(const LatrSystem *sys);
 /* Reflects CLINT/device state for one hart into that hart's MIP. */
 void latr_system_update_hart(LatrSystem *sys, CPUArchState *env, uint32_t hartid);
 /* Hart 0 convenience wrapper: tick 1 us then update hart 0. */
