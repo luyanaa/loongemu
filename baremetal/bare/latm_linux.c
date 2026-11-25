@@ -331,6 +331,18 @@ static int linux_run_one(CPUMIPSState *env)
         if (n <= 0) {
             return 0;
         }
+#ifdef LINUX_DUMP_BLOCK
+        if (tb_ran == 0) {
+            const uint32_t *w = (const uint32_t *)host;
+            for (int k = 0; k < n; k++) {
+                char b[9];
+                for (int q = 0; q < 8; q++) b[q] = "0123456789abcdef"[(w[k] >> (q * 4)) & 15];
+                b[8] = 0;
+                latx_bare_uart_puts(b);
+                latx_bare_uart_putc(k + 1 == n ? '\n' : ' ');
+            }
+        }
+#endif
         if (tb_ran < 4) {
             latx_bare_uart_puts("latm-linux: block pc=");
             { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(env->active_tc.PC>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }

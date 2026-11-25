@@ -1503,6 +1503,7 @@ build/bare_latm_linux.elf: baremetal/bare/latm_linux.c build/latm_linux_blob.o \
 	$(CLANG) $(LATM_BARE_CFLAGS) -Iinclude \
 	   $(if $(LINUX_NO_EXEC),-DLINUX_NO_EXEC,) \
 	   $(if $(LINUX_TB_BUDGET),-DLINUX_TB_BUDGET=$(LINUX_TB_BUDGET),) \
+	   $(if $(LINUX_DUMP_BLOCK),-DLINUX_DUMP_BLOCK,) \
 	   -c $< -o build/latm_linux.o
 	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
 	   build/latm_linux.o build/latm_linux_blob.o build/latm_phys_mem.o \
