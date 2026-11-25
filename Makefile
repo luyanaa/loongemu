@@ -377,7 +377,7 @@ build/test_softfloat_fma: tests/test_softfloat_fma.c latx/upstream/fpu/softfloat
 	      -Wno-sign-compare -Wno-implicit-fallthrough \
 	      -I $(SOFTFLOAT_INC) -I latx/compat -I latx/compat/include -I include \
 	      -include stdint.h -include stdbool.h -D__WORDSIZE=64 \
-	      tests/test_softfloat_fma.c latx/upstream/fpu/softfloat.c -o $@
+	      tests/test_softfloat_fma.c latx/upstream/fpu/softfloat.c -lm -o $@
 
 # Shared recovery ABI: row schema plus the one fail-closed decision function.
 build/test_le_recovery_abi: tests/test_le_recovery_abi.c \
