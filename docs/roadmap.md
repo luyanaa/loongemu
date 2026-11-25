@@ -87,17 +87,36 @@ Rest of the LATA route:
 
 ## 2.2 LATR: closest to running a full OS
 
-Remaining RVV 1.0 encodings (still missing, by group):
+**RVV 1.0 encodings: complete.** The per-group table that used to sit here (24
+FP FMA, 10 carry/borrow, 8 integer MAC, 8 widening, 6 high-multiply, 6 other FP,
+2 fixed-point) went stale one batch at a time and was still saying "missing"
+after every one of those groups had landed; a session was spent surveying work
+that was already done. The check that replaces it takes one command and is the
+one to re-run before starting any RVV batch:
 
-| group | missing |
-|---|---|
-| FP FMA | 24 |
-| carry / borrow | 10 |
-| integer MAC | 8 |
-| widening `.w` | 8 |
-| high multiply `vmulh` | 6 |
-| other FP | 6 |
-| fixed-point `vsmul` | 2 |
+```sh
+python3 - <<'EOF'
+import re, pathlib
+names=[m.group(1) for l in pathlib.Path('target/riscv/latr/ir1/rv64gc-opcodes.def').read_text().splitlines()
+       if (m:=re.search(r'LATR_RV_INSN\(([A-Za-z0-9_]+),', l))]
+tr="".join(pathlib.Path(p).read_text() for p in
+    ['target/riscv/latr/translator/translate-riscv-rvv.c','target/riscv/latr/translator/rvv.c',
+     'target/riscv/latr/translator/rvv-legality.c'])
+suf=re.compile(r'_(VV|VX|VI|WV|WX|WI|VF|VVM|VXM|VIM|V)$')
+print([n for n in names if n.startswith('V') and suf.sub('', n) not in tr])
+EOF
+```
+
+Current result: `[]` - no base-V mnemonic is absent from the three files that
+translate RVV, and the 24 whole-register encodings (`vl<n>re<eew>`, `vs<n>r`,
+`vmv<n>r`) that a first-pass grep flags are dispatched through
+`latr_rvv_whole_kind()` into `latr_rvv_whole_mem()` / `latr_rvv_whole_move()`, not
+by name. The count of encodings the ISA image exercises is a different question
+and is where the remaining RVV risk is: the whole-register family has 7 of 24
+covered (`vl1re32`, `vl2re32`, `vl8re32`, `vs2r`, `vmv1r`, `vmv2r`, `vmv8r`), so
+`vl4re*`, the 8/16/64-bit EEW spellings, `vs1r/vs4r/vs8r` and `vmv4r` are
+translated but unproven. Expected values for those must come from QEMU probes,
+not the spec, per the rule at the top of the whole-register test.
 | `vrsub` | 2 |
 
 After those, SMP is still not real: `latr_machine.c:864-902` runs harts
