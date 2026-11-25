@@ -116,6 +116,19 @@ CORE_OBJS := $(BUILD)/ir2.o $(BUILD)/ir2-peephole.o $(BUILD)/ir2-assemble.o $(BU
              $(BUILD)/runtime.o \
              $(BUILD)/vclock.o $(BUILD)/compiler-rt.o
 
+# Every core object depends on every core header. The per-object rules list only
+# the headers they obviously use, but several headers embed others (LatrSystem
+# embeds LoongemuPlic, LatrMachineHart embeds LatrChainControl/SoftRas), so a
+# struct change in a transitively included header otherwise leaves objects with
+# the old layout linked against new ones - which shows up at run time as a NULL
+# code buffer or a zero dtb address, not as a build error. Recompiling 45 files
+# on a header edit is a few seconds and removes that class of bug.
+LATR_CORE_HEADERS := $(wildcard $(LATR)/include/*.h) \
+                     $(wildcard ../shared/pvir/include/*.h) \
+                     $(wildcard ../shared/backend/loongarch/include/*.h) \
+                     $(wildcard ../include/loongemu/*.h)
+$(CORE_OBJS): $(LATR_CORE_HEADERS)
+
 .PHONY: all test-decode test-legality test-elf test-tb-smp test-fence-ack test-hart-sync test-host-machine test-machine-trap check probe clean
 all: $(BUILD)/liblatr_core.a
 

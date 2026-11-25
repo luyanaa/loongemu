@@ -199,3 +199,21 @@ testable without MSI.
 AIA exists, given that the PLIC has no per-vector message semantic. Leaning: yes
 for *pending/masking* testing, no for the boot gate, so the virtual machine keeps
 PLIC wiring as the interrupt source of record.
+
+## 6. Update: the write domain is shared with CPU stores (roadmap 3.2)
+
+The DMA transaction now takes the same critical section as a CPU store: the
+embedder installs `lock`/`unlock` hooks (`loongemu_guest_dma_set_write_domain`)
+and `LatrSystem` points them at the reservation word
+(`latr_reservation_lock/unlock`). Consequences worth keeping in mind:
+
+- The acquire blocks. This is safe only because no CPU store path holds the
+  domain across a device call: the emitted fast path performs MMIO outside the
+  lock, and the C misaligned path was moved to match. If a future path takes the
+  domain and then calls a device, this becomes a deadlock - the rule is
+  "the domain covers memory stores, never device calls".
+- Nested device transactions are refused by `write_active`, so a device that
+  responds to another device's DMA cannot recurse into the domain.
+- Multi-byte guest writes are still not guest-atomic (RISC-V guarantees only
+  aligned <= XLEN). What the domain provides is mutual exclusion between a
+  device write and a CPU store, plus the epoch bump inside the same section.

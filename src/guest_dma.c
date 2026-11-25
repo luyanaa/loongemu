@@ -113,21 +113,47 @@ static void dma_notify(LoongemuGuestDma *dma, uint64_t gpa, uint64_t len)
     }
 }
 
+void loongemu_guest_dma_set_write_domain(LoongemuGuestDma *dma,
+                                         uint64_t (*lock)(void *opaque),
+                                         void (*unlock)(void *opaque,
+                                                        uint64_t token),
+                                         void *opaque)
+{
+    if (dma == NULL) {
+        return;
+    }
+    dma->lock = lock;
+    dma->unlock = unlock;
+    dma->lock_opaque = opaque;
+}
+
 static int dma_lock(LoongemuGuestDma *dma)
 {
+    if (dma->lock != NULL) {
+        dma->write_token = dma->lock(dma->lock_opaque);
+        return 1;
+    }
+    dma->write_token = 0;
     return __atomic_exchange_n(&dma->write_lock, 1, __ATOMIC_ACQUIRE) == 0;
 }
 
 static void dma_unlock(LoongemuGuestDma *dma)
 {
+    if (dma->lock != NULL) {
+        if (dma->unlock != NULL) {
+            dma->unlock(dma->lock_opaque, dma->write_token);
+        }
+        dma->write_token = 0;
+        return;
+    }
     __atomic_store_n(&dma->write_lock, 0, __ATOMIC_RELEASE);
 }
 
 int loongemu_guest_write_begin(LoongemuGuestDma *dma, uint64_t gpa,
                                uint64_t len, uint8_t **host)
 {
-    if (dma == NULL || !dma_lock(dma)) {
-        return -1;
+    if (dma == NULL || dma->write_active || !dma_lock(dma)) {
+        return -1; /* nested device writes are refused, not deadlocked */
     }
     if (!loongemu_guest_dma_ptr(dma, gpa, len, host)) {
         dma_unlock(dma);

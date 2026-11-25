@@ -24,6 +24,16 @@ build/test_loongbt: tests/test_loongbt.c $(LBT_SRC) include/loongemu/loongbt.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Ibaremetal/gen/latx/include tests/test_loongbt.c $(LBT_SRC) -o $@
 
+# Guest-write domain contract (roadmap 3.2): device DMA and CPU stores share one
+# critical section, tested with a real second thread.
+build/test_guest_write_domain: tests/test_guest_write_domain.c \
+                               src/guest_dma.c src/phys_mem.c \
+                               include/loongemu/guest_dma.h \
+                               include/loongemu/phys_mem.h
+	@mkdir -p build
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -Iinclude \
+		src/guest_dma.c src/phys_mem.c tests/test_guest_write_domain.c -o $@
+
 build/test_tb_cache: tests/test_tb_cache.c src/tb_cache.c include/loongemu/tb_cache.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) src/tb_cache.c tests/test_tb_cache.c -o $@
@@ -305,7 +315,7 @@ test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging buil
       build/test_fpsr \
       build/test_sve_helper_support build/test_sve_helper_lifecycle \
       build/test_lata_nzcv build/test_ir2_lbt_opcodes build/test_le_recovery_abi \
-      build/test_softfloat_fma
+      build/test_softfloat_fma build/test_guest_write_domain
 	./build/test_ir2_peephole
 	./build/test_loongbt
 	./build/test_loongbt_cpu
@@ -337,6 +347,7 @@ test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging buil
 	./build/test_ir2_lbt_opcodes
 	./build/test_le_recovery_abi
 	./build/test_softfloat_fma
+	./build/test_guest_write_domain
 
 # Back-end selection and the EFLAGS pack/unpack bridge.  Kept separate from
 # test_loongbt so a failure points at the glue rather than the semantics.

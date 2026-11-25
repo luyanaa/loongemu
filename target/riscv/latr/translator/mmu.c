@@ -586,6 +586,18 @@ static void reservation_unlock(uint64_t epoch)
     __atomic_store_n(&latr_guest_store_lock, epoch + 2, __ATOMIC_RELEASE);
 }
 
+uint64_t latr_reservation_lock(void)
+{
+    return reservation_lock();
+}
+
+void latr_reservation_unlock(uint64_t epoch)
+{
+    reservation_unlock(epoch);
+}
+
+
+
 /* Non-CPU writers (device DMA) invalidate LR/SC by advancing the epoch. The
  * lock is not taken when it is already held: the active CPU writer releases
  * with epoch+2, which is exactly the invalidation a reservation needs, and
@@ -637,10 +649,13 @@ static int guest_access(CPUArchState *env, uint64_t va, unsigned size,
             env->mem_va = addr;
             return cause;
         }
-        if (!is_load && !write_locked) {
-            write_epoch = reservation_lock();
-            write_locked = true;
-        }
+        /*
+         * The write domain is held across the RAM store only. A device call
+         * (MMIO) must not run under it: a device that DMAs synchronously - and
+         * every device write now takes the same domain - would deadlock on a
+         * non-recursive lock. The emitted fast path already has this property;
+         * this C path is the misaligned / page-crossing one.
+         */
         if (env->mem_mmio) {
             if (is_load) {
                 uint64_t part = latr_mmio_load(env, phys, chunk);
@@ -652,7 +667,6 @@ static int guest_access(CPUArchState *env, uint64_t va, unsigned size,
             } else {
                 latr_mmio_store(env, phys, chunk, value >> (8 * done));
                 if (env->mem_fault_cause) {
-                    reservation_unlock(write_epoch);
                     env->mem_va = addr;
                     return env->mem_fault_cause;
                 }
@@ -663,6 +677,10 @@ static int guest_access(CPUArchState *env, uint64_t va, unsigned size,
                        << (8 * (done + i));
             }
         } else {
+            if (!write_locked) {
+                write_epoch = reservation_lock();
+                write_locked = true;
+            }
             for (i = 0; i < chunk; i++) {
                 ((uint8_t *)(uintptr_t)host)[i] =
                     (uint8_t)(value >> (8 * (done + i)));

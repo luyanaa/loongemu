@@ -77,6 +77,26 @@ static void sys_pflash_write(void *opaque, uint64_t offset, uint64_t value,
     ovmf_pflash_mmio_write(flash, offset, value, size);
 }
 
+/*
+ * Device writes take the guest store domain, not just its epoch: with vCPUs on
+ * separate threads a CPU store and a DMA store to the same bytes would
+ * otherwise interleave inside a memcpy. Blocking is safe because no CPU store
+ * path holds the domain across a device call (MMIO is outside it in both the
+ * emitted fast path and the C misaligned path), so a synchronous DMA from a
+ * device cannot deadlock on it.
+ */
+static uint64_t system_dma_lock(void *opaque)
+{
+    (void)opaque;
+    return latr_reservation_lock();
+}
+
+static void system_dma_unlock(void *opaque, uint64_t epoch)
+{
+    (void)opaque;
+    latr_reservation_unlock(epoch);
+}
+
 static void system_dma_notify(void *opaque, uint64_t gpa, uint64_t len)
 {
     (void)opaque;
@@ -135,6 +155,8 @@ static int system_init(LatrSystem *sys, uint8_t *ram, uint64_t ram_size,
     }
     loongemu_mmio_bus_init(&sys->bus);
     loongemu_guest_dma_init(&sys->dma, &sys->map, system_dma_notify, sys);
+    loongemu_guest_dma_set_write_domain(&sys->dma, system_dma_lock,
+                                        system_dma_unlock, NULL);
     loongemu_clint_init(&sys->clint, 8);
     if (!loongemu_clint_attach(&sys->bus, &sys->clint,
                                LATR_SYSTEM_CLINT_BASE)) {

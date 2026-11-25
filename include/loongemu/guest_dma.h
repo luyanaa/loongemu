@@ -67,6 +67,19 @@ typedef struct LoongemuGuestDma {
     uint64_t write_gpa;
     uint64_t write_len;
     int write_active;
+    /*
+     * Domain hooks: when installed, a device write takes the *same* critical
+     * section as a CPU store (the embedder's write domain) instead of the
+     * private `write_lock` above. The acquire may block: no CPU store path holds
+     * the domain across a device call (the emitted fast path calls MMIO outside
+     * it, and the C misaligned path was moved to match), so a device that DMAs
+     * synchronously cannot deadlock on it. Nested device writes are refused by
+     * `write_active`, not by a non-recursive lock.
+     */
+    uint64_t (*lock)(void *opaque);
+    void (*unlock)(void *opaque, uint64_t token);
+    void *lock_opaque;
+    uint64_t write_token;
     /* May be NULL: a host-side unit test has no reservation domain. In the
      * VMM this is latr_reservation_notify_write() wrapped by the machine. */
     LoongemuGuestWriteNotify notify;
@@ -76,6 +89,17 @@ typedef struct LoongemuGuestDma {
 
 void loongemu_guest_dma_init(LoongemuGuestDma *dma, const LoongemuMemMap *map,
                              LoongemuGuestWriteNotify notify, void *opaque);
+/*
+ * Serialises device writes against CPU stores through the embedder's write
+ * domain (roadmap 3.2): the data store and the reservation invalidation are one
+ * critical section, and a CPU store cannot interleave. Passing NULLs restores
+ * the private device-only lock.
+ */
+void loongemu_guest_dma_set_write_domain(LoongemuGuestDma *dma,
+                                         uint64_t (*lock)(void *opaque),
+                                         void (*unlock)(void *opaque,
+                                                        uint64_t token),
+                                         void *opaque);
 
 /*
  * Resolve [gpa, gpa+len) to a host pointer inside guest RAM. Returns false for

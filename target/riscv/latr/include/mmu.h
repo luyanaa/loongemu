@@ -76,6 +76,16 @@ int latr_guest_store(CPUArchState *env, uint64_t va, unsigned size,
  */
 extern volatile uint64_t latr_guest_store_lock;
 void latr_reservation_notify_write(uint64_t pa, unsigned size);
+/*
+ * The same domain as a mutex, for writers that are not generated stores
+ * (device DMA). Bit 0 is the writer lock and the upper bits carry the epoch, so
+ * holding it excludes a CPU store and releasing it invalidates outstanding
+ * LR/SC reservations - the store and its invalidation stay one critical
+ * section. Device writes take it too, so a DMA cannot interleave with a CPU
+ * store inside one guest-visible write.
+ */
+uint64_t latr_reservation_lock(void);
+void latr_reservation_unlock(uint64_t epoch);
 
 /* Emitted-code entry points for page-crossing scalar accesses. */
 uint64_t latr_cross_load(CPUArchState *env, uint64_t va, unsigned size);

@@ -197,13 +197,34 @@ guest_write_commit(domain, gpa, data, len);
 guest_write_end(domain);
 ```
 
-Status: `loongemu_guest_write_begin/commit/end` exist, share one coarse lock,
-and DMA write/fill/write_le all route through them; the notification is issued at
-`end()` while the lock is still held, so the store and the invalidation are one
-critical section. Nested `begin()` is refused and `commit()` outside the reserved
-range is refused, both tested. What remains is the CPU side: guest stores, AMOs
-and SC must take the same transaction before vCPUs run in parallel. Until they
-do, this orders device writes against each other only, and the code says so.
+Status: **closed for RAM stores.** `loongemu_guest_write_begin/commit/end` exist
+and DMA write/fill/write_le route through them; the notification is issued at
+`end()` while the lock is still held. Nested `begin()` is refused and `commit()`
+outside the reserved range is refused, both tested. The remaining half - CPU
+stores sharing that critical section - is now in:
+
+* the domain is the reservation word itself (`latr_guest_store_lock`: bit 0 the
+  writer lock, upper bits the epoch), which emitted stores, AMOs, SC, the C
+  misaligned path and device DMA all take;
+* `LoongemuGuestDma` gained `lock`/`unlock` hooks
+  (`loongemu_guest_dma_set_write_domain`), installed by `latr_system_init` against
+  `latr_reservation_lock/unlock`, so a device write holds the same domain as a
+  CPU store: data store and epoch bump are one critical section;
+* the acquire **blocks**. That is only safe because no CPU store path holds the
+  domain across a device call - the emitted fast path already called MMIO outside
+  it, and the C misaligned path was restructured to match - so a device that DMAs
+  synchronously cannot deadlock. Nested device transactions are refused by
+  `write_active` rather than by a non-recursive lock;
+* `tests/test_guest_write_domain.c` (host, in `make test`) drives the hooks with a
+  real second thread: the domain is taken and released around a write, a nested
+  `begin` is refused, and an observer holding the domain never sees a torn device
+  write. Bypassing the hooks makes it fail (verified), so the test is load
+  bearing rather than decorative.
+
+Measured caveat, stated rather than hidden: multi-byte guest writes are not
+atomic to a *guest* (RISC-V only guarantees aligned ≤ XLEN); what this buys is
+that a device write cannot interleave with a CPU store inside one critical
+section, and that its reservation invalidation is inside that same section.
 
 ### 3.3 TB recovery ABI must be one contract - DONE (schema + decisions)
 
