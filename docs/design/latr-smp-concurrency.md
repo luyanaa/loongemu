@@ -372,7 +372,7 @@ rather than redundant.
 | **P1a** | exit request at the safe point; park/wake/command primitives; MSIP write notifies the machine; `next_action` decision point | `test-latr-hart-sync` (pthread) + CLINT notify test; ISA/sys images unchanged |
 | **P1b** | hart threads, join, TLS-gated build, on the hosted harness | done: `latr_machine_run_hart` + one pthread per hart, 21 checks including the threaded fence completing with no ack timeout |
 | **P2** | machine lock around `LatrSystem`; ticker ownership; DMA/store lock order | done for the device layer: bus lock hook, bounded system lock with counted failures, ticker thread and timer wake, two-thread MMIO-vs-DMA hammer asserting no failed acquisition, no held writer lock, and an advanced reservation epoch. Guest-level 9.3 stays blocked on LoongArch execution. |
-| **P3** | guest-level 9.3 tests, AES/fence stress, `make latr-sys-smp-run` in CI | all 9.3 green, threaded run reproducible over 100 iterations - **reproducibility done**: `make -C latr test-host-machine-stress HOST_SMP_STRESS=100` runs the threaded harness 100 times and requires a zero exit and an identical summary line each time (39 checks, measured 2.1 s); CI runs it in `host-tests`. Guest-level 9.3 and the sys-mode SMP image stay open |
+| **P3** | guest-level 9.3 tests, AES/fence stress, `latr-sys-smp-run` in CI | all 9.3 green, threaded run reproducible over 100 iterations - **reproducibility done**: `make -C latr test-host-machine-stress HOST_SMP_STRESS=100` runs the threaded harness 100 times and requires a zero exit and an identical summary line each time (39 checks, measured 2.1 s); CI runs it in `host-tests`. Guest-level 9.3 and the sys-mode SMP image stay open |
 
 Each phase lands with its tests and without changing the single-threaded
 behaviour; a phase that cannot show its acceptance test does not land.
@@ -402,6 +402,37 @@ yield is one-shot, parked harts do not dispatch - is unit-tested; the wake
 counter is tested for loss-free delivery under real threads; and the CLINT
 notify hook is tested from both the direct and MMIO paths, including that a
 clear does not wake anyone.
+
+### sys-mode SMP without the machine: attempted, not landed
+
+`latr-sys-smp-run` was attempted as a hand-written embedder loop over two harts
+(`LatrSystem` board, two TB caches, two `LatrTranslatorContext`s, the after-block
+duties spelled out) and did not reach the first guest block. Recorded with what
+the attempt established, because all of it is needed by the next one:
+
+- **`latx_bare_uart_puts` is not provided by the bare library.** Declaring it and
+  leaving it undefined links (the freestanding link does not fail on undefined
+  symbols) and calling it jumps to 0, which presents as an Instruction
+  Non-Existent loop at pc 0 with no serial byte. The function must be defined in
+  the driver, as `latr_sys_diff.c` does.
+- **A non-boot hart needs its own start state**: `privilege = M`, `hartid`, `pc =
+  RAM base`, `a0 = hartid`. A zeroed env dispatches at pc 0.
+- **`latr_system_load_firmware()` is the fw_dynamic path**, not this one: it
+  copies to the pflash address and points `sys.env.pc` there. A guest linked at
+  `LATR_SYSTEM_RAM_BASE` must be `memcpy`'d into `sys.ram` and both harts pointed
+  at the RAM base.
+- **`tr_data`/`lsenv` are per `LatrTranslatorContext`**: the driver must
+  `latr_context_create()` once per hart and `latr_context_bind()` before *every*
+  dispatch (the header says the freestanding, one-hart-at-a-time build is correct
+  precisely because each dispatch rebinds). A single `latr_tr_data_init()` shared
+  by two envs mixes their IR2 state.
+
+With those four in place the image still printed only `begin` and then ran to the
+timeout, so the remaining fault is inside the loop, not in the setup. The next
+attempt must instrument before judging: print `env->pc` and `dispatched[]` after
+the first, second and third `step_hart()` calls. Every experiment here costs one
+60 s QEMU timeout, so guessing is not viable - three of the four traps above were
+found only because a single print was added each time.
 
 ## 11. Refusals
 
