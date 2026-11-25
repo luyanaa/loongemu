@@ -433,33 +433,32 @@ the *first* instruction of a block may cross (`target_disasm`) plus the fetch an
 misaligned), fenced, and re-called: 1 before, 3 after, with the bytes checked in
 memory.
 
-**Not closed, with the bisect result recorded:** in the SMP guest, hart 1's call
-of the same straddling instruction after hart 0's fence returns 0 (trap-handler,
-idle-loop-on-IPI, and RAM-flag-polling variants alike). A **minimal 2-hart
-probe** - no trap handler, no IPI, no AMO/LR-SC, one handshake word - runs the
-same shape correctly on both engines: hart 1 reads 1 before the rewrite and 3
-after it (`B 1,3`), with and without a pre-rewrite call. So cross-core
-page-straddling itself works. A follow-up four-way probe (no prefix / AMO only /
-LR-SC only / both, hart 1 calling from a trap handler woken by an IPI) gives
-`1,3,3` in **all four** variants, so the AMO/LR-SC prefix is not a trigger
-either.
+**Not closed, characterized precisely:** hart 1's call of a translated target
+from its trap handler returns 0 **the second time the handler runs** - `a0` and
+`ra` both read back as 0 in the continuation. Each row is its own run:
 
-**A retracted claim, kept because the retraction is the useful part:** an earlier
-run of that probe looked like proof that the AMO prefix caused the 0. It was the
-probe's own data page: the flag word sat at 0x80001000, and an 8-byte store there
-overwrote the *second half* of the page-straddling instruction at 0x80000FFE (its
-`ret`), so the call executed a zero word and raised an illegal instruction.
-Moving the data page to 0x80001100 made the failure vanish. Two lessons: a
-page-straddling instruction occupies the first bytes of the *next* page, so
-nothing may put data there; and a failing probe must be checked for this class of
-self-inflicted overlap before it is believed.
+| variant | result |
+|---|---|
+| one call per handler invocation, first invocation | correct |
+| one call per handler invocation, **second** invocation (second IPI) | 0 |
+| two calls in one invocation, either order, same or different targets | first correct, second 0 |
+| two calls from **normal** code (no trap) | both correct |
+| data page moved from 0x80001000 to 0x80001200 | unchanged |
+| `latr_regcache_flush()` added at the `jalr` exit in `emit_jump_register` | unchanged |
 
-The SMP guest's 0 is therefore still unexplained, but it is now known **not** to
-be the translator's straddling path, its cross-core invalidation, or the AMO/LR-SC
-prefix. Next lead: look for the same kind of instruction/data overlap inside that
-guest (its data page starts at 0x80001000, inside the straddling word's second
-page), and only then for a real defect. The check stays out of the gate rather
-than shipped red.
+So it is not the straddling instruction, the data page, the AMO/LR-SC prefix,
+borrow accounting, or the missing flush at the `jalr` exit (that flush is a
+plausible fix for a different hazard, but it changed nothing here, so it was not
+kept). What remains is specific to entering the same translated callee from a
+trap handler a second time; the next step is to run that callee twice from the
+handler while logging `env->gpr[1]`/`env->gpr[10]` at every block boundary, which
+the machine's `enter_tb` hook can do.
+
+Two false leads are recorded with it, because both cost real time: a data page at
+0x80001000 overwrote the second half of the page-straddling instruction at
+0x80000FFE (an 8-byte flag store), and two hand-written probes had register
+mix-ups. A page-straddling instruction occupies the first bytes of the next page;
+nothing may put data there.
 
 Litmus tests were considered and deliberately not added: with the cooperative
 image the interleaving is deterministic, so MP/LB would pass vacuously and say
