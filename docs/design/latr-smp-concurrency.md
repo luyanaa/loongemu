@@ -305,7 +305,36 @@ the exit; B is parked in WFI and must be woken. Each scenario asserts the same
 invariants the host test asserts, so the CI image covers the protocol even where
 pthreads do not exist.
 
-### 9.3 Guest-level (sys image, threaded build)
+### 9.3 Guest-level (bare-metal image, `make latr-smp-run`)
+
+Implemented as `baremetal/bare/latr_smp_test.c` + `latr_smp_guest.S`: a real
+`LatrMachine` with two harts loads a two-hart M-mode RISC-V program as firmware
+and runs it through generated LoongArch code. Checks (9): the guest powers off
+through the exit device, both harts dispatch, the AMO counter reaches 32, the
+LR/SC loop completes 16 increments with no lost update, hart 1 called the *old*
+target before the rewrite (result 1), one software interrupt was delivered, and
+both harts see the *new* target (result 2) after hart 0 rewrote it and executed
+FENCE.I. The FENCE.I check is the one that fails if the cross-core shootdown
+does not actually invalidate hart 1's cached block.
+
+Two traps found while bringing it up, both worth keeping:
+
+- **Stack size is part of the contract.** With a 256 KiB stack the driver died
+  inside `run_hart` with a LoongArch *address error* (`ld.d` from a callee-saved
+  pointer that had become 0) while translating a block; nothing in the output
+  said "stack". 1 MiB fixes it. The translator + machine frames are deeper than
+  they look, and the failure mode is register corruption, not a guard page.
+- **A guest spin loop inside one TB never yields.** `target_disasm` only stops
+  at terminators when `cflags` has no `ALLOW_FLOW` bit (the machine sets 0, the
+  unit harness sets the bit), so the machine's blocks do end at branches. That
+  is why the guest can spin on a flag written by the other hart at all; the ISA
+  harness's multi-flow mode would deadlock the same program.
+
+The threaded half of 9.3 (two harts *concurrently* executing) is what the host
+harness covers; a bare-metal image has no pthreads, so the two are complementary
+rather than redundant.
+
+### 9.3b Guest-level concurrency (threaded build, still blocked)
 
 - AMO counter: 2 harts, N increments each, exact N*2 at the end.
 - LR/SC ping-pong: both harts retry until success; no lost update, no livelock

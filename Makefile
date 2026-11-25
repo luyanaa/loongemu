@@ -761,6 +761,44 @@ latr-sys-ref: build/latr_system_guest.elf
 	     -serial file:build/latr_system_guest_qemu.log -no-reboot 2>/dev/null || true
 	@grep -a 'SYS:' build/latr_system_guest_qemu.log | tail -1
 
+# Two-hart guest-level SMP scenario: real machine, real generated code, real
+# CLINT/WFI/FENCE.I. Takes the place of the guest-level half the host harness
+# cannot run (it has no LoongArch execution).
+latr-smp-image: build/bare_latr_smp.elf
+
+build/latr_smp_guest.elf: baremetal/bare/latr_smp_guest.S
+	@mkdir -p build
+	$(CLANG) --target=riscv64-unknown-elf -march=rv64ia -mabi=lp64 \
+	         -mno-relax -ffreestanding -nostdlib -fuse-ld=lld \
+	         -Wl,--no-relax -Wl,-Ttext=0x80000000 $< -o $@
+
+build/latr_smp_guest.bin: build/latr_smp_guest.elf
+	$(OBJCOPY) -O binary $< $@
+
+build/latr_smp_blob.o: baremetal/bare/latr_smp_blob.S build/latr_smp_guest.bin
+	@mkdir -p build
+	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
+	         -fno-builtin -O2 -c $< -o $@
+
+build/bare_latr_smp.elf: baremetal/bare/latr_smp_test.c \
+                         build/latr_smp_blob.o latr-core \
+                         build/latr_miniglib.o build/latr_libc_min.o \
+                         baremetal/bare/bare.lds
+	@mkdir -p build
+	$(CLANG) $(LATR_BARE_CFLAGS) -c $< -o build/latr_smp_test.o
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	   build/latr_smp_test.o build/latr_smp_blob.o \
+	   build/latr_miniglib.o build/latr_libc_min.o \
+	   latr/build/liblatr_core.a -o $@
+
+latr-smp-run: latr-smp-image
+	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_latr_smp.elf" \
+	     QEMU_LOG="build/latr_smp.log" QEMU_DONE="latr-smp: done" \
+	     QEMU_TIMEOUT=60 CPU=la464 \
+	     bash scripts/run_qemu_lata.sh
+	@grep -a "latr-smp" build/latr_smp.log | head -10
+	@grep -qa "latr-smp: PASS" build/latr_smp.log
+
 latr-sys-image: build/bare_latr_sys_diff.elf
 
 build/bare_latr_sys_diff.elf: baremetal/bare/latr_sys_diff.c \

@@ -411,6 +411,14 @@ fault recovery cost.
    wake (not request an exit) because stimecmp resets to 0, so "always due"
    plus exit-request livelocked the cooperative loop; run_machine also returns
    "no progress" after a fully-yielded pass.
+   P3 guest-level: `make latr-smp-run` boots a real two-hart machine on the
+   LoongArch image and runs a two-hart M-mode guest through generated code -
+   AMO counter, LR/SC loop, CLINT IPI waking a WFI hart, and FENCE.I coherence
+   across harts (hart 1 must see the rewritten target). Two findings recorded in
+   the design: the driver needs a >=1 MiB stack (256 KiB corrupted a callee-saved
+   pointer mid-translation and surfaced as a LoongArch address error), and a
+   guest spin loop only yields because machine TBs stop at terminators - the ISA
+   harness's ALLOW_FLOW mode would deadlock it.
    (vrsub.vx/vi, vmulh/vmulhu/vmulhsu .vv/.vx landed through the arith_extra C
    path, each with hand-computed lane checks in the ISA image), then the widening
    `.wv/.wx` eight (vd and, for `.wv`, vs1 are 2*SEW; `.wx` takes a scalar, so its

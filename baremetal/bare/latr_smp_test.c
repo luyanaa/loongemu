@@ -1,0 +1,190 @@
+/*
+ * Bare-metal driver for the LATR SMP guest scenario.
+ *
+ * The machine under test is the real one (latr_machine): two harts, CLINT,
+ * PLIC, DTB, and generated LoongArch code executed through latr_enter_tb. The
+ * guest is baremetal/bare/latr_smp_guest.S, a two-hart RISC-V M-mode program
+ * built into a flat image and embedded as a blob. Running it on a LoongArch
+ * host (QEMU or silicon) is the only place guest-visible SMP semantics are
+ * executed for real; the host harness tests the scheduler around the same
+ * machine but cannot jump into generated code.
+ *
+ * What the guest proves, and the checks below mirror it:
+ *   - AMO write-back and LR/SC forward progress in generated code;
+ *   - a software interrupt delivered through the CLINT to a hart parked in
+ *     WFI, with mret returning to the interrupted loop;
+ *   - FENCE.I coherence across harts: hart 1 translated the old code first,
+ *     hart 0 rewrote it and fenced, and hart 1's post-IPI call must see the
+ *     new instruction bytes.
+ */
+#include <stdint.h>
+#include "latr.h"
+#include "latr-machine.h"
+
+extern void latr_enter_tb(void *env, void *code);
+extern uint8_t latr_smp_guest[];
+extern uint8_t latr_smp_guest_end[];
+
+__asm__(
+".text\n"
+".globl latr_enter_tb\n"
+"latr_enter_tb:\n"
+"  addi.d $sp, $sp, -16\n"
+"  st.d   $ra, $sp, 0\n"
+"  st.d   $s8, $sp, 8\n"
+"  move   $s8, $a0\n"
+"  jirl   $ra, $a1, 0\n"
+"  ld.d   $ra, $sp, 0\n"
+"  ld.d   $s8, $sp, 8\n"
+"  addi.d $sp, $sp, 16\n"
+"  jirl   $zero, $ra, 0\n");
+
+#define UART0_THR ((volatile uint8_t *)0x1fe001e0)
+static void uart_putc(int c)
+{
+    *UART0_THR = (uint8_t)c;
+}
+static void uart_puts(const char *s)
+{
+    while (*s) {
+        uart_putc(*s++);
+    }
+}
+static void uart_dec(uint64_t v)
+{
+    char b[21];
+    int i = 20;
+
+    b[i] = 0;
+    do {
+        b[--i] = (char)('0' + (v % 10u));
+        v /= 10u;
+    } while (v != 0 && i > 0);
+    uart_puts(&b[i]);
+}
+static void uart_hex(uint64_t v)
+{
+    static const char digits[] = "0123456789abcdef";
+
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        uart_putc(digits[(v >> shift) & 15u]);
+    }
+}
+
+void kmain(void);
+__asm__(".text\n.globl _start\n_start:\n  pcalau12i $sp, %pc_hi20(latr_smp_stack)\n  addi.d $sp, $sp, %pc_lo12(latr_smp_stack)\n"
+        "  lu12i.w $t0, 128\n  add.d $sp, $sp, $t0\n  bl kmain\n1: b 1b\n");
+/* 1 MiB: the machine + translator path runs several KiB deep per frame, and a
+ * 256 KiB stack silently corrupted a callee-saved pointer mid-translation
+ * (an address error inside run_hart, not a diagnostics message). */
+static uint8_t latr_smp_stack[1u << 20] __attribute__((aligned(16), used));
+
+static uint8_t ram[16u << 20] __attribute__((aligned(4096)));
+static uint8_t machine_work[(2u << 20) * 4u] __attribute__((aligned(4096)));
+static LatrMachine machine;
+
+#define DATA_PAGE 0x80001000u
+#define D_COUNTER (DATA_PAGE + 0x08u)
+#define D_LRSC (DATA_PAGE + 0x10u)
+#define D_EARLY (DATA_PAGE + 0x18u)
+#define D_IPI (DATA_PAGE + 0x20u)
+#define D_H0 (DATA_PAGE + 0x28u)
+#define D_H1 (DATA_PAGE + 0x30u)
+#define D_EXIT (DATA_PAGE + 0x38u)
+
+static uint64_t read64(uint64_t pa)
+{
+    uint64_t *p = (uint64_t *)(void *)(ram + (pa - LATR_SYSTEM_RAM_BASE));
+
+    return *p;
+}
+
+static int checks;
+static int failures;
+
+static void check_u64(const char *what, uint64_t got, uint64_t want)
+{
+    checks++;
+    if (got != want) {
+        failures++;
+        uart_puts("latr-smp: FAIL ");
+        uart_puts(what);
+        uart_puts(" got=");
+        uart_dec(got);
+        uart_puts(" want=");
+        uart_dec(want);
+        uart_puts("\n");
+    }
+}
+
+static void check_true(const char *what, int cond)
+{
+    checks++;
+    if (!cond) {
+        failures++;
+        uart_puts("latr-smp: FAIL ");
+        uart_puts(what);
+        uart_puts("\n");
+    }
+}
+
+void kmain(void)
+{
+    int rc;
+
+    uart_puts("latr-smp: begin\n");
+    if (!latr_machine_init(&machine, ram, sizeof(ram), 2, machine_work,
+                           sizeof(machine_work))) {
+        uart_puts("latr-smp: FAIL machine init\nlatr-smp: done\n");
+        return;
+    }
+    uart_puts("latr-smp: init ok\n");
+    latr_machine_set_enter_tb(&machine, latr_enter_tb);
+    if (!latr_machine_load_firmware(
+            &machine, latr_smp_guest,
+            (uint64_t)(latr_smp_guest_end - latr_smp_guest))) {
+        uart_puts("latr-smp: FAIL firmware load\nlatr-smp: done\n");
+        return;
+    }
+    uart_puts("latr-smp: firmware loaded\n");
+    if (!latr_machine_build_dtb(&machine) || !latr_machine_boot(&machine)) {
+        uart_puts("latr-smp: FAIL boot\nlatr-smp: done\n");
+        return;
+    }
+
+    uart_puts("latr-smp: booted\n");
+    rc = latr_machine_run(&machine, 5000);
+    uart_puts("latr-smp: run rc=");
+    uart_dec((uint64_t)rc);
+    uart_puts(" trapped=");
+    uart_dec((uint64_t)machine.trapped);
+    uart_puts(" pc0=");
+    uart_hex(machine.harts[0].env.pc);
+    uart_puts(" pc1=");
+    uart_hex(machine.harts[1].env.pc);
+    uart_puts(" tbs0=");
+    uart_dec(machine.harts[0].tbs);
+    uart_puts(" tbs1=");
+    uart_dec(machine.harts[1].tbs);
+    uart_puts(" wake=");
+    uart_dec(latr_machine_wake_events(&machine));
+    uart_puts("\n");
+
+    check_true("guest powered off through the exit device",
+               rc == 1 && machine.sys.exit_request == 0x5555);
+    check_true("both harts dispatched blocks",
+               machine.harts[0].tbs > 0 && machine.harts[1].tbs > 0);
+    check_u64("AMO counter is 32", read64(D_COUNTER), 32);
+    check_u64("LR/SC incremented 16 times", read64(D_LRSC), 16);
+    check_u64("hart 1 called the old target", read64(D_EARLY), 1);
+    check_u64("one software interrupt delivered", read64(D_IPI), 1);
+    check_u64("hart 0 sees the rewritten target", read64(D_H0), 2);
+    check_u64("hart 1 sees the rewritten target", read64(D_H1), 2);
+    check_u64("exit marker carries hart 1's result", read64(D_EXIT), 2);
+
+    uart_puts(failures == 0 ? "latr-smp: PASS checks=" : "latr-smp: FAIL checks=");
+    uart_dec((uint64_t)checks);
+    uart_puts(" fails=");
+    uart_dec((uint64_t)failures);
+    uart_puts("\nlatr-smp: done\n");
+}

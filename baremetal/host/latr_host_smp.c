@@ -498,6 +498,52 @@ static void scenario_lock_order(void)
     }
 }
 
+/*
+ * Reproduce the machine's own translation of a guest block: cflags = 0 (stop at
+ * terminators), the hart's context and code buffer, guest memory through the
+ * machine's map. Used to keep translator hangs out of the image-level runs.
+ */
+static const uint32_t guest_block_words[] = {
+    0x00828f13u, /* addi t5, t0, 8 */
+    0x01028f93u, /* addi t6, t0, 16 */
+    0x00800313u, /* li t1, 8 */
+    0x006f302fu, /* amoadd.d zero, t1, (t5) */
+    0x006f302fu,
+    0x006f302fu,
+    0x006f302fu,
+    0x00000393u, /* li t2, 0 */
+    0x01000e13u, /* li t3, 16 */
+    0x100fb32fu, /* lr.d t1, (t6) */
+    0x00130313u, /* addi t1, t1, 1 */
+    0x186fbeafu, /* sc.d t4, t1, (t6) */
+    0xfe0e9ae3u, /* bnez t4, -16 */
+};
+
+static void scenario_translate_guest_block(void)
+{
+    LatrMachineHart *h = &machine.harts[0];
+    TranslationBlock tb;
+    int limit = 64;
+    int words;
+
+    /* The exact AMO+LR/SC block the guest executes: translating it hung the
+     * machine before the fix, so this keeps the shape reproducible on the host. */
+    memcpy(ram + 0x10u, guest_block_words, sizeof(guest_block_words));
+    memset(&tb, 0, sizeof(tb));
+    latr_context_bind(h->ctx);
+    latr_set_cpu_env(&h->env);
+    tb.pc = LATR_SYSTEM_RAM_BASE + 0x10u;
+    tb.tc.ptr = h->code_buf;
+    tb.cflags = 0;
+    target_disasm(&tb, &limit, &h->cpu);
+    CHECK(tb.icount > 0, "translate: guest block decoded");
+    tr_init(&tb);
+    CHECK(tr_ir2_generate(&tb), "translate: IR2 generated");
+    words = tr_ir2_assemble(h->code_buf);
+    tr_fini();
+    CHECK(words > 0, "translate: assembled");
+}
+
 static void scenario_stop_cooperative(void)
 {
     int rc;
@@ -530,6 +576,7 @@ int main(void)
     scenario_threaded();
     scenario_timer_wake();
     scenario_lock_order();
+    scenario_translate_guest_block();
     scenario_stop_cooperative();
     scenario_fini();
 
