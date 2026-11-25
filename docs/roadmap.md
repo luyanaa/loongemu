@@ -433,32 +433,42 @@ the *first* instruction of a block may cross (`target_disasm`) plus the fetch an
 misaligned), fenced, and re-called: 1 before, 3 after, with the bytes checked in
 memory.
 
-**Not closed, characterized precisely:** hart 1's call of a translated target
-from its trap handler returns 0 **the second time the handler runs** - `a0` and
-`ra` both read back as 0 in the continuation. Each row is its own run:
+**Not closed, but pinned to one instruction sequence:** a trap handler that
+calls the *same* already-translated block a second time reads `a0` back as 0
+(`ra` is correct), and the same call to a block that has **never** executed
+returns its value correctly. Four runs, each with the `enter_tb` boundary log
+(hart 1's `pc`, `ra`, `a0` printed at every block entry):
 
-| variant | result |
+| variant (handler calls `target` twice) | second result |
 |---|---|
-| one call per handler invocation, first invocation | correct |
-| one call per handler invocation, **second** invocation (second IPI) | 0 |
-| two calls in one invocation, either order, same or different targets | first correct, second 0 |
-| two calls from **normal** code (no trap) | both correct |
-| data page moved from 0x80001000 to 0x80001200 | unchanged |
-| `latr_regcache_flush()` added at the `jalr` exit in `emit_jump_register` | unchanged |
+| second call to 0x80002000, the block the first call executed | **0** |
+| second call to a fresh block 0x80002100 (`li a0,5; ret`) | 5 |
+| second call to 0x80002000 after a `fence.i` in hart 1's handler | 2 |
+| first call to 0x80002000 in the same handler | 2 |
 
-So it is not the straddling instruction, the data page, the AMO/LR-SC prefix,
-borrow accounting, or the missing flush at the `jalr` exit (that flush is a
-plausible fix for a different hazard, but it changed nothing here, so it was not
-kept). What remains is specific to entering the same translated callee from a
-trap handler a second time; the next step is to run that callee twice from the
-handler while logging `env->gpr[1]`/`env->gpr[10]` at every block boundary, which
-the machine's `enter_tb` hook can do.
+The boundary log shows the callee is **entered with the right state**
+(`pc=0x80002000 ra=0x8000017c a0=2`) and the continuation is entered with
+`env->gpr[10]` already 0, while `env->pc` is right and `ra` reads back correctly
+- so the loss happens inside a block that is re-entered after the cross-core
+invalidation, not at a boundary and not in the caller. Hart 1's own `fence.i`
+repairing it locates the difference in what the two invalidations leave behind,
+and the two that are already ruled out by reading the code are worth recording so
+the next run does not repeat them: `latr_tb_shootdown_all()` does clear
+`entry->valid` and `count`, so the dispatcher's candidate rejects a shot-down
+entry, and a re-inserted entry is validated by `code`/`code_size` against the
+arena, so a surviving candidate is not it either. That leaves the emitted code of
+the re-translated block itself, which is where the next run should look - compare
+the host code bytes of 0x80002000's translation made after hart 0's `fence.i`
+with the one made after hart 1's own. The check stays out of the gate rather
+than shipped red.
 
-Two false leads are recorded with it, because both cost real time: a data page at
-0x80001000 overwrote the second half of the page-straddling instruction at
-0x80000FFE (an 8-byte flag store), and two hand-written probes had register
-mix-ups. A page-straddling instruction occupies the first bytes of the next page;
-nothing may put data there.
+**Three self-inflicted probe errors, recorded because each one cost more than
+the real work:** a data page at 0x80001000 overwrote the second half of the
+page-straddling instruction at 0x80000FFE; two hand-written probes had register
+mix-ups; and the "second call returns 0" word was itself unwritten RAM - hart 0
+powered the machine off before hart 1's store to that word ran, so the check read
+a fresh zero. The probe now publishes a done flag and hart 0 waits for it. A zero
+read from a word the probe did not verify as written is not evidence.
 
 Litmus tests were considered and deliberately not added: with the cooperative
 image the interleaving is deterministic, so MP/LB would pass vacuously and say
