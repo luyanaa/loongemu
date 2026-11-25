@@ -28,7 +28,9 @@ extern const uint8_t latm_linux_elf[];
 extern const uint8_t latm_linux_elf_end[];
 #include "translate.h"
 
+#ifndef LINUX_TB_BUDGET
 #define LINUX_TB_BUDGET 8000000u
+#endif
 /*
  * `rdtime.d` for throughput comparisons - **not** a wall clock here. Measured on
  * this QEMU: 1,000,000 translated blocks advanced the counter by 26,003,624
@@ -221,9 +223,25 @@ void kmain(void)
     env.active_tc.PC = linux_entry;
     lata_tr_data_init(&env);
     tcg_ctx->code_ptr = code_buf + 0x1000;
-    lata_gen_prologue_env(&env, tcg_ctx);
+    {
+        uint8_t *before = (uint8_t *)tcg_ctx->code_ptr;
+
+        lata_gen_prologue_env(&env, tcg_ctx);
+        latx_bare_uart_puts("latm-linux: prologue-bytes=");
+        { char b[17]; uint64_t d = (uint64_t)((uint8_t *)tcg_ctx->code_ptr - before);
+          for (int i=15;i>=0;i--) b[15-i]="0123456789abcdef"[(d>>(i*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+        latx_bare_uart_putc('\n');
+    }
     tcg_ctx->code_ptr = code_buf + 0x3000;
-    lata_gen_epilogue_env(&env, tcg_ctx);
+    {
+        uint8_t *before = (uint8_t *)tcg_ctx->code_ptr;
+
+        lata_gen_epilogue_env(&env, tcg_ctx);
+        latx_bare_uart_puts("latm-linux: epilogue-bytes=");
+        { char b[17]; uint64_t d = (uint64_t)((uint8_t *)tcg_ctx->code_ptr - before);
+          for (int i=15;i>=0;i--) b[15-i]="0123456789abcdef"[(d>>(i*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+        latx_bare_uart_putc('\n');
+    }
 
     uint64_t t_start = now_ticks();
     for (unsigned i = 0; i < LINUX_TB_BUDGET; i++) {
@@ -313,6 +331,17 @@ static int linux_run_one(CPUMIPSState *env)
         if (n <= 0) {
             return 0;
         }
+        if (tb_ran < 4) {
+            latx_bare_uart_puts("latm-linux: block pc=");
+            { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(env->active_tc.PC>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" guest-insns=");
+            { char b[17]; uint64_t g = tb_live.icount;
+              for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(g>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" host-words=");
+            { char b[17]; uint64_t w = (uint64_t)n;
+              for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(w>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_putc('\n');
+        }
         ent = tbc_insert_mips(&tb_cache, tb_live.pc, (uint32_t)asid, mode);
         if (ent) {
             ent->code = (uintptr_t)host;
@@ -326,12 +355,14 @@ have_host:
     last_mode = mode;
     last_host = host;
 run:
+#ifndef LINUX_NO_EXEC
     exit_active = 1;
     if (smoke_setjmp(exit_jmp) == 0) {
         ((void (*)(void *, void *))(uintptr_t)
          ((TRANSLATION_DATA *)env->latm_tr_data)->cs_bt_to_native)(env, host);
     }
     exit_active = 0;
+#endif
     tb_ran++;
     return 1;
 }
