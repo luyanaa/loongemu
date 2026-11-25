@@ -433,14 +433,21 @@ the *first* instruction of a block may cross (`target_disasm`) plus the fetch an
 misaligned), fenced, and re-called: 1 before, 3 after, with the bytes checked in
 memory.
 
-**Not closed, and recorded rather than papered over:** having *hart 1* call the
-same straddling instruction after hart 0's fence does not work in this harness -
-it returns 0 in both the trap-handler and the idle-loop variants, while hart 0's
-identical call returns 3. Narrowing that (per-hart translation of a
-page-straddling block, or the trap-path recovery state) is open work; the check
-was left out of the gate rather than shipped red, and litmus tests were not added
-for the same class of reason: with the cooperative image the interleaving is
-deterministic, so MP/LB would pass vacuously and prove nothing about ordering.
+**Not closed, with the bisect result recorded:** in the SMP guest, hart 1's call
+of the same straddling instruction after hart 0's fence returns 0 (trap-handler,
+idle-loop-on-IPI, and RAM-flag-polling variants alike). A **minimal 2-hart
+probe** - no trap handler, no IPI, no AMO/LR-SC, one handshake word - runs the
+same shape correctly on both engines: hart 1 reads 1 before the rewrite and 3
+after it (`B 1,3`), with and without a pre-rewrite call. So cross-core
+page-straddling itself works; the 0 is specific to the SMP guest's context and
+the next step is to bisect *that* (drop hart 0's own straddling calls, then its
+AMO/LR-SC work, then the second target rewrite) rather than the translator's
+straddling path. The check stays out of the gate rather than shipped red.
+
+Litmus tests were considered and deliberately not added: with the cooperative
+image the interleaving is deterministic, so MP/LB would pass vacuously and say
+nothing about ordering. They need a host that can run generated code
+concurrently.
 
 Unified benchmark (implemented): `make latr-bench` prints one table and writes
 `build/latr_bench.md` from the logs the targets already write, and CI runs it so
