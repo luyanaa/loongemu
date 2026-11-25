@@ -120,6 +120,12 @@ enum {
     /* 2.2 batch: reverse subtract and the three high-half multiplies. */
     LATR_RVV_X_RSUB, LATR_RVV_X_MULH, LATR_RVV_X_MULHU,
     LATR_RVV_X_MULHSU, LATR_RVV_X_SMUL,
+    /*
+     * Integer multiply-accumulate. vd takes one of two roles: for MACC/NMSAC it
+     * is the accumulator (vd +/- a*b), for MADD/NMSUB it is a multiplicand
+     * (a*vd +/- b), so the operands cannot be shared with the wide MAC path.
+     */
+    LATR_RVV_X_MACC, LATR_RVV_X_NMSAC, LATR_RVV_X_MADD, LATR_RVV_X_NMSUB,
 };
 void latr_rvv_arith_extra(CPUArchState *env);
 

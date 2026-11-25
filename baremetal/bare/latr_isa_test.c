@@ -5931,6 +5931,105 @@ static void test_rvv_pvir_lsx_lasx(void)
         }
     }
 
+    /*
+     * 2g. Integer multiply-accumulate: vd is the accumulator for macc/nmsac and
+     * a multiplicand for madd/nmsub; the product wraps at SEW.
+     */
+    {
+        static const uint32_t mac_vv_ops[] = {
+            0xb620a457, /* vmacc.vv  v8,  v1, v2 */
+            0xbe20a557, /* vnmsac.vv v10, v1, v2 */
+            0xa620a657, /* vmadd.vv  v12, v1, v2 */
+            0xae20a757, /* vnmsub.vv v14, v1, v2 */
+        };
+        static const uint32_t mac_vx_ops[] = {
+            0xb6256857, /* vmacc.vx  v16, a0, v2 */
+            0xbe256957, /* vnmsac.vx v18, a0, v2 */
+            0xa6256a57, /* vmadd.vx  v20, a0, v2 */
+            0xae256b57, /* vnmsub.vx v22, a0, v2 */
+        };
+
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10; /* e32, m1, tu, mu */
+        env.vl = 4;
+        for (int lane = 0; lane < 4; lane++) {
+            vec_store32(1, lane, 3u);
+            vec_store32(2, lane, 4u);
+            vec_store32(8, lane, 0x10u);
+            vec_store32(10, lane, 0x10u);
+            vec_store32(12, lane, 0x10u);
+            vec_store32(14, lane, 0x10u);
+        }
+        check(latr_execute_block(mac_vv_ops, 4), 1, "integer MAC .vv translates");
+        check(vec_read32(8, 0), 0x1cu, "vmacc.vv vd = 0x10 + 3*4");
+        check(vec_read32(10, 0), 0x4u, "vnmsac.vv vd = 0x10 - 3*4");
+        check(vec_read32(12, 0), 0x34u, "vmadd.vv vd = 3*vd + 4");
+        check(vec_read32(14, 0), 0xffffffd4u, "vnmsub.vv vd = 4 - 3*vd");
+
+        /* Product truncation at SEW: 2*0x80000000 is zero modulo 2^32. */
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10;
+        env.vl = 4;
+        for (int lane = 0; lane < 4; lane++) {
+            vec_store32(1, lane, 2u);
+            vec_store32(2, lane, 0x80000000u);
+            vec_store32(8, lane, 0xffffffffu);
+        }
+        {
+            static const uint32_t mac_wrap[] = { 0xb620a457 };
+
+            check(latr_execute_block(mac_wrap, 1), 1,
+                  "integer MAC wrap case translates");
+            check(vec_read32(8, 0), 0xffffffffu,
+                  "vmacc.vv drops the product's high half (mod 2^32)");
+        }
+
+        /* .vx: the same numbers through a register scalar a0 = 3. */
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10;
+        env.vl = 4;
+        env.gpr[10] = 3;
+        for (int lane = 0; lane < 4; lane++) {
+            vec_store32(2, lane, 4u);
+            vec_store32(16, lane, 0x10u);
+            vec_store32(18, lane, 0x10u);
+            vec_store32(20, lane, 0x10u);
+            vec_store32(22, lane, 0x10u);
+        }
+        check(latr_execute_block(mac_vx_ops, 4), 1, "integer MAC .vx translates");
+        check(vec_read32(16, 0), 0x1cu, "vmacc.vx vd = 0x10 + 3*4");
+        check(vec_read32(18, 0), 0x4u, "vnmsac.vx vd = 0x10 - 3*4");
+        check(vec_read32(20, 0), 0x34u, "vmadd.vx vd = 3*vd + 4");
+        check(vec_read32(22, 0), 0xffffffd4u, "vnmsub.vx vd = 4 - 3*vd");
+
+        /*
+         * e64: the same wrap rule one width up. vl must stay within vlmax here:
+         * with VLEN=128 an e64/m1 register holds 2 elements, so a fourth lane
+         * would alias the next architectural register and the setup itself
+         * would overwrite v2.
+         */
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x18; /* e64, m1, tu, mu */
+        env.vl = 2;
+        for (int lane = 0; lane < 2; lane++) {
+            vec_store64(1, lane, 2u);
+            vec_store64(2, lane, UINT64_C(0x8000000000000000));
+            vec_store64(8, lane, UINT64_C(0xffffffffffffffff));
+        }
+        {
+            static const uint32_t mac_wrap64[] = { 0xb620a457 };
+
+            check(latr_execute_block(mac_wrap64, 1), 1,
+                  "integer MAC wrap case (e64) translates");
+            check(vec_read64(8, 0), UINT64_C(0xffffffffffffffff),
+                  "vmacc.vv wrap holds at 2^64");
+        }
+    }
+
     /* 3. vmsgt / vmsgtu + unsigned shift immediate >= 16. */
     reset_guest_state();
     env.csr[0x300] = 0x600;

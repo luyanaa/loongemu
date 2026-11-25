@@ -571,3 +571,13 @@ LATR_RV_INSN(VFWMSAC_VV, vfwmsac_vv)
 LATR_RV_INSN(VFWMSAC_VF, vfwmsac_vf)
 LATR_RV_INSN(VFWNMSAC_VV, vfwnmsac_vv)
 LATR_RV_INSN(VFWNMSAC_VF, vfwnmsac_vf)
+
+/* 2.2 batch 6: integer multiply-accumulate, .vv/.vx. */
+LATR_RV_INSN(VMACC_VV, vmacc_vv)
+LATR_RV_INSN(VMACC_VX, vmacc_vx)
+LATR_RV_INSN(VNMSAC_VV, vnmsac_vv)
+LATR_RV_INSN(VNMSAC_VX, vnmsac_vx)
+LATR_RV_INSN(VMADD_VV, vmadd_vv)
+LATR_RV_INSN(VMADD_VX, vmadd_vx)
+LATR_RV_INSN(VNMSUB_VV, vnmsub_vv)
+LATR_RV_INSN(VNMSUB_VX, vnmsub_vx)

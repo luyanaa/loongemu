@@ -384,7 +384,7 @@ fault recovery cost.
    all four spans change width at an ASLR-scale delta (0 do at +64 KiB). P2 must
    either pad relocation sites to a fixed width or re-assemble from serialised
    IR2.
-8. 2.2 LATR: remaining RVV encodings, then real SMP. Progress: 66 -> 32
+8. 2.2 LATR: remaining RVV encodings, then real SMP. Progress: 66 -> 24
    (vrsub.vx/vi, vmulh/vmulhu/vmulhsu .vv/.vx landed through the arith_extra C
    path, each with hand-computed lane checks in the ISA image), then the widening
    `.wv/.wx` eight (vd and, for `.wv`, vs1 are 2*SEW; `.wx` takes a scalar, so its
@@ -401,7 +401,10 @@ fault recovery cost.
    rounding/flag cases plus two fused-cancellation cases so that mistake cannot
    recur. The 8 widening forms (vfw{m,n}macc/msac) also landed: the same helper
    grows a 2*SEW branch where the f32 product is exact in f64 and the single
-   rounding happens at the accumulator width.
+   rounding happens at the accumulator width. The integer multiply-accumulates
+   (vmacc/vnmsac/vmadd/vnmsub, .vv/.vx) also landed: vd is the accumulator for
+   one pair and a multiplicand for the other, and the product wraps at SEW
+   before the add.
    Next after that: carry/borrow and the MAC family need the multi-destination
    helper, and the six remaining FP ops need helpers plus the 7-bit approximations
    for vfrec7/vfrsqrt7.

@@ -170,6 +170,13 @@ static void rvv_shape(unsigned opcode, RvvShape *shape)
     V(VFMADD_VV) V(VFNMADD_VV) V(VFMSUB_VV) V(VFNMSSUB_VV)
         shape->form = FORM_SSS;
         break;
+    /* Integer multiply-accumulate, same-width all three operands. */
+    V(VMACC_VV) V(VNMSAC_VV) V(VMADD_VV) V(VNMSUB_VV)
+        shape->form = FORM_SSS;
+        break;
+    V(VMACC_VX) V(VNMSAC_VX) V(VMADD_VX) V(VNMSUB_VX)
+        shape->form = FORM_SS;
+        break;
     V(VFMACC_VF) V(VFNMACC_VF) V(VFMSAC_VF) V(VFNMSC_VF)
     V(VFMADD_VF) V(VFNMADD_VF) V(VFMSUB_VF) V(VFNMSSUB_VF)
         shape->form = FORM_SS;

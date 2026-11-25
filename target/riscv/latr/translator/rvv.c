@@ -1797,6 +1797,38 @@ void latr_rvv_arith_extra(CPUArchState *env)
             continue;
         }
 
+        /*
+         * Integer multiply-accumulate, SEW-width throughout. The product wraps
+         * modulo 2^SEW before it is added, so the high half is dropped rather
+         * than carried into anything. Operand roles differ between the two
+         * halves: MACC/NMSAC accumulate into vd, MADD/NMSUB multiply vd.
+         */
+        if (op == LATR_RVV_X_MACC || op == LATR_RVV_X_NMSAC ||
+            op == LATR_RVV_X_MADD || op == LATR_RVV_X_NMSUB) {
+            uint64_t mask = rvv_sew_mask(sew);
+            uint64_t a = kind == LATR_RVV_SRC_VECTOR
+                             ? latr_rvv_read_elem(env, vs1, i, sew)
+                             : rvv_extra_scalar(env, kind, imm, sew, 0);
+            uint64_t b = latr_rvv_read_elem(env, vs2, i, sew);
+            uint64_t acc = latr_rvv_read_elem(env, vd, i, sew);
+            uint64_t prod;
+
+            a &= mask;
+            b &= mask;
+            acc &= mask;
+            if (op == LATR_RVV_X_MACC) {
+                out = (acc + (a * b)) & mask;
+            } else if (op == LATR_RVV_X_NMSAC) {
+                out = (acc - (a * b)) & mask;
+            } else if (op == LATR_RVV_X_MADD) {
+                out = (((a * acc) & mask) + b) & mask;
+            } else {
+                out = (b - ((a * acc) & mask)) & mask;
+            }
+            latr_rvv_write_elem(env, vd, i, sew, out);
+            continue;
+        }
+
         if (is_narrow) {
             uint64_t wide = latr_rvv_read_elem(env, vs2, i, dw);
             uint64_t sh;
