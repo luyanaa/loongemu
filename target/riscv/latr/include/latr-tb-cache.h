@@ -71,6 +71,14 @@ typedef struct LatrTbCache {
     volatile int lock;
     /* Set by shootdown; the owner resets the arena at its next safe point. */
     uint32_t reclaim_pending;
+    /*
+     * Fence-completion bookkeeping (design: docs/design/latr-smp-concurrency.md
+     * section 5). `applied_seq` is the last shootdown sequence this hart has
+     * observed while outside generated code; `in_code` counts live executions.
+     * Both are written only by the owning hart and read by a fence issuer.
+     */
+    volatile uint64_t applied_seq;
+    volatile uint32_t in_code;
     LatrTbHotPage hot[LATR_TB_HOT_SLOTS];
 } LatrTbCache;
 
@@ -114,6 +122,31 @@ uint32_t latr_tb_hot_busiest(const LatrTbCache *cache, uint64_t *page);
  * registers one cache per vCPU and calls these after an SFENCE.VMA / FENCE.I
  * retires on any core.
  */
+/*
+ * Fence completion.
+ *
+ * A shootdown is not complete when the issuer has invalidated every cache: a
+ * hart may already be inside a block that was fetched before the request. The
+ * issuer publishes a sequence number with latr_tb_fence_begin(), and every hart
+ * calls latr_tb_fence_ack() at its next safe point (between TBs). Waiting for
+ * all online harts is bounded so a hart that never reaches a safe point fails
+ * the machine instead of retiring a fence that is not visible.
+ *
+ * The bound is a spin count rather than a wall-clock deadline so this module
+ * stays usable in the freestanding build (no clock source); the threaded
+ * scheduler picks it from LATR_SMP_ACK_SPINS (design section 8).
+ */
+uint64_t latr_tb_fence_begin(uint32_t asid, int fence_i);
+void latr_tb_fence_ack(LatrTbCache *cache);
+void latr_tb_code_enter(LatrTbCache *cache);
+void latr_tb_code_exit(LatrTbCache *cache);
+uint64_t latr_tb_fence_seq(void);
+/* 0 = every registered hart has acknowledged, -1 = spin budget exhausted. */
+int latr_tb_fence_wait(uint64_t seq, uint64_t spin_limit);
+uint64_t latr_tb_fence_timeouts(void);
+/* Hart that was furthest behind at the last timeout (diagnostics). */
+uint64_t latr_tb_fence_last_missing(void);
+
 int latr_tb_cache_register(LatrTbCache *cache);
 void latr_tb_cache_unregister(LatrTbCache *cache);
 void latr_tb_shootdown_asid_all_cores(uint32_t asid);

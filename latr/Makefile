@@ -61,7 +61,7 @@ CORE_OBJS := $(BUILD)/ir2.o $(BUILD)/ir2-peephole.o $(BUILD)/ir2-assemble.o $(BU
              $(BUILD)/runtime.o \
              $(BUILD)/vclock.o $(BUILD)/compiler-rt.o
 
-.PHONY: all test-decode test-legality test-elf test-tb-smp test-machine-trap check probe clean
+.PHONY: all test-decode test-legality test-elf test-tb-smp test-fence-ack test-machine-trap check probe clean
 all: $(BUILD)/liblatr_core.a
 
 test-decode: $(BUILD)/test-latr-decode
@@ -76,10 +76,13 @@ test-elf: $(BUILD)/test-latr-elf
 test-tb-smp: $(BUILD)/test-latr-tb-smp
 	./$(BUILD)/test-latr-tb-smp
 
+test-fence-ack: $(BUILD)/test-latr-fence-ack
+	./$(BUILD)/test-latr-fence-ack
+
 test-machine-trap: $(BUILD)/test-latr-machine-trap
 	./$(BUILD)/test-latr-machine-trap
 
-check: all test-legality test-elf test-tb-smp test-machine-trap
+check: all test-legality test-elf test-tb-smp test-fence-ack test-machine-trap
 	NM="$(NM)" sh ../tools/check_lata_symbols.sh $(BUILD)/liblatr_core.a $(CURDIR)/latr_externals.allowlist
 
 probe: $(CORE_OBJS)
@@ -321,6 +324,10 @@ $(BUILD)/test-latr-rvv-legality: ../tests/test_latr_rvv_legality.c \
                            $(DECODE32) $(DECODE16) $(TRANS_STUBS) | $(BUILD)
 	$(HOST_CC) $(HOST_CFLAGS) $(LATR)/translator/rvv-legality.c \
 		$(LATR)/ir1/decode-riscv.c ../tests/test_latr_rvv_legality.c -o $@
+
+$(BUILD)/test-latr-fence-ack: ../tests/test_latr_fence_ack.c \
+                           $(LATR)/tb-cache.c $(LATR)/include/latr-tb-cache.h | $(BUILD)
+	$(HOST_CC) $(HOST_CFLAGS) $(LATR)/tb-cache.c ../tests/test_latr_fence_ack.c -o $@
 
 $(BUILD)/test-latr-tb-smp: ../tests/test_latr_tb_smp.c \
                            $(LATR)/tb-cache.c $(LATR)/include/latr-tb-cache.h | $(BUILD)

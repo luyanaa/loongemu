@@ -747,6 +747,33 @@ static inline void latr_icache_sync(void)
 #endif
 }
 
+/*
+ * Retiring a guest fence requires every other hart to be outside code fetched
+ * before the request. That is a real wait once harts run on their own threads;
+ * in the single-threaded scheduler the other harts cannot make progress while
+ * this one spins, so the acknowledgement is deferred to their next dispatch
+ * (which happens before they execute anything, because the invalidation is
+ * already applied by latr_tb_fence_begin()).
+ */
+static void latr_tb_fence_complete(LatrMachine *m, LatrMachineHart *h,
+                                   uint64_t seq)
+{
+    (void)h;
+#if defined(LATR_SMP_THREADS)
+    if (latr_tb_fence_wait(seq, LATR_SMP_ACK_SPINS) != 0) {
+        if (!m->failed) {
+            m->first_trap_pc = h->env.pc;
+            m->first_trap_cause = 0;
+            m->trapped = true;
+        }
+        m->failed = true;
+    }
+#else
+    (void)m;
+    (void)seq;
+#endif
+}
+
 static int run_hart(LatrMachine *m, LatrMachineHart *h)
 {
     TranslationBlock tb;
@@ -769,17 +796,26 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
         /* SFENCE.VMA on one hart must shoot down translated code keyed by that
          * ASID on *every* registered hart's cache: each hart may hold blocks
          * translated under the same guest address space, and letting another
-         * hart keep dispatching them executes stale mappings. */
-        latr_tb_shootdown_asid_all_cores((uint32_t)h->env.sfence_asid);
+         * hart keep dispatching them executes stale mappings. The fence is
+         * complete only once every other hart is out of code fetched before
+         * the request (design: latr-smp-concurrency.md section 5). */
+        uint64_t seq = latr_tb_fence_begin((uint32_t)h->env.sfence_asid, 0);
+
+        latr_tb_fence_complete(m, h, seq);
         h->env.sfence_pending = 0;
     }
     if (h->env.fence_i_pending) {
         /* FENCE.I is the guest's SMC notification; every hart's cache may
          * contain translations of the overwritten page. */
-        latr_tb_fence_i_all_cores();
+        uint64_t seq = latr_tb_fence_begin(0, 1);
+
+        latr_tb_fence_complete(m, h, seq);
         h->env.fence_i_pending = 0;
     }
     latr_context_safepoint(h->ctx);
+    /* Between TBs: this hart is provably outside generated code, so a pending
+     * shootdown is applied for real. */
+    latr_tb_fence_ack(&h->tb_cache);
     if (latr_deliver_interrupt(&h->env)) {
         h->env.exception = 0;
     }
@@ -850,7 +886,9 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
         perf_start = mid;
     }
 #endif
+    latr_tb_code_enter(&h->tb_cache);
     m->enter_tb(&h->env, (void *)(uintptr_t)code);
+    latr_tb_code_exit(&h->tb_cache);
 #ifdef LOONGEMU_PERF
     loongemu_perf_count(LOONGEMU_PERF_TB_EXEC_TICKS,
                         loongemu_perf_now() - perf_start);

@@ -1,6 +1,6 @@
 # Design index and cross-review
 
-Five designs, written one per file:
+Six designs, written one per file:
 
 | # | design | file | dominant risk |
 |---|---|---|---|
@@ -9,6 +9,7 @@ Five designs, written one per file:
 | 3 | MMIO fast path, MSI/MSI-X, DMA isolation | [mmio-msi-dma.md](mmio-msi-dma.md) | interrupt-target self-modification |
 | 4 | Chain control and RAS | [chain-control-ras.md](chain-control-ras.md) | skipping a dispatch duty |
 | 5 | Persistent code cache | [persistent-code-cache.md](persistent-code-cache.md) | executing bytes that no longer match |
+| 6 | LATR SMP concurrency | [latr-smp-concurrency.md](latr-smp-concurrency.md) | retiring a fence another hart has not reached |
 
 Each file carries its own self-review (objections and resolutions). This page is
 the cross-review: the parts that only show up when the five are read together.

@@ -13,6 +13,14 @@
  * calling host thread.
  */
 #define LATR_MACHINE_MAX_HARTS 4u
+/*
+ * Fence completion bound (design: docs/design/latr-smp-concurrency.md section
+ * 5). A spin count, not a wall clock, so the freestanding images need no clock
+ * source; the threaded scheduler treats exhaustion as a fatal machine error.
+ */
+#ifndef LATR_SMP_ACK_SPINS
+#define LATR_SMP_ACK_SPINS UINT64_C(100000000)
+#endif
 #define LATR_MACHINE_FIRMWARE_BASE LATR_SYSTEM_RAM_BASE
 #define LATR_MACHINE_KERNEL_BASE (LATR_SYSTEM_RAM_BASE + UINT64_C(0x00200000))
 #define LATR_MACHINE_FIRMWARE_MAX UINT64_C(0x00200000)

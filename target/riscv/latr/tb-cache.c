@@ -41,6 +41,8 @@ void latr_tb_cache_init(LatrTbCache *cache, uint8_t *arena, uint32_t size)
     cache->victim = 0;
     cache->lock = 0;
     cache->reclaim_pending = 0;
+    cache->applied_seq = 0;
+    cache->in_code = 0;
     for (int i = 0; i < LATR_TB_HOT_SLOTS; i++) {
         cache->hot[i].valid = 0;
     }
@@ -373,4 +375,114 @@ void latr_tb_fence_i_all_cores(void)
             latr_tb_shootdown_all(cache);
         }
     }
+}
+
+/* --- fence completion ------------------------------------------------------
+ *
+ * See docs/design/latr-smp-concurrency.md section 5. Sequence numbers are
+ * global and monotonic; acknowledgement is per hart and only happens at a safe
+ * point (between TBs), which is what makes "the hart is outside code fetched
+ * before the request" true rather than probabilistic.
+ */
+static volatile uint64_t latr_tb_fence_seq_word;
+static volatile uint64_t latr_tb_fence_timeout_count;
+static volatile uint64_t latr_tb_fence_missing_hart;
+
+uint64_t latr_tb_fence_seq(void)
+{
+    return __atomic_load_n(&latr_tb_fence_seq_word, __ATOMIC_ACQUIRE);
+}
+
+uint64_t latr_tb_fence_begin(uint32_t asid, int fence_i)
+{
+    /* Publish the sequence before the invalidation: a hart that acknowledges
+     * between the two still ends up outside code that predates the request,
+     * and the invalidation itself is applied under each cache's lock. */
+    uint64_t seq = __atomic_add_fetch(&latr_tb_fence_seq_word, 1,
+                                      __ATOMIC_ACQ_REL);
+
+    if (fence_i) {
+        latr_tb_fence_i_all_cores();
+    } else {
+        latr_tb_shootdown_asid_all_cores(asid);
+    }
+    return seq;
+}
+
+void latr_tb_code_enter(LatrTbCache *cache)
+{
+    if (cache != 0) {
+        __atomic_add_fetch(&cache->in_code, 1, __ATOMIC_ACQ_REL);
+    }
+}
+
+void latr_tb_code_exit(LatrTbCache *cache)
+{
+    if (cache != 0) {
+        __atomic_sub_fetch(&cache->in_code, 1, __ATOMIC_ACQ_REL);
+    }
+}
+
+/*
+ * Called by the owning hart at a safe point. Reading the global sequence first
+ * and publishing it second means a request that arrives in between is also
+ * covered: the hart is outside code either way, and every issuer invalidates
+ * synchronously under this cache's lock.
+ */
+void latr_tb_fence_ack(LatrTbCache *cache)
+{
+    uint64_t seq;
+
+    if (cache == 0) {
+        return;
+    }
+    seq = __atomic_load_n(&latr_tb_fence_seq_word, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&cache->applied_seq, seq, __ATOMIC_RELEASE);
+}
+
+int latr_tb_fence_wait(uint64_t seq, uint64_t spin_limit)
+{
+    for (;;) {
+        uint64_t worst = 0;
+        int pending = 0;
+
+        for (int i = 0; i < LATR_TB_CACHE_MAX_CORES; i++) {
+            LatrTbCache *cache = __atomic_load_n(&latr_tb_cores[i],
+                                                 __ATOMIC_ACQUIRE);
+            uint64_t applied;
+
+            if (cache == 0) {
+                continue;
+            }
+            applied = __atomic_load_n(&cache->applied_seq, __ATOMIC_ACQUIRE);
+            if (applied < seq) {
+                pending = 1;
+                if (seq - applied > worst) {
+                    worst = seq - applied;
+                }
+            }
+        }
+        if (!pending) {
+            return 0;
+        }
+        if (spin_limit == 0) {
+            __atomic_add_fetch(&latr_tb_fence_timeout_count, 1,
+                               __ATOMIC_RELAXED);
+            __atomic_store_n(&latr_tb_fence_missing_hart, worst,
+                             __ATOMIC_RELAXED);
+            return -1;
+        }
+        spin_limit--;
+        __asm__ volatile("" ::: "memory");
+    }
+}
+
+uint64_t latr_tb_fence_timeouts(void)
+{
+    return __atomic_load_n(&latr_tb_fence_timeout_count, __ATOMIC_RELAXED);
+}
+
+uint64_t latr_tb_fence_last_missing(void)
+{
+    return __atomic_load_n(&latr_tb_fence_missing_hart, __ATOMIC_RELAXED);
 }
