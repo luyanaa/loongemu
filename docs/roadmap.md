@@ -433,54 +433,37 @@ the *first* instruction of a block may cross (`target_disasm`) plus the fetch an
 misaligned), fenced, and re-called: 1 before, 3 after, with the bytes checked in
 memory.
 
-**Not closed, but pinned to one instruction sequence:** a trap handler that
-calls the *same* already-translated block a second time reads `a0` back as 0
-(`ra` is correct), and the same call to a block that has **never** executed
-returns its value correctly. Four runs, each with the `enter_tb` boundary log
-(hart 1's `pc`, `ra`, `a0` printed at every block entry):
-
-| variant (handler calls `target` twice) | second result |
-|---|---|
-| second call to 0x80002000, the block the first call executed | **0** |
-| second call to a fresh block 0x80002100 (`li a0,5; ret`) | 5 |
-| second call to 0x80002000 after a `fence.i` in hart 1's handler | 2 |
-| first call to 0x80002000 in the same handler | 2 |
-
-The boundary log shows the callee is **entered with the right state**
-(`pc=0x80002000 ra=0x8000017c a0=2`) and the continuation is entered with
-`env->gpr[10]` already 0, while `env->pc` is right and `ra` reads back correctly
-- so the loss happens inside a block that is re-entered after the cross-core
-invalidation, not at a boundary and not in the caller.
-
-**Host-code comparison done, and it rules the bytes out.** The harness dumps the
-`LatrTbEntry.code` bytes of 0x80002000 at every entry (via the `enter_tb` hook,
-which runs after translation), for two builds - one where hart 0's cross-core
-`fence.i` is the only invalidation, one where hart 1 also executes `fence.i`
-itself. Measured, 320 bytes each:
+**Not closed. What is solid:** a trap handler's second call of a
+*never-executed* block returns its own value (5 in the run that measured it), and
+the same second call after a `fence.i` in the handler returns the rewritten value
+(2). Both numbers can only come from a call that actually ran, so those two runs
+are real. Dumping `LatrTbEntry.code` from the `enter_tb` hook (after translation)
+showed, 320 bytes each:
 
 | observation | result |
 |---|---|
 | distinct translations of 0x80002000 in one run | **two** |
-| bytes differing between them | **one word**, offset 0x40: `0c04c002` vs `0c08c002` (bit 10 of the immediate/register field) |
+| bytes differing between them | **one word**, offset 0x40: `0c04c002` vs `0c08c002` |
 | translation set with vs without hart 1's own `fence.i` | **identical** |
 
-So the emitted code is a function of the caching state, not of *which* hart
-invalidated: the two bodies differ by a single word and are exactly the same pair
-in both runs. Nothing else in the 320 bytes moves, so the failing/passing
-difference is not the code the block runs at all - it is which of the two bodies
-a given entry executes, or the state that body is handed. The next run should log
-`entry->code` (the address) next to `env->gpr[10]` at each entry, so the body and
-the value can be correlated directly.
+So the emitted body is a function of the caching state, not of which hart
+invalidated. **What is withdrawn:** every "the second call returns 0" row. Those
+zeros sit in words the probe never proved were written, and the last attempt to
+re-measure them mangled the probe's own guest - an edit loop left the two-call
+block out and a stray `nop` before `mret`, so the word was simply never stored and
+the check read a fresh zero (`[probe] second=0`). That is the fourth probe error
+in this hunt and the same class as the third.
 
-The check stays out of the gate rather than shipped red.
+The rule that follows is procedural, not architectural: **disassemble the probe
+guest before trusting a probe run.** A done flag only proves hart 0 waited; it
+does not prove the instruction that writes the word exists. `llvm-objdump -d
+build/latr_smp_guest.elf` is one command and would have caught all four errors.
 
-**Three self-inflicted probe errors, recorded because each one cost more than
-the real work:** a data page at 0x80001000 overwrote the second half of the
-page-straddling instruction at 0x80000FFE; two hand-written probes had register
-mix-ups; and the "second call returns 0" word was itself unwritten RAM - hart 0
-powered the machine off before hart 1's store to that word ran, so the check read
-a fresh zero. The probe now publishes a done flag and hart 0 waits for it. A zero
-read from a word the probe did not verify as written is not evidence.
+Next run, in this order: (1) patch the guest, (2) disassemble 0x8000016c and
+confirm the second `jalr` is there, (3) dump `entry->code` beside
+`env->gpr[10]` at every entry of the callee, (4) only then read the result word.
+The joint dump is written and ready; it printed the pair per entry in the run
+that had no second call, so it needs no further work - only a verified guest.
 
 Litmus tests were considered and deliberately not added: with the cooperative
 image the interleaving is deterministic, so MP/LB would pass vacuously and say
