@@ -187,14 +187,26 @@ as host words holding big-endian encodings, e.g. `lui $t0,0x8000` is `0x3c0c8000
    `exception_base + 0x180` that counts the interrupt and clears the mailbox
    through IOCSR 0x100c. Measured: `mailbox=1 vector-pc=0xffffffff80000180
    status=0`, `latm-ipi: PASS`, `EPC` back at the interrupted instruction.
-   Mutation-tested: removing the handler's clear makes it FAIL. Two encoding
-   facts worth keeping: `iocsrwr` needs major opcode 0x32 (my first attempt
-   omitted it and the instruction decoded as something harmless, so the hook was
-   never called), and the handler's count reads 6 for one interrupt - the six
-   steps re-enter it even though EPC is right and the loop never runs, so the
-   count is not yet a per-interrupt measure and the assertion is "ran and
-   cleared" instead of "ran exactly once". That re-entry is the next thing to
-   pin;
+   Mutation-tested: removing the handler's clear makes it FAIL (status stays 1
+   and the assertion sees it).
+
+   **The "handler ran six times for one interrupt" anomaly is solved, and it was
+   two bugs of my own making plus one model gap.** (a) The handler used `$t0`,
+   which the interrupted loop was using as its counter base, so after `eret` the
+   loop incremented the *handler's* word - one interrupt, one handler run, but a
+   counter that kept climbing. A real handler saves what it uses; this one now
+   uses `$s0`/`$s1`. (b) `$k0`/`$k1` cannot be used at all: the LATM register
+   allocator keeps them and asserts `guest register writeback requires an itemp`
+   on a guest write, which is a concrete constraint for any handler written for
+   this port. (c) The IPI is level-triggered and the model never deasserted
+   `Cause.IP4` after the mailbox cleared, so the board now clears the bit when
+   `uncore.mailbox[cpu].status` is clear - without that the hart re-enters the
+   handler on every dispatch. With all three fixed the measurement is
+   `handled=1 loop=21` (the loop resumed past its pre-IPI 16), and the assertion
+   is exact rather than "at least one";
+   `iocsrwr` also needs major opcode 0x32 - the first encoding omitted it, the
+   instruction decoded as something harmless and the platform hook was never
+   called;
 4. an LL/SC pair on CPU 1 is invalidated by a plain store from CPU 0 (reservation
    coherence), which needs a shared reservation table the uncore does not have
    yet; this changes the memory path, so it is its own step.

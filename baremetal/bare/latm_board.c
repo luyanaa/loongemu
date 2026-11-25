@@ -546,14 +546,19 @@ static const uint32_t smp_guest[] = {
 /* IPI handler, entered at exception_base + 0x180: count the interrupt and
  * clear the mailbox bit through IOCSR (0x100c, write-1-to-clear). */
 static const uint32_t ipi_handler[] = {
-    0x3c0c8000, /* lui    $t0, 0x8000 */
-    0x658c1010, /* daddiu $t0, $t0, 0x1010 */
-    0xdd890000, /* ld     $t1, 0($t0) */
-    0x65290001, /* daddiu $t1, $t1, 1 */
-    0xfd890000, /* sd     $t1, 0($t0) */
-    0x3405100c, /* ori    $a1, $zero, 0x100c */
-    0x34060001, /* ori    $a2, $zero, 1 */
-    0xc8a13118, /* iocsrwr $a2, $a1: major opcode 0x32, rd = value, rs = addr */
+    /* $s0/$s1, not $k0/$k1: the LATM register allocator keeps k0/k1 for itself
+     * and asserts on a guest write to them ("guest register writeback requires an
+     * itemp"). An earlier version used $t0, which the interrupted loop was using
+     * as its counter base, so after eret the loop incremented the handler's word
+     * and the count read 6 for one interrupt. */
+    0x3c108000, /* lui    $s0, 0x8000 */
+    0x66101010, /* daddiu $s0, $s0, 0x1010 */
+    0xde110000, /* ld     $s1, 0($s0) */
+    0x66310001, /* daddiu $s1, $s1, 1 */
+    0xfe110000, /* sd     $s1, 0($s0) */
+    0x3410100c, /* ori    $s0, $zero, 0x100c */
+    0x34110001, /* ori    $s1, $zero, 1 */
+    0xca018918, /* iocsrwr $s1, $s0: major opcode 0x32, rd = value, rs = addr */
     0x42000018, /* eret */
 };
 
@@ -875,9 +880,20 @@ void kmain(void)
         latm_check_interrupts(&env1);
         uint64_t handler_pc = env1.active_tc.PC;
         for (int i = 0; i < 6; i++) {
-            run_one_tb_of(&env1, &board_tb_cache1, code_buf1, &board_tb_next1,
-                          (uint32_t)sizeof(code_buf1));
+            (void)run_one_tb_of(&env1, &board_tb_cache1, code_buf1,
+                                &board_tb_next1, (uint32_t)sizeof(code_buf1));
+            /*
+             * The IPI is level-triggered: once the handler has cleared the
+             * mailbox bit, the CPU must stop seeing the interrupt. Without this
+             * deassert the hart re-enters the handler on every dispatch while
+             * Cause.IP4 stays set.
+             */
+            if ((uncore.mailbox[1].status & 1u) == 0) {
+                env1.CP0_Cause &= ~ipi_ip;
+            }
         }
+        uint64_t loop_after = 0;
+        memcpy(&loop_after, ram + 0x1008, 8);
         uint64_t handled = 0;
         memcpy(&handled, ram + 0x1010, 8);
         latx_bare_uart_puts("latm-ipi: mailbox=");
@@ -888,22 +904,20 @@ void kmain(void)
         puthex(handled);
         latx_bare_uart_puts(" status=");
         puthex(uncore.mailbox[1].status);
+        latx_bare_uart_puts(" loop=");
+        puthex(loop_after);
         latx_bare_uart_puts("\n");
         /*
-         * Asserted: the guest's IOCSR write reached the model, the interrupt
-         * vector was 0x180 for CPU 1, CPU 1's handler executed (it counts and
-         * clears the mailbox through IOCSR), the mailbox bit is gone, and the
-         * hart returned to the instruction it was interrupted at.
-         *
-         * The raw count is printed because it is 6 in the current bring-up:
-         * six steps re-enter the handler even though EPC is 0x4014 and the loop
-         * never runs, so the count is not yet a per-interrupt measure. What the
-         * check pins is "the handler ran and cleared it", which is what the
-         * slice needs; the exact re-entry cause is recorded in the roadmap.
+         * Asserted, now exactly: the guest's IOCSR write reached the model, the
+         * interrupt vector was 0x180 for CPU 1, the handler ran **once** and
+         * cleared the mailbox through IOCSR, the mailbox bit is gone, the hart
+         * is back at the instruction it was interrupted at, and it has resumed
+         * its own loop (its counter moved past the 16 it had before the IPI).
          */
         int ipi_ok = (mailbox & 1u) != 0 &&
                      handler_pc == 0xffffffff80000180ull &&
-                     handled >= 1 &&
+                     handled == 1 &&
+                     loop_after > 16 &&
                      env1.CP0_EPC == 0xffffffff80004014ull &&
                      (uncore.mailbox[1].status & 1u) == 0;
         latx_bare_uart_puts(ipi_ok ? "latm-ipi: PASS\n" : "latm-ipi: FAIL\n");
