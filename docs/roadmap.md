@@ -391,9 +391,12 @@ fault recovery cost.
    P0 (fence completion: shootdown sequence, per-hart ack at the safe point,
    bounded wait that fails closed) and P1a (park/wake/exit primitives, MSIP write
    notifies the machine, one tested `next_action` decision point) are in.
-   P1b (hart threads + join) is blocked on a hosted machine harness: the only
-   in-image user of latr_machine_run is the two-hart boot-smoke phase, which
-   already fails at HEAD before dispatching, so it cannot gate the scheduler.
+   P1b's prerequisite is in: baremetal/host/latr_host_smp.c builds the machine
+   for the host (build-host/, pthreads) and drives two harts with scripted
+   blocks, because generated code is LoongArch. It asserts the IPI wake -> exit
+   at a block boundary, WFI clock fast-forward, cross-cache invalidation from
+   SFENCE.VMA, and STOP taking one hart offline. Next: run the harts on their
+   own threads against this harness.
    (vrsub.vx/vi, vmulh/vmulhu/vmulhsu .vv/.vx landed through the arith_extra C
    path, each with hand-computed lane checks in the ISA image), then the widening
    `.wv/.wx` eight (vd and, for `.wv`, vs1 are 2*SEW; `.wx` takes a scalar, so its

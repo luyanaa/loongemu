@@ -4,6 +4,7 @@ qemu-system-loongarch64
 /baremetal/build/
 /lata/build/
 /latr/build/
+/latr/build-host/
 
 # Editor / tooling scratch
 .commandcode/

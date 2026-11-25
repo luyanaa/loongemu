@@ -226,10 +226,30 @@ Two rules that are easy to get wrong and are therefore stated as requirements:
   interleaving.
 - `LATR_SMP_ACK_SPINS` and `LATR_MACHINE_MAX_HARTS` are compile-time knobs with
   defaults (1e8 spins, 4 harts).
+- The hosted build (`build-host/`) deliberately does not gate on warnings: it
+  compiles the translator with a host compiler (gcc on the CI runner) whose
+  diagnostics have never been validated with `-Werror`, and the freestanding
+  build remains the warning gate. The harness file itself is compiled with
+  `-Werror`.
 
 ## 9. Test plan
 
 ### 9.1 Host tests (`make test`, pthread, no guest)
+
+- **Hosted dispatcher harness** (`baremetal/host/latr_host_smp.c`,
+  `make -C latr test-host-machine`, in `latr check`). The machine is compiled
+  for the host (`build-host/`, a separate directory so objects built with
+  different flags never mix) and driven with two harts. Generated code is
+  LoongArch, so the harness replaces `enter_tb` with a scripted block model and
+  drives the same entry points generated code would use: a CLINT MSIP write for
+  the IPI, `env->wfi_pending` for WFI, `env->sfence_pending` for SFENCE.VMA,
+  and the SiFive test device for exit. It asserts: both harts dispatch and
+  produce host code, exactly one MSIP reaches the machine, the woken hart
+  honours its exit request at a block boundary, WFI fast-forwards the clock,
+  SFENCE.VMA advances the sequence and invalidates **both** caches (generation
+  bump on each, not just the issuer's), and STOP takes one hart offline while
+  the other keeps running. Guest semantics stay in the bare-metal images; this
+  harness covers the C layer around the generated code.
 
 - **Fence ack protocol**: N threads, each at a safepoint loop; issuer requests a
   shootdown; every thread must apply it before the issuer returns. A thread
@@ -269,7 +289,7 @@ pthreads do not exist.
 |---|---|---|
 | **P0** | `LatrShootdownAck` sequence + safepoint ack + bounded wait, single-threaded build drives it through the deterministic harness | host test 9.1 (first two items), existing ISA/sys images unchanged |
 | **P1a** | exit request at the safe point; park/wake/command primitives; MSIP write notifies the machine; `next_action` decision point | `test-latr-hart-sync` (pthread) + CLINT notify test; ISA/sys images unchanged |
-| **P1b** | hart threads, join, TLS-gated build (needs a hosted machine harness, see below) | the P1a tests plus a threaded two-hart machine run |
+| **P1b** | hart threads, join, TLS-gated build, on the hosted harness | the P1a tests plus a threaded two-hart machine run |
 | **P2** | machine lock around `LatrSystem`; ticker ownership; DMA/store lock order | lock-order host test; threaded sys run with 2 harts |
 | **P3** | guest-level 9.3 tests, AES/fence stress, `make latr-sys-smp-run` in CI | all 9.3 green, threaded run reproducible over 100 iterations |
 
@@ -277,7 +297,11 @@ Each phase lands with its tests and without changing the single-threaded
 behaviour; a phase that cannot show its acceptance test does not land.
 
 **Why P1 is split.** The hart-thread half needs a machine that can be linked
-against pthreads, and today's machine only exists inside freestanding images
+against pthreads and can be driven by a test. The hosted harness above now
+supplies both (it compiles the machine for the host and links pthreads), so P1b
+is unblocked; the remaining work is the scheduler itself and its join. The
+earlier blocker, kept here because it explains why this was not done sooner:
+today's machine only exists inside freestanding images
 (`latr/Makefile` builds `liblatr_core.a` with `-ffreestanding --target=loongarch64`).
 The two-hart phase in `baremetal/bare/latr_boot_smoke.c` is the only in-image
 user of `latr_machine_run`, and it already fails at HEAD before reaching the
@@ -286,6 +310,10 @@ acceptance test for wiring either. P1b therefore starts by building a hosted
 machine harness (compile `latr_machine.c` + system + translator for the host,
 boot a tiny guest, one thread per hart); until that exists the scheduler would
 be code no test can run, which is exactly what this design refuses to ship.
+
+**P1b prerequisite, done.** The hosted machine harness exists and passes on
+`make -C latr test-host-machine`; it is the acceptance floor the thread
+scheduler will be added against.
 
 **What P1a does verify.** The decision that makes a hart leave a block lives in
 one function (`latr_hart_next_action`), so its policy - stop beats yield, a

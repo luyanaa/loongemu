@@ -47,6 +47,59 @@ HOST_CFLAGS ?= -std=gnu11 -O2 -Wall -Wextra -Werror -Wno-unused-parameter \
 QEMU_INSNS := $(if $(wildcard $(QEMU_SRC)/target/riscv/insn32.decode),$(QEMU_SRC)/target/riscv,$(LATR)/ir1/qemu)
 QEMU_DECODETREE := $(if $(wildcard $(QEMU_SRC)/scripts/decodetree.py),$(QEMU_SRC)/scripts/decodetree.py,$(LATR)/scripts/decodetree.py)
 
+# Hosted build of the same core, for things the freestanding images cannot do:
+# pthreads, and a dispatcher harness. Generated code is LoongArch, so the host
+# harness scripts block execution instead of jumping into it (see
+# baremetal/host/latr_host_smp.c). Kept as a separate build directory on
+# purpose: reusing $(BUILD) would mix objects built with different flags.
+HOST_BUILD := build-host
+HOST_CORE_SRCS := \
+            ../shared/backend/loongarch/ir2.c \
+            ../shared/backend/loongarch/ir2-peephole.c \
+            ../shared/backend/loongarch/ir2-assemble.c \
+            ../shared/backend/loongarch/la-append.c \
+            ../shared/perf/src/perf.c \
+            mem-latr.c \
+            ../target/arm/lata/translator/macro-helper.c \
+            ../target/riscv/latr/latr.c \
+            ../target/riscv/latr/translator/reg-alloc.c \
+            ../target/riscv/latr/translator/translate-riscv.c \
+            ../target/riscv/latr/translator/translate-riscv-csr.c \
+            ../target/riscv/latr/translator/translate-riscv-fp.c \
+            ../target/riscv/latr/translator/translate-riscv-fp-helper.c \
+            ../target/riscv/latr/ir1/decode-riscv.c \
+            ../shared/pvir/src/pvir.c \
+            ../shared/pvir/src/pvir-plan.c \
+            ../target/riscv/latr/translator/pvir-exec.c \
+            ../target/riscv/latr/translator/pvir-lower-lsx.c \
+            ../latx/runtime/cpu_features.c \
+            ../target/riscv/latr/translator/mmu.c \
+            ../target/riscv/latr/translator/interrupt.c \
+            ../target/riscv/latr/translator/mmio.c \
+            ../target/riscv/latr/translator/rvv.c \
+            ../target/riscv/latr/translator/rvv-legality.c \
+            ../target/riscv/latr/translator/translate-riscv-rvv.c \
+            ../target/riscv/latr/tb-cache.c \
+            ../target/riscv/latr/translator/tb-insn-map.c \
+            ../target/riscv/latr/hart-sync.c \
+            ../src/phys_mem.c \
+            ../src/mmio_bus.c \
+            ../src/guest_dma.c \
+            ../src/riscv_virtio_blk.c \
+            ../target/riscv/latr/system/latr_system.c \
+            ../target/riscv/latr/system/latr_elf.c \
+            ../target/riscv/latr/system/latr_fdt.c \
+            ../target/riscv/latr/system/latr_machine.c \
+            ../src/uart16550.c \
+            ../src/riscv_clint.c \
+            ../src/riscv_plic.c \
+            ../src/riscv_acpi.c \
+            ../src/riscv_fw.c \
+            ../src/ovmf_board.c \
+            ../src/riscv_sbi.c \
+            runtime.c \
+            ../src/vclock.c
+
 DECODE32 := $(BUILD)/decode-insn32.c.inc
 DECODE16 := $(BUILD)/decode-insn16.c.inc
 TRANS_STUBS := $(BUILD)/decode-trans-stubs.inc
@@ -61,7 +114,7 @@ CORE_OBJS := $(BUILD)/ir2.o $(BUILD)/ir2-peephole.o $(BUILD)/ir2-assemble.o $(BU
              $(BUILD)/runtime.o \
              $(BUILD)/vclock.o $(BUILD)/compiler-rt.o
 
-.PHONY: all test-decode test-legality test-elf test-tb-smp test-fence-ack test-hart-sync test-machine-trap check probe clean
+.PHONY: all test-decode test-legality test-elf test-tb-smp test-fence-ack test-hart-sync test-host-machine test-machine-trap check probe clean
 all: $(BUILD)/liblatr_core.a
 
 test-decode: $(BUILD)/test-latr-decode
@@ -76,6 +129,38 @@ test-elf: $(BUILD)/test-latr-elf
 test-tb-smp: $(BUILD)/test-latr-tb-smp
 	./$(BUILD)/test-latr-tb-smp
 
+$(HOST_BUILD):
+	@mkdir -p $@
+
+# The staged core is not a warning gate: it is 45 translator files compiled for
+# a host whose compiler (gcc on the CI runner) has never been validated with
+# -Werror, and a spurious -Wmaybe-uninitialized there would fail a job for no
+# defect. The freestanding build stays the warning gate; the harness file itself
+# is compiled with -Werror below so our own code is held to the same bar.
+HOST_CORE_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra \
+                    -Wno-unused-parameter -Wno-unused-function \
+                    -Wno-unused-variable -Wno-sign-compare \
+                    -Wno-unused-but-set-variable -pthread $(INCS) $(DEFS_HOST)
+HOST_STRICT_CFLAGS := $(HOST_CORE_CFLAGS) -Werror
+
+# Same flags as the freestanding object: the compat include paths supply
+# qemu/osdep.h, and __FAST_MATH__ must not leak into any other file.
+$(HOST_BUILD)/softfloat-host.o: $(LATX)/upstream/fpu/softfloat.c | $(HOST_BUILD)
+	$(HOST_CC) $(HOST_CORE_CFLAGS) -DTARGET_RISCV -D__FAST_MATH__ \
+		-Wno-error=#warnings -fno-strict-aliasing -c $< -o $@
+
+$(HOST_BUILD)/latr_host_smp.o: ../baremetal/host/latr_host_smp.c | $(HOST_BUILD)
+	$(HOST_CC) $(HOST_STRICT_CFLAGS) -c $< -o $@
+
+$(HOST_BUILD)/latr-host-smp: $(HOST_BUILD)/latr_host_smp.o $(HOST_CORE_SRCS) \
+                             $(HOST_BUILD)/softfloat-host.o \
+                             $(DECODE32) $(DECODE16) $(TRANS_STUBS) | $(HOST_BUILD)
+	$(HOST_CC) $(HOST_CORE_CFLAGS) $(HOST_BUILD)/latr_host_smp.o \
+		$(HOST_CORE_SRCS) $(HOST_BUILD)/softfloat-host.o -o $@
+
+test-host-machine: $(HOST_BUILD)/latr-host-smp
+	./$(HOST_BUILD)/latr-host-smp
+
 test-fence-ack: $(BUILD)/test-latr-fence-ack
 	./$(BUILD)/test-latr-fence-ack
 
@@ -85,7 +170,7 @@ test-hart-sync: $(BUILD)/test-latr-hart-sync
 test-machine-trap: $(BUILD)/test-latr-machine-trap
 	./$(BUILD)/test-latr-machine-trap
 
-check: all test-legality test-elf test-tb-smp test-fence-ack test-hart-sync test-machine-trap
+check: all test-legality test-elf test-tb-smp test-fence-ack test-hart-sync test-host-machine test-machine-trap
 	NM="$(NM)" sh ../tools/check_lata_symbols.sh $(BUILD)/liblatr_core.a $(CURDIR)/latr_externals.allowlist
 
 probe: $(CORE_OBJS)
