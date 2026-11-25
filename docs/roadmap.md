@@ -141,6 +141,42 @@ Priority: finish single-hart Linux boot, then make SMP real.
 
 ## 2.3 LATM: the missing piece is a genuine 3A4000-compatible machine
 
+**Inventory before starting (measured, so the next attempt does not redo it).**
+`make test-latm` is green: decode, tlb, vclock, interrupts, insn-map, tb-cache,
+cpu, loongson, system, uncore, llsc, unaligned (296), pci, board-system (55)
+suites, plus `latm-isa-run` (60 checks) and `latm-boot-smoke-run` (ELF load, one
+TB, a UART byte through the board). Already present and tested, so **not** part
+of the 2.3 work:
+
+| piece | where | covered by |
+|---|---|---|
+| 4-CPU mailboxes + IPI enable/status/set/clear + send-buf, Linux `loongson3_ipi` offsets (0x1004/08/0c, 0x1020+, 0x1040/48) | `uncore/latm_uncore.c:299` | `latm-uncore` 25 checks |
+| EXTIOI: per-CPU `coreisr[4][8]`, `cpu_ip[4]` Cause-IP masks, route/coremap/nodetype, write-1-to-clear | same | `latm-uncore`, `latm-interrupts` |
+| PCH PIC (64 lines), MSI window, 7A PCI config/BAR | `system/latm_pci.c`, `uncore` | `latm-pci` 7, `latm-board-system` |
+| DTB: 4 `cpu@N` nodes with `enable-method = loongson,3a4000` and a matching `cpu-map` | `system/latm_dtb.c:216` | `latm-system` 21 |
+| boot info + 3A4000 memory layout (low/high RAM, VMM, code) | `system/latm_memory.c`, `latm-system.h` | `latm-system` |
+| 3A4000 CPU profile, MMI/LLSC/unaligned | `cpu/`, `helpers/` | `latm-cpu`, `latm-loongson`, `latm-llsc`, `latm-unaligned` |
+
+**What is actually missing is the execution model, not the register model:** the
+board image drives exactly one `CPUMIPSState` through one dispatch loop, so no
+second vCPU ever runs and nothing cross-CPU can be observed. The next step is the
+LATR-shaped piece for LATM, and its acceptance test can be stated now:
+
+1. a per-CPU context (`CPUMIPSState` + translator context + TB cache per CPU) and
+   a cooperative `step_cpu(sys, cpu)` that does fetch/translate/run and then
+   applies the after-block duties (TLB shootdown, interrupt delivery, WFI);
+2. two CPUs boot from the same ELF with `a0 = cpuid`, run their own blocks, and
+   the board test asserts both PCs advanced;
+3. CPU 0 writes IOCSR 0x1040 targeting CPU 1; CPU 1's `cpu_ip` gains the vector,
+   and CPU 1's handler runs and clears it - the register half of this is already
+   covered by `latm-uncore`, so the new assertion is that *execution* crosses;
+4. an LL/SC pair on CPU 1 is invalidated by a plain store from CPU 0 (reservation
+   coherence), which needs a shared reservation table the uncore does not have
+   yet.
+
+Items 1-3 are the first slice; 4 is its own step because it changes the memory
+path.
+
 | module | remaining work | priority |
 |---|---|---|
 | MIPS64 Linux | real vmlinux/initrd boot into `start_kernel()` | P0 |
