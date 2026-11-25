@@ -129,7 +129,7 @@ LATR_CORE_HEADERS := $(wildcard $(LATR)/include/*.h) \
                      $(wildcard ../include/loongemu/*.h)
 $(CORE_OBJS): $(LATR_CORE_HEADERS)
 
-.PHONY: all test-decode test-legality test-elf test-tb-smp test-fence-ack test-hart-sync test-host-machine test-machine-trap check probe clean
+.PHONY: all test-decode test-legality test-elf test-tb-smp test-fence-ack test-hart-sync test-host-machine test-host-machine-stress test-machine-trap check probe clean
 all: $(BUILD)/liblatr_core.a
 
 test-decode: $(BUILD)/test-latr-decode
@@ -184,6 +184,30 @@ $(HOST_BUILD)/latr-host-smp: $(HOST_BUILD)/latr_host_smp.o $(HOST_CORE_SRCS) \
 
 test-host-machine: $(HOST_BUILD)/latr-host-smp
 	./$(HOST_BUILD)/latr-host-smp
+
+# A threaded harness passes once by winning a race; it is only trustworthy if it
+# passes every time. Repeat it HOST_SMP_STRESS times and require both a zero exit
+# and an identical summary line, so a lost wake, a lost fence ack or a check that
+# silently stops running cannot hide in a lucky interleaving.
+HOST_SMP_STRESS ?= 100
+
+test-host-machine-stress: $(HOST_BUILD)/latr-host-smp
+	@first=''; i=1; \
+	while [ $$i -le $(HOST_SMP_STRESS) ]; do \
+	    out=`./$(HOST_BUILD)/latr-host-smp` || { \
+	        echo "latr-host-smp: iteration $$i FAILED (exit $$?)"; exit 1; }; \
+	    sig=`printf '%s\n' "$$out" | tail -1`; \
+	    if [ -z "$$first" ]; then \
+	        first="$$sig"; \
+	    elif [ "$$sig" != "$$first" ]; then \
+	        echo "latr-host-smp: iteration $$i differs"; \
+	        echo "  first: $$first"; \
+	        echo "  now:   $$sig"; \
+	        exit 1; \
+	    fi; \
+	    i=`expr $$i + 1`; \
+	done; \
+	echo "latr-host-smp: PASS $(HOST_SMP_STRESS) iterations: $$first"
 
 test-fence-ack: $(BUILD)/test-latr-fence-ack
 	./$(BUILD)/test-latr-fence-ack

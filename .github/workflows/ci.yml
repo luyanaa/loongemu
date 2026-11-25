@@ -59,6 +59,15 @@ jobs:
         working-directory: latr
         run: make check CLANG=clang AR=llvm-ar
 
+      # The hosted machine harness is threaded, so one green run proves only
+      # that a race came out the right way once. Hundred iterations, with the
+      # summary line required to be identical, is the acceptance criterion the
+      # SMP design sets for a threaded run; a lost wake or a lost fence ack
+      # shows up as a different line or a non-zero exit.
+      - name: LATR threaded SMP reproducibility
+        working-directory: latr
+        run: make test-host-machine-stress HOST_SMP_STRESS=100 CLANG=clang AR=llvm-ar
+
   # ISA tier: boot the LATR and LATM bare ISA images.
   #
   # Runner image: Debian trixie ships qemu 10, which decodes the LSX/LASX lanes

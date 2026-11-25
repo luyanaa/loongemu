@@ -353,7 +353,7 @@ rather than redundant.
 | **P1a** | exit request at the safe point; park/wake/command primitives; MSIP write notifies the machine; `next_action` decision point | `test-latr-hart-sync` (pthread) + CLINT notify test; ISA/sys images unchanged |
 | **P1b** | hart threads, join, TLS-gated build, on the hosted harness | done: `latr_machine_run_hart` + one pthread per hart, 21 checks including the threaded fence completing with no ack timeout |
 | **P2** | machine lock around `LatrSystem`; ticker ownership; DMA/store lock order | done for the device layer: bus lock hook, bounded system lock with counted failures, ticker thread and timer wake, two-thread MMIO-vs-DMA hammer asserting no failed acquisition, no held writer lock, and an advanced reservation epoch. Guest-level 9.3 stays blocked on LoongArch execution. |
-| **P3** | guest-level 9.3 tests, AES/fence stress, `make latr-sys-smp-run` in CI | all 9.3 green, threaded run reproducible over 100 iterations |
+| **P3** | guest-level 9.3 tests, AES/fence stress, `make latr-sys-smp-run` in CI | all 9.3 green, threaded run reproducible over 100 iterations - **reproducibility done**: `make -C latr test-host-machine-stress HOST_SMP_STRESS=100` runs the threaded harness 100 times and requires a zero exit and an identical summary line each time (39 checks, measured 2.1 s); CI runs it in `host-tests`. Guest-level 9.3 and the sys-mode SMP image stay open |
 
 Each phase lands with its tests and without changing the single-threaded
 behaviour; a phase that cannot show its acceptance test does not land.
