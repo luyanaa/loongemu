@@ -159,9 +159,29 @@ def fingerprint():
     return hashlib.sha256(blob).hexdigest()[:16], parts
 
 
+def head_commit():
+    """Short HEAD, tolerating a container without git (CI images often lack it):
+    fall back to reading .git directly, and to "unknown" rather than crashing."""
+    try:
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=10)
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    ref = ROOT / ".git" / "HEAD"
+    if ref.exists():
+        text = ref.read_text().strip()
+        if text.startswith("ref:"):
+            target = ROOT / ".git" / text.split(" ", 1)[1].strip()
+            if target.exists():
+                return target.read_text().strip()[:7]
+        return text[:7]
+    return "unknown"
+
+
 def main():
-    head = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
-                          capture_output=True, text=True).stdout.strip() or "?"
+    head = head_commit()
     isa_section()
     smp_section()
     sys_section()
