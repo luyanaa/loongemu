@@ -3955,6 +3955,28 @@ static void test_rvv_whole_segment_ldff(void)
         0x9e803257, /* 10 vmv1r.v     v4, v8    */
         0x4203e207, /* 11 vlseg3e32.v v4, (x7)  */
         0xe283ec07, /* 12 vl8re32.v   v24, (x7) */
+        /* EEW spellings and register counts the first thirteen do not reach.
+         * Expected bytes were measured on qemu-system-riscv64 -M virt -cpu max
+         * (-cpu rv64,v=true agrees) with a page holding byte i+1 at offset i:
+         * every form is a contiguous copy, so the EEW only changes the
+         * alignment the base address must satisfy. */
+        0x02838207, /* 13 vl1re8.v    v4, (x7)  */
+        0x0283d207, /* 14 vl1re16.v   v4, (x7)  */
+        0x0283f207, /* 15 vl1re64.v   v4, (x7)  */
+        0x2283d207, /* 16 vl2re16.v   v4, (x7)  */
+        0x62838207, /* 17 vl4re8.v    v4, (x7)  */
+        0x6283f207, /* 18 vl4re64.v   v4, (x7)  */
+        0xe283dc07, /* 19 vl8re16.v   v24, (x7) */
+        0xe283fc07, /* 20 vl8re64.v   v24, (x7) */
+        0x9e41b457, /* 21 vmv4r.v     v8, v4    */
+        0x02840227, /* 22 vs1r.v      v4, (x8)  */
+        0x62840227, /* 23 vs4r.v      v4, (x8)  */
+        0xe2840c27, /* 24 vs8r.v      v24, (x8) */
+        0x22838207, /* 25 vl2re8.v    v4, (x7)  */
+        0x2283f207, /* 26 vl2re64.v   v4, (x7)  */
+        0x6283d207, /* 27 vl4re16.v   v4, (x7)  */
+        0xe2838c07, /* 28 vl8re8.v    v24, (x7) */
+        0x6283e207, /* 29 vl4re32.v   v4, (x7)  */
     };
     static uint8_t page[4096] __attribute__((aligned(4096)));
     static uint8_t copy[4096] __attribute__((aligned(4096)));
@@ -4252,6 +4274,100 @@ static void test_rvv_whole_segment_ldff(void)
     check(copy[15], 0x11, "vs2r stores all of the first register");
     check(copy[16], 0x22, "vs2r stores the second register");
     check(copy[31], 0x22, "vs2r stores all of the second register");
+
+    /*
+     * EEW spellings. Every vl<n>re<eew> moves nf*VLEN/8 contiguous bytes, so
+     * the EEW only decides the alignment the base address must satisfy; the
+     * measured bytes below are therefore identical across EEW for a given nf.
+     * The page holds byte i+1 at offset i, so register k of a group starts at
+     * byte 16*k+1.
+     */
+    static const struct {
+        uint32_t index;
+        int reg;
+        uint8_t first;
+        uint8_t last;
+        const char *name;
+    } eew_loads[] = {
+        { 13, 4, 1, 16, "vl1re8" },
+        { 14, 4, 1, 16, "vl1re16" },
+        { 15, 4, 1, 16, "vl1re64" },
+        { 16, 5, 17, 32, "vl2re16" },
+        { 17, 7, 49, 64, "vl4re8" },
+        { 18, 7, 49, 64, "vl4re64" },
+        { 19, 31, 113, 128, "vl8re16" },
+        { 20, 31, 113, 128, "vl8re64" },
+        { 29, 7, 49, 64, "vl4re32" },
+        { 25, 5, 17, 32, "vl2re8" },
+        { 26, 5, 17, 32, "vl2re64" },
+        { 27, 7, 49, 64, "vl4re16" },
+        { 28, 31, 113, 128, "vl8re8" },
+    };
+    for (unsigned t = 0; t < sizeof(eew_loads) / sizeof(eew_loads[0]); t++) {
+        reset_guest_state();
+        env.privilege = 1;
+        env.mem_map = &map;
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x00;
+        env.vl = 1;
+        env.gpr[7] = 0x10000;
+        rvv_fill_sentinel(4);
+        rvv_fill_sentinel(5);
+        rvv_fill_sentinel(31);
+        check(latr_execute_block(code + eew_loads[t].index, 1), 1,
+              eew_loads[t].name);
+        check(env.vreg[eew_loads[t].reg][0], eew_loads[t].first,
+              eew_loads[t].name);
+        check(env.vreg[eew_loads[t].reg][15], eew_loads[t].last,
+              eew_loads[t].name);
+    }
+
+    /* vmv4r copies four registers: v11 is the fourth of the destination group. */
+    reset_guest_state();
+    env.privilege = 1;
+    env.mem_map = &map;
+    env.csr[0x300] = 0x600;
+    env.vtype = 0x00;
+    env.vl = 1;
+    env.gpr[7] = 0x10000;
+    /* The source group has to hold the page first: vl4re8 covers v4..v7. */
+    check(latr_execute_block(code + 17, 1), 1, "vl4re8 loads for vmv4r");
+    check(latr_execute_block(code + 21, 1), 1, "vmv4r translates");
+    check(env.vreg[8][0], 1, "vmv4r copies the first of four");
+    check(env.vreg[11][0], 49, "vmv4r copies the fourth of four");
+    check(env.vreg[11][15], 64, "vmv4r copies the end of the fourth");
+
+    /* vs1r/vs4r/vs8r store 16, 64 and 128 bytes and touch nothing past that. */
+    static const struct {
+        uint32_t load;
+        uint32_t index;
+        int bytes;
+        const char *name;
+    } stores[] = {
+        { 17, 22, 16, "vs1r" },   /* vl4re8 fills v4..v7  */
+        { 17, 23, 64, "vs4r" },
+        { 12, 24, 128, "vs8r" },  /* vl8re32 fills v24..v31 */
+    };
+    for (unsigned t = 0; t < sizeof(stores) / sizeof(stores[0]); t++) {
+        reset_guest_state();
+        env.privilege = 1;
+        env.mem_map = &map;
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x00;
+        env.vl = 1;
+        env.gpr[7] = 0x10000;
+        env.gpr[8] = 0x11000;
+        for (int i = 0; i < 512; i++) {
+            copy[i] = 0xaa;
+        }
+        /* Fill the register group first, with the load that reaches it. */
+        check(latr_execute_block(code + stores[t].load, 1), 1,
+              "group load for the store");
+        check(latr_execute_block(code + stores[t].index, 1), 1, stores[t].name);
+        check(copy[0], 1, stores[t].name);
+        check(copy[stores[t].bytes - 1], (uint8_t)stores[t].bytes, stores[t].name);
+        check(copy[stores[t].bytes], 0xaa, stores[t].name);
+    }
 }
 
 /*

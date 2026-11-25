@@ -111,12 +111,20 @@ Current result: `[]` - no base-V mnemonic is absent from the three files that
 translate RVV, and the 24 whole-register encodings (`vl<n>re<eew>`, `vs<n>r`,
 `vmv<n>r`) that a first-pass grep flags are dispatched through
 `latr_rvv_whole_kind()` into `latr_rvv_whole_mem()` / `latr_rvv_whole_move()`, not
-by name. The count of encodings the ISA image exercises is a different question
-and is where the remaining RVV risk is: the whole-register family has 7 of 24
-covered (`vl1re32`, `vl2re32`, `vl8re32`, `vs2r`, `vmv1r`, `vmv2r`, `vmv8r`), so
-`vl4re*`, the 8/16/64-bit EEW spellings, `vs1r/vs4r/vs8r` and `vmv4r` are
-translated but unproven. Expected values for those must come from QEMU probes,
-not the spec, per the rule at the top of the whole-register test.
+by name.
+
+That family is now covered by the ISA image end to end: all 24 encodings are
+executed (20 loads across the four EEW spellings, `vs1r/vs2r/vs4r/vs8r` and
+`vmv1r/vmv2r/vmv4r/vmv8r`), 1830 checks in the image. The expected bytes come
+from a QEMU probe, not the spec: `qemu-system-riscv64 -M virt -cpu max` (and
+`-cpu rv64,v=true`) run against a page holding byte i+1 at offset i returns
+`01..10` for `vl1re{8,16,64}`, `11..20` for the second register of a
+two-register group, `31..40` for the fourth of four, `71..80` for the eighth of
+eight, and the stores write exactly `1..16`, `1..64`, `1..128` bytes and nothing
+past that. Two probe facts worth keeping, both of which cost a run: `mstatus.VS`
+must be set (`csrs mstatus, 0x600`) or `vsetvli` traps as illegal with no output
+at all, and a bring-up routine must not use `t2`/`x7` (nor `s0`/`x8`) if those
+hold the probe's base addresses.
 | `vrsub` | 2 |
 
 After those, SMP is still not real: `latr_machine.c:864-902` runs harts
