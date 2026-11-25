@@ -169,6 +169,10 @@ void kmain(void)
         putdec((unsigned)rc.release_only_flushes);
         latx_bare_uart_puts(" dead-stores=");
         putdec((unsigned)rc.dead_stores);
+        latx_bare_uart_puts(" borrow-leaks=");
+        putdec((unsigned)rc.borrow_leaks);
+        latx_bare_uart_puts(" borrow-max=");
+        putdec((unsigned)rc.borrow_outstanding_max);
         latx_bare_uart_puts(" scans=");
         putdec((unsigned)rc.scan_entries);
         latx_bare_uart_puts(" writebacks=");

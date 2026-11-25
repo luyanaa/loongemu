@@ -439,19 +439,27 @@ idle-loop-on-IPI, and RAM-flag-polling variants alike). A **minimal 2-hart
 probe** - no trap handler, no IPI, no AMO/LR-SC, one handshake word - runs the
 same shape correctly on both engines: hart 1 reads 1 before the rewrite and 3
 after it (`B 1,3`), with and without a pre-rewrite call. So cross-core
-page-straddling itself works, and the bisect narrowed the trigger further: adding
-hart 0's **AMO + LR/SC prefix** to the working probe - nothing else - makes hart
-1's straddling call return 0 again. Hart 0's own straddling calls do not trigger
-it (still 3 with them added), and a trap-handler call does not trigger it on its
-own (still 3 with IPI + handler, before the AMO prefix).
+page-straddling itself works. A follow-up four-way probe (no prefix / AMO only /
+LR-SC only / both, hart 1 calling from a trap handler woken by an IPI) gives
+`1,3,3` in **all four** variants, so the AMO/LR-SC prefix is not a trigger
+either.
 
-That points at the AMO/LR-SC path leaving something behind that a later
-translation or execution observes (reservation epoch, regcache borrows, or the
-`mem_*` scratch env fields), not at page-straddling or at cross-core visibility.
-The next step is to split AMO from LR/SC inside the *SMP guest itself* rather
-than in a hand-written probe (two of my quick probes had their own register and
-layout bugs, which cost more than they were worth). The check stays out of the
-gate rather than shipped red.
+**A retracted claim, kept because the retraction is the useful part:** an earlier
+run of that probe looked like proof that the AMO prefix caused the 0. It was the
+probe's own data page: the flag word sat at 0x80001000, and an 8-byte store there
+overwrote the *second half* of the page-straddling instruction at 0x80000FFE (its
+`ret`), so the call executed a zero word and raised an illegal instruction.
+Moving the data page to 0x80001100 made the failure vanish. Two lessons: a
+page-straddling instruction occupies the first bytes of the *next* page, so
+nothing may put data there; and a failing probe must be checked for this class of
+self-inflicted overlap before it is believed.
+
+The SMP guest's 0 is therefore still unexplained, but it is now known **not** to
+be the translator's straddling path, its cross-core invalidation, or the AMO/LR-SC
+prefix. Next lead: look for the same kind of instruction/data overlap inside that
+guest (its data page starts at 0x80001000, inside the straddling word's second
+page), and only then for a real defect. The check stays out of the gate rather
+than shipped red.
 
 Litmus tests were considered and deliberately not added: with the cooperative
 image the interleaving is deterministic, so MP/LB would pass vacuously and say

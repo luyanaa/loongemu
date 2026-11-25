@@ -75,6 +75,7 @@ def isa_section():
         ("regcache writebacks", grab(text, r"writebacks=(\d+)")),
         ("regcache reloads", grab(text, r"reloads=(\d+)")),
         ("code-sym sites", grab(text, r"total=(\d+)")),
+        ("borrow leaks (translation invariant)", grab(text, r"borrow-leaks=(\d+)")),
         ("random diff", grab(text, r"latr-rand-diff=([0-9a-f]+)")),
     ]
     table("ISA image", f"build/latr_isa.log ({age('latr_isa.log')})", rows)

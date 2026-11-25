@@ -261,6 +261,24 @@ void kmain(void)
         (void)hexbuf;
     }
 #endif
+    {
+        /* Translation-time invariant: every borrowed temporary is returned
+         * before the next guest instruction. A leak here would let a later
+         * translation reuse a register that still holds a guest value. */
+        LatrRegCacheStats rc = latr_regcache_stats();
+
+        uart_puts("latr-smp-borrow: leaks=");
+        uart_dec(rc.borrow_leaks);
+        uart_puts(" max=");
+        uart_dec(rc.borrow_outstanding_max);
+        uart_puts(" first-opcode=");
+        uart_dec(rc.borrow_leak_opcode);
+        uart_puts("\n");
+        check_u64("no translator borrow leaks in this run",
+                  rc.borrow_leaks, 0);
+        check_u64("no outstanding borrows after any instruction",
+                  rc.borrow_outstanding_max, 0);
+    }
     uart_puts(failures == 0 ? "latr-smp: PASS checks=" : "latr-smp: FAIL checks=");
     uart_dec((uint64_t)checks);
     uart_puts(" fails=");

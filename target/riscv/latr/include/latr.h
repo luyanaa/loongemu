@@ -349,9 +349,22 @@ typedef struct LatrRegCacheStats {
     uint64_t elided_flushes;
     uint64_t release_only_flushes;
     uint64_t dead_stores;
+    /*
+     * Translation-time invariant: every borrowed itemp/ftemp must be returned
+     * before the next guest instruction is translated. A leak here means a
+     * temporary is never freed (or freed twice), so later translations in the
+     * same block can be handed a register that still belongs to a guest value -
+     * which shows up as wrong code far from the instruction that caused it.
+     * Counted per instruction, with the first offending opcode kept.
+     */
+    uint64_t borrow_leaks;
+    uint64_t borrow_leak_opcode;
+    uint64_t borrow_outstanding_max;
 } LatrRegCacheStats;
 
 void latr_regcache_stats_reset(void);
+/* Number of itemp/ftemp slots currently borrowed (both banks). */
+unsigned latr_regcache_outstanding_borrows(void);
 LatrRegCacheStats latr_regcache_stats(void);
 
 void latr_regcache_flush(void);

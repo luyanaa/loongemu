@@ -636,6 +636,22 @@ bool latr_regcache_evict_ftemp(void)
     return regcache_evict(true);
 }
 
+unsigned latr_regcache_outstanding_borrows(void)
+{
+    const LatrRegCache *cache = &lsenv->tr_data->regcache;
+    unsigned outstanding = 0;
+
+    for (unsigned i = 0; i < 6; i++) {
+        if (cache->itemp_borrows[i] != 0) {
+            outstanding++;
+        }
+        if (cache->ftemp_borrows[i] != 0) {
+            outstanding++;
+        }
+    }
+    return outstanding;
+}
+
 static void regcache_borrow(IR2_OPND value, bool is_fpr)
 {
     int slot = regcache_temp_slot(value._reg_num, is_fpr);
@@ -1141,6 +1157,26 @@ bool tr_ir2_generate(TranslationBlock *tb)
         (la_label)(labels[i]);
         if (!latr_translate_ir1(&ctx)) {
             return false;
+        }
+        /*
+         * The borrow invariant: an instruction translation must hand every
+         * temporary back. A leak is recorded rather than asserted here because
+         * one leak poisons the rest of the block, so a hard abort would hide the
+         * first offender behind the cascading ones.
+         */
+        {
+            unsigned outstanding = latr_regcache_outstanding_borrows();
+
+            if (outstanding > latr_regcache_stats_counters.borrow_outstanding_max) {
+                latr_regcache_stats_counters.borrow_outstanding_max = outstanding;
+            }
+            if (outstanding != 0) {
+                if (latr_regcache_stats_counters.borrow_leaks == 0) {
+                    latr_regcache_stats_counters.borrow_leak_opcode =
+                        (uint64_t)insns[i].opcode;
+                }
+                latr_regcache_stats_counters.borrow_leaks++;
+            }
         }
     }
 
