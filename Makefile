@@ -888,7 +888,8 @@ build/latr_smp_blob.o: baremetal/bare/latr_smp_blob.S build/latr_smp_guest.bin
 	         -fno-builtin -O2 -c $< -o $@
 
 build/bare_latr_smp.elf: baremetal/bare/latr_smp_test.c \
-                         build/latr_smp_blob.o build/latr_smp_idle_blob.o latr-core \
+                         build/latr_smp_blob.o build/latr_smp_idle_blob.o \
+                         build/latr_smp_smc_blob.o latr-core \
                          build/latr_miniglib.o build/latr_libc_min.o \
                          baremetal/bare/bare.lds
 	@mkdir -p build
