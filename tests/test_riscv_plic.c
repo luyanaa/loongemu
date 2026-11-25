@@ -60,6 +60,28 @@ int main(void)
     CHECK(rd(&plic, LOONGEMU_PLIC_PENDING_BASE, &err) == (1u << 5),
           "pending register ignores writes");
 
+    /*
+     * The pending level is memoised per context under `state_seq`: a second
+     * query without a mutation must agree, and every mutation that can change a
+     * level must invalidate the memo. These check the visible behaviour only -
+     * the cache is an implementation detail, so a missed invalidation shows up
+     * here as a stale level.
+     */
+    CHECK(loongemu_plic_pending(&plic, 0) == 1, "cached level repeats");
+    CHECK(loongemu_plic_pending(&plic, 0) == 1, "cached level repeats again");
+    wr(&plic, LOONGEMU_PLIC_ENABLE_BASE, 0);      /* disable in context 0 */
+    CHECK(loongemu_plic_pending(&plic, 0) == 0, "enable write invalidates");
+    wr(&plic, LOONGEMU_PLIC_ENABLE_BASE, 1u << 5);
+    CHECK(loongemu_plic_pending(&plic, 0) == 1, "re-enable invalidates");
+    loongemu_plic_set_irq(&plic, 5, 0);
+    CHECK(loongemu_plic_pending(&plic, 0) == 0, "deassert invalidates");
+    loongemu_plic_set_irq(&plic, 5, 1);
+    CHECK(loongemu_plic_pending(&plic, 0) == 1, "assert invalidates");
+    wr(&plic, LOONGEMU_PLIC_PRIORITY_BASE + 4 * 5, 0);
+    CHECK(loongemu_plic_pending(&plic, 0) == 0, "priority write invalidates");
+    wr(&plic, LOONGEMU_PLIC_PRIORITY_BASE + 4 * 5, 3);
+    CHECK(loongemu_plic_pending(&plic, 0) == 1, "priority restore invalidates");
+
     /* Threshold blocks low priorities. */
     wr(&plic, LOONGEMU_PLIC_CONTEXT_BASE, 3);
     CHECK(loongemu_plic_pending(&plic, 0) == 0,

@@ -469,6 +469,13 @@ fault recovery cost.
     ns, dispatch 119-138 ns, of which the interrupt refresh (update_hart) is
     ~47% - so Phase A saves ~2% and Phase B (generated-code chaining) is the
     only lever for the rest, with its own risk budget.
+    Follow-up done instead of Phase B: that 47% was a PLIC source scan, not an
+    unavoidable duty. `loongemu_plic_pending()` now memoises the per-context level
+    under a `state_seq` that every level-changing mutator bumps (set_irq, claim,
+    complete, enable/threshold/priority writes) - measured: interrupts 52 -> 3-5
+    ns, update_hart 54-69 -> 9-10 ns, cached dispatch 116-165 -> 26-36 ns, with
+    `test_riscv_plic` pinning that a mutation invalidates the memo. Phase B is not
+    justified on these numbers.
 12. 5.4 MSI-X/IMSIC and virtio-PCI transport; DMA domains.
 13. 4.1 shared modules (arena, recovery, regcache, IRQ sink, DMA domain).
 14. 6.1 passthrough manager, only with an IOMMU or an explicit trusted-guest

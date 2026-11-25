@@ -9,12 +9,18 @@ static int source_valid(const LoongemuPlic *plic, uint32_t source)
     return source >= 1 && source <= plic->num_sources;
 }
 
+static void plic_changed(LoongemuPlic *plic)
+{
+    plic->state_seq++;
+}
+
 static void set_pending(LoongemuPlic *plic, uint32_t source, int pending)
 {
-    if (pending) {
-        plic->pending[source] = 1;
-    } else {
-        plic->pending[source] = 0;
+    uint32_t value = pending ? 1u : 0u;
+
+    if (plic->pending[source] != value) {
+        plic->pending[source] = value;
+        plic_changed(plic);
     }
 }
 
@@ -29,6 +35,7 @@ int loongemu_plic_init(LoongemuPlic *plic, uint32_t num_sources,
     memset(plic, 0, sizeof(*plic));
     plic->num_sources = num_sources;
     plic->num_contexts = num_contexts;
+    plic->state_seq = 1; /* a zero-initialised cache must miss */
     return 1;
 }
 
@@ -49,11 +56,26 @@ void loongemu_plic_set_irq(LoongemuPlic *plic, uint32_t source, int level)
     }
 }
 
-int loongemu_plic_pending(const LoongemuPlic *plic, uint32_t context)
+static int plic_scan_pending(const LoongemuPlic *plic, uint32_t context);
+
+int loongemu_plic_pending(LoongemuPlic *plic, uint32_t context)
 {
+    int level;
+
     if (plic == 0 || context >= plic->num_contexts) {
         return 0;
     }
+    if (plic->pending_cache[context].seq == plic->state_seq) {
+        return plic->pending_cache[context].level;
+    }
+    level = plic_scan_pending(plic, context);
+    plic->pending_cache[context].seq = plic->state_seq;
+    plic->pending_cache[context].level = level;
+    return level;
+}
+
+static int plic_scan_pending(const LoongemuPlic *plic, uint32_t context)
+{
     uint32_t threshold = plic->threshold[context];
 
     for (uint32_t source = 1; source <= plic->num_sources; source++) {
@@ -224,6 +246,7 @@ void loongemu_plic_write32(LoongemuPlic *plic, uint32_t offset,
             return;
         }
         plic->priority[source] = value & LOONGEMU_PLIC_MAX_PRIORITY;
+        plic_changed(plic);
         return;
     }
 
@@ -255,6 +278,7 @@ void loongemu_plic_write32(LoongemuPlic *plic, uint32_t offset,
                 plic->enable[context][word] &= ~(1u << bit);
             }
         }
+        plic_changed(plic);
         return;
     }
 
@@ -270,6 +294,7 @@ void loongemu_plic_write32(LoongemuPlic *plic, uint32_t offset,
         }
         if (within == 0) {
             plic->threshold[context] = value & LOONGEMU_PLIC_MAX_PRIORITY;
+            plic_changed(plic);
             return;
         }
         if (within == 4) {

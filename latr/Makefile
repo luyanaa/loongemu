@@ -152,7 +152,15 @@ $(HOST_BUILD)/softfloat-host.o: $(LATX)/upstream/fpu/softfloat.c | $(HOST_BUILD)
 	$(HOST_CC) $(HOST_CORE_CFLAGS) -DTARGET_RISCV -D__FAST_MATH__ \
 		-fno-strict-aliasing -c $< -o $@
 
-$(HOST_BUILD)/latr_host_smp.o: ../baremetal/host/latr_host_smp.c | $(HOST_BUILD)
+# Depends on every header it can pull in: the harness is compiled once and then
+# linked against a freshly compiled core, so a stale object with old struct
+# layouts (LatrSystem, LatrMachineHart) crashes at run time instead of failing
+# the build. Header mtime is a cheap proxy for "recompile it".
+HARNESS_HEADERS := $(wildcard $(LATR)/include/*.h) $(wildcard ../include/loongemu/*.h) \
+                   $(wildcard ../shared/pvir/include/*.h)
+
+$(HOST_BUILD)/latr_host_smp.o: ../baremetal/host/latr_host_smp.c \
+                               $(HARNESS_HEADERS) | $(HOST_BUILD)
 	$(HOST_CC) $(HOST_STRICT_CFLAGS) -c $< -o $@
 
 $(HOST_BUILD)/latr-host-smp: $(HOST_BUILD)/latr_host_smp.o $(HOST_CORE_SRCS) \

@@ -606,6 +606,26 @@ static void scenario_dispatch_cost(void)
             latr_system_update_hart(&machine.sys, &h->env, 0);
         }
         upd = now_ns() - start;
+        {
+            uint64_t clint_ns;
+            uint64_t irq_ns;
+            uint64_t now = loongemu_vclock_now_ns(&machine.sys.vclock);
+
+            start = now_ns();
+            for (uint32_t i = 0; i < iterations; i++) {
+                loongemu_clint_tick(&machine.sys.clint, now,
+                                    &h->env.csr[0x344], 0);
+            }
+            clint_ns = now_ns() - start;
+            start = now_ns();
+            for (uint32_t i = 0; i < iterations; i++) {
+                latr_update_interrupts(&h->env);
+            }
+            irq_ns = now_ns() - start;
+            printf("latr-dispatch-parts2: clint-tick=%lluns interrupts=%lluns\n",
+                   (unsigned long long)(clint_ns / iterations),
+                   (unsigned long long)(irq_ns / iterations));
+        }
         start = now_ns();
         for (uint32_t i = 0; i < iterations; i++) {
             latr_context_safepoint(h->ctx);

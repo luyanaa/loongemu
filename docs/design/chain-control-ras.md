@@ -218,11 +218,38 @@ Cost measured on the host harness (200k iterations, `latr-dispatch` line):
 
 So Phase A removes ~2% of dispatch. That is the design's own prediction in
 self-review objection 1, now confirmed with numbers: the remaining dispatch cost
-is the per-block *semantics* duty (the CLINT/PLIC interrupt refresh, ~47%), which
-only generated-code chaining (Phase B) could amortise - and Phase B carries the
-stub/reclaim/host-fault risks the design lists. Phase B therefore needs its own
-justification; Phase A's contribution is that the dispatch counters and the link
-path now exist and are measured.
+is the per-block *semantics* duty (the CLINT/PLIC interrupt refresh, ~47%).
+
+### 3.3 The 47% was a scan, not a duty
+
+Splitting `latr_system_update_hart` (54-69 ns) showed the CLINT tick is ~2 ns and
+`latr_update_interrupts` is ~52 ns - because it asks `loongemu_plic_pending()`
+twice (M and S contexts) and that scans every source, while its inputs change
+rarely. The PLIC now keeps a `state_seq` bumped by every mutation that can move a
+level (set_irq, claim through `set_pending`, complete's re-pend, and the enable /
+threshold / priority writes), and memoises the per-context level under it.
+`loongemu_plic_pending` takes a non-const PLIC for that reason; a zero-initialised
+cache cannot hit because `init` starts `state_seq` at 1.
+
+Measured after the change (same harness, same 200k iterations):
+
+| item | before | after |
+|---|---|---|
+| `loongemu_plic_pending` scan (per context) | ~50 ns x2 | memoised |
+| `latr_update_interrupts` | 52 ns | 3-5 ns |
+| `latr_system_update_hart` | 54-69 ns | 9-10 ns |
+| full dispatch of a cached block | 116-165 ns | 26-36 ns |
+
+Dispatch is now 4-5x cheaper and the interrupt refresh is ~10% of it instead of
+~47%. The correctness argument is one sentence: the memo is keyed by a sequence
+that every level-changing mutator increments, so a stale level can only mean a
+mutator that forgot to bump it - and `test_riscv_plic` now pins that behaviour
+from the outside (query, mutate enable/priority/pending, query again), so a
+forgotten bump fails a test instead of dropping an interrupt.
+
+With that gone, generated-code chaining (Phase B) would be chasing what is left
+of a 26-36 ns dispatch, against the stub/reclaim/host-fault risks the design
+lists. The honest position: Phase B is **not** justified by this measurement.
 
 Note the phantom this measurement avoided: a 200k-dispatch loop with a *stale*
 harness binary crashed inside `tr_ir2_assemble` with a NULL code buffer. That was

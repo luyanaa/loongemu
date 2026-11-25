@@ -45,6 +45,19 @@ typedef struct LoongemuPlic {
     uint32_t enable[LOONGEMU_PLIC_MAX_CONTEXTS]
                    [(LOONGEMU_PLIC_MAX_SOURCES + 31) / 32];
     uint32_t threshold[LOONGEMU_PLIC_MAX_CONTEXTS];
+    /*
+     * Pending-level cache. `loongemu_plic_pending()` scans every source and is
+     * asked once per dispatch per context, so the per-hart interrupt refresh was
+     * dominated by a scan whose inputs rarely change. `state_seq` moves on every
+     * mutation that can change a level (set_irq, claim, complete, enable,
+     * threshold, priority); a context whose cached sequence matches does not
+     * rescan. Any new mutator must bump it, or a level change could be missed.
+     */
+    uint32_t state_seq;
+    struct {
+        uint32_t seq;
+        int level;
+    } pending_cache[LOONGEMU_PLIC_MAX_CONTEXTS];
 } LoongemuPlic;
 
 /* Returns 1 on success, 0 for invalid counts. */
@@ -58,7 +71,8 @@ void loongemu_plic_set_irq(LoongemuPlic *plic, uint32_t source, int level);
  * True when `context` has a claimable interrupt: pending, enabled and with a
  * priority strictly above the context threshold.
  */
-int loongemu_plic_pending(const LoongemuPlic *plic, uint32_t context);
+/* Not const: the result is memoised per context under `state_seq`. */
+int loongemu_plic_pending(LoongemuPlic *plic, uint32_t context);
 
 /* MMIO accessors; `offset` is relative to the PLIC base. */
 uint32_t loongemu_plic_read32(LoongemuPlic *plic, uint32_t offset,
