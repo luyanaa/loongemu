@@ -123,6 +123,11 @@ jobs:
           make latr-smp-run \
             CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
             QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+          # One table of every deterministic counter and the host dispatch cost,
+          # so a change is comparable against the last run in the job log.
+          make latr-bench \
+            CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
           # PERF build from a clean tree: make does not track the -DLOONGEMU_PERF
           # change and would relink stale objects.
           make -C latr clean CLANG=clang AR=llvm-ar

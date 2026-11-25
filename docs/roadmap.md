@@ -442,6 +442,35 @@ was left out of the gate rather than shipped red, and litmus tests were not adde
 for the same class of reason: with the cooperative image the interleaving is
 deterministic, so MP/LB would pass vacuously and prove nothing about ordering.
 
+Unified benchmark (implemented): `make latr-bench` prints one table and writes
+`build/latr_bench.md` from the logs the targets already write, and CI runs it so
+the table lands in every push's log. It is report-only on purpose - re-running a
+target from inside the reporter would make the numbers depend on the reporter's
+idea of freshness - and each section states which log it read and how old it is.
+Deterministic counters (checks, blocks, writebacks, chain links, diff hashes) go
+into a fingerprint; host nanoseconds stay out of it, because they are wall clock
+on whichever machine ran them.
+
+Baseline (HEAD 30fd024, host = Apple silicon, guest OS = QEMU LoongArch):
+
+| section | metric | value |
+|---|---|---|
+| ISA image | checks | 1771 |
+| | regcache flushes / elided / writebacks / reloads | 14531 / 14020 / 330 / 416 |
+| | code-symbol sites | 552 |
+| | random diff | dab61bfe2223bc9e |
+| SMP image | checks / harts dispatched | 19 / 46+44 |
+| | chain links h0 / h1 | 1 / 34 |
+| | fault diff | c482341e1af54e1d |
+| guest boot | regcache flushes / writebacks / reloads | 10022 / 605 / 776 |
+| dispatch (host) | lookup / full dispatch | 1 ns / 26 ns |
+| | of which clint tick / interrupt refresh / safepoint / bind | 1 / 6 / 3 / 2 ns |
+
+Not reported, and why: `guest instructions/sec` needs a LoongArch wall clock the
+images cannot produce, and `host instructions per guest instruction` needs host
+instruction counters. Printing a number that measures QEMU instead would be
+worse than the gap.
+
 Performance moves from local PERF counters to one benchmark reporting: guest
 instructions/sec, host instructions per guest instruction, TB hit rate,
 translation time, writebacks, helper call rate, chaining hit rate, MMIO latency,

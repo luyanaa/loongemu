@@ -1121,6 +1121,15 @@ latr-rand-sweep:
 	 rm -f build/latr_isa_test.o build/bare_latr_isa.elf \
 	       build/latr_riscv_ref.elf
 
+# Unified benchmark: one table out of the logs the targets already write. It is
+# report-only on purpose (see tools/latr_bench.py); `latr-bench-run` refreshes
+# every source first, which is what CI does.
+latr-bench:
+	@$(PYTHON) tools/latr_bench.py
+
+latr-bench-run: latr-isa-run latr-smp-run latr-rand-diff latr-fault-diff
+	@$(PYTHON) tools/latr_bench.py
+
 # Delete both logs first: a stale log left by an earlier seed would otherwise be
 # compared and "pass". A missing signature is then a hard error.
 latr-rand-diff:
