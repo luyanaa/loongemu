@@ -367,7 +367,7 @@ architecture coverage beyond fixed fixtures:
 | test type | coverage |
 |---|---|
 | ISA differential | four guest ISAs against QEMU |
-| random instruction | operands, flags, boundary values, illegal encodings |
+| random instruction | **done for RV64 integer**: `make latr-rand-diff` (fixed seed) and `latr-rand-sweep` (3 more seeds) run one generated R-type stream on LATR and on qemu-system-riscv64 and compare a 64-bit hash of x5..x31. FP/vector streams and illegal-encoding fuzzing are still open. |
 | fault differential | page fault, unaligned, privilege, delay slot |
 | memory litmus | TSO, RVWMO, ARM ordering |
 | SMP stress | LL/SC, AMO, DMA, shootdown |
@@ -376,6 +376,30 @@ architecture coverage beyond fixed fixtures:
 | feature matrix | scalar, LBT, LSX, LASX |
 | OS boot | pinned Linux + Buildroot/BusyBox |
 | native hardware | 3A6000 and a LoongArch host without LBT |
+
+Random-instruction differential (implemented): `tools/gen_latr_rand_vectors.py`
+emits, from one fixed seed, `build/latr_rand_vectors.h` (C array + initial
+x5..x31 + hash constants) and `build/latr_rand_run.inc` (the same words as
+assembly plus a hash loop), so the two engines cannot drift apart. The stream is
+48 non-trapping R-type ops (`add/sub/sll/srl/sra/slt/sltu/xor/or/and`, the M
+multiply/divide family, and the W variants) with random registers; division by
+zero and `INT_MIN / -1` occur on purpose. Both sides hash x5..x31 with
+`h = (h ^ x) * prime` and print `latr-rand-diff=<hex>`; `make latr-rand-diff`
+fails on a mismatch. Seeded sweeps (`LATR_RAND_SEEDS`) multiply the coverage at
+one rebuild and one QEMU boot per seed.
+
+Two findings from building it, both recorded because they are the kind that
+wastes an afternoon:
+
+* **QEMU's `-kernel` entry is 0x80000000, not the ELF entry point.** Placing the
+  generated runner above `_start` in the source file put it at 0x80000000 and the
+  guest executed it as boot code - illegal instruction, trap loop, no output. The
+  include now sits at the end of the file with a comment saying why.
+* **`funct3` is bits 14:12.** The first generator shifted it by 11, which
+  overlapped `rd`'s high bits: 48 "random" words, of which QEMU accepted the
+  ones that happened to be legal. The differential found its own generator bug
+  before it found any translator bug - which is exactly what a differential is
+  for.
 
 Performance moves from local PERF counters to one benchmark reporting: guest
 instructions/sec, host instructions per guest instruction, TB hit rate,

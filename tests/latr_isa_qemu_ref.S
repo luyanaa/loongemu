@@ -376,6 +376,27 @@ _start:
     li      t0, 10
     sb      t0, 0(a1)
 
+    /* Random-instruction differential: same words, same hash on both engines. */
+    jal     ra, latr_rand_run
+    la      t0, .Lsave_div
+    sd      a0, 24(t0)
+    li      t0, 0x10000000
+    la      t1, .Lrand_prefix
+.Lwrite_rand_prefix:
+    lbu     t2, 0(t1)
+    beqz    t2, .Lprint_rand
+    sb      t2, 0(t0)
+    addi    t1, t1, 1
+    j       .Lwrite_rand_prefix
+.Lprint_rand:
+    li      a1, 0x10000000
+    la      a2, .Lhex_digits
+    la      t0, .Lsave_div
+    ld      a0, 24(t0)
+    jal     ra, .Lprint_hex64
+    li      t0, 10
+    sb      t0, 0(a1)
+
     li      t0, 0x10000000
     la      t1, .Lpass
 .Lwrite_pass:
@@ -422,6 +443,8 @@ _start:
     .section .rodata
 .Lprefix:
     .asciz "latr-diff="
+.Lrand_prefix:
+    .asciz "latr-rand-diff="
 .Lhex_digits:
     .ascii "0123456789abcdef"
 .Lpass:
@@ -435,3 +458,9 @@ _start:
     .dword 0
     .dword 0
     .dword 0
+    .dword 0
+
+/* Generated random-instruction runner. Appended (not included at the top):
+ * QEMU's -kernel entry is 0x80000000 regardless of the ELF entry point, so any
+ * code placed before _start would be executed instead of it. */
+#include "latr_rand_run.inc"

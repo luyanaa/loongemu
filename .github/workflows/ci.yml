@@ -99,6 +99,15 @@ jobs:
           make latr-sys-run \
             CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
             QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+          # Random-instruction differential: the same seeded ALU stream on LATR
+          # and on qemu-system-riscv64, compared by a register-set hash, plus
+          # extra seeds so one lucky stream cannot hide a defect.
+          make latr-rand-diff \
+            CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+          make latr-rand-sweep \
+            CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
           # Guest-level SMP: two harts, real AMO/LR-SC/IPI/FENCE.I, real machine.
           make latr-smp-run \
             CLANG=clang AR=llvm-ar LD_LLD=ld.lld \

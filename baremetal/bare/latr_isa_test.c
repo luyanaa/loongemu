@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include "exec/exec-all.h"
+#include "latr_rand_vectors.h"
 #include "latr.h"
 #include "translate.h"
 #include "fpu/softfloat.h"
@@ -7644,6 +7645,34 @@ void kmain(void)
             failures++;
             latx_bare_uart_puts("\nlatr-isa: FAIL code-symbol table overflowed");
         }
+    }
+    {
+        /*
+         * Random-instruction differential (roadmap 7): the words in
+         * build/latr_rand_vectors.h are generated with a fixed seed and are also
+         * assembled into the QEMU reference image. Both engines hash x5..x31
+         * with the same function, so any divergence is a translator defect
+         * rather than a hand-written expectation. Only non-trapping R-type ops
+         * are generated, including the div-by-zero and INT_MIN/-1 cases.
+         */
+        uint64_t hash = LATR_RAND_HASH_SEED;
+
+        reset_guest_state();
+        env.csr[0x300] = UINT64_C(3) << 13;
+        for (unsigned i = 0; i < LATR_RAND_REGS; i++) {
+            env.gpr[5 + i] = latr_rand_init[i];
+        }
+        {
+            bool ran = latr_execute_block(latr_rand_words, (int)LATR_RAND_COUNT);
+
+            check(ran, 1, "random instruction stream translates as one block");
+        }
+        for (unsigned i = 0; i < LATR_RAND_REGS; i++) {
+            hash = (hash ^ env.gpr[5 + i]) * LATR_RAND_HASH_PRIME;
+        }
+        latx_bare_uart_puts("\nlatr-rand-diff=");
+        puthex(hash);
+        latx_bare_uart_puts("\n");
     }
     {
         /* Register-cache accounting for design P0 (ir2-value-version.md): the

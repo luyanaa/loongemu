@@ -12,6 +12,8 @@ AR ?= $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/llvm-ar,llvm-ar)
 endif
 OBJDUMP ?= $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/llvm-objdump,llvm-objdump)
 OBJCOPY ?= $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/llvm-objcopy,llvm-objcopy)
+# BSD/macOS has no `timeout` unless coreutils is installed; CI (Debian) does.
+TIMEOUT ?= $(shell command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null)
 LLD_PREFIX ?= $(shell brew --prefix lld 2>/dev/null)
 LD_LLD   ?= $(if $(LLD_PREFIX),$(LLD_PREFIX)/bin/ld.lld,ld.lld)
 QEMU_PREFIX ?= $(shell brew --prefix qemu 2>/dev/null)
@@ -731,9 +733,10 @@ build/latr_isa_test.o: baremetal/bare/latr_isa_test.c \
                        target/riscv/latr/include/latr.h \
                        target/riscv/latr/include/mmu.h \
                        target/riscv/latr/include/translate.h \
-                       tests/latr_isa_diff_vectors.h
+                       tests/latr_isa_diff_vectors.h \
+                       build/latr_rand_vectors.h
 	@mkdir -p build
-	$(CLANG) $(LATR_BARE_CFLAGS) -c $< -o $@
+	$(CLANG) $(LATR_BARE_CFLAGS) -I build -c $< -o $@
 
 build/latr_miniglib.o: latx/compat/miniglib.c
 	@mkdir -p build
@@ -1020,16 +1023,55 @@ latr-isa-run: latr-isa-image
 	@grep -aE 'latr-isa' build/latr_isa.log | head -30
 	@grep -qa 'latr-isa: PASS' build/latr_isa.log
 
+# Random-instruction differential vectors: one generator, two consumers (the
+# LATR ISA image includes the .h, the QEMU reference assembles the .inc), so the
+# executed words cannot drift apart.
+LATR_RAND_GEN := tools/gen_latr_rand_vectors.py
+build/latr_rand_vectors.h build/latr_rand_run.inc: $(LATR_RAND_GEN)
+	@mkdir -p build
+	$(PYTHON) $(LATR_RAND_GEN)
+
 build/latr_riscv_ref.elf: tests/latr_isa_qemu_ref.S \
-                          tests/latr_isa_diff_vectors.h
+                          tests/latr_isa_diff_vectors.h \
+                          build/latr_rand_run.inc
 	@mkdir -p build
 	$(CLANG) --target=riscv64-unknown-elf -march=rv64gcv -mabi=lp64d \
 	         -ffreestanding -nostdlib -fno-builtin -O2 -fuse-ld=lld \
-	         -I tests -Wl,-Ttext=0x80000000 -Wl,-e,_start $< -o $@
+	         -I tests -I build -Wl,-Ttext=0x80000000 -Wl,-e,_start $< -o $@
+
+# Additional seeds, run in CI after the fixed one. Each seed is a different
+# 48-instruction stream: a translator bug that one stream happens to miss is
+# found by the next, at the cost of one rebuild and one QEMU boot.
+LATR_RAND_SEEDS ?= 1 2 3
+latr-rand-sweep:
+	@set -e; \
+	 for seed in $(LATR_RAND_SEEDS); do \
+	     echo "--- rand seed $$seed"; \
+	     LATR_RAND_SEED=$$seed $(PYTHON) $(LATR_RAND_GEN) >/dev/null; \
+	     rm -f build/latr_isa_test.o build/bare_latr_isa.elf \
+	           build/latr_riscv_ref.elf; \
+	     $(MAKE) --no-print-directory latr-rand-diff \
+	         CLANG=$(CLANG) AR=$(AR) LD_LLD=$(LD_LLD) \
+	         QLVZ_REPO=$(QLVZ_REPO) | tail -1; \
+	 done; \
+	 $(PYTHON) $(LATR_RAND_GEN) >/dev/null
+
+latr-rand-diff: latr-isa-run latr-riscv-ref
+	@latr_sig=$$(grep -aho 'latr-rand-diff=[0-9a-f]*' build/latr_isa.log | tail -1); \
+	 qemu_sig=$$(grep -aho 'latr-rand-diff=[0-9a-f]*' build/latr_riscv_ref.log | tail -1); \
+	 if [ -z "$$latr_sig" ] || [ -z "$$qemu_sig" ]; then \
+	     echo "latr-rand-diff: missing signature (latr='$$latr_sig' qemu='$$qemu_sig')"; \
+	     exit 1; \
+	 fi; \
+	 if [ "$$latr_sig" != "$$qemu_sig" ]; then \
+	     echo "latr-rand-diff: MISMATCH latr=$$latr_sig qemu=$$qemu_sig"; \
+	     exit 1; \
+	 fi; \
+	 echo "latr-rand-diff: PASS $$latr_sig"
 
 latr-riscv-ref: build/latr_riscv_ref.elf
 	@rm -f build/latr_riscv_ref.log
-	@timeout 20 $(QEMU_RISCV64) -M virt -cpu max -m 128M -bios none \
+	@$(if $(TIMEOUT),$(TIMEOUT) 20,) $(QEMU_RISCV64) -M virt -cpu max -m 128M -bios none \
 	     -kernel $< -display none -monitor none \
 	     -serial file:build/latr_riscv_ref.log -no-reboot 2>/dev/null
 	@grep -a 'latr-riscv-ref: PASS' build/latr_riscv_ref.log
