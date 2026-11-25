@@ -140,7 +140,17 @@ typedef struct TRANSLATION_DATA {
     int tb_code_sym_count;
     uint8_t tb_code_sym_overflow;
     int tb_code_sym_ir2[LATR_TB_CODE_SYMS];
+    /* li_d expands into several IR2 instructions, so a symbol owns the half-open
+     * IR2 index range [start, end) rather than a single instruction. */
+    int tb_code_sym_ir2_end[LATR_TB_CODE_SYMS];
     const void *tb_code_sym_fn[LATR_TB_CODE_SYMS];
+    uint8_t tb_code_sym_reg[LATR_TB_CODE_SYMS];
+    /* Filled by tr_ir2_assemble(): the word span that materialises the symbol.
+     * li_d is a variable-length expansion, so the count is measured, not
+     * assumed - see docs/design/persistent-code-cache.md for why that matters
+     * to relocation. */
+    uint32_t tb_code_sym_word[LATR_TB_CODE_SYMS];
+    uint32_t tb_code_sym_words[LATR_TB_CODE_SYMS];
     /* Per-insn recovery staging (C1): site kind + regcache binding snapshot
      * captured during translate, committed into the map at assemble. */
     uint8_t tb_insn_site[LATR_TB_MAP_SPANS];
@@ -338,6 +348,11 @@ int latr_tb_code_symbol_count(void);
 const void *latr_tb_code_symbol(int index);
 int latr_tb_code_symbol_ir2(int index);
 int latr_tb_code_symbols_overflowed(void);
+/* Word span of the symbol's materialisation inside the assembled block. */
+int latr_tb_code_symbol_span(int index, uint32_t *word_start,
+                             uint32_t *word_count);
+/* Physical register the symbol is loaded into (needed to re-emit the load). */
+int latr_tb_code_symbol_reg(int index);
 bool latr_regcache_evict_itemp(void);
 bool latr_regcache_evict_ftemp(void);
 void latr_regcache_prepare_fpr_write(IR2_OPND value);

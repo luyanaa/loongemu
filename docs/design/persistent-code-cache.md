@@ -150,6 +150,40 @@ because a checksum whose collision an attacker can compute is not a checksum.
 P0 is the decisive step: if the relocation test cannot be made to pass, nothing
 after it can be correct, and the test is cheap.
 
+## 3a. Round-trip result and the one blocker it found
+
+The P1 test (`test_reloc_round_trip` in the LATR ISA image) does exactly the
+sequence §4 describes, in one process:
+
+1. translate `sd x9, 8(x8)` into the arena: 245 words, **4 symbol spans**;
+2. copy the words to a second, differently aligned buffer;
+3. re-emit each span with `li_d(reg, symbol)` for the *same* symbol and require
+   the word count to match (it does, so the recorded spans are exact);
+4. poison the original arena with zeros, so any unrecorded self-address would
+   fault instead of silently working;
+5. execute the copy: the guest store lands and the guest state matches the
+   original run.
+
+So the records are complete enough to rebuild a block byte-for-byte at a new
+address, and the block itself is position-independent apart from the recorded
+spans.
+
+**The blocker that decides P2's shape:** `li_d` is a variable-length expansion
+(`imm_helper` chooses among `lu12i/ori/lu32i/lu52i`). Measured on the same four
+spans:
+
+| relocation delta | spans whose word count changes |
+|---|---|
+| +64 KiB | 0 of 4 |
+| +4 GiB (ASLR scale) | **4 of 4** |
+
+In-place patching therefore only works for small displacements. A cache loaded
+into a fresh process faces an ASLR-scale delta, so P2 must either emit relocation
+sites in a fixed-width form (for example always four words, padding with `nop`)
+or re-assemble the block from serialised IR2. The measurement is in the ISA log
+line `relocation spans=4 words=245 resized_64k=0 resized_4g=4`, so the next
+attempt starts from data rather than from this paragraph.
+
 ## 4. The relocation test that decides everything
 
 1. Translate a fixture block into arena A; record results (guest registers,

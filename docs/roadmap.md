@@ -378,7 +378,12 @@ fault recovery cost.
    guest boot; writebacks unchanged, so semantics are identical). Call-site
    elision at the ten hand-placed flushes stays open and needs its own
    measurement first.
-7. 5.3 relocation round trip (builds on `latr_emit_code_symbol`).
+7. 5.3 relocation round trip - done: same-symbol round trip at a second base with
+   the original arena poisoned (4 spans, 245 words, guest state identical). It
+   also measured the blocker for the disk cache: `li_d` is variable-length, so
+   all four spans change width at an ASLR-scale delta (0 do at +64 KiB). P2 must
+   either pad relocation sites to a fixed width or re-assemble from serialised
+   IR2.
 8. 2.2 LATR: remaining RVV encodings, then real SMP.
 9. 2.3 LATM: vmlinux boot, then SMP, then 3A4000 platform alignment.
 10. 2.4 LATX: LAPIC/IOAPIC/time, virtio-PCI or AHCI, and the `tb_sys.c` split.

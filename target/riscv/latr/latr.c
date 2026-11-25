@@ -282,21 +282,47 @@ void latr_tr_data_init(CPUArchState *env)
 
 static LatrRegCacheStats latr_regcache_stats_counters;
 
+/*
+ * Index of the next instruction to be appended, counting non-label IR2 entries.
+ * `TRANSLATION_DATA.ir2_inst_num_current` looks like it should answer this but
+ * is never incremented by any emitter, so the count is taken from the list and
+ * the assembler's walk uses the same rule.
+ */
+static int latr_ir2_count_now(TRANSLATION_DATA *data)
+{
+    int n = 0;
+
+    for (IR2_INST *it = data->first_ir2; it != NULL; it = ir2_next(it)) {
+        if (ir2_opcode(it) != LISA_LABEL) {
+            n++;
+        }
+    }
+    return n;
+}
+
 void latr_emit_code_symbol(IR2_OPND dst, const void *sym)
 {
     TRANSLATION_DATA *data = lsenv->tr_data;
 
+    int slot = -1;
     if (data->tb_code_sym_count < LATR_TB_CODE_SYMS) {
-        int i = data->tb_code_sym_count++;
-
-        data->tb_code_sym_ir2[i] = data->ir2_inst_num_current;
-        data->tb_code_sym_fn[i] = sym;
+        slot = data->tb_code_sym_count++;
+        data->tb_code_sym_ir2[slot] = latr_ir2_count_now(data);
+        data->tb_code_sym_ir2_end[slot] = data->tb_code_sym_ir2[slot];
+        data->tb_code_sym_fn[slot] = sym;
+        data->tb_code_sym_reg[slot] = (uint8_t)dst._reg_num;
+        data->tb_code_sym_word[slot] = 0;
+        data->tb_code_sym_words[slot] = 0;
     } else {
         /* A block that needs more slots than this is not a size problem: it is
          * a block whose relocation list is incomplete, so say so loudly. */
         data->tb_code_sym_overflow = 1;
     }
     li_d(dst, (int64_t)(uintptr_t)sym);
+    if (slot >= 0) {
+        /* Exact extent of the expansion, measured rather than guessed. */
+        data->tb_code_sym_ir2_end[slot] = latr_ir2_count_now(data);
+    }
 }
 
 int latr_tb_code_symbol_count(void)
@@ -310,6 +336,30 @@ const void *latr_tb_code_symbol(int index)
         return NULL;
     }
     return lsenv->tr_data->tb_code_sym_fn[index];
+}
+
+int latr_tb_code_symbol_span(int index, uint32_t *word_start,
+                             uint32_t *word_count)
+{
+    if (index < 0 || index >= lsenv->tr_data->tb_code_sym_count ||
+        lsenv->tr_data->tb_code_sym_words[index] == 0) {
+        return 0;
+    }
+    if (word_start != NULL) {
+        *word_start = lsenv->tr_data->tb_code_sym_word[index];
+    }
+    if (word_count != NULL) {
+        *word_count = lsenv->tr_data->tb_code_sym_words[index];
+    }
+    return 1;
+}
+
+int latr_tb_code_symbol_reg(int index)
+{
+    if (index < 0 || index >= lsenv->tr_data->tb_code_sym_count) {
+        return -1;
+    }
+    return lsenv->tr_data->tb_code_sym_reg[index];
 }
 
 int latr_tb_code_symbols_overflowed(void)
@@ -1289,6 +1339,7 @@ int tr_ir2_assemble(const void *code_start_addr)
     for (int i = 0; i <= data->tb_insn_count && i <= LATR_TB_MAP_SPANS; i++) {
         span_off[i] = 0;
     }
+    int ir2_index = 0;
     for (IR2_INST *inst = data->first_ir2; inst != NULL; inst = ir2_next(inst)) {
         if (ir2_opcode(inst) == LISA_LABEL) {
             int id = ir2_opnd_label_id(&inst->_opnd[0]);
@@ -1299,7 +1350,25 @@ int tr_ir2_assemble(const void *code_start_addr)
             }
             continue;
         }
+        /*
+         * A recorded code symbol starts at its own IR2 index. li_d expands to a
+         * variable number of words (imm_helper decides which of lu12i/ori/
+         * lu32i/lu52i are needed), so the span is measured here rather than
+         * assumed from the pseudo's shape.
+         */
+        for (int i = 0; i < data->tb_code_sym_count; i++) {
+            if (data->tb_code_sym_ir2[i] == ir2_index) {
+                data->tb_code_sym_word[i] = (uint32_t)count;
+            }
+        }
         code[count++] = ir2_assemble(inst);
+        ir2_index++;
+        for (int i = 0; i < data->tb_code_sym_count; i++) {
+            if (data->tb_code_sym_ir2_end[i] == ir2_index) {
+                data->tb_code_sym_words[i] =
+                    (uint32_t)count - data->tb_code_sym_word[i];
+            }
+        }
     }
 
     latr_tb_insn_map_begin((void *)code_start_addr, (uint32_t)count * 4);

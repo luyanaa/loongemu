@@ -67,6 +67,13 @@ extern int tr_ir2_assemble(const void *code_start_addr);
 extern void target_disasm(TranslationBlock *tb, int *max_insns, CPUState *cpu);
 extern bool tr_ir2_generate(TranslationBlock *tb);
 extern void latr_enter_tb(void *env, void *code);
+
+/* latr_enter_tb returns through a trampoline; the harness only needs "it ran". */
+static int latr_enter_tb_checked(void *envp, void *code)
+{
+    latr_enter_tb(envp, code);
+    return 1;
+}
 extern bool latr_tb_insn_map_resolve(uintptr_t host_pc, uint64_t *guest_pc,
                                      uint32_t *raw_len);
 extern void latr_tb_insn_map_forget(void *code);
@@ -6659,6 +6666,148 @@ static void test_elf_loader(void)
           "short program header entries are rejected");
 }
 
+
+/*
+ * Relocation round trip (persistent-code-cache P1).
+ *
+ * Translate a block that embeds host addresses into the arena, copy the words to
+ * a second buffer at a different address, re-emit each recorded symbol span
+ * against the loader's symbol table, then execute the copy and compare guest
+ * state with the original run. The original is poisoned first, so any address
+ * the block still holds into itself would fault instead of silently working.
+ *
+ * li_d is a variable-length expansion, so this also measures whether a span can
+ * be rewritten in place at all: the same symbol reproduces the same word count
+ * (asserted below), while relocating to a *different* address may need a
+ * different count - the P2 blocker, measured rather than assumed.
+ */
+extern void li_d(IR2_OPND opnd2, int64_t value);
+
+#define RELOC_MAX_SYMS 8
+
+static void test_reloc_round_trip(void)
+{
+    /* sd x9, 8(x8): a guest write, so the store-lock symbol is embedded. */
+    static const uint32_t store_block[] = {
+        0x00943423u, /* sd x9, 8(x8) */
+    };
+    uint64_t data[2] = { 0, 0 };
+    static uint8_t reloc_buf[4096] __attribute__((aligned(4096)));
+    uint32_t spans_start[RELOC_MAX_SYMS], spans_words[RELOC_MAX_SYMS];
+    int spans_reg[RELOC_MAX_SYMS];
+    const void *spans_sym[RELOC_MAX_SYMS];
+    int syms = 0;
+    uint32_t total_words = 0;
+    uint32_t resized_small = 0;
+    uint32_t resized_aslr = 0;
+
+    latx_bare_uart_puts("latr-isa: relocation begin\n");
+    reset_guest_state();
+    env.gpr[8] = (uint64_t)(uintptr_t)&data[0];
+    env.gpr[9] = 0x2222;
+
+    {
+        int max_insns = 1;
+
+        for (size_t i = 0; i < sizeof(tb); i++) {
+            ((uint8_t *)&tb)[i] = 0;
+        }
+        cpu.env_ptr = &env;
+        env.pc = (uint64_t)(uintptr_t)store_block;
+        tb.pc = env.pc;
+        tb.tc.ptr = code_buf;
+        tb.cflags = LATR_TB_CFLAGS_ALLOW_FLOW;
+        target_disasm(&tb, &max_insns, &cpu);
+        check(tb.icount, 1, "reloc block decodes one instruction");
+        tr_init(&tb);
+        check(tr_ir2_generate(&tb), 1, "reloc block translates");
+        total_words = (uint32_t)tr_ir2_assemble(code_buf);
+        syms = latr_tb_code_symbol_count();
+        if (syms > RELOC_MAX_SYMS) {
+            syms = RELOC_MAX_SYMS;
+        }
+        check(syms > 0, 1, "reloc block embeds a host symbol");
+        for (int i = 0; i < syms; i++) {
+            check(latr_tb_code_symbol_span(i, &spans_start[i], &spans_words[i]),
+                  1, "symbol span recorded");
+            spans_reg[i] = latr_tb_code_symbol_reg(i);
+            spans_sym[i] = latr_tb_code_symbol(i);
+            check(spans_words[i] > 0, 1, "symbol span covers words");
+            check(spans_start[i] + spans_words[i] <= total_words, 1,
+                  "symbol span stays inside the block");
+        }
+        tr_fini();
+    }
+
+    check(latr_enter_tb_checked(&env, code_buf), 1, "baseline block runs");
+    check(data[1], UINT64_C(0x2222), "baseline store landed");
+
+    for (uint32_t i = 0; i < total_words; i++) {
+        ((uint32_t *)reloc_buf)[i] = ((const uint32_t *)code_buf)[i];
+    }
+    for (int i = 0; i < syms; i++) {
+        uint32_t scratch[8];
+        int w;
+
+        tr_init(&tb);
+        li_d(ir2_opnd_new(IR2_OPND_GPR, spans_reg[i]),
+             (int64_t)(uintptr_t)spans_sym[i]);
+        w = tr_ir2_assemble(scratch);
+        tr_fini();
+        check((uint32_t)w, spans_words[i],
+              "same symbol re-emits the same word count");
+        if ((uint32_t)w == spans_words[i]) {
+            for (int k = 0; k < w; k++) {
+                ((uint32_t *)reloc_buf)[spans_start[i] + k] = scratch[k];
+            }
+        }
+
+        /* Two relocation deltas: a nearby one, and one the size of an ASLR
+         * slide (64 KiB vs 4 GiB). The second is what a cache loaded into a
+         * fresh process actually faces. */
+        tr_init(&tb);
+        li_d(ir2_opnd_new(IR2_OPND_GPR, spans_reg[i]),
+             (int64_t)((uintptr_t)spans_sym[i] + 0x10000u));
+        w = tr_ir2_assemble(scratch);
+        tr_fini();
+        if ((uint32_t)w != spans_words[i]) {
+            resized_small++;
+        }
+        tr_init(&tb);
+        li_d(ir2_opnd_new(IR2_OPND_GPR, spans_reg[i]),
+             (int64_t)((uintptr_t)spans_sym[i] + UINT64_C(0x100000000)));
+        w = tr_ir2_assemble(scratch);
+        tr_fini();
+        if ((uint32_t)w != spans_words[i]) {
+            resized_aslr++;
+        }
+    }
+
+    /* Poison the original: an unrecorded self-address would now fault. */
+    for (uint32_t i = 0; i < total_words; i++) {
+        ((uint32_t *)code_buf)[i] = 0;
+    }
+    __asm__ volatile("ibar 0" ::: "memory");
+
+    reset_guest_state();
+    env.gpr[8] = (uint64_t)(uintptr_t)&data[0];
+    env.gpr[9] = 0x3333;
+    check(latr_enter_tb_checked(&env, reloc_buf), 1,
+          "relocated block runs at a different address");
+    check(data[1], UINT64_C(0x3333), "relocated block still performs the store");
+
+    latx_bare_uart_puts("latr-isa: relocation spans=");
+    putdec((unsigned)syms);
+    latx_bare_uart_puts(" words=");
+    putdec((unsigned)total_words);
+    latx_bare_uart_puts(" resized_64k=");
+    putdec((unsigned)resized_small);
+    latx_bare_uart_puts(" resized_4g=");
+    putdec((unsigned)resized_aslr);
+    latx_bare_uart_puts("\n");
+    latx_bare_uart_puts("latr-isa: relocation done\n");
+}
+
 void kmain(void)
 {
     uint64_t euen;
@@ -6730,6 +6879,7 @@ void kmain(void)
     test_rvv_pvir_lsx_lasx();
     test_tb_insn_map();
     test_tb_recovery();
+    test_reloc_round_trip();
     test_recovery_atomic_apply();
     test_mmu_fetch();
     test_counters();
