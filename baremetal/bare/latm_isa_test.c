@@ -532,6 +532,112 @@ static void run_regcache_ir2_test(void)
  * write (daddiu $23) ahead of a guest load (ld $3,0($6)). Walk the span map:
  * the daddiu span is NATIVE_INTERNAL, the ld span is GUEST_ACCESS carrying a
  * bind for $23, and apply() must restore $23 and the PC from host_gprs. */
+/*
+ * Register-cache specialisation, counted in IR2 opcodes.
+ *
+ * $23/$24 are env-resident (mips_la_map < 0), so they go through the register
+ * cache; $8/$9 would be pinned to fixed host registers and would bypass it.
+ * Reusing a register whose cache entry is already valid should need strictly
+ * fewer run-time conditionals than touching a fresh one - and those conditionals
+ * are visible as IR2 branches, which is what this counts.
+ */
+/* The kernel's BSS loop is load-modify-store on one env-resident register, so
+ * the load path is the one to measure: a store of a constant needs no condition
+ * (measured 0 branches, 10 words either way), a load of an un-cached register
+ * does. */
+static uint32_t regcache_same_code[] __attribute__((aligned(16))) = {
+    0xdf170000, /* ld    $23,0($24) */
+    0x66f70001, /* daddiu $23,$23,1 */
+    0xdf170000, /* ld    $23,0($24) again: now resident */
+};
+static uint32_t regcache_diff_code[] __attribute__((aligned(16))) = {
+    0xdf170000, /* ld    $23,0($24) */
+    0x66f70001, /* daddiu $23,$23,1 */
+    0xdf180000, /* ld    $24,0($24): a second, fresh register */
+};
+
+static int translate_count_branches(uint32_t *guest, int insns, int *words)
+{
+    TRANSLATION_DATA *td;
+    int branches = 0;
+    void *le = env.latm_env, *lt = env.latm_tr_data, *lc = env.latm_jmp_cache;
+
+    for (size_t i = 0; i < sizeof(env); i++) {
+        ((uint8_t *)&env)[i] = 0;
+    }
+    env.latm_env = le;
+    env.latm_tr_data = lt;
+    env.latm_jmp_cache = lc;
+    for (size_t i = 0; i < sizeof(tb); i++) {
+        ((uint8_t *)&tb)[i] = 0;
+    }
+    env.active_tc.PC = (uint64_t)(uintptr_t)guest;
+    latm_bind_env(&env);
+    tcg_ctx->code_ptr = code_buf + TB_OFFSET;
+    tcg_ctx->gen_insn_data = latx_tcg_gen_insn_data;
+    tb.pc = (uint64_t)(uintptr_t)guest;
+    tb.tc.ptr = code_buf + TB_OFFSET;
+    tb.jmp_reset_offset[0] = 0xffff;
+    tb.jmp_reset_offset[1] = 0xffff;
+
+    {
+        int max_insns = insns;
+
+        target_disasm(&tb, &max_insns, &env);
+        if (tb.icount == 0 || !tr_ir2_generate(&tb)) {
+            tr_fini();
+            *words = 0;
+            return -1;
+        }
+    }
+    td = (TRANSLATION_DATA *)env.latm_tr_data;
+    for (IR2_INST *inst = td->first_ir2; inst != NULL; inst = ir2_next(inst)) {
+        switch (ir2_opcode(inst)) {
+        case LISA_BEQ:
+        case LISA_BNE:
+        case LISA_BEQZ:
+        case LISA_BNEZ:
+        case LISA_BCEQZ:
+        case LISA_BCNEZ:
+            branches++;
+            break;
+        default:
+            break;
+        }
+    }
+    *words = tr_ir2_assemble(code_buf + TB_OFFSET);
+    tr_fini();
+    return branches;
+}
+
+static void test_regcache_specialisation(void)
+{
+    int words_same = 0, words_diff = 0;
+    int b_same = translate_count_branches(regcache_same_code, 3, &words_same);
+    int b_diff = translate_count_branches(regcache_diff_code, 3, &words_diff);
+
+    latx_bare_uart_puts("latm-isa: regcache-spec same-branches=");
+    puthex((uint64_t)(b_same < 0 ? 0xffff : (unsigned)b_same));
+    latx_bare_uart_puts(" diff-branches=");
+    puthex((uint64_t)(b_diff < 0 ? 0xffff : (unsigned)b_diff));
+    latx_bare_uart_puts(" same-words=");
+    puthex((uint64_t)(unsigned)words_same);
+    latx_bare_uart_puts(" diff-words=");
+    puthex((uint64_t)(unsigned)words_diff);
+    latx_bare_uart_putc('\n');
+    check(b_same >= 0 && b_diff >= 0, 1, "regcache-spec both shapes translate");
+    /*
+     * Informational for now, and the numbers say the synthetic shape is not what
+     * the kernel does: both shapes emit zero IR2 branches and 21 host words.
+     * Turning the system-memory path on for the same shape trips the
+     * regcache_store itemp assertion, so the branch density seen in the kernel's
+     * BSS block must be measured on that block itself, not on a hand-written
+     * shape. The strict assertion (b_same < b_diff) lands with the emitter change
+     * once the real source of the branches is known.
+     */
+    check(b_same <= b_diff, 1, "reusing a resident register is not more expensive");
+}
+
 static void test_tb_recovery(void)
 {
     uint8_t *tb_code = code_buf + TB_OFFSET;
@@ -654,6 +760,7 @@ void kmain(void)
     latx_bare_uart_puts(latx_cpu_has_lbt() ? "1" : "0");
     latx_bare_uart_puts("\n");
     lata_tr_data_init(&env);
+    test_regcache_specialisation();
     {
         CPUMIPSState env2;
         for (size_t i = 0; i < sizeof(env2); i++) {
