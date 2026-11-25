@@ -7595,12 +7595,6 @@ void kmain(void)
     puthex(diff_fp_fma);
     puthex(diff_rvv);
     latx_bare_uart_putc('\n');
-    if (failures == 0) {
-        latx_bare_uart_puts("latr-isa: PASS checks=");
-    } else {
-        latx_bare_uart_puts("latr-isa: FAIL checks=");
-    }
-    putdec((unsigned)checks);
 #ifdef LOONGEMU_PERF
     {
         /* `make latr-isa-run PERF=1` reports the guest-access event mix for
@@ -7660,6 +7654,12 @@ void kmain(void)
         putdec((unsigned)rc.flushes);
         latx_bare_uart_puts(" empty=");
         putdec((unsigned)rc.empty_flushes);
+        latx_bare_uart_puts(" elided=");
+        putdec((unsigned)rc.elided_flushes);
+        latx_bare_uart_puts(" release-only=");
+        putdec((unsigned)rc.release_only_flushes);
+        latx_bare_uart_puts(" dead-stores=");
+        putdec((unsigned)rc.dead_stores);
         latx_bare_uart_puts(" scans=");
         putdec((unsigned)rc.scan_entries);
         latx_bare_uart_puts(" writebacks=");
@@ -7670,6 +7670,28 @@ void kmain(void)
         putdec((unsigned)rc.stores);
         latx_bare_uart_puts(" evictions=");
         putdec((unsigned)rc.evictions);
+        /*
+         * Pin the property 5.1 step 4 rests on: every guest-register write is
+         * written back exactly once, and a flush is either elided, release-only
+         * or carries at least one writeback. If a future change starts writing
+         * a value twice, this fails instead of the design note going stale.
+         */
+        check(rc.writebacks, rc.stores,
+              "no guest register is written back twice");
+        check(rc.elided_flushes + rc.release_only_flushes <= rc.flushes, 1,
+              "flush categories partition the flush count");
+        check(rc.elided_flushes > 0, 1,
+              "most flushes are elided (regcache stays lazy across edges)");
     }
+    /* The summary is printed last on purpose: the code-symbol census and the
+     * register-cache accounting below add checks of their own, and a gate that
+     * greps this line must see their verdict. */
+    latx_bare_uart_putc('\n');
+    if (failures == 0) {
+        latx_bare_uart_puts("latr-isa: PASS checks=");
+    } else {
+        latx_bare_uart_puts("latr-isa: FAIL checks=");
+    }
+    putdec((unsigned)checks);
     latx_bare_uart_puts("\nlatr-isa: done\n");
 }

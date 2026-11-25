@@ -329,12 +329,26 @@ void latr_regcache_reset(void);
  */
 typedef struct LatrRegCacheStats {
     uint64_t flushes;    /* latr_regcache_flush() calls */
-    uint64_t empty_flushes; /* ... of which found nothing dirty */
+    uint64_t empty_flushes; /* ... of which found entries but nothing dirty */
     uint64_t scan_entries;  /* entries examined by flush/eviction scans */
     uint64_t writebacks; /* guest-state stores emitted (flush and eviction) */
     uint64_t reloads;    /* env loads because the value was not resident */
     uint64_t stores;     /* guest-register writes taken by store_gpr_dst() */
     uint64_t evictions;  /* resident entries dropped to free a slot */
+    /*
+     * 5.1 step 4 evidence (see docs/design/ir2-value-version.md section 5):
+     *   elided_flushes    flush calls that returned before any scan because
+     *                     nothing was resident - pure call overhead;
+     *   release_only      flushes with resident-but-clean entries, i.e. the
+     *                     flush only freed temporaries and wrote nothing;
+     *   dead_stores       a guest register's dirty value replaced by a newer
+     *                     write with no writeback in between. This is the
+     *                     dead-write case: the old value never reaches memory,
+     *                     so there is nothing left to eliminate.
+     */
+    uint64_t elided_flushes;
+    uint64_t release_only_flushes;
+    uint64_t dead_stores;
 } LatrRegCacheStats;
 
 void latr_regcache_stats_reset(void);

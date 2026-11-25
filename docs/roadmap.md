@@ -258,7 +258,12 @@ Order (P0 already measured - see `docs/design/ir2-value-version.md`):
 2. shared ValueVersion and canonical state - **retired by the measurement**, the
    double-writeback case it targeted does not occur;
 3. conservative flush elision at internal labels/branches;
-4. next-use and dead-write elimination;
+4. next-use and dead-write elimination - **retired by measurement** (see
+   `ir2-value-version.md` §3.2b): `dead_stores == 0` in both workloads, so there
+   is nothing to eliminate, and no writeback happens at a label/exit/block-end
+   flush (all 282/605 happen at helper-call boundaries where canonical state is
+   mandatory). The remaining next-use work is load hoisting across an edge,
+   which needs the successor - i.e. chaining, step 5;
 5. cross-TB register residency after chaining exists.
 
 Software NZCV also belongs in this frame: N/Z/C/V as guest state materialised

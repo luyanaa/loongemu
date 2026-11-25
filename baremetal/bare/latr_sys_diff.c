@@ -163,6 +163,12 @@ void kmain(void)
         putdec((unsigned)rc.flushes);
         latx_bare_uart_puts(" empty=");
         putdec((unsigned)rc.empty_flushes);
+        latx_bare_uart_puts(" elided=");
+        putdec((unsigned)rc.elided_flushes);
+        latx_bare_uart_puts(" release-only=");
+        putdec((unsigned)rc.release_only_flushes);
+        latx_bare_uart_puts(" dead-stores=");
+        putdec((unsigned)rc.dead_stores);
         latx_bare_uart_puts(" scans=");
         putdec((unsigned)rc.scan_entries);
         latx_bare_uart_puts(" writebacks=");

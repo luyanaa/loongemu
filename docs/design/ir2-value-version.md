@@ -103,6 +103,44 @@ the label to the previous boundary, because the port emits linearly.
   `tb_insn_label[]` (`latr.h:108`), consumed when it resolves labels at
   `latr.c:1139-1146`. No new analysis pass is needed.
 
+### 3.2b Step 4 measured and retired (dead writes and next-use at labels)
+
+Before building anything, the two claims step 4 rests on were measured with
+permanent counters in `LatrRegCacheStats` (`dead_stores`, `elided_flushes`,
+`release_only_flushes`) plus a temporary per-site split (instrumentation removed
+after the run; numbers recorded here):
+
+| workload | flushes | elided | release-only | dead stores | writebacks | stores | reloads |
+|---|---|---|---|---|---|---|---|
+| ISA image (1770 checks) | 14268 | 13822 | 164 | 0 | 282 | 282 | 321 |
+| guest boot | 10022 | 9078 | 339 | 0 | 605 | 605 | 776 |
+
+Per-site split on the ISA image (writebacks/flushes): helper-call boundaries
+282/13936, internal label 0/4, exit stub 0/1, block end 0/327.
+
+What that says:
+
+1. **Dead writes do not exist in these workloads.** `dead_stores == 0` means no
+   guest register is written twice inside one translated block, so there is no
+   value to eliminate. The mechanism is already right where it matters: when a
+   guest register's dirty value is replaced by a newer write, `regcache_store`
+   drops the old value without a writeback (`latr.c:667-700`), so a dead write
+   can never cost a store. A future workload that does produce them still costs
+   nothing beyond the instruction itself.
+2. **Writebacks only happen where canonical state is mandatory.** All 282/605
+   writebacks occur at helper-call flush points (memory/atomic/CSR helpers that
+   may enter the guest trap path), and the label/exit/block-end flushes write
+   nothing back - they only free temporaries or find the cache empty.
+3. **The remaining flush cost is translator time, not emitted code.** 97%/91% of
+   flush calls find nothing resident, and those already emitted nothing; the
+   fast path now returns before the counter split and the release loops (the
+   desync assertion still runs).
+
+So step 4's regcache half is retired by measurement, the same way step 2 was.
+Next-use in the sense of *hoisting a load into a predecessor edge* stays open by
+design: it needs the successor block to be known, i.e. chaining (5.2), and §3.3
+already says it changes no observable state.
+
 ### 3.3 Next-use for writeback ordering, not elimination
 
 Where a writeback set must be emitted anyway (TB exit, helper call, fault

@@ -567,8 +567,20 @@ void latr_regcache_flush(void)
     LatrRegCacheEntry *fpr = regcache_entries(true);
 
     latr_regcache_stats_counters.flushes++;
+    if (cache->gpr_valid == 0 && cache->fpr_valid == 0) {
+        /* Nothing resident: no store to emit and no temporary to free. The
+         * whole flush is a no-op, so return before the counter split below -
+         * this is the only part of a flush that costs translator time. */
+        latr_regcache_stats_counters.elided_flushes++;
+        /* Nothing resident means nothing dirty; a dirty flag without a
+         * resident temporary would be a counter desync. */
+        lsassertm(cache->gpr_dirty == 0 && cache->fpr_dirty == 0,
+                  "register-cache dirty counter without a resident entry");
+        return;
+    }
     if (cache->gpr_dirty == 0 && cache->fpr_dirty == 0) {
         latr_regcache_stats_counters.empty_flushes++;
+        latr_regcache_stats_counters.release_only_flushes++;
     }
     /*
      * Only walk a bank that has something to write back. The release loop still
@@ -674,9 +686,20 @@ static void regcache_store(int reg, IR2_OPND value, bool is_fpr)
     lsassertm(slot >= 0, "guest register writeback requires a temporary operand");
 
     if (entry->valid && entry->temp == value._reg_num) {
+        if (entry->dirty) {
+            /* The previous value is replaced in place and never reaches
+             * memory: the second half of the dead-write case. */
+            latr_regcache_stats_counters.dead_stores++;
+        }
         regcache_set_dirty(entry, is_fpr);
         regcache_touch(entry);
         return;
+    }
+    if (entry->valid && entry->dirty) {
+        /* Overwritten before any flush: the old value is dead and is dropped
+         * without a writeback on purpose. Counted so the claim stays measured
+         * rather than asserted. */
+        latr_regcache_stats_counters.dead_stores++;
     }
     regcache_release(entry, is_fpr, false);
 
