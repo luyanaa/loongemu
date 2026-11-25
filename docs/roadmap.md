@@ -231,7 +231,21 @@ as host words holding big-endian encodings, e.g. `lui $t0,0x8000` is `0x3c0c8000
 
 **What the dump shows, and the fix it points at.** The 124-word block for 12 guest instructions contains **51 branch-class words** (top six bits in 0x10-0x1b): 24 `bceqz` and 19 `bnez`, against only 11 `addi`-class and 7 `ld`-class. So the block is not branch-dense because of guest control flow - it is branch-dense because **every guest-register access emits a run-time conditional**: "if this entry is dirty, store it back", "if it is invalid, load it", "if the value is already in this register, skip". All of those conditions are decided during translation, so most of them can be specialised away: emit the load/store unconditionally when the state is known, and only branch in the genuinely dynamic case. That is the concrete target (24 `bceqz` first), with the same `-d exec` count as acceptance: host TBs per emitted block must drop from ~30 without changing any ISA check.
 
-**A synthetic reproduction of that density failed, and that is the useful result.** `latm-isa` now has `test_regcache_specialisation` (2 checks, image at 62) which translates two hand-written shapes on an env-resident register and counts IR2 branches and host words: a load-modify-load of the *same* register and of two *different* registers both come out at **0 branches and 21 words**, and the constant-store pair at 0 branches and 10 words. So the register cache's own specialisation is already good, and the 43 conditional words in the kernel block come from somewhere else. Turning the system-memory path on for the same shape aborts the translator instead (`regcache_store` itemp assertion), so the next measurement must be taken **on the kernel's own block**: dump its IR2 opcodes (the ISA test already walks `first_ir2`/`ir2_next`) rather than guessing shapes. Recorded so the synthetic-test route is not repeated. Two other measured facts: a 256 MiB `.bss` yields a 303 MB `memsz` segment and QEMU's LoongArch `-kernel` loader then runs the image with **no serial output at all** (64 MiB works), and this PC is the ready-made benchmark for 5.2 chaining |
+**Correction: the 51 "branch words" were a measurement artefact.** The hex dump
+printed nibbles low-to-high, so reading the words back by hand reversed every
+word and the top-six-bit histogram was meaningless. Measured properly, at the IR2
+level and on the kernel's own block shape (`sw $zero,0($4); addiu $4,$4,4;
+bne $6,$4,-3` - $4/$6 are pinned host registers, so the register cache is not
+involved): **0 IR2 branches either way**, but **15 host words with the system
+memory path off and 71 with it on** (4.7x). So the per-instruction cost is not
+branch density and not the register cache - it is the expansion the system memory
+path adds to every guest access, which is exactly what the boot harness must run
+(enabling it on the env-resident shape instead trips the `regcache_store` itemp
+assertion, a separate pre-existing limit). `latm-isa` now pins both directions:
+the sys path must cost extra words, and the loop must need no IR2 branch.
+
+**The earlier synthetic test failed to reproduce the density, and that was useful
+too.** `latm-isa` now has `test_regcache_specialisation` (2 checks, image at 62) which translates two hand-written shapes on an env-resident register and counts IR2 branches and host words: a load-modify-load of the *same* register and of two *different* registers both come out at **0 branches and 21 words**, and the constant-store pair at 0 branches and 10 words. So the register cache's own specialisation is already good, and the 43 conditional words in the kernel block come from somewhere else. Turning the system-memory path on for the same shape aborts the translator instead (`regcache_store` itemp assertion), so the next measurement must be taken **on the kernel's own block**: dump its IR2 opcodes (the ISA test already walks `first_ir2`/`ir2_next`) rather than guessing shapes. Recorded so the synthetic-test route is not repeated. Two other measured facts: a 256 MiB `.bss` yields a 303 MB `memsz` segment and QEMU's LoongArch `-kernel` loader then runs the image with **no serial output at all** (64 MiB works), and this PC is the ready-made benchmark for 5.2 chaining |
 | SMP | four vCPUs, IPI, cross-core TLB, reservation coherence | P0 |
 | 3A4000 platform | IOCSR/EXTIOI/PCH behaviour aligned with Linux drivers | P0 |
 | 7A PCI | BAR, MSI, real device IRQ, DMA ownership | P1 |

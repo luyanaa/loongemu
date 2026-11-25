@@ -610,6 +610,51 @@ static int translate_count_branches(uint32_t *guest, int insns, int *words)
     return branches;
 }
 
+/*
+ * The kernel's own BSS-clear block: sw $zero,0($4); addiu $4,$4,4;
+ * bne $6,$4,-3 (branching to itself). Measured with the system memory path off
+ * and on, because the boot harness runs with it on (it needs MMIO) and that path
+ * is where per-access conditionals would come from - $4/$6 are pinned host
+ * registers, so the register cache is not involved at all.
+ */
+static uint32_t bss_loop_code[] __attribute__((aligned(16))) = {
+    0xac800000, /* sw    $zero,0($4) */
+    0x24840004, /* addiu $4,$4,4 */
+    0x14c4fffd, /* bne   $6,$4,-3 */
+};
+
+static void test_bss_loop_opcodes(void)
+{
+    int words = 0;
+
+    latm_set_system_memory(false);
+    int b_off = translate_count_branches(bss_loop_code, 3, &words);
+    int w_off = words;
+    latm_set_system_memory(true);
+    int b_on = translate_count_branches(bss_loop_code, 3, &words);
+    int w_on = words;
+    latm_set_system_memory(false);
+
+    latx_bare_uart_puts("latm-isa: bss-loop off: branches=");
+    puthex((uint64_t)(b_off < 0 ? 0xffff : (unsigned)b_off));
+    latx_bare_uart_puts(" words=");
+    puthex((uint64_t)(unsigned)w_off);
+    latx_bare_uart_puts(" on: branches=");
+    puthex((uint64_t)(b_on < 0 ? 0xffff : (unsigned)b_on));
+    latx_bare_uart_puts(" words=");
+    puthex((uint64_t)(unsigned)w_on);
+    latx_bare_uart_putc('\n');
+    check(b_off >= 0 && b_on >= 0, 1, "bss-loop translates both ways");
+    /*
+     * The cost of the kernel's block is not branches (zero either way) but the
+     * size the system memory path adds to each access: 15 words without it, 71
+     * with. Pinning the direction means a change that makes the sys path cheaper
+     * shows up here, and one that makes it worse fails.
+     */
+    check(w_on > w_off, 1, "the system memory path costs extra words");
+    check(b_off == 0 && b_on == 0, 1, "the bss loop needs no IR2 branch");
+}
+
 static void test_regcache_specialisation(void)
 {
     int words_same = 0, words_diff = 0;
@@ -760,6 +805,7 @@ void kmain(void)
     latx_bare_uart_puts(latx_cpu_has_lbt() ? "1" : "0");
     latx_bare_uart_puts("\n");
     lata_tr_data_init(&env);
+    test_bss_loop_opcodes();
     test_regcache_specialisation();
     {
         CPUMIPSState env2;
