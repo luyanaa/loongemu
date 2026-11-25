@@ -24,6 +24,8 @@
 
 extern const uint8_t latr_smp_idle[];
 extern const uint8_t latr_smp_idle_end[];
+extern const uint8_t latr_smp_smc[];
+extern const uint8_t latr_smp_smc_end[];
 
 extern void latr_enter_tb(void *env, void *code);
 extern uint8_t latr_smp_guest[];
@@ -234,6 +236,56 @@ static void scripted_scenarios(void)
     check_u64("hart 0 never entered the scripted run", m.harts[0].tbs, 0);
 }
 
+/*
+ * SMC + shootdown stress (design 9.3b, last item): rewrite, FENCE.I, execute,
+ * repeat, with the other hart polling. The guest drives the interleaving with
+ * two handshake words, so this is deterministic rather than racy - what it
+ * stresses is repetition, not luck: 32 consecutive stale-translation cases, each
+ * one requiring the fence to reach the other hart's cache.
+ */
+static void smc_stress(void)
+{
+    static LatrMachine m;
+    static uint8_t work[1u << 20];
+    int rc;
+
+    uart_puts("latr-smp-smc: begin\n");
+    if (!latr_machine_init(&m, ram, sizeof(ram), 2, work, sizeof(work))) {
+        uart_puts("latr-smp: FAIL smc machine init\n");
+        check_true("smc machine init", 0);
+        return;
+    }
+    latr_machine_set_enter_tb(&m, latr_enter_tb);
+    if (!latr_machine_load_firmware(&m, latr_smp_smc,
+                                    (uint64_t)(latr_smp_smc_end -
+                                               latr_smp_smc)) ||
+        !latr_machine_build_dtb(&m) || !latr_machine_boot(&m)) {
+        uart_puts("latr-smp: FAIL smc boot\n");
+        check_true("smc firmware boots", 0);
+        return;
+    }
+    rc = latr_machine_run(&m, 5000);
+    uart_puts("latr-smp-smc: rc=");
+    uart_dec((uint64_t)rc);
+    uart_puts(" ok=");
+    uart_dec(read64(DATA_PAGE + 0x08u));
+    uart_puts(" bad=");
+    uart_dec(read64(DATA_PAGE + 0x10u));
+    uart_puts(" published=");
+    uart_dec(read64(DATA_PAGE + 0x18u));
+    uart_puts("\n");
+
+    check_true("smc stress powered off through the exit device",
+               rc == 1 && m.sys.exit_request == 0x5555);
+    check_u64("all 32 rewrites were published", read64(DATA_PAGE + 0x18u), 32);
+    check_u64("every iteration observed the new value",
+              read64(DATA_PAGE + 0x08u), 32);
+    check_u64("no iteration observed a stale value",
+              read64(DATA_PAGE + 0x10u), 0);
+    check_u64("no translator borrow leaks in the stress run",
+              latr_regcache_stats().borrow_leaks, 0);
+}
+
 void kmain(void)
 {
     int rc;
@@ -383,6 +435,7 @@ void kmain(void)
                   rc.borrow_outstanding_max, 0);
     }
     scripted_scenarios();
+    smc_stress();
     uart_puts(failures == 0 ? "latr-smp: PASS checks=" : "latr-smp: FAIL checks=");
     uart_dec((uint64_t)checks);
     uart_puts(" fails=");

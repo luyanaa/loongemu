@@ -372,7 +372,7 @@ rather than redundant.
 | **P1a** | exit request at the safe point; park/wake/command primitives; MSIP write notifies the machine; `next_action` decision point | `test-latr-hart-sync` (pthread) + CLINT notify test; ISA/sys images unchanged |
 | **P1b** | hart threads, join, TLS-gated build, on the hosted harness | done: `latr_machine_run_hart` + one pthread per hart, 21 checks including the threaded fence completing with no ack timeout |
 | **P2** | machine lock around `LatrSystem`; ticker ownership; DMA/store lock order | done for the device layer: bus lock hook, bounded system lock with counted failures, ticker thread and timer wake, two-thread MMIO-vs-DMA hammer asserting no failed acquisition, no held writer lock, and an advanced reservation epoch. Guest-level 9.3 stays blocked on LoongArch execution. |
-| **P3** | guest-level 9.3 tests, AES/fence stress, `latr-sys-smp-run` in CI | all 9.3 green, threaded run reproducible over 100 iterations - **reproducibility done**: `make -C latr test-host-machine-stress HOST_SMP_STRESS=100` runs the threaded harness 100 times and requires a zero exit and an identical summary line each time (39 checks, measured 2.1 s); CI runs it in `host-tests`. Guest-level 9.3 is green; the sys-mode SMP image landed as `make latr-sys-smp-run` (10 checks, mutation-tested) and runs in the `isa-latr` CI job. AES/fence stress stays open |
+| **P3** | guest-level 9.3 tests, AES/fence stress, `latr-sys-smp-run` in CI | all 9.3 green, threaded run reproducible over 100 iterations - **reproducibility done**: `make -C latr test-host-machine-stress HOST_SMP_STRESS=100` runs the threaded harness 100 times and requires a zero exit and an identical summary line each time (39 checks, measured 2.1 s); CI runs it in `host-tests`. Guest-level 9.3 is green; the sys-mode SMP image landed as `make latr-sys-smp-run` (10 checks, mutation-tested) and runs in the `isa-latr` CI job. AES/fence stress landed as the SMC + shootdown loop (32 iterations, mutation-tested) |
 
 Each phase lands with its tests and without changing the single-threaded
 behaviour; a phase that cannot show its acceptance test does not land.
@@ -402,6 +402,26 @@ yield is one-shot, parked harts do not dispatch - is unit-tested; the wake
 counter is tested for loss-free delivery under real threads; and the CLINT
 notify hook is tested from both the direct and MMIO paths, including that a
 clear does not wake anyone.
+
+### SMC + shootdown stress: landed in `latr-smp-run`
+
+Design 9.3b's last item - "rewrite, fence, execute, repeat, with a hart polling" -
+runs as a third machine inside `latr-smp-run` (`latr_smp_smc.S`, 5 checks). Hart 0
+rewrites the target's `li a0, N` constant and executes FENCE.I once per iteration;
+hart 1 waits for the published iteration, calls the target, and must observe N+1.
+The handshake is two data words, so the interleaving is driven by the guest and
+the run is deterministic; what is stressed is repetition - 32 consecutive
+stale-translation cases, each requiring the fence to reach the other hart's cache.
+Measured: `ok=32 bad=0 published=32`, 38 checks total in `latr-smp-run`, 1.4 s.
+
+Mutation-tested: replacing the all-cores shootdown with a shootdown of only the
+issuer's cache (`latr_tb_shootdown_all(&h->tb_cache)` in place of
+`latr_tb_fence_begin(0, 1)`) makes the run fail - hart 1 keeps executing the old
+`li a0, 1`, so the existing "hart 1 sees the rewritten target" check flips to
+`got=1 want=2` and the stress never reaches its exit. A weaker mutation that only
+switches `latr_tb_fence_begin(0, 1)` to `(0, 0)` changes nothing, which is correct
+and worth recording: asid 0 already means "all harts" in
+`latr_tb_shootdown_asid`, so that is not a mutation at all.
 
 ### sys-mode SMP without the machine: `make latr-sys-smp-run`, landed
 
