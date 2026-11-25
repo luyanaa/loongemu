@@ -891,7 +891,20 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
 #ifdef LOONGEMU_PERF
     uint64_t perf_start = loongemu_perf_now();
 #endif
-    entry = latr_tb_cache_lookup(&h->tb_cache, h->env.pc, key);
+    /*
+     * Phase A (design: chain-control-ras.md 2.2): try the chain candidate
+     * first. It is the same validity condition the hash lookup enforces -
+     * entry valid, same guest PC, whole TB key equal, code still inside the
+     * arena - so a hit only avoids the hash and the set scan, nothing else.
+     * All dispatcher duties above still ran.
+     */
+    entry = latr_chain_link_candidate(&h->chain, &h->tb_cache, h->env.pc, &key);
+    if (entry == NULL) {
+        entry = latr_tb_cache_lookup(&h->tb_cache, h->env.pc, key);
+        if (entry != NULL) {
+            latr_chain_remember(&h->chain, entry, &key);
+        }
+    }
     if (entry == NULL) {
         latr_chain_break(&h->chain, LATR_CHAIN_BREAK_MISS);
         if (m->translate_tb != NULL) {
@@ -918,6 +931,9 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
         entry = latr_tb_cache_insert(&h->tb_cache, tb.pc, key, h->code_buf,
                                      (uint32_t)words * 4u, tb.icount);
         latr_chain_tb_changed(&h->chain);
+        if (entry != NULL) {
+            latr_chain_remember(&h->chain, entry, &key);
+        }
         if (entry == NULL) {
             /* Between TBs on the owning hart: safe to recycle the arena. */
             latr_tb_cache_reclaim_all(&h->tb_cache);

@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "loongemu/soft_ras.h"
+#include "latr-tb-cache.h"
 
 /*
  * Per-hart chain control (design: docs/design/chain-control-ras.md).
@@ -35,6 +36,21 @@ typedef enum LatrChainBreak {
     LATR_CHAIN_BREAK_COUNT = 8
 } LatrChainBreak;
 
+/*
+ * Successor candidates (Phase A): a direct-mapped set of recently looked-up
+ * entries. A chain may reuse one when the guest PC and the whole TB key still
+ * match and the entry is still valid and still inside the arena - that is the
+ * same condition the hash lookup checks, minus the hash and the set scan.
+ * Rejecting on a key change is what keeps `csrw satp` and friends honest.
+ */
+#define LATR_CHAIN_CAND_SLOTS 4
+
+typedef struct LatrChainCandidate {
+    LatrTbEntry *entry;
+    uint64_t pc;
+    LatrTbKey key;
+} LatrChainCandidate;
+
 typedef struct LatrChainControl {
     /* Bumped by every event that invalidates "nothing changed since entry". */
     uint64_t chain_epoch;
@@ -46,6 +62,9 @@ typedef struct LatrChainControl {
     uint64_t length_histogram[8];
     uint64_t breaks[LATR_CHAIN_BREAK_COUNT];
     uint32_t max_chain; /* policy cap, 0 = chaining disabled */
+    LatrChainCandidate candidates[LATR_CHAIN_CAND_SLOTS];
+    uint64_t candidate_hits;   /* links taken through a candidate */
+    uint64_t candidate_stores; /* candidates remembered */
     SoftRas ras;
 } LatrChainControl;
 
@@ -56,6 +75,19 @@ void latr_chain_break(LatrChainControl *chain, LatrChainBreak reason);
 void latr_chain_tb_changed(LatrChainControl *chain);
 /* Record a completed chain of `length` blocks (P1+; unused while links == 0). */
 void latr_chain_record_length(LatrChainControl *chain, uint32_t length);
+
+/*
+ * Phase A link: returns the candidate entry for (pc, key) when it is still
+ * valid, still inside `cache`'s arena and the key matches word for word;
+ * NULL otherwise. A hit counts as one link and does not move the epoch.
+ */
+LatrTbEntry *latr_chain_link_candidate(LatrChainControl *chain,
+                                       const LatrTbCache *cache, uint64_t pc,
+                                       const LatrTbKey *key);
+/* Remember a successful lookup/insert so the next dispatch of this PC is cheap. */
+void latr_chain_remember(LatrChainControl *chain, LatrTbEntry *entry,
+                         const LatrTbKey *key);
+uint64_t latr_chain_candidate_hits(const LatrChainControl *chain);
 
 uint64_t latr_chain_epoch(const LatrChainControl *chain);
 uint64_t latr_chain_tb_generation(const LatrChainControl *chain);

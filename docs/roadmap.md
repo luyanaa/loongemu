@@ -462,6 +462,13 @@ fault recovery cost.
     epoch 12 (11 miss + 1 fence-i), hart 1 epoch 43 (33 wfi + 9 miss + 1
     interrupt). That baseline already shows P1 must not key on "no insert since
     entry" - inserts rival blocks - and that WFI dominates an idle hart.
+    P1 is in: a per-hart 4-entry candidate set reuses a looked-up entry when the
+    PC matches, the entry is still valid, the whole TB key is equal and the code
+    is still inside the arena. On the two-hart guest the idle hart's wfi loop now
+    takes 30 of 39 dispatches without hashing. Measured on the host: lookup 2-4
+    ns, dispatch 119-138 ns, of which the interrupt refresh (update_hart) is
+    ~47% - so Phase A saves ~2% and Phase B (generated-code chaining) is the
+    only lever for the rest, with its own risk budget.
 12. 5.4 MSI-X/IMSIC and virtio-PCI transport; DMA domains.
 13. 4.1 shared modules (arena, recovery, regcache, IRQ sink, DMA domain).
 14. 6.1 passthrough manager, only with an IOMMU or an explicit trusted-guest

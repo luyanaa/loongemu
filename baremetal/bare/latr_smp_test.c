@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include "latr.h"
 #include "latr-machine.h"
+#include "loongemu-perf.h"
 
 extern void latr_enter_tb(void *env, void *code);
 extern uint8_t latr_smp_guest[];
@@ -195,6 +196,8 @@ void kmain(void)
         uart_dec(latr_chain_tb_generation(c));
         uart_puts(" links=");
         uart_dec(latr_chain_links(c));
+        uart_puts(" cand-hits=");
+        uart_dec(latr_chain_candidate_hits(c));
         for (unsigned r = 0; r < LATR_CHAIN_BREAK_COUNT; r++) {
             uart_puts(" ");
             uart_puts(latr_chain_break_name((LatrChainBreak)r));
@@ -202,11 +205,42 @@ void kmain(void)
             uart_dec(latr_chain_breaks(c, (LatrChainBreak)r));
         }
         uart_puts("\n");
-        check_u64("no chained dispatch in P0", latr_chain_links(c), 0);
+        /* Phase A: a chained dispatch is one that reused a chain candidate
+         * instead of hashing the key and scanning the set. */
+        check_true("chained dispatches happened", latr_chain_links(c) > 0);
+        check_u64("every link came through a candidate",
+                  latr_chain_links(c), latr_chain_candidate_hits(c));
         check_u64("chain epoch equals the sum of its breaks",
                   latr_chain_epoch(c), latr_chain_total_breaks(c));
     }
 
+#ifdef LOONGEMU_PERF
+    /* Dispatch cost vs execution cost, per block: this is the number that says
+     * whether chaining (5.2 Phase A/B) can pay for itself at all. */
+    {
+        char hexbuf[19];
+        unsigned long long vals[2] = {
+            (unsigned long long)loongemu_perf_read(
+                LOONGEMU_PERF_TB_COMPILE_TICKS),
+            (unsigned long long)loongemu_perf_read(LOONGEMU_PERF_TB_EXEC_TICKS),
+        };
+
+        uart_puts("latr-smp-perf: compile=");
+        for (int k = 15; k >= 0; k--) {
+            unsigned d = (unsigned)((vals[0] >> (k * 4)) & 15u);
+
+            uart_putc("0123456789abcdef"[d]);
+        }
+        uart_puts(" exec=");
+        for (int k = 15; k >= 0; k--) {
+            unsigned d = (unsigned)((vals[1] >> (k * 4)) & 15u);
+
+            uart_putc("0123456789abcdef"[d]);
+        }
+        uart_puts("\n");
+        (void)hexbuf;
+    }
+#endif
     uart_puts(failures == 0 ? "latr-smp: PASS checks=" : "latr-smp: FAIL checks=");
     uart_dec((uint64_t)checks);
     uart_puts(" fails=");

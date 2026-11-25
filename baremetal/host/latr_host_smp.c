@@ -543,6 +543,97 @@ static void scenario_translate_guest_block(void)
     CHECK(words > 0, "translate: assembled");
 }
 
+/*
+ * Dispatch cost, measured rather than assumed (design: chain-control-ras.md
+ * section 5 objection 1: if dispatch is already a small share, Phase B should
+ * not be built). Two numbers, both per operation, on this host:
+ *   - a cache-hit lookup (key build + hash + set scan), timed standalone;
+ *   - one full run_hart dispatch of an already-translated block, i.e. every
+ *     duty plus the lookup, timed through the machine.
+ * The ratio decides how much a chain could possibly remove.
+ */
+static uint64_t now_ns(void)
+{
+    struct timespec ts = {0, 0};
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
+
+static void scenario_dispatch_cost(void)
+{
+    LatrMachineHart *h = &machine.harts[0];
+    const uint32_t iterations = 200000u;
+    LatrTbKey key;
+    uint64_t start;
+    uint64_t lookup_ns;
+    uint64_t dispatch_ns;
+    uint32_t hits = 0;
+
+    /* One dispatch to make sure the block is translated and cached. */
+    latr_hart_set_command(&machine.harts[0].park, LATR_HART_RUN);
+    machine.harts[0].online = 1;
+    send_ipi = 0;
+    send_fence = 0;
+    hart1_woke = 0;
+    (void)latr_machine_run_hart(&machine, 0, 1);
+
+    key = latr_tb_cache_key(&h->env);
+    start = now_ns();
+    for (uint32_t i = 0; i < iterations; i++) {
+        if (latr_tb_cache_lookup(&h->tb_cache, h->env.pc, key) != 0) {
+            hits++;
+        }
+    }
+    lookup_ns = now_ns() - start;
+
+    start = now_ns();
+    for (uint32_t i = 0; i < iterations; i++) {
+        if (latr_machine_run_hart(&machine, 0, 1) != 1) {
+            break;
+        }
+    }
+    dispatch_ns = now_ns() - start;
+
+    {
+        uint64_t t;
+        uint64_t upd;
+        uint64_t sp;
+        uint64_t bind;
+
+        start = now_ns();
+        for (uint32_t i = 0; i < iterations; i++) {
+            latr_system_update_hart(&machine.sys, &h->env, 0);
+        }
+        upd = now_ns() - start;
+        start = now_ns();
+        for (uint32_t i = 0; i < iterations; i++) {
+            latr_context_safepoint(h->ctx);
+        }
+        sp = now_ns() - start;
+        start = now_ns();
+        for (uint32_t i = 0; i < iterations; i++) {
+            (void)latr_context_bind(h->ctx);
+        }
+        bind = now_ns() - start;
+        t = 0;
+        (void)t;
+        printf("latr-dispatch-parts: update-hart=%lluns safepoint=%lluns bind=%lluns\n",
+               (unsigned long long)(upd / iterations),
+               (unsigned long long)(sp / iterations),
+               (unsigned long long)(bind / iterations));
+    }
+    printf("latr-dispatch: lookup=%lluns/dispatch=%lluns hits=%u/%u\n",
+           (unsigned long long)(lookup_ns / iterations),
+           (unsigned long long)(dispatch_ns / iterations), hits, iterations);
+    CHECK(hits == iterations, "dispatch cost: lookup hits are stable");
+    CHECK(dispatch_ns > 0 && lookup_ns > 0, "dispatch cost: timers advanced");
+    /* The share the chain work could remove, printed above; asserted loosely so
+     * a machine difference cannot fail the gate. */
+    CHECK(lookup_ns * 100u <= dispatch_ns * 100u,
+          "dispatch cost: lookup cannot exceed dispatch");
+}
+
 static void scenario_stop_cooperative(void)
 {
     int rc;
@@ -576,6 +667,7 @@ int main(void)
     scenario_timer_wake();
     scenario_lock_order();
     scenario_translate_guest_block();
+    scenario_dispatch_cost();
     scenario_stop_cooperative();
     scenario_fini();
 

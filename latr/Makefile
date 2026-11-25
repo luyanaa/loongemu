@@ -430,9 +430,11 @@ $(BUILD)/test-latr-rvv-legality: ../tests/test_latr_rvv_legality.c \
 		$(LATR)/ir1/decode-riscv.c ../tests/test_latr_rvv_legality.c -o $@
 
 $(BUILD)/test-latr-chain: ../tests/test_latr_chain.c \
-                          $(LATR)/chain.c $(LATR)/include/latr-chain.h \
+                          $(LATR)/chain.c $(LATR)/tb-cache.c \
+                          $(LATR)/hart-sync.c $(LATR)/include/latr-chain.h \
                           ../src/soft_ras.c ../include/loongemu/soft_ras.h | $(BUILD)
-	$(HOST_CC) $(HOST_CFLAGS) $(LATR)/chain.c ../src/soft_ras.c \
+	$(HOST_CC) $(HOST_CFLAGS) $(LATR)/chain.c $(LATR)/tb-cache.c \
+		$(LATR)/hart-sync.c ../src/soft_ras.c \
 		../tests/test_latr_chain.c -o $@
 
 $(BUILD)/test-latr-hart-sync: ../tests/test_latr_hart_sync.c \

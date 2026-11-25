@@ -153,7 +153,7 @@ counters answering "why did dispatch go back to C". Plus:
 | phase | change | gate |
 |---|---|---|
 | P0 | `LatrChainControl` with counters only; `links` stays 0 - **done** | `test-latr-chain` (40 checks), `latr-isa` unchanged, `latr-smp` prints the baseline |
-| P1 | Phase A re-dispatch + `breaks[]` | boot smoke, `latr-isa 1607`, counters recorded |
+| P1 | Phase A candidate re-dispatch - **done** | `test-latr-chain` 54 checks, `latr-smp` 15/15, links/cand-hits recorded (below) |
 | P2 | exit stub (Phase B) + epoch compare, chain cap | same, plus forced-break tests |
 | P3 | RAS-keyed prediction feeding `chain_next_code` | same, plus hit-rate counters |
 | P4 | SMP: epochs are per-hart; broadcast only where a duty is cross-core (shootdown) | boot-smp CI job |
@@ -185,6 +185,50 @@ Two facts this baseline already settles for P1:
 - WFI dominates the break counts on an idle hart (33/43). That is the expected
   shape and the reason the design puts WFI in the break table rather than
   special-casing it.
+
+### 3.2 Phase A (measured)
+
+Implemented as a 4-entry direct-mapped candidate set per hart
+(`LatrChainCandidate`): a dispatch reuses a candidate when the guest PC matches,
+the entry is still `valid`, the **whole `LatrTbKey` is equal word for word**, and
+the entry's code still lies inside the cache's arena. That is exactly the
+condition the hash lookup enforces, minus the hash and the set scan, so a hit
+cannot be less safe than a lookup - and a key change (`csrw satp`, privilege
+switch) rejects the candidate rather than trusting the epoch.
+
+Two-hart guest, `make latr-smp-run`:
+
+| hart | dispatches | links (candidate hits) | miss before/after |
+|---|---|---|---|
+| 0 | 41 | 1 | 11 / 11 |
+| 1 | 39 | 30 | 9 / 9 |
+
+The idle hart's `wfi; j` loop is exactly the shape it targets: 30 of 39
+dispatches skip the hash. `links == candidate_hits` is asserted, so a link can
+only come from this path.
+
+Cost measured on the host harness (200k iterations, `latr-dispatch` line):
+
+| item | ns |
+|---|---|
+| cache-hit lookup (hash + 4-way scan) | 2-4 |
+| full dispatch of a cached block | 119-138 |
+| of which `latr_system_update_hart` | 56-65 |
+| of which safepoint / context bind | 2-3 / 3 |
+
+So Phase A removes ~2% of dispatch. That is the design's own prediction in
+self-review objection 1, now confirmed with numbers: the remaining dispatch cost
+is the per-block *semantics* duty (the CLINT/PLIC interrupt refresh, ~47%), which
+only generated-code chaining (Phase B) could amortise - and Phase B carries the
+stub/reclaim/host-fault risks the design lists. Phase B therefore needs its own
+justification; Phase A's contribution is that the dispatch counters and the link
+path now exist and are measured.
+
+Note the phantom this measurement avoided: a 200k-dispatch loop with a *stale*
+harness binary crashed inside `tr_ir2_assemble` with a NULL code buffer. That was
+a build artefact (host harness objects are one link; a stale binary predated the
+`LatrChainControl` change), not a Phase A defect - a clean `build-host` rebuild
+plus 150 consecutive runs pass.
 
 ## 4. Tests
 

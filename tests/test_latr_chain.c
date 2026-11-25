@@ -120,6 +120,78 @@ static void test_lengths(void)
           "length: recording a chain does not fake links");
 }
 
+/* Phase A: the candidate cache is a link only when the whole condition holds. */
+static void test_candidates(void)
+{
+    static uint8_t arena[4096];
+    static LatrTbCache cache;
+    LatrChainControl chain;
+    LatrTbKey key;
+    LatrTbEntry *entry;
+    const uint32_t code[4] = {1, 2, 3, 4};
+
+    memset(&key, 0, sizeof(key));
+    key.satp_mode = 8;
+    key.privilege = 3;
+    key.asid = 5;
+    latr_tb_cache_init(&cache, arena, sizeof(arena));
+    latr_chain_init(&chain, 16);
+
+    entry = latr_tb_cache_insert(&cache, 0x80000000u, key, code,
+                                 sizeof(code), 2);
+    CHECK(entry != NULL, "candidate: insert succeeded");
+    latr_chain_remember(&chain, entry, &key);
+
+    CHECK(latr_chain_link_candidate(&chain, &cache, 0x80000000u, &key) == entry,
+          "candidate: same pc and key links");
+    CHECK(latr_chain_links(&chain) == 1, "candidate: a link is counted");
+    CHECK(latr_chain_epoch(&chain) == 0, "candidate: linking does not break");
+
+    /* Different PC, different key, invalidated entry: all must miss. */
+    CHECK(latr_chain_link_candidate(&chain, &cache, 0x80000004u, &key) == NULL,
+          "candidate: a different pc does not link");
+    {
+        LatrTbKey other = key;
+
+        other.asid = 6;
+        CHECK(latr_chain_link_candidate(&chain, &cache, 0x80000000u, &other) ==
+                  NULL,
+              "candidate: a different ASID does not link");
+        other = key;
+        other.privilege = 1;
+        CHECK(latr_chain_link_candidate(&chain, &cache, 0x80000000u, &other) ==
+                  NULL,
+              "candidate: a different privilege does not link");
+    }
+    CHECK(latr_chain_link_candidate(&chain, &cache, 0x80000000u, &key) == entry,
+          "candidate: still links after a rejected probe");
+
+    /* A shootdown invalidates the entry itself, so the candidate must stop
+     * linking without the chain state having to notice. */
+    latr_tb_shootdown_all(&cache);
+    CHECK(latr_chain_link_candidate(&chain, &cache, 0x80000000u, &key) == NULL,
+          "candidate: shootdown stops the link");
+    {
+        uint64_t links = latr_chain_links(&chain);
+
+        /* Arena reset after the shootdown: the code range is gone too. */
+        latr_tb_cache_safepoint(&cache);
+        CHECK(latr_chain_link_candidate(&chain, &cache, 0x80000000u, &key) ==
+                  NULL,
+              "candidate: a reclaimed arena stops the link");
+        CHECK(latr_chain_links(&chain) == links, "candidate: misses add no links");
+    }
+
+    /* A fresh insert at the same PC and key links again. */
+    entry = latr_tb_cache_insert(&cache, 0x80000000u, key, code, sizeof(code), 2);
+    CHECK(entry != NULL, "candidate: re-insert after reclaim");
+    latr_chain_remember(&chain, entry, &key);
+    CHECK(latr_chain_link_candidate(&chain, &cache, 0x80000000u, &key) == entry,
+          "candidate: re-translated block links again");
+    CHECK(latr_chain_candidate_hits(&chain) == 3,
+          "candidate: hit counter tracks links");
+}
+
 static void test_null_and_bounds(void)
 {
     LatrChainControl chain;
@@ -145,6 +217,7 @@ int main(void)
     test_breaks();
     test_generation();
     test_lengths();
+    test_candidates();
     test_null_and_bounds();
 
     printf("latr-chain: %d checks, %d fails\n", checks, failures);

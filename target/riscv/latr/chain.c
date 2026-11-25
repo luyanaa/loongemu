@@ -48,6 +48,60 @@ void latr_chain_record_length(LatrChainControl *chain, uint32_t length)
     chain->length_histogram[bucket]++;
 }
 
+static bool chain_key_equal(const LatrTbKey *a, const LatrTbKey *b)
+{
+    return a->satp_mode == b->satp_mode && a->privilege == b->privilege &&
+           a->asid == b->asid && a->vspec == b->vspec &&
+           a->root_ppn == b->root_ppn;
+}
+
+LatrTbEntry *latr_chain_link_candidate(LatrChainControl *chain,
+                                       const LatrTbCache *cache, uint64_t pc,
+                                       const LatrTbKey *key)
+{
+    LatrChainCandidate *slot;
+
+    if (chain == 0 || cache == 0 || key == 0) {
+        return 0;
+    }
+    slot = &chain->candidates[pc & (LATR_CHAIN_CAND_SLOTS - 1u)];
+    if (slot->entry == 0 || slot->pc != pc || !slot->entry->valid ||
+        !chain_key_equal(&slot->key, key)) {
+        return 0;
+    }
+    /* Belt and braces against arena reuse: a reclaim resets arena_used, so an
+     * entry whose code is outside it can never be entered again. */
+    if (cache->arena == 0 || slot->entry->code < cache->arena ||
+        slot->entry->code_size > cache->arena_used ||
+        slot->entry->code > cache->arena + cache->arena_used -
+                                slot->entry->code_size) {
+        return 0;
+    }
+    chain->candidate_hits++;
+    chain->links++;
+    return slot->entry;
+}
+
+void latr_chain_remember(LatrChainControl *chain, LatrTbEntry *entry,
+                         const LatrTbKey *key)
+{
+    LatrChainCandidate *slot;
+
+    if (chain == 0 || entry == 0 || key == 0) {
+        return;
+    }
+    slot = &chain->candidates[entry->guest_pc & (LATR_CHAIN_CAND_SLOTS - 1u)];
+    slot->entry = entry;
+    slot->pc = entry->guest_pc;
+    slot->key = *key;
+    chain->candidate_stores++;
+}
+
+uint64_t latr_chain_candidate_hits(const LatrChainControl *chain)
+{
+    return chain == 0 ? 0 : chain->candidate_hits;
+}
+
 uint64_t latr_chain_epoch(const LatrChainControl *chain)
 {
     return chain == 0 ? 0 : chain->chain_epoch;
