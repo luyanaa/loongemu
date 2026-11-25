@@ -905,6 +905,27 @@ build/bare_latr_sys_diff.elf: baremetal/bare/latr_sys_diff.c \
 	   build/latr_sys_diff.o build/latr_miniglib.o build/latr_libc_min.o \
 	   latr/build/liblatr_core.a -o $@
 
+latr-sys-smp-image: build/bare_latr_sys_smp.elf
+
+build/bare_latr_sys_smp.elf: baremetal/bare/latr_sys_smp.c \
+                             build/latr_smp_blob.o latr-core \
+                             build/latr_miniglib.o build/latr_libc_min.o \
+                             baremetal/bare/bare.lds
+	@mkdir -p build
+	$(CLANG) $(LATR_BARE_CFLAGS) -c $< -o build/latr_sys_smp.o
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	   build/latr_sys_smp.o build/latr_smp_blob.o \
+	   build/latr_miniglib.o build/latr_libc_min.o \
+	   latr/build/liblatr_core.a -o $@
+
+latr-sys-smp-run: latr-sys-smp-image
+	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_latr_sys_smp.elf" \
+	     QEMU_LOG="build/latr_sys_smp.log" QEMU_DONE="latr-sys-smp: done" \
+	     QEMU_TIMEOUT=60 CPU=la464 \
+	     bash scripts/run_qemu_lata.sh
+	@grep -a "latr-sys-smp" build/latr_sys_smp.log | head -10
+	@grep -qa "latr-sys-smp: PASS" build/latr_sys_smp.log
+
 latr-sys-run: latr-sys-image
 	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_latr_sys_diff.elf" \
 	     QEMU_LOG="build/latr_sys_diff.log" QEMU_DONE="latr-sys: done" \

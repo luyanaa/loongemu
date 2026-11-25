@@ -132,6 +132,13 @@ jobs:
           make latr-smp-run \
             CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
             QLVZ_REPO=/usr/bin/qemu-system-loongarch64
+          # The same two-hart guest through the sys board with the embedder
+          # owning the scheduler (per-hart translator context and TB cache,
+          # after-block duties written out): a cross-core FENCE.I that misses
+          # the other hart's cache fails here and nowhere else.
+          make latr-sys-smp-run \
+            CLANG=clang AR=llvm-ar LD_LLD=ld.lld \
+            QLVZ_REPO=/usr/bin/qemu-system-loongarch64
           # One table of every deterministic counter and the host dispatch cost,
           # so a change is comparable against the last run in the job log.
           make latr-bench \
