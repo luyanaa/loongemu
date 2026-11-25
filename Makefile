@@ -1070,12 +1070,16 @@ latr-rand-diff: latr-isa-run latr-riscv-ref
 	 echo "latr-rand-diff: PASS $$latr_sig"
 
 latr-riscv-ref: build/latr_riscv_ref.elf
-	@rm -f build/latr_riscv_ref.log
-	@$(if $(TIMEOUT),$(TIMEOUT) 20,) $(QEMU_RISCV64) -M virt -cpu max -m 128M -bios none \
+	@command -v $(QEMU_RISCV64) >/dev/null 2>&1 || { \
+	     echo "latr-riscv-ref: $(QEMU_RISCV64) is not installed or not on PATH"; \
+	     echo "latr-riscv-ref: PATH=$$PATH"; \
+	     exit 1; }
+	rm -f build/latr_riscv_ref.log
+	$(if $(TIMEOUT),$(TIMEOUT) 20,) $(QEMU_RISCV64) -M virt -cpu max -m 128M -bios none \
 	     -kernel $< -display none -monitor none \
-	     -serial file:build/latr_riscv_ref.log -no-reboot 2>/dev/null
-	@grep -a 'latr-riscv-ref: PASS' build/latr_riscv_ref.log
-	@grep -aE 'latr-diff=' build/latr_riscv_ref.log
+	     -serial file:build/latr_riscv_ref.log -no-reboot 2>/dev/null || true
+	grep -a 'latr-riscv-ref: PASS' build/latr_riscv_ref.log
+	grep -aE 'latr-diff=' build/latr_riscv_ref.log
 
 build/lata_smoke.o: baremetal/bare/lata_smoke.c
 	@mkdir -p build
