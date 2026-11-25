@@ -439,10 +439,19 @@ idle-loop-on-IPI, and RAM-flag-polling variants alike). A **minimal 2-hart
 probe** - no trap handler, no IPI, no AMO/LR-SC, one handshake word - runs the
 same shape correctly on both engines: hart 1 reads 1 before the rewrite and 3
 after it (`B 1,3`), with and without a pre-rewrite call. So cross-core
-page-straddling itself works; the 0 is specific to the SMP guest's context and
-the next step is to bisect *that* (drop hart 0's own straddling calls, then its
-AMO/LR-SC work, then the second target rewrite) rather than the translator's
-straddling path. The check stays out of the gate rather than shipped red.
+page-straddling itself works, and the bisect narrowed the trigger further: adding
+hart 0's **AMO + LR/SC prefix** to the working probe - nothing else - makes hart
+1's straddling call return 0 again. Hart 0's own straddling calls do not trigger
+it (still 3 with them added), and a trap-handler call does not trigger it on its
+own (still 3 with IPI + handler, before the AMO prefix).
+
+That points at the AMO/LR-SC path leaving something behind that a later
+translation or execution observes (reservation epoch, regcache borrows, or the
+`mem_*` scratch env fields), not at page-straddling or at cross-core visibility.
+The next step is to split AMO from LR/SC inside the *SMP guest itself* rather
+than in a hand-written probe (two of my quick probes had their own register and
+layout bugs, which cost more than they were worth). The check stays out of the
+gate rather than shipped red.
 
 Litmus tests were considered and deliberately not added: with the cooperative
 image the interleaving is deterministic, so MP/LB would pass vacuously and say
