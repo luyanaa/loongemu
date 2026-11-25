@@ -63,8 +63,14 @@
   "disabling hardfloat due to -ffast-math" 并保留基于宿主 `fmaf` 的快路径；而 `softfloat_init` 是
   `constructor`，freestanding 镜像里不会运行，因此宿主 FMA 从未被校验。已试过显式强制软 FMA
   （`softfloat_force_soft_fma`），结果不变，说明软路径或其 status 参数同样是嫌疑。
-  下一步：把 `float32_muladd` 单独做成宿主单测与 QEMU 参考值对齐（不需要 RISC-V 硬件），定位后再重开这 16 条；
-  widening 的 8 条 `vfw{m,n}macc/msac` 另行处理。
+  已做：`tests/test_softfloat_fma.c`（进 `make test`，8 checks / 0 fails / 2 known-broken）在**宿主**上复现同一现象，
+  与交叉编译、与 `-ffast-math` 均无关（两种构建结果相同）。工作用例全对：单独乘积舍入、精确乘积相加、
+  `(1+2^-23)-1`、tiny addend、`negate_product`、`negate_c`；**只有需要未舍入乘积的消去用例错**，
+  f32/f64 同型错（f32 应 `-2^-46`，得 `0x337ffffe`；f64 应 `-2^-57`，得 `0x3c9fff…ffe`）。
+  实现侧已排除：`float32_muladd → soft_f32_muladd → parts_muladd` 是标准 QEMU 结构，`FloatParts64` 的加宽类型是
+  `FloatParts128`；嫌疑落在 `parts_muladd` 的加宽/`parts_sub_normal` 路径或 `frac_*` 助手在本树的配置。
+  结论：**16 条 FMA 仍不能重开**——它们会静默算错消去类结果；先修 softfloat（改完后 known-broken 归零、驱动改为失败），
+  再重开 16 条，最后处理 widening 的 8 条。
 
 - [~] **RVV 1.0 指令补齐**：已登记 318 条（+3 条 `vset*`），**仍缺 48 条编码**（逐名比对 `insn32.decode:340-760`，明细见 [`RVV_P1_LEGALITY.md`](RVV_P1_LEGALITY.md) §2.1）：carry/borrow 10、整数 MAC 8、FP FMA 24、`vfrsub/vfrdiv/vfrec7/vfrsqrt7/vfslide1*.vf` 6。
   本轮落地 `vrsub.vx/vi` 与 `vmulh/vmulhu/vmulhsu` 的 `.vv/.vx`（共 8 条），走 `latr_rvv_arith_extra` 的 C 路径；

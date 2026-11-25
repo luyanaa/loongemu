@@ -304,7 +304,8 @@ test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging buil
       build/test_riscv_uart build/test_riscv_fw \
       build/test_fpsr \
       build/test_sve_helper_support build/test_sve_helper_lifecycle \
-      build/test_lata_nzcv build/test_ir2_lbt_opcodes build/test_le_recovery_abi
+      build/test_lata_nzcv build/test_ir2_lbt_opcodes build/test_le_recovery_abi \
+      build/test_softfloat_fma
 	./build/test_ir2_peephole
 	./build/test_loongbt
 	./build/test_loongbt_cpu
@@ -335,6 +336,7 @@ test: build/test_loongbt build/test_loongbt_cpu build/test_loongarch_paging buil
 	./build/test_lata_nzcv
 	./build/test_ir2_lbt_opcodes
 	./build/test_le_recovery_abi
+	./build/test_softfloat_fma
 
 # Back-end selection and the EFLAGS pack/unpack bridge.  Kept separate from
 # test_loongbt so a failure points at the glue rather than the semantics.
@@ -365,6 +367,18 @@ test-pci-host: build/test_pci_host
 
 # AArch64 NZCV / condition reference (see tests/test_lata_nzcv.c): the software
 # path LATA needs on hosts without LBT has to match this before it is wired in.
+# Vendored softfloat FMA probe: the LATR FMA work depends on it, and the fused
+# cancellation cases are currently known-broken (see the file header).
+SOFTFLOAT_INC := latx/upstream/include
+build/test_softfloat_fma: tests/test_softfloat_fma.c latx/upstream/fpu/softfloat.c \
+                          $(SOFTFLOAT_INC)/fpu/softfloat.h
+	@mkdir -p build
+	$(CC) -std=gnu11 -O2 -g -Wall -Wextra -Wno-unused-parameter \
+	      -Wno-sign-compare -Wno-implicit-fallthrough \
+	      -I $(SOFTFLOAT_INC) -I latx/compat -I latx/compat/include -I include \
+	      -include stdint.h -include stdbool.h -D__WORDSIZE=64 \
+	      tests/test_softfloat_fma.c latx/upstream/fpu/softfloat.c -o $@
+
 # Shared recovery ABI: row schema plus the one fail-closed decision function.
 build/test_le_recovery_abi: tests/test_le_recovery_abi.c \
                             shared/backend/loongarch/include/le-recovery.h

@@ -391,10 +391,19 @@ fault recovery cost.
    rs1 must not be treated as a vector group), then `vsmul.vv/.vx`, which needed a
    one-line validator fix: PVIR already implemented SAT_MUL with vxrm rounding and
    vxsat but the validator forced ROUND_DEFAULT on it, so the instruction could not
-   execute at all. Next:
-   carry/borrow and the MAC family need the multi-destination helper, FP FMA needs
-   a single-rounding multiply-add, and the six remaining FP ops need helpers plus
-   the 7-bit approximations for vfrec7/vfrsqrt7.
+   execute at all.
+   FP FMA (24) was implemented and reverted: the 16 non-widening forms translate
+   with the correct sign matrix, but the vendored softfloat's muladd does not
+   return the IEEE fused value for cancellation inputs. `tests/test_softfloat_fma.c`
+   (in `make test`) reproduces it on the host with no cross-compilation - six
+   rounding/flag cases pass, both fused-cancellation cases fail identically in f32
+   and f64, and the result is the same with and without `-ffast-math`, so neither
+   the host `fmaf` nor the flag is the cause. Remaining suspects are inside
+   `parts_muladd`'s widening/subtract path. Fix softfloat first; the encodings then
+   need no rework beyond restoring them, followed by the widening eight.
+   Next after that: carry/borrow and the MAC family need the multi-destination
+   helper, and the six remaining FP ops need helpers plus the 7-bit approximations
+   for vfrec7/vfrsqrt7.
 9. 2.3 LATM: vmlinux boot, then SMP, then 3A4000 platform alignment.
 10. 2.4 LATX: LAPIC/IOAPIC/time, virtio-PCI or AHCI, and the `tb_sys.c` split.
 11. 5.2 chaining tiers (only after 3.3 and 5.1 step 3).
