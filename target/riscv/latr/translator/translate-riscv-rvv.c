@@ -341,6 +341,10 @@ static bool rvv_fp_op(int opcode, unsigned *op, unsigned *kind)
     case LATR_RV_VFMAX_VV: *op = LATR_RVV_FP_MAX; return true;
     case LATR_RV_VFMAX_VF: *op = LATR_RVV_FP_MAX; *kind = LATR_RVV_SRC_SCALAR; return true;
     case LATR_RV_VFSQRT_V: *op = LATR_RVV_FP_SQRT; return true;
+    case LATR_RV_VFRSUB_VF: *op = LATR_RVV_FP_RSUB; *kind = LATR_RVV_SRC_SCALAR; return true;
+    case LATR_RV_VFRDIV_VF: *op = LATR_RVV_FP_RDIV; *kind = LATR_RVV_SRC_SCALAR; return true;
+    case LATR_RV_VFREC7_V: *op = LATR_RVV_FP_REC7; return true;
+    case LATR_RV_VFRSQRT7_V: *op = LATR_RVV_FP_RSQRT7; return true;
     case LATR_RV_VFSGNJ_VV: *op = LATR_RVV_FP_SGNJ; return true;
     case LATR_RV_VFSGNJ_VF: *op = LATR_RVV_FP_SGNJ; *kind = LATR_RVV_SRC_SCALAR; return true;
     case LATR_RV_VFSGNJN_VV: *op = LATR_RVV_FP_SGNJN; return true;
@@ -516,7 +520,11 @@ static bool rvv_perm_op(int opcode, unsigned *op, unsigned *kind,
     case LATR_RV_VSLIDEDOWN_VX:  *op = LATR_RVV_PERM_SLIDEDOWN; return true;
     case LATR_RV_VSLIDEDOWN_VI:  *op = LATR_RVV_PERM_SLIDEDOWN; *kind = LATR_RVV_SRC_IMM; return true;
     case LATR_RV_VSLIDE1UP_VX:   *op = LATR_RVV_PERM_SLIDE1UP; return true;
+    case LATR_RV_VFSLIDE1UP_VF:  *op = LATR_RVV_PERM_SLIDE1UP;
+                                 *kind = LATR_RVV_SRC_FSCALAR; return true;
     case LATR_RV_VSLIDE1DOWN_VX: *op = LATR_RVV_PERM_SLIDE1DOWN; return true;
+    case LATR_RV_VFSLIDE1DOWN_VF: *op = LATR_RVV_PERM_SLIDE1DOWN;
+                                  *kind = LATR_RVV_SRC_FSCALAR; return true;
     case LATR_RV_VRGATHER_VV:    *op = LATR_RVV_PERM_GATHER; *kind = LATR_RVV_SRC_VECTOR; return true;
     case LATR_RV_VRGATHER_VX:    *op = LATR_RVV_PERM_GATHER; return true;
     case LATR_RV_VRGATHER_VI:    *op = LATR_RVV_PERM_GATHER; *kind = LATR_RVV_SRC_IMM; return true;

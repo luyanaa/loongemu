@@ -384,7 +384,8 @@ fault recovery cost.
    all four spans change width at an ASLR-scale delta (0 do at +64 KiB). P2 must
    either pad relocation sites to a fixed width or re-assemble from serialised
    IR2.
-8. 2.2 LATR: remaining RVV encodings, then real SMP. Progress: 66 -> 14
+8. 2.2 LATR: RVV 1.0 encoding work is complete (0 base-V mnemonics missing),
+   next is real SMP. Progress: 66 -> 0 base-V; Zv*/BF16 extensions deferred.
    (vrsub.vx/vi, vmulh/vmulhu/vmulhsu .vv/.vx landed through the arith_extra C
    path, each with hand-computed lane checks in the ISA image), then the widening
    `.wv/.wx` eight (vd and, for `.wv`, vs1 are 2*SEW; `.wx` takes a scalar, so its
@@ -406,7 +407,12 @@ fault recovery cost.
    one pair and a multiplicand for the other, and the product wraps at SEW
    before the add. Carry/borrow closed too: v0 is a carry-in there, never a
    mask, so the decoder's forced vm=1 on vadc/vsbc means the carry rule and the
-   reserved vd == v0 case both need explicit handling.
+   reserved vd == v0 case both need explicit handling. The last six FP encodings
+   finished the base set: vfrsub/vfrdiv take the scalar as the first operand,
+   vfrec7/vfrsqrt7 are the spec's 7-bit table-driven estimates (implemented from
+   the vfrec7.adoc/vfrsqrt7.adoc tables, validated against the spec's numeric
+   examples and never replaced by an exact division), and the fp slide1 pair
+   reuses the integer permute path with an f-register scalar.
    Next after that: carry/borrow and the MAC family need the multi-destination
    helper, and the six remaining FP ops need helpers plus the 7-bit approximations
    for vfrec7/vfrsqrt7.

@@ -49,6 +49,8 @@ enum {
     LATR_RVV_SRC_VECTOR = 0,
     LATR_RVV_SRC_SCALAR = 1,
     LATR_RVV_SRC_IMM = 2,
+    /* Scalar taken from an f register (the .vf forms); the arg is a regno. */
+    LATR_RVV_SRC_FSCALAR = 3,
 };
 enum {
     LATR_RVV_OP_ADD = 0, LATR_RVV_OP_SUB, LATR_RVV_OP_AND,
@@ -164,6 +166,8 @@ enum {
     LATR_RVV_FP_MV_F_S, LATR_RVV_FP_MV_S_F,
     LATR_RVV_FP_CMP_EQ, LATR_RVV_FP_CMP_NE, LATR_RVV_FP_CMP_LT,
     LATR_RVV_FP_CMP_LE, LATR_RVV_FP_CMP_GT, LATR_RVV_FP_CMP_GE,
+    /* Reverse-order scalar ops and the 7-bit estimates (see rvv.c). */
+    LATR_RVV_FP_RSUB, LATR_RVV_FP_RDIV, LATR_RVV_FP_REC7, LATR_RVV_FP_RSQRT7,
     LATR_RVV_FP_CLASS, LATR_RVV_FP_FWADD, LATR_RVV_FP_FWSUB,
     LATR_RVV_FP_FWMUL,
 };

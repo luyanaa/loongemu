@@ -6204,6 +6204,132 @@ static void test_rvv_pvir_lsx_lasx(void)
         }
     }
 
+    /*
+     * 2i. Remaining FP: reverse-order scalar ops, the 7-bit estimates, and the
+     * floating-point slide1 pair.
+     */
+    {
+        static const uint32_t fp_rev[] = {
+            0x9e20d457, /* vfrsub.vf   v8,  v2, f1 */
+            0x8620d557, /* vfrdiv.vf   v10, v2, f1 */
+        };
+        static const uint32_t fp_est[] = {
+            0x4e229657, /* vfrec7.v    v12, v2 */
+            0x4e221757, /* vfrsqrt7.v  v14, v2 */
+        };
+
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10; /* e32, m1, tu, mu */
+        env.vl = 4;
+        env.fpr[1] = UINT64_C(0xffffffff40a00000); /* 5.0 */
+        vec_store32(2, 0, 0x3fc00000u); /* 1.5 */
+        vec_store32(2, 1, 0x40000000u); /* 2.0 */
+        vec_store32(2, 2, 0x40800000u); /* 4.0 */
+        vec_store32(2, 3, 0x41000000u); /* 8.0 */
+        check(latr_execute_block(fp_rev, 2), 1, "vfrsub/vfrdiv translate");
+        check(vec_read32(8, 0), 0x40600000u, "vfrsub.vf 5.0 - 1.5 = 3.5");
+        check(vec_read32(8, 3), 0xc0400000u, "vfrsub.vf 5.0 - 8.0 = -3.0");
+        check(vec_read32(10, 0), 0x40555555u, "vfrdiv.vf 5.0 / 1.5");
+        check(vec_read32(10, 3), 0x3f200000u, "vfrdiv.vf 5.0 / 8.0 = 0.625");
+
+        /* Estimates: the table value for a power of two with 7-bit precision. */
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10;
+        env.vl = 4;
+        vec_store32(2, 0, 0x3f800000u); /* 1.0 */
+        vec_store32(2, 1, 0x40000000u); /* 2.0 */
+        vec_store32(2, 2, 0x40800000u); /* 4.0 */
+        vec_store32(2, 3, 0x7fffffu);   /* largest subnormal */
+        check(latr_execute_block(fp_est, 2), 1, "vfrec7/vfrsqrt7 translate");
+        check(vec_read32(12, 0), 0x3f7f0000u, "vfrec7(1.0) = 1.9922");
+        check(vec_read32(12, 1), 0x3eff0000u, "vfrec7(2.0) = 0.9961");
+        check(vec_read32(12, 2), 0x3e7f0000u, "vfrec7(4.0) = 0.4980");
+        check(vec_read32(12, 3), 0x7e800000u,
+              "vfrec7(largest subnormal) = 2^126 exactly");
+        check(vec_read32(14, 0), 0x3f7f0000u, "vfrsqrt7(1.0)");
+        check(vec_read32(14, 1), 0x3f340000u, "vfrsqrt7(2.0)");
+        check(vec_read32(14, 2), 0x3eff0000u, "vfrsqrt7(4.0)");
+
+        /* The four numeric examples quoted in the spec text itself. */
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10;
+        env.vl = 2;
+        vec_store32(2, 0, 0x00718abcu);
+        vec_store32(2, 1, 0x7f765432u);
+        check(latr_execute_block(fp_est, 2), 1, "spec examples translate");
+        check(vec_read32(12, 0), 0x7e900000u, "vfrec7(0x00718abc) = 0x7e900000");
+        check(vec_read32(12, 1), 0x00214000u, "vfrec7(0x7f765432) = 0x00214000");
+        check(vec_read32(14, 0), 0x5f080000u, "vfrsqrt7(0x00718abc) = 0x5f080000");
+        check(vec_read32(14, 1), 0x1f820000u, "vfrsqrt7(0x7f765432) = 0x1f820000");
+
+        /* Special values and the exception flags they must raise. */
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10;
+        env.vl = 4;
+        env.fcsr = UINT64_C(3) << 13;
+        vec_store32(2, 0, 0x00000000u); /* +0 */
+        vec_store32(2, 1, 0xff800000u); /* -inf */
+        vec_store32(2, 2, 0x00000001u); /* smallest subnormal: overflow */
+        vec_store32(2, 3, 0x7fc12345u); /* qNaN */
+        check(latr_execute_block(fp_est, 1), 1, "vfrec7 special cases translate");
+        check(vec_read32(12, 0), 0x7f800000u, "vfrec7(+0) = +inf");
+        check((env.fcsr >> 3) & 1u, 1u, "vfrec7(+0) raises DZ");
+        check(vec_read32(12, 1), 0x80000000u, "vfrec7(-inf) = -0.0");
+        check(vec_read32(12, 2), 0x7f800000u,
+              "vfrec7(tiny subnormal) overflows to +inf under RNE");
+        check(((env.fcsr >> 2) & 1u) | ((env.fcsr >> 0) & 1u), 1u,
+              "vfrec7 overflow raises OF (and NX)");
+        check(vec_read32(12, 3), 0x7fc00000u, "vfrec7(qNaN) = canonical NaN");
+
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10;
+        env.vl = 4;
+        env.fcsr = UINT64_C(3) << 13;
+        vec_store32(2, 0, 0xbf800000u); /* -1.0 */
+        vec_store32(2, 1, 0x7f800000u); /* +inf */
+        vec_store32(2, 2, 0x00000000u); /* +0 */
+        vec_store32(2, 3, 0x41200000u); /* 10.0 */
+        check(latr_execute_block(fp_est + 1, 1), 1,
+              "vfrsqrt7 special cases translate");
+        check(vec_read32(14, 0), 0x7fc00000u, "vfrsqrt7(-1.0) = canonical NaN");
+        check((env.fcsr >> 4) & 1u, 1u, "vfrsqrt7(negative) raises NV");
+        check(vec_read32(14, 1), 0x00000000u, "vfrsqrt7(+inf) = +0");
+        check(vec_read32(14, 2), 0x7f800000u, "vfrsqrt7(+0) = +inf");
+        /* 0.3145 vs 1/sqrt(10) = 0.31623: 0.56% is inside the 2^-7 estimate
+         * bound, which is the contract - not exactness. */
+        check(vec_read32(14, 3), 0x3ea10000u, "vfrsqrt7(10.0) = 0.3145");
+
+        /* vfslide1up/down.vf: f-register scalar enters at the boundary. */
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10;
+        env.vl = 4;
+        env.fpr[1] = UINT64_C(0xffffffff41100000); /* 9.0 */
+        for (int lane = 0; lane < 4; lane++) {
+            vec_store32(2, lane, (uint32_t)(lane + 1));
+        }
+        {
+            static const uint32_t fp_slide_up[] = { 0x3a20d857 };
+            static const uint32_t fp_slide_down[] = { 0x3e20d957 };
+
+            check(latr_execute_block(fp_slide_up, 1), 1,
+                  "vfslide1up.vf translates");
+            check(vec_read32(16, 0), 0x41100000u, "vfslide1up.vf writes f1 first");
+            check(vec_read32(16, 1), 1u, "vfslide1up.vf shifts the source up");
+            check(vec_read32(16, 3), 3u, "vfslide1up.vf keeps lane order");
+            check(latr_execute_block(fp_slide_down, 1), 1,
+                  "vfslide1down.vf translates");
+            check(vec_read32(18, 0), 2u, "vfslide1down.vf shifts the source down");
+            check(vec_read32(18, 3), 0x41100000u,
+                  "vfslide1down.vf writes f1 at vl-1");
+        }
+    }
+
     /* 3. vmsgt / vmsgtu + unsigned shift immediate >= 16. */
     reset_guest_state();
     env.csr[0x300] = 0x600;

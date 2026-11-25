@@ -65,7 +65,8 @@
   `(1+2^-13)(1-2^-13) = 1-2^-26` 这种"乘积本身需超精度、单独会舍入到 1.0"的判别用例后，
   f32/f64 全部正确。`tests/test_softfloat_fma.c`（8 checks）现在全绿，用于防止把这类
   "期望值算错"再次误判成库缺陷。
-- [~] **RVV 1.0 指令补齐**：已登记 360 条（+3 条 `vset*`），**仍缺 14 条编码**（逐名比对 `insn32.decode:340-760`，明细见 [`RVV_P1_LEGALITY.md`](RVV_P1_LEGALITY.md) §2.1）：`vfrsub/vfrdiv/vfrec7/vfrsqrt7/vfslide1*.vf` 6。
+- [~] **RVV 1.0 指令补齐**：已登记 366 条（+3 条 `vset*`），**RVV 1.0 基础指令族已归零**（逐名比对 `insn32.decode`：355 个向量助记符里 0 个基础指令缺失）。
+  仍缺的 45 个助记符全部属于 **Zvbb/Zvbc/Zvk\*/BF16** 扩展（`vclmul*`、`vrol/vror/vbrev*`、`vclz/vctz/vcpop`、`vwsll`、`vaes*`、`vsha2*`、`vsm3*`、`vsm4*`、`vghsh/vgmul`、`vfncvtbf16` 等），按 §2.2 的结论单列，不计入 RVV 1.0 完整性目标。
   本轮落地 `vrsub.vx/vi` 与 `vmulh/vmulhu/vmulhsu` 的 `.vv/.vx`（共 8 条），走 `latr_rvv_arith_extra` 的 C 路径；
   高位乘在 2·SEW 上求出乘积再右移 SEW，`mulhsu` 按 vs2 有符号、vs1/x 无符号混合。
   **登记位置有陷阱**：把新编码插到 `rv64gc-opcodes.def` 中部（`vmul.vx` 之后）会让 16 项既有 FP 检查（RMM/NaN-box）

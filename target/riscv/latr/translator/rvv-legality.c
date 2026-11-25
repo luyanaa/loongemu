@@ -187,6 +187,10 @@ static void rvv_shape(unsigned opcode, RvvShape *shape)
     V(VMADC_VXM) V(VMADC_VIM) V(VMSBC_VXM)
         shape->form = FORM_MS;
         break;
+    /* Reverse scalar-and-vector FP and the 7-bit estimates: vd and vs2 only. */
+    V(VFRSUB_VF) V(VFRDIV_VF) V(VFREC7_V) V(VFRSQRT7_V)
+        shape->form = FORM_SS;
+        break;
     /* Integer multiply-accumulate, same-width all three operands. */
     V(VMACC_VV) V(VNMSAC_VV) V(VMADD_VV) V(VNMSUB_VV)
         shape->form = FORM_SSS;
@@ -325,10 +329,10 @@ static void rvv_shape(unsigned opcode, RvvShape *shape)
         break;
 
     /* Permute. */
-    V(VSLIDEUP_VX) V(VSLIDEUP_VI) V(VSLIDE1UP_VX)
+    V(VSLIDEUP_VX) V(VSLIDEUP_VI) V(VSLIDE1UP_VX) V(VFSLIDE1UP_VF)
         shape->form = FORM_SLIDE_UP;
         break;
-    V(VSLIDEDOWN_VX) V(VSLIDEDOWN_VI) V(VSLIDE1DOWN_VX)
+    V(VSLIDEDOWN_VX) V(VSLIDEDOWN_VI) V(VSLIDE1DOWN_VX) V(VFSLIDE1DOWN_VF)
         shape->form = FORM_SLIDE_DOWN;
         break;
     V(VRGATHER_VV)
@@ -1006,6 +1010,8 @@ bool latr_rvv_uses_frm(unsigned opcode)
     case LATR_RV_VFMIN_VV: case LATR_RV_VFMIN_VF:
     case LATR_RV_VFMAX_VV: case LATR_RV_VFMAX_VF:
     case LATR_RV_VFSQRT_V: case LATR_RV_VFCLASS_V:
+    case LATR_RV_VFRSUB_VF: case LATR_RV_VFRDIV_VF:
+    case LATR_RV_VFREC7_V: case LATR_RV_VFRSQRT7_V:
     case LATR_RV_VFSGNJ_VV: case LATR_RV_VFSGNJ_VF:
     case LATR_RV_VFSGNJN_VV: case LATR_RV_VFSGNJN_VF:
     case LATR_RV_VFSGNJX_VV: case LATR_RV_VFSGNJX_VF:

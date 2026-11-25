@@ -593,3 +593,11 @@ LATR_RV_INSN(VSBC_VVM, vsbc_vvm)
 LATR_RV_INSN(VSBC_VXM, vsbc_vxm)
 LATR_RV_INSN(VMSBC_VVM, vmsbc_vvm)
 LATR_RV_INSN(VMSBC_VXM, vmsbc_vxm)
+
+/* 2.2 batch 8: remaining FP - reverse scalar ops, 7-bit estimates, fp slide1. */
+LATR_RV_INSN(VFRSUB_VF, vfrsub_vf)
+LATR_RV_INSN(VFRDIV_VF, vfrdiv_vf)
+LATR_RV_INSN(VFREC7_V, vfrec7_v)
+LATR_RV_INSN(VFRSQRT7_V, vfrsqrt7_v)
+LATR_RV_INSN(VFSLIDE1UP_VF, vfslide1up_vf)
+LATR_RV_INSN(VFSLIDE1DOWN_VF, vfslide1down_vf)

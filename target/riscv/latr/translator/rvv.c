@@ -223,6 +223,10 @@ static void rvv_build_mask(CPUArchState *env, int masked)
     env->v_mask_version++;
 }
 
+/* Defined with the FP helpers further down; needed by the permute path. */
+static float32 rvv_fp_scalar32(const CPUArchState *env, unsigned reg);
+static float64 rvv_fp_scalar64(const CPUArchState *env, unsigned reg);
+
 static unsigned rvv_mask_bit(const CPUArchState *env, unsigned lane)
 {
     return (unsigned)((env->v_mask_words[lane / 64] >> (lane % 64)) & 1u);
@@ -1458,6 +1462,10 @@ void latr_rvv_permute(CPUArchState *env)
     unsigned vlmax = rvv_vlmax(env);
     unsigned i;
 
+    if (kind == LATR_RVV_SRC_FSCALAR) {
+        value = sew == 32 ? (uint64_t)rvv_fp_scalar32(env, (unsigned)value)
+                          : rvv_fp_scalar64(env, (unsigned)value);
+    }
     env->mem_fault_cause = 0;
     if (env->vstart >= env->vl) {
         env->vstart = 0;
@@ -2202,6 +2210,205 @@ void latr_rvv_fma(CPUArchState *env)
     }
 }
 
+/* ---- floating-point estimates and reverse-order scalar ops -----------------
+ *
+ * vfrec7 and vfrsqrt7 are table-driven: the spec fixes the 7-bit result, so the
+ * tables below are transcribed from vfrec7.adoc / vfrsqrt7.adoc and the
+ * exponent arithmetic is done here. They are estimates by definition - never
+ * substitute an exact division, and never let softfloat round them.
+ *
+ * The "normalized input exponent" E_in is the biased exponent field for normal
+ * inputs and -clz(frac) for subnormals; the examples in the spec pin both
+ * rules (vfrec7(0x00718abc) = 0x7e900000 needs E_in = 0 from a subnormal with
+ * no leading zeros, and vfrsqrt7(4.0) needs E_in = 129 from an odd exponent).
+ */
+
+static const uint8_t latr_vfrec7_lut[128] = {
+    127, 125, 123, 121, 119, 117, 116, 114, 112, 110, 109, 107, 105, 104, 102, 100,
+     99,  97,  96,  94,  93,  91,  90,  88,  87,  85,  84,  83,  81,  80,  79,  77,
+     76,  75,  74,  72,  71,  70,  69,  68,  66,  65,  64,  63,  62,  61,  60,  59,
+     58,  57,  56,  55,  54,  53,  52,  51,  50,  49,  48,  47,  46,  45,  44,  43,
+     42,  41,  40,  40,  39,  38,  37,  36,  35,  35,  34,  33,  32,  31,  31,  30,
+     29,  28,  28,  27,  26,  25,  25,  24,  23,  23,  22,  21,  21,  20,  19,  19,
+     18,  17,  17,  16,  15,  15,  14,  14,  13,  12,  12,  11,  11,  10,   9,   9,
+      8,   8,   7,   7,   6,   5,   5,   4,   4,   3,   3,   2,   2,   1,   1,   0,
+};
+
+/* Index is exp[0]*64 + sig[MSB-:6]; exp[0] is the LSB of the input exponent. */
+static const uint8_t latr_vfrsqrt7_lut[128] = {
+     52,  51,  50,  48,  47,  46,  44,  43,  42,  41,  40,  39,  38,  36,  35,  34,
+     33,  32,  31,  30,  30,  29,  28,  27,  26,  25,  24,  23,  23,  22,  21,  20,
+     19,  19,  18,  17,  16,  16,  15,  14,  14,  13,  12,  12,  11,  10,  10,   9,
+      9,   8,   7,   7,   6,   6,   5,   4,   4,   3,   3,   2,   2,   1,   1,   0,
+    127, 125, 123, 121, 119, 118, 116, 114, 113, 111, 109, 108, 106, 105, 103, 102,
+    100,  99,  97,  96,  95,  93,  92,  91,  90,  88,  87,  86,  85,  84,  83,  82,
+     80,  79,  78,  77,  76,  75,  74,  73,  72,  71,  70,  70,  69,  68,  67,  66,
+     65,  64,  63,  63,  62,  61,  60,  59,  59,  58,  57,  56,  56,  55,  54,  53,
+};
+
+static uint64_t rvv_fpest_canonical_nan(unsigned sew)
+{
+    return sew == 32 ? UINT64_C(0x7fc00000) : UINT64_C(0x7ff8000000000000);
+}
+
+static uint64_t rvv_fpest_inf(unsigned sew, uint64_t sign_bits)
+{
+    return sign_bits |
+           (sew == 32 ? UINT64_C(0x7f800000) : UINT64_C(0x7ff0000000000000));
+}
+
+static uint64_t rvv_fpest_max_finite(unsigned sew, uint64_t sign_bits)
+{
+    return sign_bits |
+           (sew == 32 ? UINT64_C(0x7f7fffff) : UINT64_C(0x7fefffffffffffff));
+}
+
+/* One lane. `bits` is the raw SEW-wide input; returns the raw output. */
+static uint64_t rvv_fpest_lane(unsigned op, uint64_t bits, unsigned sew,
+                               int frm, float_status *st)
+{
+    const unsigned ebits = sew == 32 ? 8u : 11u;
+    const unsigned mbits = sew == 32 ? 23u : 52u;
+    const int bias = sew == 32 ? 127 : 1023;
+    const unsigned expmax = (1u << ebits) - 1u;
+    const uint64_t fracmask = (UINT64_C(1) << mbits) - 1u;
+    uint64_t sign_bits = (bits >> (sew - 1)) & 1u;
+    unsigned e = (unsigned)((bits >> mbits) & expmax);
+    uint64_t f = bits & fracmask;
+    int ein;
+    uint64_t nf;
+
+    sign_bits <<= sew - 1;
+    if (e == expmax) {
+        if (f != 0) {
+            /* Signaling NaN is defined by a clear quiet bit (the frac MSB). */
+            if (((f >> (mbits - 1)) & 1u) == 0) {
+                float_raise(float_flag_invalid, st);
+            }
+            return rvv_fpest_canonical_nan(sew);
+        }
+        if (op == LATR_RVV_FP_REC7) {
+            return sign_bits; /* +/-inf -> +/-0 */
+        }
+        if (sign_bits) {
+            float_raise(float_flag_invalid, st); /* -inf has no estimate */
+            return rvv_fpest_canonical_nan(sew);
+        }
+        return 0; /* +inf -> +0 */
+    }
+    if (e == 0 && f == 0) {
+        float_raise(float_flag_divbyzero, st);
+        return rvv_fpest_inf(sew, sign_bits);
+    }
+    if (op == LATR_RVV_FP_RSQRT7 && sign_bits) {
+        float_raise(float_flag_invalid, st);
+        return rvv_fpest_canonical_nan(sew);
+    }
+    if (e == 0) {
+        unsigned clz = mbits - (unsigned)(64 - __builtin_clzll(f));
+
+        ein = -(int)clz;
+        nf = (f << (1 + clz)) & fracmask;
+    } else {
+        ein = (int)e;
+        nf = f;
+    }
+    if (op == LATR_RVV_FP_REC7) {
+        int eout = 2 * bias - 1 - ein;
+        unsigned m7 = latr_vfrec7_lut[(unsigned)(nf >> (mbits - 7)) & 0x7fu];
+
+        if (eout > 2 * bias) {
+            /* Overflow: the result depends on the dynamic rounding mode. */
+            int to_inf = sign_bits
+                             ? (frm == 2 || frm == 0 || frm == 4)
+                             : (frm == 3 || frm == 0 || frm == 4);
+
+            float_raise(float_flag_overflow | float_flag_inexact, st);
+            return to_inf ? rvv_fpest_inf(sew, sign_bits)
+                          : rvv_fpest_max_finite(sew, sign_bits);
+        }
+        if (eout >= 1) {
+            return sign_bits | ((uint64_t)eout << mbits) |
+                   ((uint64_t)m7 << (mbits - 7));
+        }
+        /* eout is 0 or -1: subnormal, the leading one moves down with it. */
+        return sign_bits |
+               ((UINT64_C(0x80) | m7) << (mbits - 8 + (unsigned)eout));
+    }
+    {
+        /* vfrsqrt7: floor((3B - 1 - E_in) / 2), table keyed by E_in[0] and
+         * the six MSBs of the normalized fraction. */
+        unsigned exp0 = (unsigned)ein & 1u;
+        unsigned m7 = latr_vfrsqrt7_lut[exp0 * 64u +
+                                        ((unsigned)(nf >> (mbits - 6)) & 0x3fu)];
+        int eout = (3 * bias - 1 - ein) / 2;
+
+        return sign_bits | ((uint64_t)eout << mbits) |
+               ((uint64_t)m7 << (mbits - 7));
+    }
+}
+
+static void latr_rvv_fp_est(CPUArchState *env)
+{
+    unsigned op = (unsigned)env->rvv_args[0];
+    unsigned vd = (unsigned)env->rvv_args[1];
+    unsigned vs2 = (unsigned)env->rvv_args[2];
+    unsigned vs1 = (unsigned)env->rvv_args[3];
+    int vm = (int)env->rvv_args[5];
+    unsigned sew = rvv_sew(env);
+    int frm = (int)((env->fcsr >> 5) & 7u);
+    int reverse = op == LATR_RVV_FP_RSUB || op == LATR_RVV_FP_RDIV;
+    float_status status;
+    uint64_t scalar = 0;
+    unsigned i;
+
+    if (env->vstart >= env->vl) {
+        env->vstart = 0;
+        return;
+    }
+    rvv_build_mask(env, !vm);
+    if (reverse) {
+        scalar = sew == 32 ? (uint64_t)rvv_fp_scalar32(env, vs1)
+                           : rvv_fp_scalar64(env, vs1);
+    }
+    latr_fp_status_begin(env, &status, 0);
+    for (i = (unsigned)env->vstart; i < (unsigned)env->vl; i++) {
+        uint64_t elem;
+        uint64_t out;
+
+        if (!rvv_mask_bit(env, i)) {
+            if (RVV_VTYPE_VMA(env->vtype)) {
+                latr_rvv_write_elem(env, vd, i, sew, rvv_sew_mask(sew));
+            }
+            continue;
+        }
+        elem = latr_rvv_read_elem(env, vs2, i, sew);
+        if (op == LATR_RVV_FP_RSUB) {
+            out = sew == 32
+                      ? (uint64_t)float32_sub((float32)scalar, (float32)elem,
+                                              &status)
+                      : (uint64_t)float64_sub((float64)scalar, (float64)elem,
+                                              &status);
+        } else if (op == LATR_RVV_FP_RDIV) {
+            out = sew == 32
+                      ? (uint64_t)float32_div((float32)scalar, (float32)elem,
+                                              &status)
+                      : (uint64_t)float64_div((float64)scalar, (float64)elem,
+                                              &status);
+        } else {
+            out = rvv_fpest_lane(op, elem, sew, frm, &status);
+        }
+        latr_rvv_write_elem(env, vd, i, sew, out);
+    }
+    latr_fp_status_end(env, &status);
+    env->vstart = 0;
+    if (RVV_VTYPE_VTA(env->vtype)) {
+        for (i = (unsigned)env->vl; i < rvv_vlmax(env); i++) {
+            latr_rvv_write_elem(env, vd, i, sew, rvv_sew_mask(sew));
+        }
+    }
+}
+
 void latr_rvv_fp(CPUArchState *env)
 {
     unsigned op = (unsigned)env->rvv_args[0];
@@ -2221,6 +2428,11 @@ void latr_rvv_fp(CPUArchState *env)
     }
     if (env->vstart >= env->vl) {
         env->vstart = 0;
+        return;
+    }
+    if (op == LATR_RVV_FP_RSUB || op == LATR_RVV_FP_RDIV ||
+        op == LATR_RVV_FP_REC7 || op == LATR_RVV_FP_RSQRT7) {
+        latr_rvv_fp_est(env);
         return;
     }
 
