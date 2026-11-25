@@ -244,6 +244,19 @@ path adds to every guest access, which is exactly what the boot harness must run
 assertion, a separate pre-existing limit). `latm-isa` now pins both directions:
 the sys path must cost extra words, and the loop must need no IR2 branch.
 
+**Where the 71 words come from, measured in the code.** A sys-memory access is a
+single `hcall2(latm_helper_load/store, op, addr)`, and `hcall()` wraps every call
+in `lata_gen_call_helper_prologue()` / `epilogue()`, which spill and reload **all
+17 guest registers that are mapped onto a1-a7 / t3-t8 / ra** (the ABI registers
+the C helper may clobber) around each call: 34 memory operations, about the whole
+cost of the block. So the fast path is not a micro-edit: either the translator
+learns the RAM window and inlines the access (needs a RAM pointer/window handed
+to it, which the design doc's "hand the physical root complex to the guest"
+already argues for), or the spill set shrinks to what each helper really touches.
+The first is the one that reaches the 15-word figure; the second is a smaller win
+with a correctness argument per helper. Neither is a one-line change, and both can
+be judged by the same two numbers already pinned in `latm-isa`.
+
 **The earlier synthetic test failed to reproduce the density, and that was useful
 too.** `latm-isa` now has `test_regcache_specialisation` (2 checks, image at 62) which translates two hand-written shapes on an env-resident register and counts IR2 branches and host words: a load-modify-load of the *same* register and of two *different* registers both come out at **0 branches and 21 words**, and the constant-store pair at 0 branches and 10 words. So the register cache's own specialisation is already good, and the 43 conditional words in the kernel block come from somewhere else. Turning the system-memory path on for the same shape aborts the translator instead (`regcache_store` itemp assertion), so the next measurement must be taken **on the kernel's own block**: dump its IR2 opcodes (the ISA test already walks `first_ir2`/`ir2_next`) rather than guessing shapes. Recorded so the synthetic-test route is not repeated. Two other measured facts: a 256 MiB `.bss` yields a 303 MB `memsz` segment and QEMU's LoongArch `-kernel` loader then runs the image with **no serial output at all** (64 MiB works), and this PC is the ready-made benchmark for 5.2 chaining |
 | SMP | four vCPUs, IPI, cross-core TLB, reservation coherence | P0 |
