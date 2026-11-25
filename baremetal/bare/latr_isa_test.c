@@ -5742,6 +5742,46 @@ static void test_rvv_pvir_lsx_lasx(void)
               "vwsubu.wx(0x80000000, 3)");
     }
 
+    /*
+     * 2d. vsmul (fixed-point signed multiply): 2*SEW product, roundoff >> SEW-1
+     * by vxrm (default 0 = round-to-nearest-up on the magnitude), saturate with
+     * vxsat. v1 = {2^30, -2^30, INT32_MAX, INT32_MIN},
+     * v2 = {2^30, 2^30, INT32_MAX, INT32_MIN}, t0 = 3.
+     */
+    {
+        static const uint32_t vsmul_ops[] = {
+            0x9e110457, /* vsmul.vv v8, v1, v2 */
+            0x9e12c557, /* vsmul.vx v10, v1, t0 */
+        };
+
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10; /* e32, m1, tu, mu */
+        env.vl = 4;
+        env.gpr[5] = 3;
+        vec_store32(1, 0, 0x40000000u);
+        vec_store32(1, 1, 0xc0000000u);
+        vec_store32(1, 2, 0x7fffffffu);
+        vec_store32(1, 3, 0x80000000u);
+        vec_store32(2, 0, 0x40000000u);
+        vec_store32(2, 1, 0x40000000u);
+        vec_store32(2, 2, 0x7fffffffu);
+        vec_store32(2, 3, 0x80000000u);
+        check(latr_execute_block(vsmul_ops, 2), 1, "vsmul family translates");
+        check(vec_read32(8, 0), 0x20000000u, "vsmul.vv 2^30 * 2^30 >> 31");
+        check(vec_read32(8, 1), 0xe0000000u, "vsmul.vv -2^30 * 2^30 >> 31");
+        check(vec_read32(8, 2), 0x7ffffffeu,
+              "vsmul.vv INT32_MAX^2 rounds to INT32_MAX-1");
+        check(vec_read32(8, 3), 0x7fffffffu,
+              "vsmul.vv INT32_MIN^2 saturates");
+        check((uint32_t)env.vxsat, 1u, "vsmul saturation sets vxsat");
+        /* vsmul.vx by 3: 1.5 -> 2, -1.5 -> -2 (magnitude rounding). */
+        check(vec_read32(10, 0), 2u, "vsmul.vx 2^30 * 3 rounds to 2");
+        check(vec_read32(10, 1), 0xfffffffeu, "vsmul.vx -2^30 * 3 rounds to -2");
+        check(vec_read32(10, 2), 3u, "vsmul.vx INT32_MAX * 3 -> 3");
+        check(vec_read32(10, 3), 0xfffffffdu, "vsmul.vx INT32_MIN * 3 -> -3");
+    }
+
     /* 3. vmsgt / vmsgtu + unsigned shift immediate >= 16. */
     reset_guest_state();
     env.csr[0x300] = 0x600;

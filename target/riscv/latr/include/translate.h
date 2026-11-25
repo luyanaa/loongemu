@@ -119,7 +119,7 @@ enum {
     LATR_RVV_X_SEXT2, LATR_RVV_X_SEXT4, LATR_RVV_X_SEXT8,
     /* 2.2 batch: reverse subtract and the three high-half multiplies. */
     LATR_RVV_X_RSUB, LATR_RVV_X_MULH, LATR_RVV_X_MULHU,
-    LATR_RVV_X_MULHSU,
+    LATR_RVV_X_MULHSU, LATR_RVV_X_SMUL,
 };
 void latr_rvv_arith_extra(CPUArchState *env);
 enum {

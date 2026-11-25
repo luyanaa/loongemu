@@ -1059,10 +1059,14 @@ static bool valid_fixed_operation(const PvirInstruction *instruction)
             return false;
         }
     }
-    /* AVG_* and SCALE_SHIFT/CLIP round; SAT_* do not. */
+    /* AVG_*, SAT_MUL and SCALE_SHIFT/CLIP round; SAT_ADD/SAT_SUB do not.
+     * SAT_MUL belongs with the rounding kinds because RVV `vsmul` shifts its
+     * 2*SEW product right by SEW-1 using vxrm - the executor already rounds for
+     * it, so requiring ROUND_DEFAULT here only made the instruction unexecutable. */
     switch (operation->kind) {
     case PVIR_FIXED_AVG_ADD:
     case PVIR_FIXED_AVG_SUB:
+    case PVIR_FIXED_SAT_MUL:
     case PVIR_FIXED_SCALE_SHIFT:
     case PVIR_FIXED_CLIP:
         if (!valid_fixed_rounding(operation->rounding)) {

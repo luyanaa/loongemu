@@ -434,6 +434,8 @@ static bool rvv_extra_op(int opcode, unsigned *op, unsigned *kind,
     RVV_X_WX(VWSUB, LATR_RVV_X_WSUB, 1);
     RVV_X_WV(VWSUBU, LATR_RVV_X_WSUBU);
     RVV_X_WX(VWSUBU, LATR_RVV_X_WSUBU, 0);
+    RVV_X_VV(VSMUL, LATR_RVV_X_SMUL);
+    RVV_X_VX(VSMUL, LATR_RVV_X_SMUL);
     default: return false;
     }
 }

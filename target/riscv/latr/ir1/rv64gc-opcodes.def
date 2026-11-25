@@ -539,3 +539,7 @@ LATR_RV_INSN(VWSUB_WV, vwsub_wv)
 LATR_RV_INSN(VWSUB_WX, vwsub_wx)
 LATR_RV_INSN(VWSUBU_WV, vwsubu_wv)
 LATR_RV_INSN(VWSUBU_WX, vwsubu_wx)
+
+/* 2.2 batch 3: fixed-point signed multiply (vxrm rounding, vxsat saturation). */
+LATR_RV_INSN(VSMUL_VV, vsmul_vv)
+LATR_RV_INSN(VSMUL_VX, vsmul_vx)

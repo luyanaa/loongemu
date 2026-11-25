@@ -1639,6 +1639,7 @@ static bool rvv_arith_fixed(CPUArchState *env, unsigned op, unsigned vd,
     case LATR_RVV_X_SSUBU:  fkind = PVIR_FIXED_SAT_SUB; is_signed = false; saturating = true; break;
     case LATR_RVV_X_SSRL:   fkind = PVIR_FIXED_SCALE_SHIFT; is_signed = false; uses_round = true; break;
     case LATR_RVV_X_SSRA:   fkind = PVIR_FIXED_SCALE_SHIFT; is_signed = true; uses_round = true; break;
+    case LATR_RVV_X_SMUL:   fkind = PVIR_FIXED_SAT_MUL; is_signed = true; uses_round = true; saturating = true; break;
     case LATR_RVV_X_NCLIP:  fkind = PVIR_FIXED_CLIP; is_signed = true; uses_round = true; saturating = true; break;
     case LATR_RVV_X_NCLIPU: fkind = PVIR_FIXED_CLIP; is_signed = false; uses_round = true; saturating = true; break;
     default:
