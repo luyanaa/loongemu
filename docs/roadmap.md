@@ -450,17 +450,29 @@ The boundary log shows the callee is **entered with the right state**
 (`pc=0x80002000 ra=0x8000017c a0=2`) and the continuation is entered with
 `env->gpr[10]` already 0, while `env->pc` is right and `ra` reads back correctly
 - so the loss happens inside a block that is re-entered after the cross-core
-invalidation, not at a boundary and not in the caller. Hart 1's own `fence.i`
-repairing it locates the difference in what the two invalidations leave behind,
-and the two that are already ruled out by reading the code are worth recording so
-the next run does not repeat them: `latr_tb_shootdown_all()` does clear
-`entry->valid` and `count`, so the dispatcher's candidate rejects a shot-down
-entry, and a re-inserted entry is validated by `code`/`code_size` against the
-arena, so a surviving candidate is not it either. That leaves the emitted code of
-the re-translated block itself, which is where the next run should look - compare
-the host code bytes of 0x80002000's translation made after hart 0's `fence.i`
-with the one made after hart 1's own. The check stays out of the gate rather
-than shipped red.
+invalidation, not at a boundary and not in the caller.
+
+**Host-code comparison done, and it rules the bytes out.** The harness dumps the
+`LatrTbEntry.code` bytes of 0x80002000 at every entry (via the `enter_tb` hook,
+which runs after translation), for two builds - one where hart 0's cross-core
+`fence.i` is the only invalidation, one where hart 1 also executes `fence.i`
+itself. Measured, 320 bytes each:
+
+| observation | result |
+|---|---|
+| distinct translations of 0x80002000 in one run | **two** |
+| bytes differing between them | **one word**, offset 0x40: `0c04c002` vs `0c08c002` (bit 10 of the immediate/register field) |
+| translation set with vs without hart 1's own `fence.i` | **identical** |
+
+So the emitted code is a function of the caching state, not of *which* hart
+invalidated: the two bodies differ by a single word and are exactly the same pair
+in both runs. Nothing else in the 320 bytes moves, so the failing/passing
+difference is not the code the block runs at all - it is which of the two bodies
+a given entry executes, or the state that body is handed. The next run should log
+`entry->code` (the address) next to `env->gpr[10]` at each entry, so the body and
+the value can be correlated directly.
+
+The check stays out of the gate rather than shipped red.
 
 **Three self-inflicted probe errors, recorded because each one cost more than
 the real work:** a data page at 0x80001000 overwrote the second half of the
