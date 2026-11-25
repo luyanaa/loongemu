@@ -63,10 +63,12 @@ These are the contract. Each one is testable without a guest (see §9).
 
 ## 3. Threading model
 
-- One host thread per online hart, created at `latr_machine_boot()`, joined at
-  `latr_machine_stop()`. `latr_machine_run(max_tbs)` keeps its current meaning
-  only for the single-threaded build; the threaded build exposes
-  `latr_machine_run_threads()` plus a step/barrier API for tests.
+- One host thread per online hart. The machine owns no threads: it exposes
+  `latr_machine_run_hart(m, hartid, max_tbs)` (one hart, in the calling thread,
+  returns 1 = dispatched, 2 = yielded, 3 = STOP honoured and offline, 0 =
+  failure) and the embedder runs the service loop: dispatch while RUN, park on
+  `latr_hart_park_wait` when idle, break on STOP, join. `latr_machine_run`
+  keeps the cooperative round-robin meaning for the freestanding build.
 - **Build gate.** Threads require a hosted build with `LATR_ENABLE_TLS` and
   pthreads. The freestanding images (`-ffreestanding`, `__thread` empty,
   `latr/Makefile:20-33`) keep the deterministic round-robin scheduler: CI runs
@@ -133,7 +135,10 @@ struct LatrShootdownAck {
 
 - A shootdown becomes a sequenced request: the issuer increments a global
   `shootdown_seq`, publishes `(seq, kind, asid)`, walks the registry applying
-  the invalidation, and sets each target's `wake`.
+  the invalidation, and sets each target's `wake`. **Both halves are load-bearing
+  and were found the hard way** (see below): a parked hart never acks unless the
+  publication wakes it, and the issuer must ack its own sequence before waiting
+  or the wait is guaranteed to time out.
 - Each hart's dispatcher already sits between TBs
   (`latr_context_safepoint`, `latr_machine.c:782`). It now also does:
   read `seq`; if behind, apply the pending request locally, release, store its
@@ -157,6 +162,19 @@ struct LatrShootdownAck {
   `latr_tb_shootdown_asid_all_cores` already implements the second, so the
   sequence number is per (kind, asid) pair - a coefficient of the request, not a
   new registry.
+
+Two measured traps (the threaded harness fails without either fix):
+
+1. **The wait includes the issuer.** `latr_tb_fence_wait` walks every registered
+   cache, and the issuer's own `applied_seq` only advances *after* the wait,
+   so every fence timed out once and failed the machine. The issuer is inside
+   `run_hart` at a block boundary, i.e. provably outside generated code, so it
+   acknowledges its own request before waiting.
+2. **A parked hart cannot ack.** A hart sitting in WFI will not reach its next
+   safe point until something wakes it, so the publication itself must be a wake
+   event: `latr_tb_fence_begin` bumps every registered hart's wake word (`struct
+   LatrTbCache` carries a `LatrHartSync *park`). Without this, any `SFENCE.VMA`
+   issued while another hart is idle burns its bound and fails the machine.
 
 The TB epilogue hook is one word per hart: the translator already ends a block
 at a controlled point, so the exit check is an `env` field test plus a branch
@@ -219,8 +237,13 @@ Two rules that are easy to get wrong and are therefore stated as requirements:
 
 ## 8. Build and configuration
 
-- `-DLATR_SMP_THREADS` enables the threaded scheduler and requires
-  `LATR_ENABLE_TLS` + pthreads; the build fails fast if TLS is off.
+- `-DLATR_SMP_THREADS` enables the fence-ack wait (without it the machine retires
+  a fence immediately, which is correct only when nobody else can run). With
+  threads it requires `LATR_ENABLE_TLS` + pthreads.
+  **Measured:** without `LATR_ENABLE_TLS` the host build defines `__thread` away,
+  `tr_data`/`lsenv` become plain globals, and two harts translating
+  concurrently abort the process (about 1 run in 10 in the harness). With TLS
+  on, 200 consecutive runs pass.
 - Default stays single-threaded. `make test` runs the host protocol tests
   (pthread) unconditionally; the bare-metal images exercise the deterministic
   interleaving.
@@ -289,7 +312,7 @@ pthreads do not exist.
 |---|---|---|
 | **P0** | `LatrShootdownAck` sequence + safepoint ack + bounded wait, single-threaded build drives it through the deterministic harness | host test 9.1 (first two items), existing ISA/sys images unchanged |
 | **P1a** | exit request at the safe point; park/wake/command primitives; MSIP write notifies the machine; `next_action` decision point | `test-latr-hart-sync` (pthread) + CLINT notify test; ISA/sys images unchanged |
-| **P1b** | hart threads, join, TLS-gated build, on the hosted harness | the P1a tests plus a threaded two-hart machine run |
+| **P1b** | hart threads, join, TLS-gated build, on the hosted harness | done: `latr_machine_run_hart` + one pthread per hart, 21 checks including the threaded fence completing with no ack timeout |
 | **P2** | machine lock around `LatrSystem`; ticker ownership; DMA/store lock order | lock-order host test; threaded sys run with 2 harts |
 | **P3** | guest-level 9.3 tests, AES/fence stress, `make latr-sys-smp-run` in CI | all 9.3 green, threaded run reproducible over 100 iterations |
 

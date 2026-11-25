@@ -6,6 +6,7 @@
  */
 #include <string.h>
 #include "latr-tb-cache.h"
+#include "latr-hart-sync.h"
 
 #define SATP_ASID_SHIFT 44
 #define SATP_MODE_SHIFT 60
@@ -43,6 +44,7 @@ void latr_tb_cache_init(LatrTbCache *cache, uint8_t *arena, uint32_t size)
     cache->reclaim_pending = 0;
     cache->applied_seq = 0;
     cache->in_code = 0;
+    cache->park = 0;
     for (int i = 0; i < LATR_TB_HOT_SLOTS; i++) {
         cache->hot[i].valid = 0;
     }
@@ -393,6 +395,13 @@ uint64_t latr_tb_fence_seq(void)
     return __atomic_load_n(&latr_tb_fence_seq_word, __ATOMIC_ACQUIRE);
 }
 
+void latr_tb_cache_set_park(LatrTbCache *cache, struct LatrHartSync *park)
+{
+    if (cache != 0) {
+        cache->park = park;
+    }
+}
+
 uint64_t latr_tb_fence_begin(uint32_t asid, int fence_i)
 {
     /* Publish the sequence before the invalidation: a hart that acknowledges
@@ -405,6 +414,19 @@ uint64_t latr_tb_fence_begin(uint32_t asid, int fence_i)
         latr_tb_fence_i_all_cores();
     } else {
         latr_tb_shootdown_asid_all_cores(asid);
+    }
+    /*
+     * A hart parked in WFI will not reach its safe point on its own, so a
+     * request that needs an acknowledgement must be a wake event (design
+     * section 5). Waking is enough: the next dispatcher entry acks before it
+     * executes anything.
+     */
+    for (int i = 0; i < LATR_TB_CACHE_MAX_CORES; i++) {
+        LatrTbCache *cache = __atomic_load_n(&latr_tb_cores[i],
+                                             __ATOMIC_ACQUIRE);
+        if (cache != 0 && cache->park != 0) {
+            latr_hart_wake(cache->park);
+        }
     }
     return seq;
 }

@@ -112,6 +112,7 @@ int latr_machine_init(LatrMachine *m, uint8_t *ram, uint64_t ram_size,
         latr_hart_sync_init(&h->park);
         latr_hart_set_command(&h->park, LATR_HART_PARKED);
         latr_tb_cache_init(&h->tb_cache, h->arena, h->arena_size);
+        latr_tb_cache_set_park(&h->tb_cache, &h->park);
         latr_tb_cache_register(&h->tb_cache);
         h->ctx = latr_context_create(&h->env, &h->tb_cache, h->code_buf,
                                      h->code_buf_size);
@@ -137,7 +138,7 @@ void latr_machine_wake_hart(LatrMachine *m, uint32_t hartid)
     if (m == NULL || hartid >= m->nharts) {
         return;
     }
-    m->wake_events++;
+    __atomic_add_fetch(&m->wake_events, 1, __ATOMIC_RELAXED);
     latr_hart_wake(&m->harts[hartid].park);
     /* Prompt response: the target leaves the block it is in at the next
      * dispatcher entry instead of running out its current slice. */
@@ -794,12 +795,14 @@ static void latr_tb_fence_complete(LatrMachine *m, LatrMachineHart *h,
     (void)h;
 #if defined(LATR_SMP_THREADS)
     if (latr_tb_fence_wait(seq, LATR_SMP_ACK_SPINS) != 0) {
-        if (!m->failed) {
+        /* First failure wins the diagnostic latch; the failure itself is a
+         * plain atomic because hart threads observe it. */
+        if (!__atomic_load_n(&m->failed, __ATOMIC_ACQUIRE)) {
             m->first_trap_pc = h->env.pc;
             m->first_trap_cause = 0;
             m->trapped = true;
         }
-        m->failed = true;
+        __atomic_store_n(&m->failed, true, __ATOMIC_RELEASE);
     }
 #else
     (void)m;
@@ -834,6 +837,10 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
          * the request (design: latr-smp-concurrency.md section 5). */
         uint64_t seq = latr_tb_fence_begin((uint32_t)h->env.sfence_asid, 0);
 
+        /* The issuer is between blocks right here, so it is at a safe point:
+         * acknowledge its own request before waiting, otherwise the wait
+         * includes the issuer's stale sequence and always times out. */
+        latr_tb_fence_ack(&h->tb_cache);
         latr_tb_fence_complete(m, h, seq);
         h->env.sfence_pending = 0;
     }
@@ -842,6 +849,7 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
          * contain translations of the overwritten page. */
         uint64_t seq = latr_tb_fence_begin(0, 1);
 
+        latr_tb_fence_ack(&h->tb_cache);
         latr_tb_fence_complete(m, h, seq);
         h->env.fence_i_pending = 0;
     }
@@ -960,9 +968,45 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
     h->env.mem_fault_cause = 0;
     h->env.fetch_faulted = 0;
     m->last_pc = pc_before;
-    m->dispatch_count++;
+    __atomic_add_fetch(&m->dispatch_count, 1, __ATOMIC_RELAXED);
     h->tbs++;
     return 1;
+}
+
+int latr_machine_run_hart(LatrMachine *m, uint32_t hartid, uint32_t max_tbs)
+{
+    LatrMachineHart *h;
+    uint32_t executed = 0;
+    int last = 2;
+
+    if (m == NULL || !m->booted || hartid >= m->nharts) {
+        return 0;
+    }
+    h = &m->harts[hartid];
+    if (!h->online) {
+        return 3;
+    }
+    while (executed < max_tbs) {
+        int ran = run_hart(m, h);
+
+        if (ran == 0) {
+            __atomic_store_n(&m->failed, true, __ATOMIC_RELEASE);
+            return 0;
+        }
+        if (ran == 3) {
+            /* A stopped hart stops dispatching; the machine keeps running as
+             * long as some hart is online, which is what an SBI HSM hart-off
+             * expects. */
+            h->online = false;
+            return 3;
+        }
+        if (ran == 2) {
+            return 2; /* yielded without dispatching */
+        }
+        executed++;
+        last = 1;
+    }
+    return last;
 }
 
 int latr_machine_run(LatrMachine *m, uint32_t max_tbs)
@@ -979,30 +1023,18 @@ int latr_machine_run(LatrMachine *m, uint32_t max_tbs)
          * latch its own CLINT comparators against it. */
         latr_system_tick(&m->sys, UINT64_C(1000));
         for (uint32_t i = 0; i < m->nharts; i++) {
-            LatrMachineHart *h = &m->harts[i];
+            int ran;
 
-            if (!h->online) {
+            if (!m->harts[i].online) {
                 continue;
             }
             online = true;
-            {
-                int ran = run_hart(m, h);
-
-                if (ran == 0) {
-                    m->failed = true;
-                    return 0;
-                }
-                if (ran == 3) {
-                    /* A stopped hart stops dispatching; the machine keeps
-                     * running as long as some hart is online, which is what an
-                     * SBI HSM hart-off expects. */
-                    h->online = false;
-                    continue;
-                }
-                if (ran == 2) {
-                    /* Yielded without dispatching: let the next hart run. */
-                    continue;
-                }
+            ran = latr_machine_run_hart(m, i, 1);
+            if (ran == 0) {
+                return 0;
+            }
+            if (ran == 3 || ran == 2) {
+                continue;
             }
             executed++;
             if (m->sys.exit_request != 0) {

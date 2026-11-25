@@ -79,6 +79,13 @@ typedef struct LatrTbCache {
      */
     volatile uint64_t applied_seq;
     volatile uint32_t in_code;
+    /*
+     * Wake target for this hart. A hart parked in WFI cannot acknowledge a
+     * fence on its own: the issuer must bump its wake word so it re-enters the
+     * dispatcher and acks. Without this every SFENCE.VMA issued while any hart
+     * is idle waits out its bound and fails the machine.
+     */
+    struct LatrHartSync *park;
     LatrTbHotPage hot[LATR_TB_HOT_SLOTS];
 } LatrTbCache;
 
@@ -136,6 +143,7 @@ uint32_t latr_tb_hot_busiest(const LatrTbCache *cache, uint64_t *page);
  * stays usable in the freestanding build (no clock source); the threaded
  * scheduler picks it from LATR_SMP_ACK_SPINS (design section 8).
  */
+void latr_tb_cache_set_park(LatrTbCache *cache, struct LatrHartSync *park);
 uint64_t latr_tb_fence_begin(uint32_t asid, int fence_i);
 void latr_tb_fence_ack(LatrTbCache *cache);
 void latr_tb_code_enter(LatrTbCache *cache);

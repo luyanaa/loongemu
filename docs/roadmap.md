@@ -395,8 +395,15 @@ fault recovery cost.
    for the host (build-host/, pthreads) and drives two harts with scripted
    blocks, because generated code is LoongArch. It asserts the IPI wake -> exit
    at a block boundary, WFI clock fast-forward, cross-cache invalidation from
-   SFENCE.VMA, and STOP taking one hart offline. Next: run the harts on their
-   own threads against this harness.
+   SFENCE.VMA, and STOP taking one hart offline.
+   P1b is in: latr_machine_run_hart() lets the embedder run one hart per thread,
+   and the harness now does exactly that (two pthreads, park/wake, join). Two
+   concurrency bugs were found by the harness and fixed in the machine: the
+   fence wait included the issuer's own stale sequence (self-ack before waiting),
+   and a parked hart could never ack because publication did not wake it. The
+   host build also needs LATR_ENABLE_TLS: without it tr_data/lsenv are shared
+   globals and concurrent translation aborts (~1 in 10 runs). Next: P2, the
+   machine lock around the device model and ticker ownership.
    (vrsub.vx/vi, vmulh/vmulhu/vmulhsu .vv/.vx landed through the arith_extra C
    path, each with hand-computed lane checks in the ISA image), then the widening
    `.wv/.wx` eight (vd and, for `.wv`, vs1 are 2*SEW; `.wx` takes a scalar, so its

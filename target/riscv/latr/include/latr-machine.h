@@ -180,6 +180,15 @@ int latr_machine_boot(LatrMachine *m);
  * 0 on a guest fault/translation failure, 2 when max_tbs was reached. */
 int latr_machine_run(LatrMachine *m, uint32_t max_tbs);
 /*
+ * One hart, in the calling thread: LRGB's service loop for a scheduler that
+ * runs each hart on its own thread. Same return codes as run_hart internally
+ * (1 = dispatched a block, 2 = yielded without dispatching, 3 = STOP honoured
+ * and the hart is now offline, 0 = failure and the machine is marked failed).
+ * The machine itself owns no threads: the embedder creates them, calls this in
+ * a loop, and parks on LatrHartSync when the hart is idle.
+ */
+int latr_machine_run_hart(LatrMachine *m, uint32_t hartid, uint32_t max_tbs);
+/*
  * Makes progress possible on a parked hart: bumps its wake counter and asks it
  * to return to the dispatcher after the block it is in. Called from the CLINT
  * MSIP write path (an IPI is the only thing that can wake a WFI hart) and from

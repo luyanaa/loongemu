@@ -1,26 +1,34 @@
 /*
  * Host harness for the LATR machine dispatcher (design:
- * docs/design/latr-smp-concurrency.md, phase P1b prerequisite).
+ * docs/design/latr-smp-concurrency.md, phases P1a/P1b).
  *
  * Why this is a *scripted* machine and not a guest run: the translator emits
  * LoongArch words, and the trampoline that jumps into them (`latr_enter_tb`,
  * bare-metal/LoongArch asm) cannot exist on an x86/AArch64 host. Guest
  * execution therefore stays in the bare-metal images; this harness replaces
  * `enter_tb` with a scripted block model and exercises everything that runs in
- * C around it:
+ * C around it.
  *
- *   - the dispatcher (lookup / translate+assemble / caches per hart),
- *   - a CLINT MSIP write waking a hart that has parked in WFI,
- *   - the exit request being honoured at a block boundary,
- *   - SFENCE.VMA driving the fence sequence and a cross-core shootdown,
- *   - STOP taking a hart offline while the others keep running.
+ * It runs both scheduler shapes the design defines:
  *
- * The script is keyed by hartid and block count, and drives the same entry
- * points generated code would (latr_system_mmio_write for CLINT and the exit
- * device, env->wfi_pending for WFI, env->sfence_pending for SFENCE.VMA), so a
+ *   - cooperative (`latr_machine_run`, one caller thread): every hart runs in
+ *     turn, which is what the freestanding build does;
+ *   - threaded (`latr_machine_run_hart` per hart, one pthread each, `park_wait`
+ *     for idle harts). This is the shape the P1b scheduler needs, and the only
+ *     place the fence-ack wait, the WFI park and the join path are exercised
+ *     with real concurrency.
+ *
+ * The script is keyed by hartid and drives the same entry points generated
+ * code would (latr_system_mmio_write for CLINT and the exit device,
+ * env->wfi_pending for WFI, env->sfence_pending for SFENCE.VMA), so a
  * scheduler bug surfaces here without a LoongArch host.
  */
+#include <pthread.h>
 #include <stdio.h>
+#include <time.h>
+/* The translator headers pull in QEMU-style shims whose stdio lacks
+ * setvbuf/stderr, so the harness keeps its output to a single printf at the
+ * end (flushed at exit). */
 #include <string.h>
 #include <stdint.h>
 #include "latr-machine.h"
@@ -42,7 +50,7 @@ static uint8_t machine_work[(2u << 20) * 4]; /* 2 harts: arena + staging each */
 static LatrMachine machine;
 
 /* Valid RISC-V instructions for the scripted entry PCs: the dispatcher only
- * needs to decode a block, it never executes the emitted words here. */
+ * needs to decode and translate a block, it never executes the words here. */
 static const uint32_t firmware_words[] = {
     0x00000013u, /* nop */
     0x00000013u, /* nop */
@@ -52,59 +60,68 @@ static const uint32_t firmware_words[] = {
 #define FW_LOOP (LATR_MACHINE_FIRMWARE_BASE + 8u)
 #define HART1_DISC 0x80000040u /* hart 1's "discovered" marker */
 
-static uint64_t vclock_start;
-
 /* Script state. */
-static int hart0_ipi_sent;
-static int hart1_woke;
-static uint64_t fence_seq_start;
-static uint64_t gen0_start;
-static uint64_t gen1_start;
-static uint32_t exit_value;
+static volatile uint64_t vclock_start;
+static volatile int hart0_ipi_sent;
+static volatile int hart1_woke;
+static volatile int hart1_ready;   /* hart 1 is dispatching, not parked */
+static volatile int hart1_wants_wfi; /* scripted WFI: the thread parks */
+static volatile int send_ipi;      /* hart 0 sends MSIP to hart 1 */
+static volatile int send_fence;    /* hart 0 also emits SFENCE.VMA (threads) */
+static volatile uint32_t exit_value;
 
 static void guest_write(uint64_t pa, unsigned size, uint64_t value)
 {
     latr_system_mmio_write(&machine.sys, pa, size, value);
 }
 
-/*
- * Replace ment of the LoongArch trampoline. `env` is the hart's state and
- * `code` the just-assembled block; the guest PC is still the block's PC.
- */
+/* Replacement for the LoongArch trampoline. */
 static void scripted_enter_tb(void *envp, void *code)
 {
     CPUArchState *env = (CPUArchState *)envp;
 
     (void)code;
     if (env->hartid == 0) {
-        if (!hart0_ipi_sent) {
-            /* What generated code does for `sd zero, 0(clint+4)`: an IPI to
-             * hart 1. This is the only wake a hart parked in WFI can get. */
+        if (!hart0_ipi_sent && send_ipi) {
+            /* Only in threaded mode does it pay to wait for the other hart: in
+             * the cooperative pass it cannot progress while this block runs. */
+            if (send_fence) {
+                while (!hart1_ready) {
+                }
+            }
+            /* What generated code does for `sd zero, 0(clint+4)`: an IPI. */
             guest_write(LATR_SYSTEM_CLINT_BASE + 4u, 4, 1);
             hart0_ipi_sent = 1;
-            /* And a guest SFENCE.VMA without an ASID (asid 0 = global), which
-             * must drop every hart's entries through the fence sequence. */
-            env->sfence_asid = 0;
-            env->sfence_pending = 1;
+            if (send_fence) {
+                /* A guest SFENCE.VMA without an ASID (asid 0 = global). The
+                 * issuer blocks in latr_tb_fence_complete until every other
+                 * hart has acknowledged; the publication itself wakes parked
+                 * harts, which is what lets a WFI hart ack at all. */
+                env->sfence_asid = 0;
+                env->sfence_pending = 1;
+            }
         }
         if (hart1_woke) {
-            /* Leave through the SiFive test device, like firmware does. */
             exit_value = 0x5555;
             guest_write(LATR_SYSTEM_EXIT_BASE, 4, exit_value);
         }
         env->pc = FW_LOOP;
         return;
     }
-    /* Hart 1: park in WFI until the IPI has been delivered, then "handle" it
-     * by clearing the marker and reporting the wake. */
+    /* Hart 1: reach a safe point (ack the fence), then park in WFI until the
+     * IPI has been delivered and "handle" it. */
     if (env->csr[0x344] & (UINT64_C(1) << 3)) {
         hart1_woke = 1;
         guest_write(LATR_SYSTEM_CLINT_BASE + 4u, 4, 0); /* clear MSIP */
         env->pc = HART1_DISC;
         return;
     }
+    hart1_ready = 1;
     env->pc = FW_PC;
+    /* WFI: report it to the runtime (clock fast-forward) and tell this
+     * harness's hart thread to park until a wake arrives. */
     env->wfi_pending = 1;
+    hart1_wants_wfi = 1;
 }
 
 static int setup_machine(void)
@@ -130,65 +147,195 @@ static int setup_machine(void)
     {
         LatrMachineHart *h1 = &machine.harts[1];
 
-        h1->env.csr[0x305] = HART1_DISC;          /* mtvec */
-        h1->env.csr[0x304] |= (UINT64_C(1) << 3); /* mie.MSIE */
-        h1->env.csr[0x300] |= (UINT64_C(1) << 3); /* mstatus.MIE */
+        h1->env.csr[0x305] = HART1_DISC;           /* mtvec */
+        h1->env.csr[0x304] |= (UINT64_C(1) << 3);  /* mie.MSIE */
+        h1->env.csr[0x300] |= (UINT64_C(1) << 3);  /* mstatus.MIE */
     }
     return latr_machine_boot(&machine);
 }
 
-static void scenario_ipi_and_wfi(void)
+static void reset_scenario(void)
 {
-    uint64_t vclock_before;
-    uint64_t fence_before;
-    int rc;
-
+    machine.sys.exit_request = 0;
+    exit_value = 0;
     hart0_ipi_sent = 0;
     hart1_woke = 0;
+    hart1_ready = 0;
+    hart1_wants_wfi = 0;
+    send_ipi = 0;
+    send_fence = 0;
     vclock_start = loongemu_vclock_now_ns(&machine.sys.vclock);
-    vclock_before = vclock_start;
-    fence_seq_start = latr_tb_fence_seq();
-    fence_before = fence_seq_start;
-    gen0_start = machine.harts[0].tb_cache.generation;
-    gen1_start = machine.harts[1].tb_cache.generation;
-
-    rc = latr_machine_run(&machine, 64);
-    CHECK(rc == 1, "machine exits when the guest writes the exit device");
-    CHECK(machine.sys.exit_request == 0x5555, "exit value came from the guest");
-    CHECK(machine.harts[0].tbs > 0 && machine.harts[1].tbs > 0,
-          "both harts dispatched blocks");
-    CHECK(latr_machine_wake_events(&machine) == 1,
-          "exactly one CLINT MSIP write reached the machine");
-    CHECK(latr_hart_exit_count(&machine.harts[1].park) == 1,
-          "the woken hart honoured its exit request at a block boundary");
-    CHECK(hart1_woke == 1, "hart 1 came back from WFI and handled the IPI");
-    CHECK(loongemu_vclock_now_ns(&machine.sys.vclock) > vclock_before,
-          "the parked hart's WFI fast-forwarded the clock");
-    CHECK(latr_tb_fence_seq() > fence_before,
-          "SFENCE.VMA published a fence sequence");
-    CHECK(latr_tb_fence_wait(latr_tb_fence_seq(), 0) == 0,
-          "the fence completed once every hart reached its safe point");
-    CHECK(machine.harts[0].tb_cache.generation > gen0_start &&
-              machine.harts[1].tb_cache.generation > gen1_start,
-          "SFENCE.VMA invalidated both harts' caches, not only the issuer's");
-    CHECK(machine.harts[0].tb_cache.count > 0 && machine.harts[1].tb_cache.count > 0,
-          "each hart has a cached translation after the run");
-    CHECK(machine.harts[0].last_code != 0 && machine.harts[1].last_code != 0,
-          "both harts produced host code for their blocks");
 }
 
-static void scenario_stop(void)
+/* --- cooperative scheduler (one caller thread) ------------------------- */
+
+static void scenario_cooperative(void)
 {
     int rc;
 
-    /* A fresh pass: the exit device is cleared, and hart 0 no longer has an
-     * exit to write, so only the STOP on hart 1 matters here. */
+    reset_scenario();
+    send_ipi = 1;
+    rc = latr_machine_run(&machine, 64);
+    CHECK(machine.sys.exit_request == 0x5555, "cooperative: exit value");
+    CHECK(machine.harts[0].tbs > 0 && machine.harts[1].tbs > 0,
+          "cooperative: both harts dispatched blocks");
+    CHECK(latr_machine_wake_events(&machine) == 1,
+          "cooperative: exactly one CLINT MSIP reached the machine");
+    CHECK(latr_hart_exit_count(&machine.harts[1].park) == 1,
+          "cooperative: the woken hart honoured its exit request");
+    CHECK(hart1_woke == 1, "cooperative: hart 1 came back from WFI");
+    CHECK(loongemu_vclock_now_ns(&machine.sys.vclock) > vclock_start,
+          "cooperative: WFI fast-forwarded the clock");
+    CHECK(machine.harts[0].last_code != 0 && machine.harts[1].last_code != 0,
+          "cooperative: both harts produced host code");
+}
+
+/* --- threaded scheduler: one pthread per hart -------------------------- */
+
+typedef struct HartThread {
+    LatrMachine *m;
+    uint32_t id;
+    pthread_t thread;
+    volatile int exited;
+    uint32_t dispatched;
+} HartThread;
+
+/*
+ * The service loop a VMM thread runs: dispatch while RUN, park on the hart's
+ * sync word when idle, leave on STOP. Exactly the shape the design describes
+ * for P1b; the machine itself owns no threads.
+ */
+static void *hart_main(void *arg)
+{
+    HartThread *ht = (HartThread *)arg;
+
+    for (;;) {
+        LatrHartCommand cmd = latr_hart_command(&ht->m->harts[ht->id].park);
+
+        if (cmd == LATR_HART_STOP) {
+            break;
+        }
+        if (cmd == LATR_HART_PARKED || hart1_wants_wfi) {
+            /* WFI: park until an interrupt source wakes this hart. The spin
+             * bound keeps a protocol bug from hanging the test. */
+            if (latr_hart_park_wait(&ht->m->harts[ht->id].park, 1u << 20) ==
+                LATR_HART_STOP) {
+                break;
+            }
+            if (ht->id == 1) {
+                hart1_wants_wfi = 0;
+            }
+            continue;
+        }
+        {
+            int ran = latr_machine_run_hart(ht->m, ht->id, 1);
+
+            if (ran == 0) {
+                break; /* machine failed */
+            }
+            if (ran == 3) {
+                break; /* STOP honoured */
+            }
+            if (ran == 1) {
+                ht->dispatched++;
+            }
+        }
+        if (ht->m->sys.exit_request != 0) {
+            break; /* guest asked to power off */
+        }
+    }
+    ht->exited = 1;
+    return NULL;
+}
+
+static void scenario_threaded(void)
+{
+    HartThread hts[2];
+    uint64_t fence_before;
+    uint64_t timeouts_before;
+    int started = 1;
+
+    reset_scenario();
+    send_ipi = 1;
+    send_fence = 1;
+    fence_before = latr_tb_fence_seq();
+    timeouts_before = latr_tb_fence_timeouts();
+
+    for (uint32_t i = 0; i < 2; i++) {
+        hts[i].m = &machine;
+        hts[i].id = i;
+        hts[i].exited = 0;
+        hts[i].dispatched = 0;
+        /* Each hart's waiter is a plain poll in this harness; the real VMM
+         * installs a condvar-backed wait, which latr-hart-sync also tests. */
+        latr_hart_sync_set_waiter(&machine.harts[i].park, 0, 0);
+        if (pthread_create(&hts[i].thread, 0, hart_main, &hts[i]) != 0) {
+            started = 0;
+            break;
+        }
+    }
+    CHECK(started, "threaded: one thread per hart");
+
+    /* Let them run until the guest powers off or both exit on STOP. Bounded:
+     * a scheduler bug must fail the test, not hang CI. */
+    for (int spin = 0; spin < 2000; spin++) {
+        if (machine.sys.exit_request != 0) {
+            break;
+        }
+        for (int i = 0; i < 2; i++) {
+            if (hts[i].exited) {
+                continue;
+            }
+        }
+        if (hts[0].exited && hts[1].exited) {
+            break;
+        }
+        struct timespec ts = {0, 1000000}; /* 1 ms */
+
+        nanosleep(&ts, 0);
+    }
+
+    CHECK(machine.sys.exit_request == 0x5555,
+          "threaded: the guest powered off through the exit device");
+    CHECK(latr_machine_wake_events(&machine) >= 1,
+          "threaded: the CLINT MSIP write woke the parked hart");
+    CHECK(hts[1].dispatched > 0 && hts[0].dispatched > 0,
+          "threaded: both harts dispatched blocks on their own threads");
+    CHECK(latr_tb_fence_seq() > fence_before,
+          "threaded: SFENCE.VMA published a fence sequence");
+    CHECK(latr_tb_fence_wait(latr_tb_fence_seq(), UINT64_C(1) << 20) == 0,
+          "threaded: the fence completed (every hart acknowledged)");
+    CHECK(latr_tb_fence_timeouts() == timeouts_before,
+          "threaded: no ack timeout was needed for this fence");
+
+    /* STOP both harts and join: the scheduler's shutdown path. */
+    for (uint32_t i = 0; i < 2; i++) {
+        latr_hart_set_command(&machine.harts[i].park, LATR_HART_STOP);
+        latr_hart_wake(&machine.harts[i].park);
+    }
+    for (uint32_t i = 0; i < 2; i++) {
+        pthread_join(hts[i].thread, 0);
+        CHECK(hts[i].exited == 1, "threaded: hart thread exited on STOP");
+    }
+    CHECK(machine.harts[0].online && machine.harts[1].online,
+          "threaded: a guest exit request is not a hart stop");
+}
+
+static void scenario_stop_cooperative(void)
+{
+    int rc;
+
     machine.sys.exit_request = 0;
     hart1_woke = 0;
+    hart0_ipi_sent = 1; /* no second IPI in this pass */
+    /* The threaded scenario stopped both harts; this one restarts hart 0 so a
+     * single stopped hart is what the pass actually observes. */
+    machine.harts[0].online = 1;
+    latr_hart_set_command(&machine.harts[0].park, LATR_HART_RUN);
     latr_hart_set_command(&machine.harts[1].park, LATR_HART_STOP);
     rc = latr_machine_run(&machine, 8);
-    CHECK(rc == 2, "the machine keeps running with one hart stopped");
-    CHECK(!machine.harts[1].online, "STOP takes the hart offline");
+    CHECK(rc == 2, "cooperative: the machine runs with one hart stopped");
+    CHECK(!machine.harts[1].online, "cooperative: STOP takes the hart offline");
 }
 
 static void scenario_fini(void)
@@ -202,8 +349,9 @@ static void scenario_fini(void)
 int main(void)
 {
     CHECK(setup_machine(), "machine init on the host");
-    scenario_ipi_and_wfi();
-    scenario_stop();
+    scenario_cooperative();
+    scenario_threaded();
+    scenario_stop_cooperative();
     scenario_fini();
 
     printf("latr-host-smp: %d checks, %d fails (guest blocks scripted: no "

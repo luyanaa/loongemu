@@ -140,7 +140,8 @@ $(HOST_BUILD):
 HOST_CORE_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra \
                     -Wno-unused-parameter -Wno-unused-function \
                     -Wno-unused-variable -Wno-sign-compare \
-                    -Wno-unused-but-set-variable -pthread $(INCS) $(DEFS_HOST)
+                    -Wno-unused-but-set-variable -pthread -DLATR_SMP_THREADS -DLATR_ENABLE_TLS \
+                    $(INCS) $(DEFS_HOST)
 HOST_STRICT_CFLAGS := $(HOST_CORE_CFLAGS) -Werror
 
 # Same flags as the freestanding object: the compat include paths supply
@@ -422,12 +423,16 @@ $(BUILD)/test-latr-hart-sync: ../tests/test_latr_hart_sync.c \
 		../tests/test_latr_hart_sync.c -o $@
 
 $(BUILD)/test-latr-fence-ack: ../tests/test_latr_fence_ack.c \
-                           $(LATR)/tb-cache.c $(LATR)/include/latr-tb-cache.h | $(BUILD)
-	$(HOST_CC) $(HOST_CFLAGS) $(LATR)/tb-cache.c ../tests/test_latr_fence_ack.c -o $@
+                           $(LATR)/tb-cache.c $(LATR)/hart-sync.c \
+                           $(LATR)/include/latr-tb-cache.h $(LATR)/include/latr-hart-sync.h | $(BUILD)
+	$(HOST_CC) $(HOST_CFLAGS) $(LATR)/tb-cache.c $(LATR)/hart-sync.c \
+		../tests/test_latr_fence_ack.c -o $@
 
 $(BUILD)/test-latr-tb-smp: ../tests/test_latr_tb_smp.c \
-                           $(LATR)/tb-cache.c $(LATR)/include/latr-tb-cache.h | $(BUILD)
-	$(HOST_CC) $(HOST_CFLAGS) $(LATR)/tb-cache.c ../tests/test_latr_tb_smp.c -o $@
+                           $(LATR)/tb-cache.c $(LATR)/hart-sync.c \
+                           $(LATR)/include/latr-tb-cache.h $(LATR)/include/latr-hart-sync.h | $(BUILD)
+	$(HOST_CC) $(HOST_CFLAGS) $(LATR)/tb-cache.c $(LATR)/hart-sync.c \
+		../tests/test_latr_tb_smp.c -o $@
 
 # Runtime synchronous-exception entry (native fault -> guest trap handler).
 $(BUILD)/test-latr-machine-trap: ../tests/test_latr_machine_trap.c \
