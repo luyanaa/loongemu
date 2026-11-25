@@ -42,6 +42,8 @@ static void format_node(char *out, const char *prefix, uint32_t value)
     out[n] = '\0';
 }
 
+static void latr_machine_msip_notify(void *opaque, uint32_t hartid);
+
 int latr_machine_init(LatrMachine *m, uint8_t *ram, uint64_t ram_size,
                       uint32_t nharts, uint8_t *work, uint32_t work_size)
 {
@@ -107,6 +109,8 @@ int latr_machine_init(LatrMachine *m, uint8_t *ram, uint64_t ram_size,
         h->arena_size = per;
         h->code_buf = work + (size_t)(nharts + i) * per;
         h->code_buf_size = per;
+        latr_hart_sync_init(&h->park);
+        latr_hart_set_command(&h->park, LATR_HART_PARKED);
         latr_tb_cache_init(&h->tb_cache, h->arena, h->arena_size);
         latr_tb_cache_register(&h->tb_cache);
         h->ctx = latr_context_create(&h->env, &h->tb_cache, h->code_buf,
@@ -116,7 +120,33 @@ int latr_machine_init(LatrMachine *m, uint8_t *ram, uint64_t ram_size,
             return 0;
         }
     }
+    /* An IPI is the only wake-up a hart parked in WFI can receive from another
+     * hart, and the write is the only moment the target is reachable. */
+    m->sys.clint.msip_notify = latr_machine_msip_notify;
+    m->sys.clint.msip_opaque = m;
     return 1;
+}
+
+static void latr_machine_msip_notify(void *opaque, uint32_t hartid)
+{
+    latr_machine_wake_hart((LatrMachine *)opaque, hartid);
+}
+
+void latr_machine_wake_hart(LatrMachine *m, uint32_t hartid)
+{
+    if (m == NULL || hartid >= m->nharts) {
+        return;
+    }
+    m->wake_events++;
+    latr_hart_wake(&m->harts[hartid].park);
+    /* Prompt response: the target leaves the block it is in at the next
+     * dispatcher entry instead of running out its current slice. */
+    latr_hart_request_exit(&m->harts[hartid].park);
+}
+
+uint64_t latr_machine_wake_events(const LatrMachine *m)
+{
+    return m == NULL ? 0 : m->wake_events;
 }
 
 void latr_machine_fini(LatrMachine *m)
@@ -126,6 +156,8 @@ void latr_machine_fini(LatrMachine *m)
     }
     for (uint32_t i = 0; i < LATR_MACHINE_MAX_HARTS; i++) {
         if (m->harts[i].ctx != NULL) {
+            /* Threaded schedulers wait for this before joining. */
+            latr_hart_set_command(&m->harts[i].park, LATR_HART_STOP);
             latr_tb_cache_unregister(&m->harts[i].tb_cache);
             latr_context_destroy(m->harts[i].ctx);
             m->harts[i].ctx = NULL;
@@ -706,6 +738,7 @@ int latr_machine_boot(LatrMachine *m)
         h->env.exception = 0;
         h->env.mem_fault_cause = 0;
         h->env.fetch_faulted = 0;
+        latr_hart_set_command(&h->park, LATR_HART_RUN);
         h->env.gpr[10] = i;           /* a0 = hartid */
         h->env.gpr[11] = m->dtb_addr; /* a1 = DTB */
         h->env.gpr[12] = m->firmware_loaded
@@ -816,6 +849,19 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
     /* Between TBs: this hart is provably outside generated code, so a pending
      * shootdown is applied for real. */
     latr_tb_fence_ack(&h->tb_cache);
+    /*
+     * Scheduler handshake at the only point where leaving is safe. A hart must
+     * never be unwound mid-block: the block already committed its effects and
+     * its recovery map assumes a clean boundary.
+     */
+    switch (latr_hart_next_action(&h->park)) {
+    case LATR_HART_NEXT_YIELD:
+        return 2; /* did not dispatch: exit request, or parked */
+    case LATR_HART_NEXT_STOP:
+        return 3; /* stop request honoured */
+    default:
+        break;
+    }
     if (latr_deliver_interrupt(&h->env)) {
         h->env.exception = 0;
     }
@@ -939,9 +985,24 @@ int latr_machine_run(LatrMachine *m, uint32_t max_tbs)
                 continue;
             }
             online = true;
-            if (!run_hart(m, h)) {
-                m->failed = true;
-                return 0;
+            {
+                int ran = run_hart(m, h);
+
+                if (ran == 0) {
+                    m->failed = true;
+                    return 0;
+                }
+                if (ran == 3) {
+                    /* A stopped hart stops dispatching; the machine keeps
+                     * running as long as some hart is online, which is what an
+                     * SBI HSM hart-off expects. */
+                    h->online = false;
+                    continue;
+                }
+                if (ran == 2) {
+                    /* Yielded without dispatching: let the next hart run. */
+                    continue;
+                }
             }
             executed++;
             if (m->sys.exit_request != 0) {

@@ -63,6 +63,11 @@ void loongemu_clint_write(LoongemuClint *clint, uint64_t offset,
         clint->msip[index] =
             (clint->msip[index] & ~(mask << shift)) |
             (((uint32_t)value & mask) << shift);
+        /* Only a transition to pending wakes the target: clearing the bit is
+         * how a hart acknowledges its own interrupt. */
+        if (clint->msip[index] != 0 && clint->msip_notify != NULL) {
+            clint->msip_notify(clint->msip_opaque, index);
+        }
         return;
     }
     if (offset >= LOONGEMU_CLINT_MTIMECMP_BASE &&

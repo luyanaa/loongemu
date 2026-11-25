@@ -386,6 +386,14 @@ fault recovery cost.
    IR2.
 8. 2.2 LATR: RVV 1.0 encoding work is complete (0 base-V mnemonics missing),
    next is real SMP. Progress: 66 -> 0 base-V; Zv*/BF16 extensions deferred.
+
+   **SMP (2.2 continued).** design: docs/design/latr-smp-concurrency.md.
+   P0 (fence completion: shootdown sequence, per-hart ack at the safe point,
+   bounded wait that fails closed) and P1a (park/wake/exit primitives, MSIP write
+   notifies the machine, one tested `next_action` decision point) are in.
+   P1b (hart threads + join) is blocked on a hosted machine harness: the only
+   in-image user of latr_machine_run is the two-hart boot-smoke phase, which
+   already fails at HEAD before dispatching, so it cannot gate the scheduler.
    (vrsub.vx/vi, vmulh/vmulhu/vmulhsu .vv/.vx landed through the arith_extra C
    path, each with hand-computed lane checks in the ISA image), then the widening
    `.wv/.wx` eight (vd and, for `.wv`, vs1 are 2*SEW; `.wx` takes a scalar, so its

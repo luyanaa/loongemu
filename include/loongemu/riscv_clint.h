@@ -16,11 +16,22 @@ extern "C" {
 #define LOONGEMU_CLINT_SIZE          0x10000u
 #define LOONGEMU_CLINT_MAX_HARTS     8
 
+/*
+ * A software interrupt is the only wake-up a parked hart (WFI) can be given
+ * from another hart, and the write itself is the only moment the target can be
+ * reached: by the time anybody polls mip, the target is already asleep. The
+ * notify hook is therefore called from the MSIP write path, with the hart index
+ * whose msip became non-zero. It must not call back into the CLINT.
+ */
+typedef void (*LoongemuClintMsipNotify)(void *opaque, uint32_t hart);
+
 typedef struct LoongemuClint {
     uint32_t msip[LOONGEMU_CLINT_MAX_HARTS];
     uint64_t mtimecmp[LOONGEMU_CLINT_MAX_HARTS];
     uint64_t mtime;
     uint32_t hart_count;
+    LoongemuClintMsipNotify msip_notify;
+    void *msip_opaque;
 } LoongemuClint;
 
 void loongemu_clint_init(LoongemuClint *clint, uint32_t hart_count);

@@ -3,6 +3,7 @@
 
 #include "latr-system.h"
 #include "latr.h"
+#include "latr-hart-sync.h"
 #include "loongemu/riscv_virtio_blk.h"
 
 /*
@@ -78,6 +79,8 @@ typedef struct LatrMachineFaultInfo {
 
 typedef struct LatrMachineHart {
     CPUArchState env;
+    /* Run/wake/exit handshake with the scheduler (and, later, other harts). */
+    LatrHartSync park;
     CPUState cpu;
     LatrTbCache tb_cache;
     LatrTranslatorContext *ctx;
@@ -121,6 +124,7 @@ typedef struct LatrMachine {
     uint64_t first_trap_mem;
     uint64_t last_pc;
     uint64_t dispatch_count;
+    uint64_t wake_events;
     LatrMachineEnterTb enter_tb;
     LatrMachineTranslateTb translate_tb;
     LatrMachineTranslatedTb translated_tb;
@@ -175,5 +179,14 @@ int latr_machine_boot(LatrMachine *m);
 /* Cooperative dispatch of all online harts. Returns 1 on exit request,
  * 0 on a guest fault/translation failure, 2 when max_tbs was reached. */
 int latr_machine_run(LatrMachine *m, uint32_t max_tbs);
+/*
+ * Makes progress possible on a parked hart: bumps its wake counter and asks it
+ * to return to the dispatcher after the block it is in. Called from the CLINT
+ * MSIP write path (an IPI is the only thing that can wake a WFI hart) and from
+ * the device step when it raises a deliverable interrupt.
+ */
+void latr_machine_wake_hart(LatrMachine *m, uint32_t hartid);
+/* Total wake events delivered to harts; diagnostics for "did the IPI arrive". */
+uint64_t latr_machine_wake_events(const LatrMachine *m);
 
 #endif

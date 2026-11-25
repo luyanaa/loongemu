@@ -268,12 +268,31 @@ pthreads do not exist.
 | Phase | Scope | Acceptance |
 |---|---|---|
 | **P0** | `LatrShootdownAck` sequence + safepoint ack + bounded wait, single-threaded build drives it through the deterministic harness | host test 9.1 (first two items), existing ISA/sys images unchanged |
-| **P1** | TB epilogue exit request; WFI park/wake; hart threads and join; TLS-gated build | P0 tests plus threaded WFI/IPI host test; sys image still passes single-threaded |
+| **P1a** | exit request at the safe point; park/wake/command primitives; MSIP write notifies the machine; `next_action` decision point | `test-latr-hart-sync` (pthread) + CLINT notify test; ISA/sys images unchanged |
+| **P1b** | hart threads, join, TLS-gated build (needs a hosted machine harness, see below) | the P1a tests plus a threaded two-hart machine run |
 | **P2** | machine lock around `LatrSystem`; ticker ownership; DMA/store lock order | lock-order host test; threaded sys run with 2 harts |
 | **P3** | guest-level 9.3 tests, AES/fence stress, `make latr-sys-smp-run` in CI | all 9.3 green, threaded run reproducible over 100 iterations |
 
 Each phase lands with its tests and without changing the single-threaded
 behaviour; a phase that cannot show its acceptance test does not land.
+
+**Why P1 is split.** The hart-thread half needs a machine that can be linked
+against pthreads, and today's machine only exists inside freestanding images
+(`latr/Makefile` builds `liblatr_core.a` with `-ffreestanding --target=loongarch64`).
+The two-hart phase in `baremetal/bare/latr_boot_smoke.c` is the only in-image
+user of `latr_machine_run`, and it already fails at HEAD before reaching the
+dispatch assertions (host fault at `0x80200018`), so it cannot be the
+acceptance test for wiring either. P1b therefore starts by building a hosted
+machine harness (compile `latr_machine.c` + system + translator for the host,
+boot a tiny guest, one thread per hart); until that exists the scheduler would
+be code no test can run, which is exactly what this design refuses to ship.
+
+**What P1a does verify.** The decision that makes a hart leave a block lives in
+one function (`latr_hart_next_action`), so its policy - stop beats yield, a
+yield is one-shot, parked harts do not dispatch - is unit-tested; the wake
+counter is tested for loss-free delivery under real threads; and the CLINT
+notify hook is tested from both the direct and MMIO paths, including that a
+clear does not wake anyone.
 
 ## 11. Refusals
 
