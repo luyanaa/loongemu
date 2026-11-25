@@ -13,6 +13,7 @@
 #include "latm.h"
 #include "latm-helpers.h"
 #include "latm-platform.h"
+#include "latm-llsc.h"
 #include "translate.h"
 #include "loongemu/phys_mem.h"
 #include "loongemu/vclock.h"
@@ -268,11 +269,18 @@ static int board_read(CPUMIPSState *env, uint64_t gpa, uint64_t *value,
     return LATM_MEM_FAULT;
 }
 
+/* Tentative definitions, so the memory hooks can use them before the block
+ * further down where the uncore and the table are described. */
+static LatmLlscTable llsc;
+static unsigned board_cpu_id;
+
 static int board_write(CPUMIPSState *env, uint64_t gpa, uint64_t value,
                        uint32_t size)
 {
     LoongemuMemLookup lk;
     (void)env;
+    /* A plain store from any hart breaks every overlapping reservation. */
+    latm_llsc_store(&llsc, board_cpu_id, gpa, size);
     if (loongemu_mem_resolve(&mem_map, gpa, size, &lk) == LOONGEMU_MEM_RAM) {
         for (uint32_t i = 0; i < size; i++) {
             ram[lk.offset + i] = (uint8_t)(value >> (8 * i));
@@ -300,6 +308,7 @@ static int board_atomic_ll(CPUMIPSState *env, uint64_t gpa, unsigned size,
         v |= (uint64_t)ram[lk.offset + i] << (8 * i);
     }
     *value = v;
+    latm_llsc_reserve(&llsc, board_cpu_id, gpa, size);
     return LATM_MEM_OK;
 }
 
@@ -313,6 +322,13 @@ static int board_atomic_sc(CPUMIPSState *env, uint64_t gpa, unsigned size,
         return LATM_MEM_FAULT;
     }
     *ok = 0;
+    /*
+     * Another hart's plain store may have dropped this reservation since the LL;
+     * the per-CPU flag cannot know that, the shared table can.
+     */
+    if (!latm_llsc_valid(&llsc, board_cpu_id, gpa, size)) {
+        return LATM_MEM_OK;
+    }
     if (size == 4) {
         uint32_t old = (uint32_t)expected;
         *ok = __atomic_compare_exchange_n(
@@ -324,6 +340,7 @@ static int board_atomic_sc(CPUMIPSState *env, uint64_t gpa, unsigned size,
             (uint64_t *)(void *)(ram + lk.offset), &old, desired, false,
             __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
     }
+    latm_llsc_clear(&llsc, board_cpu_id);
     return LATM_MEM_OK;
 }
 
@@ -342,6 +359,7 @@ static void board_smc_broadcast(CPUMIPSState *env, uint64_t start,
  * two-vCPU IPI needs it, so a single uncore instance sits behind the platform
  * hooks and the dispatching CPU id tells the model who wrote. */
 static LatmUncore uncore;
+static LatmLlscTable llsc;
 static unsigned board_cpu_id;
 static unsigned board_iocsr_writes;
 
@@ -798,6 +816,7 @@ void kmain(void)
         latx_bare_uart_puts("latm-board: FAIL tb-cache init\n");
         return;
     }
+    latm_llsc_init(&llsc);
     latm_platform_set(&platform);
     latm_set_system_memory(true);
     unsigned fdt_len = build_dtb();
@@ -922,6 +941,42 @@ void kmain(void)
                      (uncore.mailbox[1].status & 1u) == 0;
         latx_bare_uart_puts(ipi_ok ? "latm-ipi: PASS\n" : "latm-ipi: FAIL\n");
 
+    }
+
+    /* ---------------------------------------------- cross-core LL/SC ----
+     * Driven through the same platform hooks the generated code calls, so this
+     * verifies the wiring rather than a parallel implementation: hart 1's LL,
+     * then hart 0's plain store to the same word, then hart 1's SC - which must
+     * fail and leave memory untouched.
+     */
+    {
+        uint64_t v = 0;
+        int ok = 0;
+        uint64_t before = 0, after = 0;
+
+        memset(ram + 0x2000, 0, 16);
+        ram[0x2000] = 0x5a;
+        memcpy(&before, ram + 0x2000, 8);
+        board_cpu_id = 1;
+        (void)board_atomic_ll(&env1, 0x2000, 8, &v);
+        board_cpu_id = 0;
+        /* The store writes the *same* byte: memory does not change, so only a
+         * reservation table can make the SC fail. A different value would let
+         * the compare-and-swap alone catch it, which is not what this tests. */
+        (void)board_write(&env, 0x2000, 0x5a, 1);
+        board_cpu_id = 1;
+        (void)board_atomic_sc(&env1, 0x2000, 8, v, 0x1234, &ok);
+        memcpy(&after, ram + 0x2000, 8);
+        latx_bare_uart_puts("latm-llsc-ipi: sc-ok=");
+        puthex((uint64_t)ok);
+        latx_bare_uart_puts(" before=");
+        puthex(before);
+        latx_bare_uart_puts(" after=");
+        puthex(after);
+        latx_bare_uart_puts("\n");
+        int llsc_ok = ok == 0 && after == before;
+        latx_bare_uart_puts(llsc_ok ? "latm-llsc-ipi: PASS\n"
+                                    : "latm-llsc-ipi: FAIL\n");
     }
 
     for (int i = 0; i < 8 && !board_exit_code; i++) {

@@ -1343,13 +1343,14 @@ build/test_latm_unaligned: tests/test_latm_unaligned.c \
 	      tests/test_latm_unaligned.c target/mips/latm/helpers/memory.c -o $@
 
 build/test_latm_llsc: tests/test_latm_llsc.c \
-                      target/mips/latm/helpers/int.c
+                      target/mips/latm/helpers/int.c target/mips/latm/llsc.c
 	@mkdir -p build
 	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
 	      -I target/mips -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
 	      -I latx/compat -I latx/upstream/include -I . \
 	      $(CFLAGS) -Wno-gnu-empty-struct \
-	      tests/test_latm_llsc.c target/mips/latm/helpers/int.c -o $@
+	      tests/test_latm_llsc.c target/mips/latm/helpers/int.c \
+	      target/mips/latm/llsc.c -o $@
 
 test-latm-pci: build/test_latm_pci
 	./build/test_latm_pci
@@ -1534,12 +1535,13 @@ build/latm_vclock.o: src/vclock.c include/loongemu/vclock.h
 	@mkdir -p build
 	$(CLANG) $(LATM_BARE_CFLAGS) -Iinclude -c $< -o $@
 
-build/bare_latm_board.elf: build/latm_board.o build/latm_phys_mem.o                             build/latm_vclock.o build/latm_tb_cache.o                             build/latm_system.o build/latm_mmio.o                             build/latm_memory.o build/latm_dtb.o                             build/latm_pci.o build/latm_uart.o                             build/latm_uncore.o build/latm_acpi_tables.o                             build/latm_pci_host.o                             build/latm_miniglib.o build/latm_libc_min.o                             latm/build/liblatm_core.a baremetal/bare/bare.lds
+build/bare_latm_board.elf: build/latm_board.o build/latm_phys_mem.o                             build/latm_vclock.o build/latm_tb_cache.o                             build/latm_system.o build/latm_mmio.o                             build/latm_memory.o build/latm_dtb.o                             build/latm_pci.o build/latm_uart.o                             build/latm_uncore.o build/latm_llsc.o build/latm_acpi_tables.o                             build/latm_pci_host.o                             build/latm_miniglib.o build/latm_libc_min.o                             latm/build/liblatm_core.a baremetal/bare/bare.lds
 	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
 	   build/latm_board.o build/latm_phys_mem.o build/latm_vclock.o \
 	   build/latm_tb_cache.o build/latm_system.o build/latm_mmio.o \
 	   build/latm_memory.o build/latm_dtb.o build/latm_pci.o \
-	   build/latm_uart.o build/latm_uncore.o build/latm_acpi_tables.o \
+	   build/latm_uart.o build/latm_uncore.o build/latm_llsc.o \
+	   build/latm_acpi_tables.o \
 	   build/latm_pci_host.o build/latm_miniglib.o build/latm_libc_min.o \
 	   latm/build/liblatm_core.a -o $@
 
@@ -1575,6 +1577,10 @@ build/latm_pci.o: target/mips/latm/system/latm_pci.c
 build/latm_uart.o: target/mips/latm/system/latm_uart.c
 	@mkdir -p build
 	$(CLANG) $(LATM_BARE_CFLAGS) -Iinclude -c $< -o $@
+
+build/latm_llsc.o: target/mips/latm/llsc.c target/mips/latm/include/latm-llsc.h
+	@mkdir -p build
+	$(CLANG) $(LATM_BARE_CFLAGS) -c $< -o $@
 
 build/latm_uncore.o: target/mips/latm/uncore/latm_uncore.c
 	@mkdir -p build
@@ -1626,6 +1632,9 @@ latm-board-run: latm-board-image
 	# Cross-core IPI: the guest's IOCSR write reaches the uncore, CPU 1's
 	# handler runs at vector 0x180 and clears the mailbox through IOCSR.
 	@grep -qa 'latm-ipi: PASS' build/latm_board.log
+	# Cross-core LL/SC: an idempotent store from hart 0 must still make hart 1's
+	# SC fail, which only a shared reservation table can do.
+	@grep -qa 'latm-llsc-ipi: PASS' build/latm_board.log
 
 latm-isa-run: latm-isa-image
 	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_latm_isa.elf" \

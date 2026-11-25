@@ -207,9 +207,22 @@ as host words holding big-endian encodings, e.g. `lui $t0,0x8000` is `0x3c0c8000
    `iocsrwr` also needs major opcode 0x32 - the first encoding omitted it, the
    instruction decoded as something harmless and the platform hook was never
    called;
-4. an LL/SC pair on CPU 1 is invalidated by a plain store from CPU 0 (reservation
-   coherence), which needs a shared reservation table the uncore does not have
-   yet; this changes the memory path, so it is its own step.
+4. **in**: a shared reservation table (`target/mips/latm/llsc.c`,
+   `latm-llsc.h`, one entry per hart) now sits behind the board's memory hooks -
+   LL records, any store invalidates every *overlapping* reservation including
+   the issuer's own, SC checks the table before the compare-and-swap and clears
+   afterwards. Eleven host checks cover the semantics (cross-hart invalidation,
+   overlap not equality, adjacent ranges untouched, own-store self-invalidation,
+   address and width matching) and the board asserts the wiring end to end:
+   hart 1's LL, an **idempotent** store from hart 0 (same byte value), then hart
+   1's SC - `sc-ok=0`, memory unchanged. The idempotent store is the whole point:
+   with a different value the compare-and-swap alone would fail the SC and the
+   test would not prove the table matters. Mutation-verified: removing the
+   invalidation makes `sc-ok=1` and the memory updated, and the board gate fails.
+
+   A build trap repeated from the SMC blob work: `build/latm_llsc.o` was added to
+   the link's prerequisite list but not to the command line, so the link failed
+   with undefined symbols only after the fact - both places have to be edited.
 
 | module | remaining work | priority |
 |---|---|---|

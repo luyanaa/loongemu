@@ -4,6 +4,7 @@
 #include "internal.h"
 #include "latm-helpers.h"
 #include "latm-platform.h"
+#include "latm-llsc.h"
 
 static int checks, fails, raised;
 static uint8_t backing[0x4000] __attribute__((aligned(16)));
@@ -76,6 +77,73 @@ static void check(uint64_t got, uint64_t want, const char *what)
     }
 }
 
+/*
+ * Cross-core reservation coherence. The per-hart flag on CPUMIPSState cannot see
+ * another hart's store, so the board keeps a shared table: a store by any hart
+ * to a reserved range drops every overlapping reservation, which is what stops
+ * two harts from both entering a lock built from LL/SC.
+ */
+static void test_cross_core_reservations(void)
+{
+    LatmLlscTable t;
+
+    latm_llsc_init(&t);
+    latm_llsc_reserve(&t, 1, 0x2000, 8);
+    check(latm_llsc_valid(&t, 1, 0x2000, 8), 1, "hart 1 holds its reservation");
+
+    /* A store from hart 0 to the reserved word drops hart 1's reservation. */
+    latm_llsc_store(&t, 0, 0x2000, 8);
+    check(latm_llsc_valid(&t, 1, 0x2000, 8), 0,
+          "hart 0's store to the reserved word clears hart 1");
+
+    /* A store elsewhere does not. */
+    latm_llsc_reserve(&t, 1, 0x2000, 8);
+    latm_llsc_store(&t, 0, 0x3000, 8);
+    check(latm_llsc_valid(&t, 1, 0x2000, 8), 1,
+          "hart 0's store elsewhere leaves hart 1 alone");
+
+    /* Overlap, not equality: an 8-byte store over a 4-byte reservation counts,
+     * and so does a store that starts inside the reserved range. */
+    latm_llsc_reserve(&t, 2, 0x2004, 4);
+    latm_llsc_store(&t, 0, 0x2000, 8);
+    check(latm_llsc_valid(&t, 2, 0x2004, 4), 0,
+          "an overlapping wide store clears a narrow reservation");
+
+    latm_llsc_reserve(&t, 2, 0x2000, 8);
+    latm_llsc_store(&t, 1, 0x2004, 4);
+    check(latm_llsc_valid(&t, 2, 0x2000, 8), 0,
+          "a store inside the reserved range clears it");
+
+    /* Adjacent ranges must not interfere - otherwise every store near a
+     * reservation would break it and the lock would livelock. */
+    latm_llsc_reserve(&t, 3, 0x2000, 8);
+    latm_llsc_store(&t, 0, 0x2008, 8);
+    check(latm_llsc_valid(&t, 3, 0x2000, 8), 1,
+          "a store directly after the reservation does not clear it");
+    latm_llsc_store(&t, 0, 0x1ff8, 8);
+    check(latm_llsc_valid(&t, 3, 0x2000, 8), 1,
+          "a store directly before the reservation does not clear it");
+
+    /* The issuer's own plain store must break its own reservation too: an SC
+     * after a store in the same sequence has to fail. */
+    latm_llsc_reserve(&t, 0, 0x2000, 8);
+    latm_llsc_store(&t, 0, 0x2000, 8);
+    check(latm_llsc_valid(&t, 0, 0x2000, 8), 0,
+          "a hart's own store clears its own reservation");
+
+    /* Explicit clear, as an SC does when it completes. */
+    latm_llsc_reserve(&t, 0, 0x2000, 8);
+    latm_llsc_clear(&t, 0);
+    check(latm_llsc_valid(&t, 0, 0x2000, 8), 0, "an SC clears the reservation");
+
+    /* A reservation only answers for its own address and width. */
+    latm_llsc_reserve(&t, 0, 0x2000, 8);
+    check(latm_llsc_valid(&t, 0, 0x2004, 8), 0,
+          "a reservation does not match another address");
+    check(latm_llsc_valid(&t, 0, 0x2000, 4), 0,
+          "a reservation does not match another width");
+}
+
 int main(void)
 {
     CPUMIPSState env;
@@ -107,6 +175,7 @@ int main(void)
     (void)latm_helper_sc(&env, MIPS_MEM_SC, 0x5000, 1);
     check(raised, 0, "SC without reservation no fault");
 
+    test_cross_core_reservations();
     printf("latm-llsc: checks=%d fails=%d\n", checks, fails);
     return fails != 0;
 }
