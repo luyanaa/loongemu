@@ -5686,6 +5686,62 @@ static void test_rvv_pvir_lsx_lasx(void)
         check(vec_read32(10, 1), 0u, "vmulhsu.vx 7 * 3 high = 0");
     }
 
+    /*
+     * 2c. Widening add/sub with a 2*SEW operand (vw*.wv/.wx).
+     * e32/m1: vs2 lanes are 32-bit, vs1 lanes and the result are 64-bit.
+     * v1 = {INT32_MIN, 7, -15, 20}, v2 (64-bit) = {-1, 0, 4, 0x100000000},
+     * t0 = 3. Signed forms sign-extend vs2; the u forms zero-extend it.
+     */
+    {
+        /* Destinations and the 2*SEW source must not overlap: vd = v8.. is a
+         * two-register group, vs1 = v2.. is another, vs2 = v1 is narrow. */
+        static const uint32_t vw_w_ops[] = {
+            0xd6112457, /* vwadd.wv  v8, v1, v2  */
+            0xd612e557, /* vwadd.wx  v10, v1, t0 */
+            0xd2112657, /* vwaddu.wv v12, v1, v2 */
+            0xd212e757, /* vwaddu.wx v14, v1, t0 */
+            0xde112857, /* vwsub.wv  v16, v1, v2 */
+            0xde12e957, /* vwsub.wx  v18, v1, t0 */
+            0xda112a57, /* vwsubu.wv v20, v1, v2 */
+            0xda12eb57, /* vwsubu.wx v22, v1, t0 */
+        };
+
+        reset_guest_state();
+        env.csr[0x300] = 0x600;
+        env.vtype = 0x10; /* e32, m1, tu, mu */
+        env.vl = 4;
+        env.gpr[5] = 3;
+        vec_store32(1, 0, 0x80000000u);
+        vec_store32(1, 1, 7u);
+        vec_store32(1, 2, (uint32_t)-15);
+        vec_store32(1, 3, 20u);
+        vec_store64(2, 0, UINT64_MAX);                 /* -1 */
+        vec_store64(2, 1, 0);
+        vec_store64(2, 2, 4);
+        vec_store64(2, 3, UINT64_C(0x100000000));
+        check(latr_execute_block(vw_w_ops, 8), 1,
+              "vw*.wv/.wx family translates");
+        /* Signed: sext(vs2) + wide operand. */
+        check(vec_read64(8, 0), UINT64_C(0xffffffff7fffffff),
+              "vwadd.wv(INT32_MIN, -1)");
+        check(vec_read64(8, 3), UINT64_C(0x100000014),
+              "vwadd.wv(20, 2^32)");
+        check(vec_read64(10, 0), UINT64_C(0xffffffff80000003),
+              "vwadd.wx(INT32_MIN, 3)");
+        /* Unsigned: zext(vs2) + wide operand. */
+        check(vec_read64(12, 0), UINT64_C(0x7fffffff),
+              "vwaddu.wv(0x80000000, -1) wraps to 0x7fffffff");
+        check(vec_read64(14, 1), 10u, "vwaddu.wx(7, 3) = 10");
+        /* Signed subtract: wide operand is the subtrahend. */
+        check(vec_read64(16, 0), UINT64_C(0xffffffff80000001),
+              "vwsub.wv(INT32_MIN, -1)");
+        check(vec_read64(18, 3), UINT64_C(0x11), "vwsub.wx(20, 3) = 17");
+        /* Unsigned subtract. */
+        check(vec_read64(20, 2), UINT64_C(0xffffffed), "vwsubu.wv(-15, 4)");
+        check(vec_read64(22, 0), UINT64_C(0x7ffffffd),
+              "vwsubu.wx(0x80000000, 3)");
+    }
+
     /* 3. vmsgt / vmsgtu + unsigned shift immediate >= 16. */
     reset_guest_state();
     env.csr[0x300] = 0x600;

@@ -39,6 +39,7 @@ typedef enum RvvForm {
     FORM_VID,          /* vid.v                                    */
     FORM_WHOLE_MOVE,   /* vmv<n>r.v: align(vd, nf) && align(vs2, nf)*/
     FORM_WHOLE_MEM,    /* vl<n>re.v / vs<n>r.v: align(vd, nf)      */
+    FORM_WIDE_SRC_W,   /* vw*.wv/.wx: 2*SEW vd and vs1, SEW vs2   */
 } RvvForm;
 
 typedef struct RvvShape {
@@ -190,6 +191,16 @@ static void rvv_shape(unsigned opcode, RvvShape *shape)
     V(VWADD_VX) V(VWADDU_VX) V(VWSUB_VX) V(VWSUBU_VX)
     V(VWMUL_VX) V(VWMULU_VX) V(VWMULSU_VX)
     V(VWMACC_VX) V(VWMACCU_VX) V(VWMACCSU_VX) V(VWMACCUS_VX)
+        shape->form = FORM_DS;
+        break;
+
+    /* Widening with a 2*SEW vector second operand: vd and vs1 both double. */
+    V(VWADD_WV) V(VWADDU_WV) V(VWSUB_WV) V(VWSUBU_WV)
+        shape->form = FORM_WIDE_SRC_W;
+        break;
+    /* The .wx forms take a scalar in rs1, so only vd is double-width; checking
+     * rs1 as a vector register is what rejected vwadd.wx, t0 (odd register). */
+    V(VWADD_WX) V(VWADDU_WX) V(VWSUB_WX) V(VWSUBU_WX)
         shape->form = FORM_DS;
         break;
 
@@ -541,6 +552,29 @@ static void check_dss(RvvCtx *c, int vd, int vs1, int vs2)
     }
 }
 
+/*
+ * Widening with a double-width source (`vwadd.wv/wx` and the unsigned/sub
+ * forms): the destination and vs1 are 2*SEW wide, so both need the wider group
+ * alignment; vs2 stays at SEW. Reusing check_ds would only align vd/vs2 and let
+ * a misaligned wide source through.
+ */
+static void check_wide_src_w(RvvCtx *c, int vd, int vs1, int vs2)
+{
+    check_ds(c, vd, vs2);
+    if (!align_ok(vs1, c->lmul + 1)) {
+        fail(c, LATR_RVV_ILLEGAL_ALIGN);
+    }
+    /* Both the destination and vs1 occupy 2*LMUL registers here, so an overlap
+     * between them is a write-after-read hazard the helper cannot honour: the
+     * wide destination would clobber the source mid-loop. */
+    if (!noover_ok(vd, c->lmul + 1, vs1, c->lmul + 1)) {
+        fail(c, LATR_RVV_ILLEGAL_OVERLAP);
+    }
+    if (!noover_ok(vd, c->lmul + 1, vs2, c->lmul)) {
+        fail(c, LATR_RVV_ILLEGAL_OVERLAP);
+    }
+}
+
 /* vext_narrow_check_common(): SEW result from a 2*SEW source. */
 static void check_sd(RvvCtx *c, int vd, int vs2)
 {
@@ -738,6 +772,9 @@ LatrRvvLegality latr_rvv_check_operands(const RiscvIR1 *insn,
         break;
     case FORM_SDS:
         check_sds(&c, vd, vs1, vs2);
+        break;
+    case FORM_WIDE_SRC_W:
+        check_wide_src_w(&c, vd, vs1, vs2);
         break;
     case FORM_REDUCTION:
         check_reduction(&c, vs2, 0);

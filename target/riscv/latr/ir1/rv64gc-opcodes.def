@@ -529,3 +529,13 @@ LATR_RV_INSN(VMULHU_VV, vmulhu_vv)
 LATR_RV_INSN(VMULHU_VX, vmulhu_vx)
 LATR_RV_INSN(VMULHSU_VV, vmulhsu_vv)
 LATR_RV_INSN(VMULHSU_VX, vmulhsu_vx)
+
+/* 2.2 batch 2: widening add/subtract with a double-width operand (.wv/.wx). */
+LATR_RV_INSN(VWADD_WV, vwadd_wv)
+LATR_RV_INSN(VWADD_WX, vwadd_wx)
+LATR_RV_INSN(VWADDU_WV, vwaddu_wv)
+LATR_RV_INSN(VWADDU_WX, vwaddu_wx)
+LATR_RV_INSN(VWSUB_WV, vwsub_wv)
+LATR_RV_INSN(VWSUB_WX, vwsub_wx)
+LATR_RV_INSN(VWSUBU_WV, vwsubu_wv)
+LATR_RV_INSN(VWSUBU_WX, vwsubu_wx)

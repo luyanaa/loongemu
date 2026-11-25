@@ -384,12 +384,13 @@ fault recovery cost.
    all four spans change width at an ASLR-scale delta (0 do at +64 KiB). P2 must
    either pad relocation sites to a fixed width or re-assemble from serialised
    IR2.
-8. 2.2 LATR: remaining RVV encodings, then real SMP. Progress: 66 -> 58
+8. 2.2 LATR: remaining RVV encodings, then real SMP. Progress: 66 -> 50
    (vrsub.vx/vi, vmulh/vmulhu/vmulhsu .vv/.vx landed through the arith_extra C
-   path, each with hand-computed lane checks in the ISA image). Next groups by the
-   same "directly addable" label: the widening `.w` 8, then `vsmul` 2; carry/borrow
-   and the MAC family need the multi-destination helper, FP FMA needs a
-   single-rounding multiply-add, and the six remaining FP ops need helpers plus
+   path, each with hand-computed lane checks in the ISA image), then the widening
+   `.wv/.wx` eight (vd and, for `.wv`, vs1 are 2*SEW; `.wx` takes a scalar, so its
+   rs1 must not be treated as a vector group). Next by the same label: `vsmul` 2;
+   carry/borrow and the MAC family need the multi-destination helper, FP FMA needs
+   a single-rounding multiply-add, and the six remaining FP ops need helpers plus
    the 7-bit approximations for vfrec7/vfrsqrt7.
 9. 2.3 LATM: vmlinux boot, then SMP, then 3A4000 platform alignment.
 10. 2.4 LATX: LAPIC/IOAPIC/time, virtio-PCI or AHCI, and the `tb_sys.c` split.

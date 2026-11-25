@@ -424,6 +424,16 @@ static bool rvv_extra_op(int opcode, unsigned *op, unsigned *kind,
     RVV_X_VX(VMULHU, LATR_RVV_X_MULHU);
     RVV_X_VV(VMULHSU, LATR_RVV_X_MULHSU);
     RVV_X_VX(VMULHSU, LATR_RVV_X_MULHSU);
+    /* .wv/.wx: the second operand is 2*SEW wide, so wide_src=1 and the helper
+     * reads it at dw instead of SEW. */
+    RVV_X_WV(VWADD, LATR_RVV_X_WADD);
+    RVV_X_WX(VWADD, LATR_RVV_X_WADD, 1);
+    RVV_X_WV(VWADDU, LATR_RVV_X_WADDU);
+    RVV_X_WX(VWADDU, LATR_RVV_X_WADDU, 0);
+    RVV_X_WV(VWSUB, LATR_RVV_X_WSUB);
+    RVV_X_WX(VWSUB, LATR_RVV_X_WSUB, 1);
+    RVV_X_WV(VWSUBU, LATR_RVV_X_WSUBU);
+    RVV_X_WX(VWSUBU, LATR_RVV_X_WSUBU, 0);
     default: return false;
     }
 }
