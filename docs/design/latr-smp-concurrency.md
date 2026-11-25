@@ -305,6 +305,25 @@ the exit; B is parked in WFI and must be woken. Each scenario asserts the same
 invariants the host test asserts, so the CI image covers the protocol even where
 pthreads do not exist.
 
+**Implemented** as `scripted_scenarios()` in `baremetal/bare/latr_smp_test.c`,
+against a second machine booted with `latr_smp_idle.S` (hart 1 starts at `wfi`,
+so the driver decides every step; hart 0 must never run, which is itself a
+check). Twelve checks, all in `make latr-smp-run` (33 checks total):
+
+- a shootdown applied while hart 1 is between TBs bumps its cache generation and
+  leaves no valid entry, and the hart gets back to dispatching with a
+  re-translated block;
+- a wake is counted, which is what an embedder parked in WFI relies on;
+- an exit request raised between TBs runs at most one more block, clears itself,
+  and does not wedge the hart.
+
+Two things the image cannot assert, and the host harness owns instead: a hart
+**parked** in WFI (the machine fast-forwards the idle advance rather than
+parking; parking is the embedder's `latr_hart_park_wait` loop), and the exact
+call index that consumes a one-shot yield - the shootdown raises one, and pinning
+it to a call made the scenario depend on how many dispatches had happened
+before, so the assertion is progress plus re-translation instead.
+
 ### 9.3 Guest-level (bare-metal image, `make latr-smp-run`)
 
 Implemented as `baremetal/bare/latr_smp_test.c` + `latr_smp_guest.S`: a real

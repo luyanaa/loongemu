@@ -852,19 +852,36 @@ build/latr_smp_guest.elf: baremetal/bare/latr_smp_guest.S
 build/latr_smp_guest.bin: build/latr_smp_guest.elf
 	$(OBJCOPY) -O binary $< $@
 
+build/latr_smp_idle.elf: baremetal/bare/latr_smp_idle.S
+	@mkdir -p build
+	$(CLANG) --target=riscv64-unknown-elf -march=rv64ia -mabi=lp64 \
+	         -mno-relax -ffreestanding -nostdlib -fuse-ld=lld \
+	         -Wl,--no-relax -Wl,-Ttext=0x80000000 $< -o $@
+
+build/latr_smp_idle.bin: build/latr_smp_idle.elf
+	$(OBJCOPY) -O binary $< $@
+
+# The idle firmware rides in the same driver object, so it is embedded the same
+# way as the SMP guest and needs no separate symbol file.
+build/latr_smp_idle_blob.o: baremetal/bare/latr_smp_idle_blob.S build/latr_smp_idle.bin
+	@mkdir -p build
+	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
+	         -fno-builtin -O2 -c $< -o $@
+
 build/latr_smp_blob.o: baremetal/bare/latr_smp_blob.S build/latr_smp_guest.bin
 	@mkdir -p build
 	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
 	         -fno-builtin -O2 -c $< -o $@
 
 build/bare_latr_smp.elf: baremetal/bare/latr_smp_test.c \
-                         build/latr_smp_blob.o latr-core \
+                         build/latr_smp_blob.o build/latr_smp_idle_blob.o latr-core \
                          build/latr_miniglib.o build/latr_libc_min.o \
                          baremetal/bare/bare.lds
 	@mkdir -p build
 	$(CLANG) $(LATR_BARE_CFLAGS) -c $< -o build/latr_smp_test.o
 	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
 	   build/latr_smp_test.o build/latr_smp_blob.o \
+	   build/latr_smp_idle_blob.o \
 	   build/latr_miniglib.o build/latr_libc_min.o \
 	   latr/build/liblatr_core.a -o $@
 

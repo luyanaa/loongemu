@@ -22,6 +22,9 @@
 #include "latr-machine.h"
 #include "loongemu-perf.h"
 
+extern const uint8_t latr_smp_idle[];
+extern const uint8_t latr_smp_idle_end[];
+
 extern void latr_enter_tb(void *env, void *code);
 extern uint8_t latr_smp_guest[];
 extern uint8_t latr_smp_guest_end[];
@@ -129,6 +132,106 @@ static void check_true(const char *what, int cond)
         uart_puts(what);
         uart_puts("\n");
     }
+}
+
+/*
+ * Scripted interleaving (design 9.2/9.3): the driver, not the guest, decides
+ * which hart runs and when. Each scenario puts hart 1 in a known place, applies
+ * one machine event from the driver's thread, and asserts the invariant the
+ * threaded host test asserts - so the protocol is covered in the CI image too,
+ * where pthreads do not exist.
+ *
+ *   1. a shootdown applied while hart 1 is between TBs invalidates its cache;
+ *   2. the hart must dispatch again after a wake (re-translation, not a stale
+ *      entry) - a hart parked in WFI cannot sample anything by itself;
+ *   3. an exit request is honoured after the block boundary it was raised at,
+ *      not in the middle of one, and does not leak into the next run.
+ */
+static void scripted_scenarios(void)
+{
+    static LatrMachine m;
+    static uint8_t work[1u << 20];
+    uint64_t generation;
+    uint32_t entries;
+    uint64_t tbs;
+    uint64_t wake;
+    int rc;
+
+    uart_puts("latr-smp-script: begin\n");
+    if (!latr_machine_init(&m, ram, sizeof(ram), 2, work, sizeof(work))) {
+        uart_puts("latr-smp: FAIL scripted machine init\n");
+        check_true("scripted machine init", 0);
+        return;
+    }
+    latr_machine_set_enter_tb(&m, latr_enter_tb);
+    if (!latr_machine_load_firmware(&m, latr_smp_idle,
+                                    (uint64_t)(latr_smp_idle_end -
+                                               latr_smp_idle)) ||
+        !latr_machine_build_dtb(&m) || !latr_machine_boot(&m)) {
+        uart_puts("latr-smp: FAIL scripted boot\n");
+        check_true("scripted firmware boots", 0);
+        return;
+    }
+
+    /* Hart 1's first TB is wfi. The machine fast-forwards the idle advance
+     * instead of parking (a parked hart is the embedder's job, and the host
+     * harness covers it), so what this image can pin is that wfi neither
+     * wedges the hart nor runs hart 0 behind the driver's back. */
+    rc = latr_machine_run_hart(&m, 1, 1);
+    if (rc == 0) {
+        uart_puts("latr-smp-script: hart 1 failed trapped=");
+        uart_dec((uint64_t)m.trapped);
+        uart_puts(" pc=");
+        uart_hex(m.harts[1].env.pc);
+        uart_puts("\n");
+    }
+    check_u64("hart 1 dispatches its wfi block", (uint64_t)rc, 1);
+    check_u64("hart 0 stayed out of the scripted run", m.harts[0].tbs, 0);
+    entries = m.harts[1].tb_cache.count;
+    check_true("hart 1 has a translated block before the fence", entries >= 1);
+
+    /* Scenario 1: a shootdown applied while hart 1 is between TBs invalidates
+     * its cache, and the hart must get back to dispatching. The one-shot yield
+     * that a shootdown raises is deliberately not pinned to a call index: it is
+     * consumed by whichever dispatch comes next, so the invariant asserted here
+     * is progress plus re-translation, not a counter value. */
+    generation = m.harts[1].tb_cache.generation;
+    (void)latr_tb_fence_begin(0, 1);
+    check_true("fence.i bumps hart 1's cache generation",
+               m.harts[1].tb_cache.generation > generation);
+    check_u64("fence.i leaves no valid entry behind",
+              m.harts[1].tb_cache.count, 0);
+    {
+        int dispatched = 0;
+
+        for (int i = 0; i < 4; i++) {
+            if (latr_machine_run_hart(&m, 1, 1) == 1) {
+                dispatched++;
+            }
+        }
+        check_true("the hart dispatches again after the shootdown",
+                   dispatched >= 1);
+        check_true("the block was re-translated after the fence",
+                   m.harts[1].tb_cache.count >= 1);
+    }
+
+    /* Scenario 2: a wake is counted, which is what lets an embedder parked in
+     * WFI (the host harness case) come back. */
+    wake = latr_machine_wake_events(&m);
+    latr_machine_wake_hart(&m, 1);
+    check_true("the wake is counted", latr_machine_wake_events(&m) == wake + 1);
+
+    /* Scenario 3: an exit request raised between TBs runs at most one more
+     * block, clears itself, and does not wedge the hart. */
+    latr_hart_request_exit(&m.harts[1].park);
+    tbs = m.harts[1].tbs;
+    (void)latr_machine_run_hart(&m, 1, 8);
+    check_true("at most one block runs after the exit request",
+               m.harts[1].tbs - tbs <= 1);
+    check_u64("the exit request is cleared", m.harts[1].park.exit_request, 0);
+    check_u64("the hart keeps running after the exit request",
+              (uint64_t)latr_machine_run_hart(&m, 1, 1), 1);
+    check_u64("hart 0 never entered the scripted run", m.harts[0].tbs, 0);
 }
 
 void kmain(void)
@@ -279,6 +382,7 @@ void kmain(void)
         check_u64("no outstanding borrows after any instruction",
                   rc.borrow_outstanding_max, 0);
     }
+    scripted_scenarios();
     uart_puts(failures == 0 ? "latr-smp: PASS checks=" : "latr-smp: FAIL checks=");
     uart_dec((uint64_t)checks);
     uart_puts(" fails=");
