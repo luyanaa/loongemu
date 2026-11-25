@@ -1474,6 +1474,46 @@ build/test_latm_decode: tests/test_latm_decode.c target/mips/latm/ir1/decode-mip
 .PHONY: test-latm test-latm-decode test-latm-tlb test-latm-vclock test-latm-tb-cache latm-core latm-isa-image latm-isa-run latm-board-image latm-board-run latm-boot-smoke-run
 test-latm: test-latm-decode test-latm-tlb test-latm-vclock test-latm-interrupts test-latm-insn-map test-latm-tb-cache test-latm-cpu test-latm-loongson test-latm-system test-latm-uncore test-latm-llsc test-latm-unaligned test-latm-pci test-latm-board-system latm-isa-run latm-board-run latm-boot-smoke-run
 
+# ---- Loongson-3 Linux boot attempt (local only) ----
+# The kernel is a Debian artifact, so it is supplied by path and never committed:
+#   make latm-linux-run LOONGSON_KERNEL=/path/to/vmlinuz-6.1.0-50-loongson-3
+LOONGSON_KERNEL ?=
+
+build/vmlinuz-loongson-3: $(LOONGSON_KERNEL)
+	@test -n "$(LOONGSON_KERNEL)" || { \
+	   echo "latm-linux-image: set LOONGSON_KERNEL to a Debian mips64el vmlinuz-*-loongson-3"; exit 1; }
+	@mkdir -p build
+	cp "$(LOONGSON_KERNEL)" $@
+
+build/latm_linux_blob.o: baremetal/bare/latm_linux_blob.S build/vmlinuz-loongson-3
+	@mkdir -p build
+	$(CLANG) $(LATM_BARE_CFLAGS) -c $< -o $@
+
+build/bare_latm_linux.elf: baremetal/bare/latm_linux.c build/latm_linux_blob.o \
+                           build/latm_phys_mem.o build/latm_vclock.o \
+                           build/latm_tb_cache.o build/latm_system.o \
+                           build/latm_mmio.o build/latm_memory.o build/latm_dtb.o \
+                           build/latm_pci.o build/latm_uart.o build/latm_uncore.o \
+                           build/latm_llsc.o build/latm_acpi_tables.o \
+                           build/latm_pci_host.o build/latm_miniglib.o \
+                           build/latm_libc_min.o latm-core baremetal/bare/bare.lds
+	@mkdir -p build
+	$(CLANG) $(LATM_BARE_CFLAGS) -Iinclude -c $< -o build/latm_linux.o
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	   build/latm_linux.o build/latm_linux_blob.o build/latm_phys_mem.o \
+	   build/latm_vclock.o build/latm_tb_cache.o build/latm_system.o \
+	   build/latm_mmio.o build/latm_memory.o build/latm_dtb.o build/latm_pci.o \
+	   build/latm_uart.o build/latm_uncore.o build/latm_llsc.o \
+	   build/latm_acpi_tables.o build/latm_pci_host.o build/latm_miniglib.o \
+	   build/latm_libc_min.o latm/build/liblatm_core.a -o $@
+
+latm-linux-run: build/bare_latm_linux.elf
+	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_latm_linux.elf" \
+	     QEMU_LOG="build/latm_linux.log" QEMU_DONE="latm-linux: done" \
+	     QEMU_TIMEOUT=120 CPU=la464 QEMU_MEM=1G \
+	     bash scripts/run_qemu_lata.sh || true
+	@grep -a 'latm-linux' build/latm_linux.log | tail -20
+
 # ---- bare-metal MIPS64r2 (LATM) execution harness ----
 LATM_BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
                -fno-builtin -O2 -mno-lsx -mno-lasx -fno-vectorize -fno-slp-vectorize \

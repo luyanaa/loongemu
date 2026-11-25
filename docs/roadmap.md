@@ -227,6 +227,7 @@ as host words holding big-endian encodings, e.g. `lui $t0,0x8000` is `0x3c0c8000
 | module | remaining work | priority |
 |---|---|---|
 | MIPS64 Linux | real vmlinux/initrd boot into `start_kernel()` | P0 |
+| MIPS64 Linux, first attempt | **A real Debian kernel boots into its own code.** `linux-image-6.1.0-50-loongson-3` (6.1.176, mips64el, ELF64, entry `0xffffffff81490000`, one 5.28 MB load segment) is loaded through `LatmSystem` and executed by a local-only harness (`make latm-linux-run LOONGSON_KERNEL=<vmlinuz>`, kernel never vendored, not in CI): 200 000 translated blocks, PC at `0xffffffff81490020`, no serial byte yet. Disassembling the entry shows that PC is the kernel's own **BSS clear loop** (`sw $zero,0($4); addiu $4,4; bne`), which has ~4.2 M iterations to go - so the next blocker is dispatch throughput on a 3-instruction block, not a firmware handshake. Two measured facts to keep: a 256 MiB `.bss` in the harness image yields a 303 MB `memsz` segment and QEMU's LoongArch `-kernel` loader then runs the image with **no serial output at all** (64 MiB works), and this PC makes a good benchmark for the chaining work in 5.2 |
 | SMP | four vCPUs, IPI, cross-core TLB, reservation coherence | P0 |
 | 3A4000 platform | IOCSR/EXTIOI/PCH behaviour aligned with Linux drivers | P0 |
 | 7A PCI | BAR, MSI, real device IRQ, DMA ownership | P1 |
