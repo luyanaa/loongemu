@@ -28,7 +28,24 @@ extern const uint8_t latm_linux_elf[];
 extern const uint8_t latm_linux_elf_end[];
 #include "translate.h"
 
-#define LINUX_TB_BUDGET 5000000u
+#define LINUX_TB_BUDGET 8000000u
+/*
+ * `rdtime.d` for throughput comparisons - **not** a wall clock here. Measured on
+ * this QEMU: 1,000,000 translated blocks advanced the counter by 26,003,624
+ * ticks while the shell measured ~205 s, i.e. ~127 kHz, so any seconds derived
+ * from it are off by orders of magnitude. The harness therefore prints raw ticks
+ * and ticks-per-block (both frequency-free and comparable between runs) and
+ * leaves wall-clock seconds to whoever times the process.
+ */
+
+
+static uint64_t now_ticks(void)
+{
+    uint64_t v;
+
+    __asm__ volatile("rdtime.d %0, $zero" : "=r"(v));
+    return v;
+}
 #define UART0_THR ((volatile unsigned char *)0x1fe001e0)
 void latx_bare_uart_putc(int c) { *UART0_THR = (unsigned char)c; }
 void latx_bare_uart_puts(const char *s)
@@ -208,6 +225,7 @@ void kmain(void)
     tcg_ctx->code_ptr = code_buf + 0x3000;
     lata_gen_epilogue_env(&env, tcg_ctx);
 
+    uint64_t t_start = now_ticks();
     for (unsigned i = 0; i < LINUX_TB_BUDGET; i++) {
         stop_pc = env.active_tc.PC;
         if (tb_ran && (tb_ran % 1000000u) == 0) {
@@ -215,6 +233,9 @@ void kmain(void)
             { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(tb_ran>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
             latx_bare_uart_puts(" pc=");
             { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(env.active_tc.PC>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" ticks=");
+            { char b[17]; uint64_t d = now_ticks() - t_start;
+              for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(d>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
             latx_bare_uart_putc('\n');
         }
         if (!linux_run_one(&env)) {
@@ -233,6 +254,13 @@ void kmain(void)
     { char b[17]; for (int i=15;i>=0;i--) b[15-i]="0123456789abcdef"[(env.CP0_EPC>>(i*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
     latx_bare_uart_puts(" cause=");
     { char b[17]; for (int i=15;i>=0;i--) b[15-i]="0123456789abcdef"[(stop_cause>>(i*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+    latx_bare_uart_puts(" ticks=");
+    { char b[17]; uint64_t d = now_ticks() - t_start;
+      for (int i=15;i>=0;i--) b[15-i]="0123456789abcdef"[(d>>(i*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+    latx_bare_uart_puts(" ticks-per-tb=");
+    { char b[17]; uint64_t d = now_ticks() - t_start;
+      uint64_t n = tb_ran ? d / tb_ran : 0;
+      for (int i=15;i>=0;i--) b[15-i]="0123456789abcdef"[(n>>(i*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
     latx_bare_uart_puts(" uart-tx=");
     { char b[17]; for (int i=15;i>=0;i--) b[15-i]="0123456789abcdef"[(sys.uart.tx_count>>(i*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
     latx_bare_uart_putc('\n');
