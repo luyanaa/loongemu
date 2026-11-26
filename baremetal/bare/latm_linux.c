@@ -56,7 +56,7 @@ void latx_bare_uart_puts(const char *s)
     while (*s) latx_bare_uart_putc(*s++);
 }
 
-static uint8_t ram[64u << 20] __attribute__((aligned(4096)));
+static uint8_t ram[192u << 20] __attribute__((aligned(4096), section(".guest_ram")));
 static uint8_t tb_pool[1u << 20] __attribute__((aligned(4096)));
 static uint32_t tb_next;
 static TbCacheEntry tb_entries[512];
@@ -260,6 +260,7 @@ void kmain(void)
         latx_bare_uart_puts("latm-linux: FAIL system init\n");
         return;
     }
+    latx_bare_uart_puts("latm-linux: init-ok\n");
     latm_set_system_memory(true);
     size_t dtb_len = latm_system_build_dtb(&sys, dtb, sizeof(dtb),
                                            dtb_struct, sizeof(dtb_struct),
@@ -268,13 +269,16 @@ void kmain(void)
         latx_bare_uart_puts("latm-linux: FAIL DTB\n");
         return;
     }
+    latx_bare_uart_puts("latm-linux: dtb-ok\n");
     memcpy(ram + 0x100000, dtb, dtb_len);
     latm_system_set_boot_args(&sys, 0x100000, 0, 0,
                               "console=ttyS0 earlycon");
+    latx_bare_uart_puts("latm-linux: bootargs-ok\n");
     if (!tbc_init(&tb_cache, tb_entries, tb_buckets, 512)) {
         latx_bare_uart_puts("latm-linux: FAIL tb cache\n");
         return;
     }
+    latx_bare_uart_puts("latm-linux: tbc-ok\n");
     if (!latm_system_load_elf(&sys, latm_linux_elf,
                               (uint64_t)(latm_linux_elf_end - latm_linux_elf),
                               &linux_entry)) {

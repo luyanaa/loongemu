@@ -403,9 +403,14 @@ static uint64_t elf_u64(const uint8_t *p)
 
 static uint64_t elf_load_gpa(uint64_t addr)
 {
-    /* MIPS64 KSEG0 vmlinux links at 0xffffffff8xxxxxxx. */
+    /* MIPS64 KSEG0 vmlinux links at 0xffffffff8xxxxxxx; a 32-bit KSEG0 kernel
+     * (NetBSD evbmips ELF32) links at 0x8xxxxxxx. Both alias physical memory in
+     * the low 512 MiB. */
     if (addr >= UINT64_C(0xffffffff80000000)) {
         return addr & UINT64_C(0x1fffffff);
+    }
+    if (addr >= UINT64_C(0x80000000) && addr < UINT64_C(0xc0000000)) {
+        return addr - UINT64_C(0x80000000);
     }
     return addr;
 }
@@ -413,28 +418,31 @@ static uint64_t elf_load_gpa(uint64_t addr)
 int latm_system_load_elf(LatmSystem *sys, const uint8_t *elf, size_t len,
                          uint64_t *entry)
 {
-    if (!sys || !elf || len < 64 || elf[0] != 0x7f || elf[1] != 'E' ||
-        elf[2] != 'L' || elf[3] != 'F' || elf[4] != 2 || elf[5] != 1 ||
+    if (!sys || !elf || len < 52 || elf[0] != 0x7f || elf[1] != 'E' ||
+        elf[2] != 'L' || elf[3] != 'F' || elf[5] != 1 ||
+        (elf[4] != 1 && elf[4] != 2) /* ELFCLASS32/64 */ ||
         elf_u16(elf + 18) != 8 /* EM_MIPS */ ||
         (elf_u16(elf + 16) != 2 && elf_u16(elf + 16) != 3)) {
         return 0;
     }
-    uint64_t phoff = elf_u64(elf + 32);
-    uint16_t phentsize = elf_u16(elf + 54);
-    uint16_t phnum = elf_u16(elf + 56);
-    uint64_t entry_pc = elf_u64(elf + 24);
-    if (!phnum || phentsize < 56 || phoff > len ||
+    int is64 = elf[4] == 2;
+    uint64_t phoff = is64 ? elf_u64(elf + 32) : elf_u32(elf + 28);
+    uint64_t entry_pc = is64 ? elf_u64(elf + 24) : elf_u32(elf + 24);
+    uint16_t phentsize = elf_u16(elf + (is64 ? 54 : 42));
+    uint16_t phnum = elf_u16(elf + (is64 ? 56 : 44));
+    uint16_t phentsize_min = is64 ? 56 : 32;
+    if (!phnum || phentsize < phentsize_min || phoff > len ||
         (uint64_t)phnum * phentsize > len - phoff) {
         return 0;
     }
     for (unsigned i = 0; i < phnum; i++) {
         const uint8_t *ph = elf + phoff + (uint64_t)i * phentsize;
         if (elf_u32(ph) != 1) continue; /* PT_LOAD */
-        uint64_t off = elf_u64(ph + 8);
-        uint64_t vaddr = elf_u64(ph + 16);
-        uint64_t paddr = elf_u64(ph + 24);
-        uint64_t filesz = elf_u64(ph + 32);
-        uint64_t memsz = elf_u64(ph + 40);
+        uint64_t off = is64 ? elf_u64(ph + 8) : elf_u32(ph + 4);
+        uint64_t vaddr = is64 ? elf_u64(ph + 16) : elf_u32(ph + 8);
+        uint64_t paddr = is64 ? elf_u64(ph + 24) : elf_u32(ph + 12);
+        uint64_t filesz = is64 ? elf_u64(ph + 32) : elf_u32(ph + 16);
+        uint64_t memsz = is64 ? elf_u64(ph + 40) : elf_u32(ph + 20);
         uint64_t dst = elf_load_gpa(paddr ? paddr : vaddr);
         if (off > len || filesz > len - off || memsz < filesz ||
             memsz == 0 || memsz > UINT32_MAX || dst + memsz < dst) return 0;
@@ -452,6 +460,7 @@ int latm_system_load_elf(LatmSystem *sys, const uint8_t *elf, size_t len,
     if (entry) *entry = entry_pc;
     return 1;
 }
+
 
 int latm_system_load_initrd(LatmSystem *sys, const uint8_t *data, size_t len,
                             uint64_t gpa)

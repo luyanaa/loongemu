@@ -702,6 +702,32 @@ be judged by the same two numbers already pinned in `latm-isa`.
 
 **The earlier synthetic test failed to reproduce the density, and that was useful
 too.** `latm-isa` now has `test_regcache_specialisation` (2 checks, image at 62) which translates two hand-written shapes on an env-resident register and counts IR2 branches and host words: a load-modify-load of the *same* register and of two *different* registers both come out at **0 branches and 21 words**, and the constant-store pair at 0 branches and 10 words. So the register cache's own specialisation is already good, and the 43 conditional words in the kernel block come from somewhere else. Turning the system-memory path on for the same shape aborts the translator instead (`regcache_store` itemp assertion), so the next measurement must be taken **on the kernel's own block**: dump its IR2 opcodes (the ISA test already walks `first_ir2`/`ir2_next`) rather than guessing shapes. Recorded so the synthetic-test route is not repeated. Two other measured facts: a 256 MiB `.bss` yields a 303 MB `memsz` segment and QEMU's LoongArch `-kernel` loader then runs the image with **no serial output at all** (64 MiB works), and this PC is the ready-made benchmark for 5.2 chaining |
+
+**A real distribution kernel now boots through `latm-linux` into its own
+executing code.** The earlier entries used the synthetic `/tmp/vmlinuz-l3`;
+this run boots the genuine AOSC `vmlinuz-7.3.4-aosc-main` (loongson3, ELF64
+LSB MIPS64 rel2, entry `0xffffffff87e50000`, one LOAD segment landing at
+guest physical `0x7e50000`-`0x922b400`, extracted from
+`linux-kernel-7.3.4_7.3.4-2_loongson3.deb`). The harness prints
+`kernel loaded, entry=ffffffff87e50000` and the translator then executes real
+kernel text: over 1.3 M translation blocks with the guest PC sweeping KSEG0
+kernel addresses (`ffffffff8001fe40`/`80083900`/`800bc240`/`800df080`) with
+no `bad pc`, no poisoned report, no wedge - the PC keeps moving instead of
+parking in a halt loop, so the kernel is doing real early-init work. Getting
+here needed two linker fixes in `baremetal/bare/bare.lds`, both forced by the
+backing-store size: the 192 MiB guest RAM cannot live in qemu-virt lowmem
+(0-256 MiB) alongside the VMM image, so it is placed in the highmem RAM
+window via a dedicated `.guest_ram` section at `0x80000000` with its own
+`PT_LOAD` phdr (without phdr isolation ld.lld merges it with `.bss` into one
+1.87 GiB segment that wedges qemu's loader); and the orphan `.got` must be
+pinned inside the lowmem group, because the highmem backing store otherwise
+pushes it past `pcalau12i` reach (+-2 GiB) of `.text`, corrupting cross-TU
+function pointers (`latm_mmio_ram_read` et al.) so any indirect mmio call
+wedged in `latm_system_init_3a4000`. `.guest_ram` uses section-address +
+`NOLOAD` form so images without it are unaffected. Remaining for console
+output: the kernel has not yet emitted serial text, which needs the
+earlycon/`ttyS0` UART clock and register semantics to line up.
+
 | SMP | four vCPUs, IPI, cross-core TLB, reservation coherence | P0 |
 | 3A4000 platform | IOCSR/EXTIOI/PCH behaviour aligned with Linux drivers | P0 |
 | 7A PCI | BAR, MSI, real device IRQ, DMA ownership | P1 |
