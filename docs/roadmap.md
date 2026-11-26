@@ -315,6 +315,22 @@ a smooth ramp at the host), and check QEMU's translated-block count from
 `-d exec` at two points in the same run. Until that is answered, no per-block
 number here is quoted.
 
+**Answered: the per-block cost is constant, and wall-clock throughput on this host
+is not measurable.** Sampling every 10 000 blocks with the tick counter shows
+`ticks/block` flat at 45-55 from 20 000 to 1 050 000 blocks with the PC never
+leaving the BSS loop - no ramp, no step, so neither host degradation nor a
+harness-side growth. The earlier "28 -> 31 -> 70" was coarser sampling noise and is
+withdrawn.
+
+What is *not* usable is wall time: the same build and the same workload ran at
+0.95 us/block in one measurement (100 000 blocks in 95 ms) and at 571 us/block in
+another (1 050 000 blocks in 600 s), a 600x spread, and `rdtime` is not a clock on
+this QEMU either. So performance work on LATM needs a **deterministic** cost
+metric - emitted host words, IR2 opcodes, helper calls per block, which the harness
+already prints - and wall clock only as a sanity check across many runs or on a
+QEMU built with `-icount`. That is the same conclusion the RVV and LATA work
+reached by a different route: count what you emit, do not time what you emulate.
+
 **The earlier attempt, kept because its failure mode is instructive:** `latm_set_ram_window()` plus an
 inlined LD/LW/LWU/SD/SW path (range test, then an indexed access into the host
 buffer, helper on the miss) reached two blocking problems: the first version

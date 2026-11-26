@@ -247,7 +247,7 @@ void kmain(void)
     uint64_t t_start = now_ticks();
     for (unsigned i = 0; i < LINUX_TB_BUDGET; i++) {
         stop_pc = env.active_tc.PC;
-        if (tb_ran && (tb_ran % 100000u) == 0) {
+        if (tb_ran && (tb_ran % 10000u) == 0) {
             latx_bare_uart_puts("latm-linux: progress tbs=");
             { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(tb_ran>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
             latx_bare_uart_puts(" pc=");
