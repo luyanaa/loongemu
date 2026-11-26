@@ -512,6 +512,20 @@ i.e. a value surviving in a host temporary after it was handed to a different ow
 (`alloc_gpr_dst()` reuse, `store_gpr_zero`, or the `latm_spill_*` slots around the
 delay slot).
 
+**Two fix attempts were tried and both are wrong; the ISA suite is the proof.**
+(i) A unified release inside `ra_free_itemp()` (any guest register still claiming the
+returned temporary is written back and dropped) breaks **18 of 69** checks, including
+`jalr`'s link - the macro is called in places where that claim is legitimate, so a
+blanket release destroys live state. (ii) Deleting the spill loop after
+`latm_regcache_flush()` in `lata_gen_call_helper_prologue()`, on the theory that it
+overwrote env with a stale host `$ra`, also breaks 18 checks - those spills are
+load-bearing. Both were reverted; the tree is back at the committed, green state.
+
+So the `$31` corruption is not the register-cache lifetime class after all. The next
+targeted step is a **write watch on `env->gpr[31]`** itself (not on guest RAM): the
+value must be written either by a spill, by a writeback, or by an `env_st_d` in the
+emitted code, and the watch will name the emitter.
+
 The exception tap stays in the tree: it costs a branch only on the raise path, and
 without it "no exception" would have remained a guess. `test_latm_interrupts` also
 needed the same `-I shared/backend/loongarch/include` fix as `test_latm_tlb` had. `latm-isa` keeps the 8-instruction case at `0x814911c8` as the green
