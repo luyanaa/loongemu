@@ -372,7 +372,27 @@ regression check in the image (67 checks). So "a single dispatch never returns"
 is not explained by this block: the stall is in the harness or dispatch layer after
 the BSS clear, not in the translated code. Next step needs a per-dispatch watchdog
 in the harness (print PC and helper state if a dispatch exceeds a bound) rather
-than more guessing from outside. That is the same conclusion the RVV and LATA work reached by a different
+than more guessing from outside.
+
+**Root cause found, and it is not a hang: the translator aborts.** Translating
+**32** instructions from `0x814911c8` in `latm-isa` (the same eight plus the rest of
+the function, including its two backward loops) stops the image with
+`assertion failed in <ra_alloc_itemp> ... out of IR2 itemps`. The pool holds three
+host temporaries (t0/t1/t2 - every other LoongArch GPR is mapped to a guest
+register) and `ra_alloc_itemp()` can only evict an entry whose temporary is not
+currently borrowed; an instruction that already holds all three while asking for a
+fourth cannot be satisfied, so the translator aborts. In the freestanding harness
+that abort is a trap/halt, which is why no further block is dispatched and no
+summary is printed - the "stall" was the translator dying on the kernel's next
+function. Eight instructions translate fine (0 branches, 191 words), which is why
+the narrow repro looked innocent.
+
+Next fix has two candidates, and the first is the cheap one: keep the 8-instruction
+regression and make the *block translator* bail out gracefully when itemps run out
+(retranslate the same PC with fewer instructions, as `target_disasm`'s limit already
+supports) instead of asserting; the alternative is to free a host GPR for a fourth
+temporary by re-mapping a guest register. Either way the acceptance test is the
+32-instruction translation at `0x814911c8`, which must translate without aborting. That is the same conclusion the RVV and LATA work reached by a different
 route: count what you emit, do not time what you emulate.
 
 **The earlier attempt, kept because its failure mode is instructive:** `latm_set_ram_window()` plus an
