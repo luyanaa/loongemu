@@ -251,7 +251,26 @@ when the work does), 2 000 translated kernel blocks take **87-125 ms**, i.e.
 artefact of measuring runs that never exited and were killed by a wrapper, so the
 "1 ms per three-instruction block" claim is withdrawn; the block cost is ~45 us.
 
-**The RAM fast path was attempted and reverted.** `latm_set_ram_window()` plus an
+**The RAM fast path was implemented, verified, measured, and reverted - because it
+did not help.** Second attempt, debugged in `latm-isa` instead of the kernel
+harness (a second per iteration instead of a 40 s hang): the itemp exhaustion was
+two temporaries held across `hcall()`, fixed by freeing them before the slow path;
+with that, the bss-loop translates in both forms and the windowed form shows the
+range test as expected (`branches 4` against `2`, `words 0x50` against `0x47` -
+the fast path is *bigger* in code size because the helper stays inline for the
+miss). Then the kernel A/B on the accepted metric: **196 / 121 / 111 ms for 2 000
+blocks with the window, against 87 / 81 / 125 ms without** - no improvement, and
+median slightly worse. So the 34-register spill around the helper is evidently not
+where the block's time goes, and the extra range test plus pointer materialisation
+costs more than it saves. Reverted whole (API, emission and test) rather than kept
+as a correctness-verified change with no measured benefit.
+
+**What this rules out** is the spill-set hypothesis for the per-access cost. The
+next measurement should time the helper call itself (per-helper counters in the
+kernel harness: how many helper calls per block, and what fraction of the block's
+time a single helper call takes) instead of inferring it from code size.
+
+**The earlier attempt, kept because its failure mode is instructive:** `latm_set_ram_window()` plus an
 inlined LD/LW/LWU/SD/SW path (range test, then an indexed access into the host
 buffer, helper on the miss) reached two blocking problems: the first version
 exhausted the IR2 itemp pool (`ra_alloc_itemp: out of IR2 itemps`) because it held
