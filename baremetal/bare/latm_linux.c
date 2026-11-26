@@ -27,6 +27,7 @@
 extern const uint8_t latm_linux_elf[];
 extern const uint8_t latm_linux_elf_end[];
 #include "translate.h"
+#include "env.h"
 
 #ifndef LINUX_TB_BUDGET
 #define LINUX_TB_BUDGET 200000u
@@ -478,6 +479,33 @@ static int linux_run_one(CPUMIPSState *env)
             tr_fini();
             return 0;
         }
+#ifdef LINUX_WATCH_GPR31
+        {
+            TRANSLATION_DATA *td = (TRANSLATION_DATA *)env->latm_tr_data;
+            unsigned st31 = 0, st_env = 0;
+
+            for (IR2_INST *inst = td->first_ir2; inst != NULL;
+                 inst = ir2_next(inst)) {
+                if (ir2_opcode(inst) != LISA_ST_D || inst->op_count != 3 ||
+                    inst->_opnd[1]._reg_num != env_ir2_opnd._reg_num) {
+                    continue;
+                }
+                st_env++;
+                if (inst->_opnd[2]._imm32 == env_offset_gpr(31)) {
+                    st31++;
+                }
+            }
+            if (st_env > 0 || env->active_tc.PC == 0xffffffff8149051cull) {
+                latx_bare_uart_puts("latm-linux: ir2 env-stores=");
+                { char b[9]; for (int k=7;k>=0;k--) b[7-k]="0123456789abcdef"[(st_env>>(k*4))&15]; b[8]=0; latx_bare_uart_puts(b); }
+                latx_bare_uart_puts(" to-gpr31=");
+                { char b[9]; for (int k=7;k>=0;k--) b[7-k]="0123456789abcdef"[(st31>>(k*4))&15]; b[8]=0; latx_bare_uart_puts(b); }
+                latx_bare_uart_puts(" at pc=");
+                { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(env->active_tc.PC>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+                latx_bare_uart_putc('\n');
+            }
+        }
+#endif
         n = tr_ir2_assemble(host);
         tb_translated++;
         tr_fini();

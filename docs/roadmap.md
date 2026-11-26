@@ -446,6 +446,19 @@ link, `$25` = target, image at **69 checks**.
 at `tbs=0x607002` with `bad pc=5ffb5495820b36ec` - identical block count, identical
 value. So the wild jump has another source.
 
+**The IR2 scan points at spilling, not at a helper.** `LINUX_WATCH_GPR31=1` walks the
+IR2 list of every translation and counts `st.d` against the env register with
+immediate `env_offset_gpr(31)`. The epilogue block at `0xffffffff8149051c` emits **six**
+such stores even though the guest code has exactly one `ld $ra,0x18($sp)`, and
+`0xffffffff814904fc` emits four. `$31` is therefore spilled repeatedly inside one block,
+each spill reading whatever host temporary the cache entry currently points at, and
+one of those six writes is the garbage seen at runtime. That is a lifetimes problem
+again, but in the *spill sequence* rather than at a helper call - which is why the
+blanket fixes failed: they targeted helper entries, not these.
+
+Next step: dump that block's IR2 sequence (opcode plus operand registers) around the
+six `st.d` ops to see which temporary each reads and where it was last written.
+
 **The watchdog found the writer.** The harness now checks `$25` and `$31` on every
 dispatch and reports the first non-canonical value together with the PC that had just
 executed:
