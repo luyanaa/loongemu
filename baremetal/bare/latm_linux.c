@@ -178,6 +178,7 @@ static LatmPlatform watch_base;
 static unsigned watch_total;
 static int watch_gprs_dumped;
 static int memcpy_entry_dumped;
+static int jt_dumped;
 static uint64_t watch_pc[WATCH_N];
 static uint64_t watch_gpa[WATCH_N];
 static uint64_t watch_val[WATCH_N];
@@ -416,6 +417,39 @@ void kmain(void)
                     latx_bare_uart_putc('\n');
                 }
             }
+        }
+        if (!jt_dumped && stop_pc == 0xffffffff81491a7cull) {
+            uint64_t idx = env.active_tc.gpr[17];
+            uint64_t r2 = env.active_tc.gpr[2];
+            uint64_t base = r2 + 0x2d08ull;
+            uint64_t slot = 0;
+
+            jt_dumped = 1;
+            latx_bare_uart_puts("latm-linux: jt17 idx=");
+            { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(idx>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" r2=");
+            { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(r2>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" base=");
+            { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(base>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" tb=");
+            { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(tb_ran>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_putc('\n');
+            if (base >= 0xffffffff80000000ull &&
+                base + 8ull * 9ull <= 0xffffffff80000000ull + sizeof(ram)) {
+                for (unsigned e = 0; e < 9; e++) {
+                    uint64_t mem = 0;
+                    uint64_t pa = base + (uint64_t)e * 8ull;
+
+                    memcpy(&mem, ram + (pa - 0xffffffff80000000ull), 8);
+                    if (e == (unsigned)idx) slot = mem;
+                    latx_bare_uart_puts("latm-linux: jt[");
+                    { char b[2]; b[0]="0123456789abcdef"[e & 15]; b[1]=0; latx_bare_uart_puts(b); }
+                    latx_bare_uart_puts("]=");
+                    { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(mem>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+                    latx_bare_uart_putc('\n');
+                }
+            }
+            (void)slot;
         }
         if (tb_ran && (tb_ran % 10000u) == 0) {
             latx_bare_uart_puts("latm-linux: progress tbs=");

@@ -517,8 +517,17 @@ the condition was zero and `movz` did the opposite.
 Swapping them makes the replay clamp to `0xc` (`latm-isa` checks=118, fails=0, plus
 both `movz` directions). The same boot now enters the copy with `a2 = 0xc`, never
 poisons `$31`, and runs the whole 40,000,000-block budget. It then sits in `b .` at
-`0xffffffff81491b18` — a kernel halt loop, not a wild PC. That spin is the next
-question.
+`0xffffffff81491b18` — a kernel halt loop, not a wild PC.
+
+**The spin is table entry 7, and the table itself is intact.** Nothing in the image
+branches to `0xffffffff81491b18` except the instruction. The `jr $2` at
+`0xffffffff81491a8c` indexes `0xffffffff81492d08` by `$17`. First dispatch of
+`0xffffffff81491a7c` (tb `0x10132f`): `$17 = 7`, `$2 = 0xffffffff81490000` (the
+`lui` in the delay slot), base `= $2 + 0x2d08 = 0xffffffff81492d08`. The nine
+qwords in RAM match the image; entries 7 and 8 are both that `b .`. So the base
+is right and the index really is 7. Next: which path writes `$17` — `addiu $17,$zero,7`
+sits in the delay slot at `0xffffffff81491abc`, and nine more copies of that
+immediate exist nearby.
 
 **The watchdog found the writer.** The harness now checks `$25` and `$31` on every
 dispatch and reports the first non-canonical value together with the PC that had just
