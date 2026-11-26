@@ -280,11 +280,21 @@ A/B at a workload where the noise is proportionally small (100 k blocks, seconds
 rather than milliseconds), and only then attribute the ~45 us to helper, call
 sequence or dispatch.
 
-**Found on the way:** `make test-latm` fails to build `build/test_latm_tlb`
-(`latm.h` pulls `mem.h`, which that target's include path lacks) - on HEAD as well,
-so it is pre-existing and unrelated to the counters; `make -k test-latm` shows the
-other 13 suites green plus `latm-boot-smoke: PASS`. Worth fixing as its own item
-since it means the local LATM gate has not been running that suite.
+**`test_latm_tlb` is fixed and back in the gate.** The rule was missing
+`-I shared/backend/loongarch/include`, so `latm.h`'s `mem.h` include failed and the
+suite had silently stopped building (on HEAD too, which is why the gate looked
+green). `make test-latm` now exits 0 with **14** `fails=0` suites including
+`latm-tlb: checks=38`, plus `latm-boot-smoke: PASS`.
+
+**Measurement quality is still the blocker, and the numbers now disagree by 3000x.**
+Same build, same BSS loop: 100,000 blocks in ~95 ms (0.95 us/block), but a
+6,000,000-block budget reached only 1,000,000 blocks in 300 s with the PC still in
+the loop. Two runs of the same code cannot both be right, so the leading
+hypothesis is TB-pool churn: the harness's 1 MiB pool holds 128 8 KiB slots and
+the wrapper flushes the cache when it fills, so a long run may be re-translating
+the same block instead of hitting. Instrument that next - translations per block,
+printed with the counters already added - before quoting any per-block number
+again; the 0.95 us figure is withdrawn until then.
 
 **The earlier attempt, kept because its failure mode is instructive:** `latm_set_ram_window()` plus an
 inlined LD/LW/LWU/SD/SW path (range test, then an indexed access into the host

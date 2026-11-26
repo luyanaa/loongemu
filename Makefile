@@ -1456,8 +1456,11 @@ build/test_latm_vclock: tests/test_latm_vclock.c src/vclock.c include/loongemu/v
 build/test_latm_tlb: tests/test_latm_tlb.c target/mips/latm/helpers/memory.c \
                      target/mips/latm/helpers/cp0.c target/mips/latm/helpers/exception.c
 	@mkdir -p build
+	# latm.h pulls mem.h from the LoongArch backend include dir; without it this
+	# target has not built for a while, so the LATM gate silently skipped it.
 	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
 	      -I target/mips -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
+	      -I shared/backend/loongarch/include \
 	      -I latx/compat -I latx/upstream/include -I . \
 	      $(CFLAGS) -Wno-gnu-empty-struct \
 	      tests/test_latm_tlb.c target/mips/latm/helpers/memory.c \
