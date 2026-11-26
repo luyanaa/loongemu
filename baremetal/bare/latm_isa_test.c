@@ -647,6 +647,37 @@ static uint32_t kernel_block_911c8[] __attribute__((aligned(16))) = {
     0xffb000a0, 0xffa50010, 0x0109402f, 0xffa00068,
 };
 
+/*
+ * The block that used to abort: 0xffffffff81491208, a run of stack stores with
+ * large negative displacements and env-resident sources ($23-$28). Each store's
+ * `op` selector used to be materialised with imm_opnd(), holding one of the three
+ * IR2 itemps across hcall() - which is what the kernel died on at 1,050,000
+ * blocks. This translation must keep working.
+ */
+static uint32_t kernel_block_91208[] __attribute__((aligned(16))) = {
+    0x3c07edb8, 0x3c0281aa, 0xffa40098, 0xfc438ab0,
+    0xffbf00e8, 0xffbe00e0, 0xffb700d8, 0xffb600d0,
+    0xffb500c8, 0xffb400c0, 0xffb200b0, 0xffb100a8,
+    0xffb000a0, 0xffa50010, 0x0109402f, 0xffa00068,
+};
+
+static void test_kernel_block_91208(void)
+{
+    int words = 0;
+    int branches;
+
+    latm_set_system_memory(true);
+    branches = translate_count_branches(kernel_block_91208, 16, &words);
+    latx_bare_uart_puts("latm-isa: kernel-91208 branches=");
+    puthex((uint64_t)(branches < 0 ? 0xffff : (unsigned)branches));
+    latx_bare_uart_puts(" words=");
+    puthex((uint64_t)(unsigned)words);
+    latx_bare_uart_putc('\n');
+    check(branches >= 0 && words > 0, 1,
+          "the block that used to starve the itemp pool translates");
+    latm_set_system_memory(false);
+}
+
 static void test_kernel_block_911c8(void)
 {
     int words = 0;
@@ -865,6 +896,7 @@ void kmain(void)
     latx_bare_uart_puts(latx_cpu_has_lbt() ? "1" : "0");
     latx_bare_uart_puts("\n");
     lata_tr_data_init(&env);
+    test_kernel_block_91208();
     test_kernel_block_911c8();
     test_bss_loop_opcodes();
     test_regcache_specialisation();

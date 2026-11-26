@@ -408,9 +408,21 @@ a million-block-scale run through its own code, where before it died at 1 050 00
 Gates after the change: `latm-isa` 66/0, `test-latm` 14 suites exit 0, and the
 board's three SMP assertions (`latm-smp`, `latm-ipi`, `latm-llsc-ipi`) still pass.
 
-Next: raise the budget and see where the kernel stops now that blocks are no longer
-the limit, and add a `latm-isa` regression that translates the previously aborting
-block at `0xffffffff81491208` so this cannot come back. `latm-isa` keeps the 8-instruction case at `0x814911c8` as the green
+**Regression added and the new stop point measured.** `latm-isa` now translates the
+block that used to abort (`0xffffffff81491208`, sixteen stack stores with large
+negative displacements and env-resident sources): 0 branches, 0x327 words, image at
+**67 checks**. With that guard in place, a 40 M-block budget shows the kernel
+running **6,324,226 blocks** and then jumping to a wild PC - the harness now reports
+it instead of hanging on the translation attempt:
+
+    latm-linux: bad pc=5ffb5495820b36ec at tbs=0x607002
+
+So the BSS clear and roughly six million blocks of real kernel code execute, and the
+next defect is a corrupted jump target (a register holding a non-canonical value)
+rather than anything block-related. Next diagnostic: run with the guard in place and
+watch the registers at the last good PC (`0xffffffff81492b10`), i.e. print the guest
+GPRs when the PC leaves the image's range, and compare the jump with the kernel's
+own disassembly at that address. `latm-isa` keeps the 8-instruction case at `0x814911c8` as the green
 regression, and `KERNEL_BLOCK_INSNS=<n>` is a build knob for bisecting block
 limits (16 translates, 24 aborts at the first PC). That is the same conclusion the RVV and LATA work reached by a different
 route: count what you emit, do not time what you emulate.

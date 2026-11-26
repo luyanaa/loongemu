@@ -246,6 +246,17 @@ void kmain(void)
 
     uint64_t t_start = now_ticks();
     for (unsigned i = 0; i < LINUX_TB_BUDGET; i++) {
+        /* A wild PC is where this kernel currently ends: report it instead of
+         * trying to translate whatever the register holds. */
+        if (env.active_tc.PC < 0xffffffff80000000ull ||
+            env.active_tc.PC >= 0xffffffff80000000ull + sizeof(ram)) {
+            latx_bare_uart_puts("latm-linux: bad pc=");
+            { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(env.active_tc.PC>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" at tbs=");
+            { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(tb_ran>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_putc('\n');
+            break;
+        }
         stop_pc = env.active_tc.PC;
         if (tb_ran && (tb_ran % 10000u) == 0) {
             latx_bare_uart_puts("latm-linux: progress tbs=");
