@@ -347,7 +347,22 @@ proportional while *wall* time per block grows 22x with run length - an effect t
 `-icount` was supposed to remove, and which is now the open question. The earlier
 "BSS clear is about 90 s" estimate is withdrawn; the measured cost of 1.05 M blocks
 is 428 s, so a full 4.9 M-block clear at that rate is ~34 minutes and the 6 M-block
-run was stopped rather than burning an hour. That is the same conclusion the RVV and LATA work reached by a different
+run was stopped rather than burning an hour.
+
+**And then the wall-clock spread turned out to be a stall, not a rate.** Sampling
+every 1 000 blocks shows every long run stopping at exactly **tbs = 1 050 000**,
+with or without `-icount`: the kernel's BSS clear is 4 194 304 bytes = 1 048 576
+words, so the loop *finishes* at that block count and the guest moves on to
+`0xffffffff81490030` and then a `jalr $25` to `0xffffffff814911c8` - after which no
+further block is ever dispatched. A single dispatch never returns there, and the
+callee's first instructions are ordinary stores, so this is not an obvious guest
+spin: it is the first concrete candidate for a **translator bug** on this path,
+and it is cheap to chase in `latm-isa` (translate and run that block, one second
+per iteration) rather than in the harness.
+
+So the kernel now gets through its BSS clear and dies at the first call afterwards;
+wall-clock "rates" on this host were measuring how long a stuck run sat there, not
+throughput. That is the same conclusion the RVV and LATA work reached by a different
 route: count what you emit, do not time what you emulate.
 
 **The earlier attempt, kept because its failure mode is instructive:** `latm_set_ram_window()` plus an
