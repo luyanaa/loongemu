@@ -339,9 +339,15 @@ to compare across changes, and it retires the "no per-block number" ban.
 
 Two side effects worth keeping: the harness now prints `latm-linux: done` and writes
 the LVZ exit device, so a run returns in ~4 s instead of burning the whole QEMU
-timeout (the wrapper waits for that token); and at this rate the kernel's BSS clear
-(4.9 M blocks) is about **90 s**, not the 47 minutes that host-noise wall clocks
-suggested. That is the same conclusion the RVV and LATA work reached by a different
+timeout (the wrapper waits for that token); **Correction after a longer run: the rate is not constant after all.** With
+`-icount`, a 200 000-block run costs 3.8 s (52 k blocks/s) and reports
+`ticks-per-tb=60`, but a 6 000 000-block budget reached only 1 050 000 blocks in
+428 s (2.4 k blocks/s) with `ticks-per-tb` still 51. So the *virtual* counter stays
+proportional while *wall* time per block grows 22x with run length - an effect that
+`-icount` was supposed to remove, and which is now the open question. The earlier
+"BSS clear is about 90 s" estimate is withdrawn; the measured cost of 1.05 M blocks
+is 428 s, so a full 4.9 M-block clear at that rate is ~34 minutes and the 6 M-block
+run was stopped rather than burning an hour. That is the same conclusion the RVV and LATA work reached by a different
 route: count what you emit, do not time what you emulate.
 
 **The earlier attempt, kept because its failure mode is instructive:** `latm_set_ram_window()` plus an
