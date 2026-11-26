@@ -179,6 +179,10 @@ static unsigned watch_total;
 static int watch_gprs_dumped;
 static int memcpy_entry_dumped;
 static int jt_dumped;
+static uint64_t s17_blk[4], s17_sz[4], s17_val[4], s17_next[4];
+static unsigned s17_n;
+static uint64_t s17_prev;
+static int s17_have;
 static uint64_t watch_pc[WATCH_N];
 static uint64_t watch_gpa[WATCH_N];
 static uint64_t watch_val[WATCH_N];
@@ -312,6 +316,24 @@ void kmain(void)
 
     uint64_t t_start = now_ticks();
     for (unsigned i = 0; i < LINUX_TB_BUDGET; i++) {
+        if (!s17_have) {
+            s17_prev = env.active_tc.gpr[17];
+            s17_have = 1;
+        } else if (env.active_tc.gpr[17] != s17_prev) {
+            unsigned slot = s17_n % 4u;
+            uint64_t asid = env.CP0_EntryHi & env.CP0_EntryHi_ASID_mask;
+            uint8_t mode = (uint8_t)(env.hflags &
+                                     (MIPS_HFLAG_UM | MIPS_HFLAG_SM | MIPS_HFLAG_M16));
+            TbCacheEntry *went = tbc_lookup_mips(&tb_cache, last_pc,
+                                                 (uint32_t)asid, mode);
+
+            s17_blk[slot] = last_pc;
+            s17_sz[slot] = went ? went->guest_size : 0;
+            s17_val[slot] = env.active_tc.gpr[17];
+            s17_next[slot] = env.active_tc.PC;
+            s17_n++;
+            s17_prev = env.active_tc.gpr[17];
+        }
         /*
          * Watch the registers that feed jalr/jr. A value that is not a canonical
          * kernel/stack address cannot be right for either, so the first time one
@@ -450,6 +472,33 @@ void kmain(void)
                 }
             }
             (void)slot;
+            {
+                unsigned n = s17_n < 4u ? s17_n : 4u;
+                unsigned start = s17_n < 4u ? 0u : (s17_n % 4u);
+
+                for (unsigned k = 0; k < n; k++) {
+                    unsigned w = (start + k) % 4u;
+                    uint64_t end = s17_blk[w] + s17_sz[w];
+
+                    latx_bare_uart_puts("latm-linux: s17 blk=");
+                    { char b[17]; for (int q=15;q>=0;q--) b[15-q]="0123456789abcdef"[(s17_blk[w]>>(q*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+                    latx_bare_uart_puts(" sz=");
+                    { char b[9]; for (int q=7;q>=0;q--) b[7-q]="0123456789abcdef"[(s17_sz[w]>>(q*4))&15]; b[8]=0; latx_bare_uart_puts(b); }
+                    latx_bare_uart_puts(" val=");
+                    { char b[17]; for (int q=15;q>=0;q--) b[15-q]="0123456789abcdef"[(s17_val[w]>>(q*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+                    latx_bare_uart_puts(" next=");
+                    { char b[17]; for (int q=15;q>=0;q--) b[15-q]="0123456789abcdef"[(s17_next[w]>>(q*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+                    if (s17_blk[w] <= 0xffffffff81491abcull &&
+                        end > 0xffffffff81491abcull) {
+                        latx_bare_uart_puts(" covers=81491abc");
+                    }
+                    if (s17_blk[w] <= 0xffffffff81491a30ull &&
+                        end > 0xffffffff81491a30ull) {
+                        latx_bare_uart_puts(" covers=81491a30");
+                    }
+                    latx_bare_uart_putc('\n');
+                }
+            }
         }
         if (tb_ran && (tb_ran % 10000u) == 0) {
             latx_bare_uart_puts("latm-linux: progress tbs=");

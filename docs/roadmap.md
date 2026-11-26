@@ -525,9 +525,15 @@ branches to `0xffffffff81491b18` except the instruction. The `jr $2` at
 `0xffffffff81491a7c` (tb `0x10132f`): `$17 = 7`, `$2 = 0xffffffff81490000` (the
 `lui` in the delay slot), base `= $2 + 0x2d08 = 0xffffffff81492d08`. The nine
 qwords in RAM match the image; entries 7 and 8 are both that `b .`. So the base
-is right and the index really is 7. Next: which path writes `$17` — `addiu $17,$zero,7`
-sits in the delay slot at `0xffffffff81491abc`, and nine more copies of that
-immediate exist nearby.
+is right and the index really is 7.
+
+**That 7 is the delay slot at `0xffffffff81491abc`.** The block that last changed
+`$17` before the table starts at `0xffffffff81491aa8`, guest size `0x18`, so it
+covers `[81491aa8, 81491ac0)`. The only write to `$17` in those six instructions is
+`addiu $17, $zero, 7` in the delay slot of `beqz $2, 0x81491a34`. The branch was
+taken (`next = 0xffffffff81491a34`) and the value left behind is 7. The other
+`addiu` at `0xffffffff81491a30` is not in the block. The kernel itself plants the
+index; the table entry for 7 is the spin.
 
 **The watchdog found the writer.** The harness now checks `$25` and `$31` on every
 dispatch and reports the first non-canonical value together with the PC that had just
