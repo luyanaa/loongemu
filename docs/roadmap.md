@@ -491,8 +491,17 @@ That leaves the wild `$ra` still unexplained, with these eliminated: the stack (
 watch), the `jalr` link register (fixed and regressed), the env pointer in helpers, and
 the helper PC. The most promising remaining lead is what the *epilogue block itself*
 loads: `ld $ra,0x18($sp)` reads a plausible saved value (`0xffffffff81490528`) as far
-as the watch can see, so the next step is to log the value at the moment of the load -
-inside `latm_helper_load` for that one address - rather than after the block. `latm-isa` keeps the 8-instruction case at `0x814911c8` as the green
+as the watch can see, so the next step was to log the value at the moment of the load
+inside `latm_helper_load` for that one address. Done, and it recorded **zero loads**
+in the watched page over the whole run. With `$sp` at load time being
+`0xffffffff81e9adc0` (the post-epilogue dump minus its `daddiu`), those loads would
+land at `0x1e9adc0/0x1e9adc8/0x1e9add8` - all inside the watched range - so the
+epilogue's loads are apparently **not reached at all**. That moves the hypothesis from
+"the load returns garbage" to "the block traps before its loads", after which `$31`
+simply keeps whatever it had. The tap cost a comparison on every load helper call and
+was removed again; next step is to instrument the exception path - print
+PC/EPC/BadVAddr when an exception is raised during that block, or check whether
+`latm_check_interrupts` fires just before it. `latm-isa` keeps the 8-instruction case at `0x814911c8` as the green
 regression, and `KERNEL_BLOCK_INSNS=<n>` is a build knob for bisecting block
 limits (16 translates, 24 aborts at the first PC). That is the same conclusion the RVV and LATA work reached by a different
 route: count what you emit, do not time what you emulate.
