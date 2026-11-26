@@ -535,6 +535,16 @@ taken (`next = 0xffffffff81491a34`) and the value left behind is 7. The other
 `addiu` at `0xffffffff81491a30` is not in the block. The kernel itself plants the
 index; the table entry for 7 is the spin.
 
+**The `beqz` at `0xffffffff81491ab8` is taken because the word it tests is zero.**
+The block is `lw $2, 0x28($23); …; beqz $2, 0x81491a34`. At the first dispatch
+(tb `0x101329`) `$23 = 0xffffffff81a98ed0` and guest RAM at `+0x28` is `0x00000000`,
+read from the harness, not from the translated load. `$23` was copied from `$18`
+by `move $23, $18` at `0xffffffff81491368`. That object is the pointer returned by
+the bump allocator at `0xffffffff81490080` (`a0 = 0x4c0`), saved in `$18`, and the
+delay slot of the following `jal` is `sw $zero, 0x28($2)` — `$2` still holds that
+pointer, so the kernel itself clears the field. No later store in this function
+writes a nonzero value there before the test.
+
 **The watchdog found the writer.** The harness now checks `$25` and `$31` on every
 dispatch and reports the first non-canonical value together with the PC that had just
 executed:
