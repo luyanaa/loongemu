@@ -58,6 +58,9 @@ uint64_t latm_helper_rdhwr(CPUMIPSState *env, uint32_t rd, uint32_t sel);
 uint64_t latm_helper_ll(CPUMIPSState *env, uint32_t op, uint64_t addr);
 uint64_t latm_helper_sc(CPUMIPSState *env, uint32_t op, uint64_t addr,
                         uint64_t val);
+/* Helper-call counters for the boot harness (see helpers/memory.c). */
+void latm_helper_stats_get(uint64_t *loads, uint64_t *stores,
+                           uint64_t *unaligned);
 uint64_t latm_helper_load(CPUMIPSState *env, uint32_t op, uint64_t addr);
 void latm_helper_store(CPUMIPSState *env, uint32_t op, uint64_t addr,
                        uint64_t val);

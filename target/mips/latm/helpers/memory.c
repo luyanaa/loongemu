@@ -329,8 +329,25 @@ uint64_t cpu_mips_translate_address(CPUMIPSState *env, uint64_t address,
     return latm_translate(env, address, access_type, ra);
 }
 
+/*
+ * Per-helper counters for the boot harness: how much of a translated block's
+ * work is helper calls. They are statics read through a getter, so the cost is a
+ * couple of increments and nothing in the translation path changes.
+ */
+uint64_t latm_helper_stats_loads;
+uint64_t latm_helper_stats_stores;
+uint64_t latm_helper_stats_unaligned;
+
+void latm_helper_stats_get(uint64_t *loads, uint64_t *stores, uint64_t *unaligned)
+{
+    if (loads) *loads = latm_helper_stats_loads;
+    if (stores) *stores = latm_helper_stats_stores;
+    if (unaligned) *unaligned = latm_helper_stats_unaligned;
+}
+
 uint64_t latm_helper_load(CPUMIPSState *env, uint32_t op, uint64_t addr)
 {
+    latm_helper_stats_loads++;
     const LatmPlatform *plat = latm_platform_get();
     uint64_t p;
     uint64_t v = 0;
@@ -379,6 +396,8 @@ void latm_helper_store(CPUMIPSState *env, uint32_t op, uint64_t addr,
                        uint64_t val)
 {
     const LatmPlatform *plat = latm_platform_get();
+
+    latm_helper_stats_stores++;
     uint64_t p;
     unsigned size;
 

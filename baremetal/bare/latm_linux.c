@@ -279,6 +279,18 @@ void kmain(void)
     { char b[17]; uint64_t d = now_ticks() - t_start;
       uint64_t n = tb_ran ? d / tb_ran : 0;
       for (int i=15;i>=0;i--) b[15-i]="0123456789abcdef"[(n>>(i*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+    {
+        uint64_t hl = 0, hs = 0, hu = 0;
+
+        latm_helper_stats_get(&hl, &hs, &hu);
+        latx_bare_uart_puts(" helper-loads=");
+        { char b[17]; for (int i=15;i>=0;i--) b[15-i]="0123456789abcdef"[(hl>>(i*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+        latx_bare_uart_puts(" helper-stores=");
+        { char b[17]; for (int i=15;i>=0;i--) b[15-i]="0123456789abcdef"[(hs>>(i*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+        latx_bare_uart_puts(" per-block=");
+        { char b[17]; uint64_t per = tb_ran ? ((hl + hs) * 1000u) / tb_ran : 0;
+          for (int i=15;i>=0;i--) b[15-i]="0123456789abcdef"[(per>>(i*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+    }
     latx_bare_uart_puts(" uart-tx=");
     { char b[17]; for (int i=15;i>=0;i--) b[15-i]="0123456789abcdef"[(sys.uart.tx_count>>(i*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
     latx_bare_uart_putc('\n');

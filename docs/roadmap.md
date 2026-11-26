@@ -265,10 +265,26 @@ where the block's time goes, and the extra range test plus pointer materialisati
 costs more than it saves. Reverted whole (API, emission and test) rather than kept
 as a correctness-verified change with no measured benefit.
 
-**What this rules out** is the spill-set hypothesis for the per-access cost. The
-next measurement should time the helper call itself (per-helper counters in the
-kernel harness: how many helper calls per block, and what fraction of the block's
-time a single helper call takes) instead of inferring it from code size.
+**The helper counters are in, and they bound the question.** `latm_helper_stats_get()`
+counts load/store helper calls (two increments, no behaviour change), and the boot
+harness prints them with the block count: for the kernel's BSS loop it is
+**exactly 1 store helper per block and 0 loads** - the block is `sw`, `addiu`,
+`bne`, so the helper call is one of four guest instructions, not an occasional
+event. Skipping the helper's memory work (mutation, reverted) gave 139/66/75 ms
+against 183/72 ms with it: **inconclusive**, because the measurement's own spread
+at 2 000 blocks (66-183 ms, i.e. 33-91 us/block) is wider than any effect being
+measured.
+
+So the next step is measurement quality before more optimisation: time the same
+A/B at a workload where the noise is proportionally small (100 k blocks, seconds
+rather than milliseconds), and only then attribute the ~45 us to helper, call
+sequence or dispatch.
+
+**Found on the way:** `make test-latm` fails to build `build/test_latm_tlb`
+(`latm.h` pulls `mem.h`, which that target's include path lacks) - on HEAD as well,
+so it is pre-existing and unrelated to the counters; `make -k test-latm` shows the
+other 13 suites green plus `latm-boot-smoke: PASS`. Worth fixing as its own item
+since it means the local LATM gate has not been running that suite.
 
 **The earlier attempt, kept because its failure mode is instructive:** `latm_set_ram_window()` plus an
 inlined LD/LW/LWU/SD/SW path (range test, then an indexed access into the host
