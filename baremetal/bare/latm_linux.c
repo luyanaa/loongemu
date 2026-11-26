@@ -166,6 +166,28 @@ static size_t build_elf(uint8_t *elf, const uint32_t *insns, size_t count)
     return code_off + count * 4;
 }
 
+/* Write watchpoint: which guest store touches the frame slot that later feeds
+ * `ld $ra,0x18($sp)`? The slot is around physical 0x1e9ae00 with the $sp seen in
+ * the post-mortem, so watch that page and log the first few writers. */
+static LatmPlatform watch_base;
+static unsigned watch_hits;
+static uint64_t watch_pc[8];
+static uint64_t watch_gpa[8];
+static uint64_t watch_val[8];
+
+static int watch_write(CPUMIPSState *env, uint64_t gpa, uint64_t value,
+                       uint32_t size)
+{
+    if (gpa >= 0x1e9adc0ull && gpa < 0x1e9ae00ull && watch_hits < 16u) {
+        watch_pc[watch_hits] = env ? env->active_tc.PC : 0;
+        watch_gpa[watch_hits] = gpa;
+        watch_val[watch_hits] = value;
+        watch_hits++;
+    }
+    return watch_base.mem_write ? watch_base.mem_write(env, gpa, value, size)
+                               : LATM_MEM_OK;
+}
+
 static int linux_run_one(CPUMIPSState *env);
 
 void kmain(void)
@@ -220,6 +242,20 @@ void kmain(void)
     latm_tlb_init(&env, &tlb, 16);
     env.exception_base = 0xffffffff80000000ull;
     env.CP0_IntCtl = 0xe0000000u;
+    {
+        const LatmPlatform *cur = latm_platform_get();
+
+        if (cur) {
+            watch_base = *cur;
+            {
+                static LatmPlatform watch_plat;
+
+                watch_plat = watch_base;
+                watch_plat.mem_write = watch_write;
+                latm_platform_set(&watch_plat);
+            }
+        }
+    }
     latm_system_apply_boot_args(&sys, &env);
     env.active_tc.PC = linux_entry;
     lata_tr_data_init(&env);
@@ -263,6 +299,20 @@ void kmain(void)
                 { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(v>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
                 latx_bare_uart_puts(" after pc=");
                 { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(last_pc>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+                latx_bare_uart_puts(" sp=");
+                { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(env.active_tc.gpr[29]>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+                {
+                    uint64_t pa = env.active_tc.gpr[29] + 0x18u;
+
+                    if (pa >= 0xffffffff80000000ull &&
+                        pa < 0xffffffff80000000ull + sizeof(ram)) {
+                        uint64_t mem = 0;
+
+                        memcpy(&mem, ram + (pa - 0xffffffff80000000ull), 8);
+                        latx_bare_uart_puts(" slot=");
+                        { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(mem>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+                    }
+                }
                 latx_bare_uart_puts(" at tbs=");
                 { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(tb_ran>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
                 latx_bare_uart_putc('\n');
@@ -346,6 +396,15 @@ void kmain(void)
     latx_bare_uart_putc('\n');
     /* The wrapper waits for this token, so a completed run must say so before
      * leaving: without it every run burns the whole QEMU timeout. */
+    for (unsigned w = 0; w < watch_hits; w++) {
+        latx_bare_uart_puts("latm-linux: watch write gpa=");
+        { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(watch_gpa[w]>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+        latx_bare_uart_puts(" pc=");
+        { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(watch_pc[w]>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+        latx_bare_uart_puts(" val=");
+        { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(watch_val[w]>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+        latx_bare_uart_putc('\n');
+    }
     latx_bare_uart_puts("latm-linux: done\n");
     *(volatile uint32_t *)(uintptr_t)0x100000 = 0x5555u; /* LVZ exit device */
     for (;;) {

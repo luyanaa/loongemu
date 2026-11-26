@@ -457,9 +457,26 @@ ld $ra,0x18($sp); jr $ra; daddiu $sp,$sp,0x20`. `$ra` is therefore *loaded from 
 stack* and that slot already held the garbage - not a register-allocation bug but a
 corrupted stack frame, and the value is high-entropy rather than a stale pointer,
 which suggests an unwritten slot or a store to the wrong address. Next diagnostic:
-trap writes to the frame slot (`$sp+0x18` at that PC, around `0xffffffff81e9ae00`
-with the `$sp` seen in the post-mortem) or compare the guest `$sp` with what the
-kernel's own prologue expects. `latm-isa` keeps the 8-instruction case at `0x814911c8` as the green
+trap writes to the frame slot.
+
+**Done, and the stack is innocent - but the helper's guest PC is not.** With a
+write watchpoint on the frame page the only writers are the kernel saving exactly
+what it should (`0xffffffff8149051c`, `...0520`, `...0524`, `...0528` - the return
+addresses of the epilogue above), so the frame contents are plausible and the wild
+`$ra` does not come from the stack.
+
+What the watch did expose is that **inside the store helper, `env->active_tc.PC`
+holds the store address, not the guest instruction address**:
+
+    watch write gpa=0x1e9adc0 pc=0x1e9ade0 val=0xffffffff81490020
+    watch write gpa=0x1e9adc4 pc=0x1e9ade4 val=0xffffffff81490020
+
+`gpa` and `pc` advance together, so the PC field tracks the data address. Any helper
+that reads or saves the guest PC - a faulting access, `GETPC()`-based exception
+posting, anything spilling registers - then records nonsense, which explains a
+high-entropy `$ra` far better than a corrupted stack. Next step: check how
+`latm_set_pc()` and the `hcall()` argument staging interact, i.e. whether the `a0`
+(env) argument or the PC slot is being overwritten by a staged argument. `latm-isa` keeps the 8-instruction case at `0x814911c8` as the green
 regression, and `KERNEL_BLOCK_INSNS=<n>` is a build knob for bisecting block
 limits (16 translates, 24 aborts at the first PC). That is the same conclusion the RVV and LATA work reached by a different
 route: count what you emit, do not time what you emulate.
