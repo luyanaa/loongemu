@@ -1520,6 +1520,7 @@ latm-linux-run: build/bare_latm_linux.elf
 	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_latm_linux.elf" \
 	     QEMU_LOG="build/latm_linux.log" QEMU_DONE="latm-linux: done" \
 	     QEMU_TIMEOUT=$(LINUX_TIMEOUT) CPU=la464 QEMU_MEM=1G \
+	     QEMU_EXTRA_ARGS="-icount shift=auto,sleep=off" \
 	     bash scripts/run_qemu_lata.sh || true
 	@grep -a 'latm-linux' build/latm_linux.log | tail -20
 

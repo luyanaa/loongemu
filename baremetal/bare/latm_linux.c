@@ -29,7 +29,7 @@ extern const uint8_t latm_linux_elf_end[];
 #include "translate.h"
 
 #ifndef LINUX_TB_BUDGET
-#define LINUX_TB_BUDGET 8000000u
+#define LINUX_TB_BUDGET 200000u
 #endif
 /*
  * `rdtime.d` for throughput comparisons - **not** a wall clock here. Measured on
@@ -297,6 +297,12 @@ void kmain(void)
     latx_bare_uart_puts(" uart-tx=");
     { char b[17]; for (int i=15;i>=0;i--) b[15-i]="0123456789abcdef"[(sys.uart.tx_count>>(i*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
     latx_bare_uart_putc('\n');
+    /* The wrapper waits for this token, so a completed run must say so before
+     * leaving: without it every run burns the whole QEMU timeout. */
+    latx_bare_uart_puts("latm-linux: done\n");
+    *(volatile uint32_t *)(uintptr_t)0x100000 = 0x5555u; /* LVZ exit device */
+    for (;;) {
+    }
 }
 
 /* One dispatch: translate on a cache miss, run, count. Returns 0 when the

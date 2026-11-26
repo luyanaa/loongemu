@@ -328,8 +328,21 @@ another (1 050 000 blocks in 600 s), a 600x spread, and `rdtime` is not a clock 
 this QEMU either. So performance work on LATM needs a **deterministic** cost
 metric - emitted host words, IR2 opcodes, helper calls per block, which the harness
 already prints - and wall clock only as a sanity check across many runs or on a
-QEMU built with `-icount`. That is the same conclusion the RVV and LATA work
-reached by a different route: count what you emit, do not time what you emulate.
+QEMU built with `-icount`.
+
+**Solved: run with `-icount shift=auto,sleep=off`.** `scripts/run_qemu_lata.sh`
+gained `QEMU_EXTRA_ARGS` and `make latm-linux-run` passes that flag, which makes the
+guest's own counter deterministic: two consecutive runs of the same workload report
+**identical** `ticks=0xb8b579`, `ticks-per-tb=0x3c` (60), `translations=2`,
+`helper-stores=200000`, with wall time 3.75 s and 3.84 s. That is a cost metric safe
+to compare across changes, and it retires the "no per-block number" ban.
+
+Two side effects worth keeping: the harness now prints `latm-linux: done` and writes
+the LVZ exit device, so a run returns in ~4 s instead of burning the whole QEMU
+timeout (the wrapper waits for that token); and at this rate the kernel's BSS clear
+(4.9 M blocks) is about **90 s**, not the 47 minutes that host-noise wall clocks
+suggested. That is the same conclusion the RVV and LATA work reached by a different
+route: count what you emit, do not time what you emulate.
 
 **The earlier attempt, kept because its failure mode is instructive:** `latm_set_ram_window()` plus an
 inlined LD/LW/LWU/SD/SW path (range test, then an indexed access into the host

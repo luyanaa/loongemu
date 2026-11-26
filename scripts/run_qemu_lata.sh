@@ -36,6 +36,14 @@ rm -f "$LOG_FILE" "$ERR_FILE"
 # guest never got scheduled at all.
 TRACE_FILE="${LOG_FILE%.log}.trace"
 QEMU_ARGS=()
+# QEMU_EXTRA_ARGS is word-split on purpose: callers pass e.g.
+#   QEMU_EXTRA_ARGS="-icount shift=auto,sleep=off"
+# `-icount ... sleep=off` makes the guest's own counter deterministic, which is
+# what turns `rdtime` from a host-clock proxy into a reproducible cost metric.
+if [[ -n "${QEMU_EXTRA_ARGS:-}" ]]; then
+    # shellcheck disable=SC2206
+    QEMU_ARGS+=(${QEMU_EXTRA_ARGS})
+fi
 if [[ "${QEMU_DEBUG:-0}" != "0" ]]; then
     rm -f "$TRACE_FILE"
     QEMU_ARGS+=(-d in_asm,int,guest_errors -D "$TRACE_FILE")
