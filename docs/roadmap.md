@@ -482,8 +482,21 @@ The next attempt should stop looking for a writer and instead **freeze the state
 replay it**: stop the harness at `0xffffffff8149051c`, dump all 32 GPRs plus the frame
 page, and replay that block in `latm-isa` by translating first and *then* loading the
 GPRs into `env` before entering through the normal `cs_bt_to_native` stub (which is
-what the earlier attempt skipped, which is why it saw `$sp == 0`). A failing replay
-there is a two-second loop instead of a 90-second kernel run.
+what the earlier attempt skipped, which is why it saw `$sp == 0`). A failing replay there is a two-second loop instead of a 90-second kernel run.
+
+**The rig is built, its control passes, and it acquits the block.** `latm-isa` now has
+`replay_block()`: translate the block, *then* load the guest GPRs into `env`, then enter
+through the normal `cs_bt_to_native` stub (the step an earlier attempt skipped, which is
+why it saw `$sp == 0`). Control block `ld $ra,0($sp); jr $ra` returns through the frame
+value as expected (`ra = pc = replay_far`). The kernel's epilogue replayed with the
+frame the write watch recorded returns **`ra = pc = 0xffffffff81490528`** - correct.
+
+So the block's translation and the rig agree: the corruption is in the *frame content*,
+not in the epilogue. And the poison dump already showed that: at crash time the slot at
+`$sp+0x18` held `9026260403a1133a`, while the write watch logged the kernel storing
+`0xffffffff81490528` there. The watch was capped at **16 entries**, so a later writer
+(the 17th and beyond) was never recorded - that is now the specific gap to close:
+watch only the exact slot with a larger cap and see which write lands the garbage.
 
 **The watchdog found the writer.** The harness now checks `$25` and `$31` on every
 dispatch and reports the first non-canonical value together with the PC that had just

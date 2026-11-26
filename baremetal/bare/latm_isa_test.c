@@ -697,6 +697,113 @@ static void test_jalr_link_register(void)
     check(env.active_tc.gpr[25], (uint64_t)target, "jalr leaves $25 as the target");
 }
 
+/*
+ * Replay rig: translate a block, then load the guest GPRs into `env` and enter
+ * through the normal context-switch stub (`cs_bt_to_native`). That is how the
+ * boot harness enters every block, and skipping it is what made an earlier
+ * attempt see $sp == 0.
+ *
+ * A control block runs first - `ld $ra,0($sp); jr $ra` - so the rig itself is
+ * proven before it is pointed at the kernel's epilogue.
+ */
+static uint32_t replay_far[] __attribute__((aligned(16))) = { 0x0000000d };
+
+static uint32_t replay_control[] __attribute__((aligned(16))) = {
+    0xdfbf0000, /* ld  $ra, 0($sp) */
+    0x03e00008, /* jr  $ra        */
+    0x00000000, /* nop            */
+};
+
+static int replay_block(uint32_t *guest, int insns, uint64_t sp,
+                        uint64_t *result_ra, uint64_t *result_pc)
+{
+    uint8_t *tb_code = code_buf + TB_OFFSET;
+    int max_insns = insns;
+    int n;
+
+    latm_bind_env(&env);
+    for (size_t i = 0; i < sizeof(tb); i++) {
+        ((uint8_t *)&tb)[i] = 0;
+    }
+    tcg_ctx->code_ptr = tb_code;
+    tcg_ctx->gen_insn_data = latx_tcg_gen_insn_data;
+    tb.pc = (uint64_t)(uintptr_t)guest;
+    tb.tc.ptr = tb_code;
+    tb.jmp_reset_offset[0] = 0xffff;
+    tb.jmp_reset_offset[1] = 0xffff;
+    env.active_tc.PC = tb.pc;
+    target_disasm(&tb, &max_insns, &env);
+    if (!tb.icount || !tr_ir2_generate(&tb)) {
+        tr_fini();
+        return 0;
+    }
+    n = tr_ir2_assemble(tb_code);
+    tr_fini();
+    __asm__ volatile("ibar 0" ::: "memory");
+    if (n <= 0) {
+        return 0;
+    }
+    /* Set the guest state *after* translation, then enter through the stub. */
+    env.active_tc.gpr[29] = sp;
+    env.active_tc.gpr[31] = 0;
+    env.active_tc.gpr[16] = 0;
+    env.active_tc.gpr[17] = 0;
+    env.active_tc.gpr[18] = 0;
+    env.active_tc.PC = tb.pc;
+    ((void (*)(void *, void *))(uintptr_t)
+     ((TRANSLATION_DATA *)env.latm_tr_data)->cs_bt_to_native)(&env, tb_code);
+    *result_ra = env.active_tc.gpr[31];
+    *result_pc = env.active_tc.PC;
+    return 1;
+}
+
+static uint32_t kernel_epilogue_9051c[] __attribute__((aligned(16))) = {
+    0xfe3000a8, 0xdfbf0018, 0xdfb20010, 0xdfb10008,
+    0xdfb00000, 0x03e00008, 0x67bd0020, 0x00008025,
+    0xfe3000a8,
+};
+
+static void test_replay_rig(void)
+{
+    static uint8_t frame[0x2000] __attribute__((aligned(16)));
+    static LatmPlatform plat = { .mem_read = platform_read,
+                                 .mem_write = platform_write };
+    uint64_t ra = 0, pc = 0;
+    uint64_t sp = (uint64_t)(uintptr_t)(frame + 0x1000);
+
+    latm_set_system_memory(true);
+    latm_platform_set(&plat);
+
+    /* Control: the rig must return through the loaded $ra. */
+    *(uint64_t *)(void *)(frame + 0x1000) = (uint64_t)(uintptr_t)replay_far;
+    check(replay_block(replay_control, 3, sp, &ra, &pc), 1, "replay rig assembles");
+    latx_bare_uart_puts("latm-isa: replay-control ra=");
+    puthex(ra);
+    latx_bare_uart_puts(" pc=");
+    puthex(pc);
+    latx_bare_uart_putc('\n');
+    check(ra, (uint64_t)(uintptr_t)replay_far, "replay rig loads $ra from the frame");
+    check(pc, (uint64_t)(uintptr_t)replay_far, "replay rig jumps through $ra");
+
+    /* Now the kernel's epilogue with the frame the watch recorded. */
+    *(uint64_t *)(void *)(frame + 0x1000 + 0x00) = 0xffffffff8149051cull;
+    *(uint64_t *)(void *)(frame + 0x1000 + 0x08) = 0xffffffff81490520ull;
+    *(uint64_t *)(void *)(frame + 0x1000 + 0x10) = 0xffffffff81490524ull;
+    *(uint64_t *)(void *)(frame + 0x1000 + 0x18) = 0xffffffff81490528ull;
+    check(replay_block(kernel_epilogue_9051c, 9, sp, &ra, &pc), 1,
+          "kernel epilogue replays");
+    latx_bare_uart_puts("latm-isa: replay-9051c ra=");
+    puthex(ra);
+    latx_bare_uart_puts(" pc=");
+    puthex(pc);
+    latx_bare_uart_putc('\n');
+    check(ra, 0xffffffff81490528ull, "the kernel epilogue returns through the saved ra");
+    check(pc, 0xffffffff81490528ull, "the kernel epilogue jumps to the saved ra");
+
+    latm_platform_set(NULL);
+    latm_set_system_memory(false);
+}
+
 static void test_kernel_block_91208(void)
 {
     int words = 0;
@@ -933,6 +1040,7 @@ void kmain(void)
     latx_bare_uart_puts("\n");
     lata_tr_data_init(&env);
     test_jalr_link_register();
+    test_replay_rig();
     test_kernel_block_91208();
     test_kernel_block_911c8();
     test_bss_loop_opcodes();
