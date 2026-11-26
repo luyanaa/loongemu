@@ -244,6 +244,24 @@ path adds to every guest access, which is exactly what the boot harness must run
 assertion, a separate pre-existing limit). `latm-isa` now pins both directions:
 the sys path must cost extra words, and the loop must need no IR2 branch.
 
+**Measured baseline for the accepted metric, and a correction.** With the boot
+harness exiting through the LVZ exit device (it now does, so a timing run ends
+when the work does), 2 000 translated kernel blocks take **87-125 ms**, i.e.
+~20 k blocks/s - not the ~1 k/s inferred earlier. That earlier figure was an
+artefact of measuring runs that never exited and were killed by a wrapper, so the
+"1 ms per three-instruction block" claim is withdrawn; the block cost is ~45 us.
+
+**The RAM fast path was attempted and reverted.** `latm_set_ram_window()` plus an
+inlined LD/LW/LWU/SD/SW path (range test, then an indexed access into the host
+buffer, helper on the miss) reached two blocking problems: the first version
+exhausted the IR2 itemp pool (`ra_alloc_itemp: out of IR2 itemps`) because it held
+three at once alongside `hcall`; reduced to two it translated, but the kernel then
+hung with no summary at all. Rather than keep an unverified core-translator change
+in the tree it was reverted whole (API included), and the next attempt should
+debug it **in `latm-isa`** on the bss-loop shape with the window set - that image
+can dump the emitted block and assert the fast/slow split in a second - instead of
+in the kernel harness, where every iteration is a 40 s hang.
+
 **Where the 71 words come from, measured in the code.** A sys-memory access is a
 single `hcall2(latm_helper_load/store, op, addr)`, and `hcall()` wraps every call
 in `lata_gen_call_helper_prologue()` / `epilogue()`, which spill and reload **all
