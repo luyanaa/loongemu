@@ -763,6 +763,8 @@ static uint32_t kernel_epilogue_9051c[] __attribute__((aligned(16))) = {
     0xfe3000a8,
 };
 
+static void test_kernel_minmax(void);
+
 static void test_replay_rig(void)
 {
     static uint8_t frame[0x2000] __attribute__((aligned(16)));
@@ -800,9 +802,113 @@ static void test_replay_rig(void)
     check(ra, 0xffffffff81490528ull, "the kernel epilogue returns through the saved ra");
     check(pc, 0xffffffff81490528ull, "the kernel epilogue jumps to the saved ra");
 
+    test_kernel_minmax();
     latm_platform_set(NULL);
     latm_set_system_memory(false);
 }
+
+/*
+ * The kernel function at 0xffffffff814904a8 computes
+ *   len = min(obj[0xb0] - obj[0xa8], desc[0x10] - desc[8])
+ * with `sltu` + `movn`, then copies that many bytes. With the values captured
+ * at the call (span 0xc versus 0x505d18) the min is 0xc. The boot harness
+ * observed len 0x505d18, which is what you get if `movn` does not fire.
+ */
+static uint32_t kernel_minmax_904bc[] __attribute__((aligned(16))) = {
+    0x00a09025, 0xdc8300a8, 0xdca50008, 0xdc8200b0,
+    0xde500010, 0x0043102f, 0x0205802f, 0x00808825,
+    0xde470000, 0x0050202b, 0x0044800b, 0x662400b8,
+    0x02003025,
+};
+
+static int replay_block_gprs(uint32_t *guest, int insns, uint64_t gprs[32])
+{
+    uint8_t *tb_code = code_buf + TB_OFFSET;
+    int max_insns = insns;
+    int n;
+
+    latm_bind_env(&env);
+    for (size_t i = 0; i < sizeof(tb); i++) {
+        ((uint8_t *)&tb)[i] = 0;
+    }
+    tcg_ctx->code_ptr = tb_code;
+    tcg_ctx->gen_insn_data = latx_tcg_gen_insn_data;
+    tb.pc = (uint64_t)(uintptr_t)guest;
+    tb.tc.ptr = tb_code;
+    tb.jmp_reset_offset[0] = 0xffff;
+    tb.jmp_reset_offset[1] = 0xffff;
+    env.active_tc.PC = tb.pc;
+    target_disasm(&tb, &max_insns, &env);
+    if (!tb.icount || !tr_ir2_generate(&tb)) {
+        tr_fini();
+        return 0;
+    }
+    n = tr_ir2_assemble(tb_code);
+    tr_fini();
+    __asm__ volatile("ibar 0" ::: "memory");
+    if (n <= 0) {
+        return 0;
+    }
+    for (int g = 0; g < 32; g++) {
+        env.active_tc.gpr[g] = gprs[g];
+    }
+    env.active_tc.PC = tb.pc;
+    ((void (*)(void *, void *))(uintptr_t)
+     ((TRANSLATION_DATA *)env.latm_tr_data)->cs_bt_to_native)(&env, tb_code);
+    for (int g = 0; g < 32; g++) {
+        gprs[g] = env.active_tc.gpr[g];
+    }
+    return 1;
+}
+
+static void test_kernel_minmax(void)
+{
+    static uint8_t obj[0x100] __attribute__((aligned(16)));
+    static uint8_t desc[0x20] __attribute__((aligned(16)));
+    uint64_t gprs[32];
+
+    for (int i = 0; i < 0x100; i++) obj[i] = 0;
+    for (int i = 0; i < 0x20; i++) desc[i] = 0;
+    *(uint64_t *)(void *)(obj + 0xa8) = 0;
+    *(uint64_t *)(void *)(obj + 0xb0) = 0xc;
+    *(uint64_t *)(void *)(desc + 0x00) = 0xffffffff81492d90ull;
+    *(uint64_t *)(void *)(desc + 0x08) = 0;
+    *(uint64_t *)(void *)(desc + 0x10) = 0x505d18ull;
+    for (int g = 0; g < 32; g++) gprs[g] = 0;
+    gprs[4] = (uint64_t)(uintptr_t)obj;
+    gprs[5] = (uint64_t)(uintptr_t)desc;
+    check(replay_block_gprs(kernel_minmax_904bc, 11, gprs), 1,
+          "kernel min sequence assembles");
+    latx_bare_uart_puts("latm-isa: minmax a2=");
+    puthex(gprs[6]);
+    latx_bare_uart_puts(" s0=");
+    puthex(gprs[16]);
+    latx_bare_uart_puts(" v0=");
+    puthex(gprs[2]);
+    latx_bare_uart_puts(" a0=");
+    puthex(gprs[4]);
+    latx_bare_uart_putc('\n');
+    check(gprs[4], 1ull, "sltu sees the object span is the smaller one");
+    check(gprs[16], 0xcull, "movn writes the smaller span back to s0");
+    {
+        static uint32_t movz_rt_zero[] __attribute__((aligned(16))) = { 0x0044800a };
+        static uint32_t movz_rt_set[] __attribute__((aligned(16))) = { 0x0044800a };
+
+        for (int g = 0; g < 32; g++) gprs[g] = 0;
+        gprs[16] = 0x111;
+        gprs[2] = 0x222;
+        gprs[4] = 0;
+        check(replay_block_gprs(movz_rt_zero, 1, gprs), 1, "movz assembles");
+        check(gprs[16], 0x222ull, "movz copies rs when rt is zero");
+        for (int g = 0; g < 32; g++) gprs[g] = 0;
+        gprs[16] = 0x111;
+        gprs[2] = 0x222;
+        gprs[4] = 1;
+        check(replay_block_gprs(movz_rt_set, 1, gprs), 1, "movz assembles again");
+        check(gprs[16], 0x111ull, "movz keeps rd when rt is nonzero");
+    }
+}
+
 
 static void test_kernel_block_91208(void)
 {

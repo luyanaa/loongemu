@@ -382,12 +382,13 @@ static bool trans_alu(DisasContext *s)
         t = ra_alloc_itemp();
         t2 = ra_alloc_itemp();
         rd = alloc_gpr_dst(s->ir1.rd);
+        /* masknez keeps rj when rk==0; maskeqz keeps rj when rk!=0. */
         if (op == MIPS_ALU_MOVZ) {
-            la_maskeqz(t, rs, rt);
-            la_masknez(t2, old, rt);
-        } else {
             la_masknez(t, rs, rt);
             la_maskeqz(t2, old, rt);
+        } else {
+            la_maskeqz(t, rs, rt);
+            la_masknez(t2, old, rt);
         }
         la_or(rd, t, t2);
         store_gpr_dst_f(s->ir1.rd, rd);

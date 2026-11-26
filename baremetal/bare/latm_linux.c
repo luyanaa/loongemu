@@ -167,23 +167,50 @@ static size_t build_elf(uint8_t *elf, const uint32_t *insns, size_t count)
     return code_off + count * 4;
 }
 
-/* Write watchpoint: which guest store touches the frame slot that later feeds
- * `ld $ra,0x18($sp)`? The slot is around physical 0x1e9ae00 with the $sp seen in
- * the post-mortem, so watch that page and log the first few writers. */
+/* Write watchpoint for the exact slot `ld $ra,0x18($sp)` reads in the epilogue
+ * at 0xffffffff8149051c. Post-mortem $sp is 0xffffffff81e9ade0, and the delay
+ * slot is `addiu $sp,$sp,0x20`, so the load address is 0xffffffff81e9add8,
+ * physical 0x1e9add8. A ring keeps the last writes even past the old cap of 16
+ * (which also overflowed an 8-entry array). */
+#define WATCH_SLOT 0x1e9add8ull
+#define WATCH_N 48u
 static LatmPlatform watch_base;
-static unsigned watch_hits;
-static uint64_t watch_pc[8];
-static uint64_t watch_gpa[8];
-static uint64_t watch_val[8];
+static unsigned watch_total;
+static int watch_gprs_dumped;
+static int memcpy_entry_dumped;
+static uint64_t watch_pc[WATCH_N];
+static uint64_t watch_gpa[WATCH_N];
+static uint64_t watch_val[WATCH_N];
+static uint32_t watch_sz[WATCH_N];
+static uint64_t watch_tb[WATCH_N];
 
 static int watch_write(CPUMIPSState *env, uint64_t gpa, uint64_t value,
                        uint32_t size)
 {
-    if (gpa >= 0x1e9adc0ull && gpa < 0x1e9ae00ull && watch_hits < 16u) {
-        watch_pc[watch_hits] = env ? env->active_tc.PC : 0;
-        watch_gpa[watch_hits] = gpa;
-        watch_val[watch_hits] = value;
-        watch_hits++;
+    uint64_t end = gpa + (size ? (uint64_t)size : 1ull);
+
+    if (gpa < WATCH_SLOT + 8ull && end > WATCH_SLOT) {
+        unsigned i = watch_total % WATCH_N;
+
+        if (env && !watch_gprs_dumped && size == 1 &&
+            env->active_tc.PC == 0xffffffff81492b28ull) {
+            watch_gprs_dumped = 1;
+            latx_bare_uart_puts("latm-linux: memcpy-sb\n");
+            for (int g = 0; g < 32; g++) {
+                latx_bare_uart_puts("latm-linux: gpr[");
+                { char b[3]; b[0]="0123456789abcdef"[(g>>4)&15]; b[1]="0123456789abcdef"[g&15]; b[2]=0; latx_bare_uart_puts(b); }
+                latx_bare_uart_puts("]=");
+                { char b[17]; uint64_t v = env->active_tc.gpr[g];
+                  for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(v>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+                latx_bare_uart_putc('\n');
+            }
+        }
+        watch_pc[i] = env ? env->active_tc.PC : 0;
+        watch_gpa[i] = gpa;
+        watch_val[i] = value;
+        watch_sz[i] = size;
+        watch_tb[i] = tb_ran;
+        watch_total++;
     }
     return watch_base.mem_write ? watch_base.mem_write(env, gpa, value, size)
                                : LATM_MEM_OK;
@@ -304,15 +331,23 @@ void kmain(void)
                 latx_bare_uart_puts(" sp=");
                 { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(env.active_tc.gpr[29]>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
                 {
-                    uint64_t pa = env.active_tc.gpr[29] + 0x18u;
+                    /* Delay slot already did `addiu $sp,$sp,0x20`, so the slot
+                     * `ld $ra,0x18($sp)` read is at the new $sp-8, not $sp+0x18. */
+                    uint64_t old_sp = env.active_tc.gpr[29] - 0x20u;
 
-                    if (pa >= 0xffffffff80000000ull &&
-                        pa < 0xffffffff80000000ull + sizeof(ram)) {
+                    latx_bare_uart_puts(" frame");
+                    for (unsigned off = 0; off < 0x40u; off += 8u) {
+                        uint64_t pa = old_sp + off;
                         uint64_t mem = 0;
 
-                        memcpy(&mem, ram + (pa - 0xffffffff80000000ull), 8);
-                        latx_bare_uart_puts(" slot=");
-                        { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(mem>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+                        latx_bare_uart_putc(' ');
+                        if (pa >= 0xffffffff80000000ull &&
+                            pa + 8u <= 0xffffffff80000000ull + sizeof(ram)) {
+                            memcpy(&mem, ram + (pa - 0xffffffff80000000ull), 8);
+                            { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(mem>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+                        } else {
+                            latx_bare_uart_puts("????????????????");
+                        }
                     }
                 }
                 latx_bare_uart_puts(" at tbs=");
@@ -346,6 +381,42 @@ void kmain(void)
             break;
         }
         stop_pc = env.active_tc.PC;
+        if (!memcpy_entry_dumped && stop_pc == 0xffffffff81492b00ull &&
+            env.active_tc.gpr[4] == 0xffffffff81a98f88ull) {
+            memcpy_entry_dumped = 1;
+            latx_bare_uart_puts("latm-linux: memcpy-entry\n");
+            for (int g = 0; g < 32; g++) {
+                latx_bare_uart_puts("latm-linux: in[");
+                { char b[3]; b[0]="0123456789abcdef"[(g>>4)&15]; b[1]="0123456789abcdef"[g&15]; b[2]=0; latx_bare_uart_puts(b); }
+                latx_bare_uart_puts("]=");
+                { char b[17]; uint64_t v = env.active_tc.gpr[g];
+                  for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(v>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+                latx_bare_uart_putc('\n');
+            }
+            {
+                static const uint64_t q[] = {
+                    0xffffffff81a98f78ull, /* object+0xa8 */
+                    0xffffffff81a98f80ull, /* object+0xb0 */
+                    0xffffffff81e9ae48ull, /* s2+0 */
+                    0xffffffff81e9ae50ull, /* s2+8 */
+                    0xffffffff81e9ae58ull, /* s2+0x10 */
+                };
+
+                for (unsigned qi = 0; qi < 5; qi++) {
+                    uint64_t mem = 0;
+
+                    latx_bare_uart_puts("latm-linux: mem ");
+                    { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(q[qi]>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+                    latx_bare_uart_puts("=");
+                    if (q[qi] >= 0xffffffff80000000ull &&
+                        q[qi] + 8u <= 0xffffffff80000000ull + sizeof(ram)) {
+                        memcpy(&mem, ram + (q[qi] - 0xffffffff80000000ull), 8);
+                        { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(mem>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+                    }
+                    latx_bare_uart_putc('\n');
+                }
+            }
+        }
         if (tb_ran && (tb_ran % 10000u) == 0) {
             latx_bare_uart_puts("latm-linux: progress tbs=");
             { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(tb_ran>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
@@ -398,14 +469,28 @@ void kmain(void)
     latx_bare_uart_putc('\n');
     /* The wrapper waits for this token, so a completed run must say so before
      * leaving: without it every run burns the whole QEMU timeout. */
-    for (unsigned w = 0; w < watch_hits; w++) {
-        latx_bare_uart_puts("latm-linux: watch write gpa=");
-        { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(watch_gpa[w]>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
-        latx_bare_uart_puts(" pc=");
-        { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(watch_pc[w]>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
-        latx_bare_uart_puts(" val=");
-        { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(watch_val[w]>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
-        latx_bare_uart_putc('\n');
+    latx_bare_uart_puts("latm-linux: slot-writes=");
+    { char b[9]; for (int k=7;k>=0;k--) b[7-k]="0123456789abcdef"[(watch_total>>(k*4))&15]; b[8]=0; latx_bare_uart_puts(b); }
+    latx_bare_uart_putc('\n');
+    {
+        unsigned n = watch_total < WATCH_N ? watch_total : WATCH_N;
+        unsigned start = watch_total < WATCH_N ? 0u : (watch_total % WATCH_N);
+
+        for (unsigned k = 0; k < n; k++) {
+            unsigned w = (start + k) % WATCH_N;
+
+            latx_bare_uart_puts("latm-linux: slot gpa=");
+            { char b[17]; for (int q=15;q>=0;q--) b[15-q]="0123456789abcdef"[(watch_gpa[w]>>(q*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" sz=");
+            { char b[3]; b[0]="0123456789abcdef"[(watch_sz[w]>>4)&15]; b[1]="0123456789abcdef"[watch_sz[w]&15]; b[2]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" pc=");
+            { char b[17]; for (int q=15;q>=0;q--) b[15-q]="0123456789abcdef"[(watch_pc[w]>>(q*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" tb=");
+            { char b[17]; for (int q=15;q>=0;q--) b[15-q]="0123456789abcdef"[(watch_tb[w]>>(q*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" val=");
+            { char b[17]; for (int q=15;q>=0;q--) b[15-q]="0123456789abcdef"[(watch_val[w]>>(q*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_putc('\n');
+        }
     }
     {
         unsigned n = 0;

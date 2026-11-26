@@ -498,6 +498,28 @@ not in the epilogue. And the poison dump already showed that: at crash time the 
 (the 17th and beyond) was never recorded - that is now the specific gap to close:
 watch only the exact slot with a larger cap and see which write lands the garbage.
 
+**Closed: `movn` had its masks backwards, so the copy length was never clamped.**
+The exact-slot watch (GPA `0x1e9add8`, the address `ld $ra,0x18($sp)` actually reads;
+the old dump's `$sp+0x18` was *after* `daddiu $sp,$sp,0x20`) records eight `sb`s from
+`0xffffffff81492b28`. That is the byte-copy loop a `jal` at `0xffffffff814904f4`
+calls. Little-endian, the eight bytes are `0x5ffb5495820b36ec`, and those same bytes
+sit in the kernel image at `src + index`. The epilogue then loads them. Neither the
+copy nor the epilogue is wrong.
+
+At the copy's entry the arguments are dest `0xffffffff81a98f88`, src
+`0xffffffff81492d90`, len `0x505d18`. The object span is `0xc`
+(`[0xb0] - [0xa8] = 12 - 0`) and `sltu` writes 1, but `s0` stays `0x505d18`. Replaying
+those 11 instructions in `latm-isa` with the same memory gives the same split:
+`a0 = 1`, `s0` unchanged. `maskeqz` keeps `rj` when `rk != 0`; `masknez` keeps `rj`
+when `rk == 0`. The emitter had the two masks swapped, so `movn` copied only when
+the condition was zero and `movz` did the opposite.
+
+Swapping them makes the replay clamp to `0xc` (`latm-isa` checks=118, fails=0, plus
+both `movz` directions). The same boot now enters the copy with `a2 = 0xc`, never
+poisons `$31`, and runs the whole 40,000,000-block budget. It then sits in `b .` at
+`0xffffffff81491b18` — a kernel halt loop, not a wild PC. That spin is the next
+question.
+
 **The watchdog found the writer.** The harness now checks `$25` and `$31` on every
 dispatch and reports the first non-canonical value together with the PC that had just
 executed:

@@ -321,7 +321,7 @@ QEMU 的 `exception_resume_pc()`（`exception.c:28`）在 `hflags & MIPS_HFLAG_B
 | `LUI rt,imm` | `sext32(imm<<16)` | `la_lu12i_w(rt, imm << 4)` |
 | `AND/OR/XOR/NOR` | 64-bit | `la_and/la_or/la_xor/la_nor` |
 | `SLT/SLTU` | 64-bit | `la_slt/la_sltu` |
-| `MOVZ/MOVN` | 条件搬移 | `la_maskeqz(t1,rs,rt)` + `la_masknez(t2,rd,rt)` + `la_or(rd,t1,t2)`；MOVN 交换 mask 条件 |
+| `MOVZ/MOVN` | 条件搬移 | `masknez` 在 rk==0 时保留 rj，`maskeqz` 在 rk!=0 时保留 rj。MOVZ：`la_masknez(t,rs,rt)` + `la_maskeqz(t2,old,rt)` + `la_or`；MOVN 交换两条 mask |
 | `MUL`（SPECIAL2） | 32×32→低 32 符号扩展 | `la_mul_w` |
 | `CLZ/CLO` | 32-bit count | `la_clz_w/la_clo_w` |
 | `DCLZ/DCLO` | 64-bit count | `la_clz_d/la_clo_d` |
