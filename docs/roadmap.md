@@ -433,8 +433,20 @@ target and link differ, ends with `$31 = link` (correct) **and `$25 = link` as
 well**, where `$25` must still hold the target. Suspect: for env-resident `$25`,
 `alloc_gpr_src(25)` takes a temporary from the same pool as `imm_opnd()`, and after
 `free_gpr_temp()` the link reuses that temporary while $25's cache entry still points
-at it. The test is not committed while it fails; next step is to fix the
-invalidate-on-free for that path and then land it as a regression. `latm-isa` keeps the 8-instruction case at `0x814911c8` as the green
+at it. **Fixed, and it was a real cache-lifetime bug.** `free_gpr_temp()` returned an
+env-resident register's host temporary to the shared pool without touching its cache
+entry, so the next allocation (the link's `imm_opnd()`) wrote into the same register
+and `$25` silently became the link address. The entry is now released through
+`latm_regcache_release_temp()`, which **writes back when dirty** and then invalidates
+- the first attempt only invalidated and lost the guest's value (`$25` read 0), which
+is why the writeback matters. `latm-isa` gains the `jalr-link` regression: `$31` =
+link, `$25` = target, image at **69 checks**.
+
+**But it was not what killed the kernel.** With the fix in, the same run still ends
+at `tbs=0x607002` with `bad pc=5ffb5495820b36ec` - identical block count, identical
+value. So the wild jump has another source; next diagnostic is a rolling snapshot of
+the last good dispatch (PC plus the GPRs that feed `jalr`/`jr`, sampled every few
+hundred blocks is enough to see which register the bad value appears in first). `latm-isa` keeps the 8-instruction case at `0x814911c8` as the green
 regression, and `KERNEL_BLOCK_INSNS=<n>` is a build knob for bisecting block
 limits (16 translates, 24 aborts at the first PC). That is the same conclusion the RVV and LATA work reached by a different
 route: count what you emit, do not time what you emulate.

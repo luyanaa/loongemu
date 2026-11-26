@@ -661,6 +661,42 @@ static uint32_t kernel_block_91208[] __attribute__((aligned(16))) = {
     0xffb000a0, 0xffa50010, 0x0109402f, 0xffa00068,
 };
 
+/*
+ * `jalr $25` (one-operand form, encoded rd=31) must put the link in $31 and leave
+ * $25 holding the target. The target lives in a separate array so the two
+ * addresses differ; before the fix in free_gpr_temp(), $25 was overwritten with
+ * the link and the Debian kernel jumped to 0x5ffb5495820b36ec.
+ */
+static uint32_t jalr_far_target[] __attribute__((aligned(16))) = {
+    0x0000000d, /* break */
+};
+
+static void test_jalr_link_register(void)
+{
+    static uint32_t jalr_code[] __attribute__((aligned(16))) = {
+        0x3c190000, /* lui   $25, hi(target)  (patched) */
+        0x37390000, /* ori   $25, $25, lo     (patched) */
+        0x0320f809, /* jalr  $25              rd=31, rs=25 */
+        0x00000000, /* nop */
+        0x0000000d, /* break */
+    };
+    uint32_t target = (uint32_t)(uintptr_t)jalr_far_target;
+
+    jalr_code[0] = 0x3c190000u | ((target >> 16) & 0xffffu);
+    jalr_code[1] = 0x37390000u | (target & 0xffffu);
+    env.active_tc.gpr[25] = 0;
+    env.active_tc.gpr[31] = 0;
+    run_block(jalr_code, 5, "jalr-link");
+    latx_bare_uart_puts("latm-isa: jalr-link ra=");
+    puthex(env.active_tc.gpr[31]);
+    latx_bare_uart_puts(" t9=");
+    puthex(env.active_tc.gpr[25]);
+    latx_bare_uart_putc('\n');
+    check(env.active_tc.gpr[31], (uint64_t)(uintptr_t)(jalr_code + 4),
+          "jalr's link goes to $31");
+    check(env.active_tc.gpr[25], (uint64_t)target, "jalr leaves $25 as the target");
+}
+
 static void test_kernel_block_91208(void)
 {
     int words = 0;
@@ -896,6 +932,7 @@ void kmain(void)
     latx_bare_uart_puts(latx_cpu_has_lbt() ? "1" : "0");
     latx_bare_uart_puts("\n");
     lata_tr_data_init(&env);
+    test_jalr_link_register();
     test_kernel_block_91208();
     test_kernel_block_911c8();
     test_bss_loop_opcodes();

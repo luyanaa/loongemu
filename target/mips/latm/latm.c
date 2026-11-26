@@ -352,6 +352,32 @@ static void regcache_writeback(LatmRegCacheEntry *entry)
     latm_env_st_d(value, env_offset_gpr(reg));
 }
 
+/*
+ * Drops guest register `reg` from the cache if it is still resident in host
+ * temporary `temp`, writing it back when dirty. Called when a temporary is about
+ * to be returned to the shared pool: leaving the entry valid would let the next
+ * allocation overwrite the guest's value (the `jalr $25` corruption), while
+ * dropping it silently would lose an unflushed write.
+ */
+void latm_regcache_release_temp(int reg, int temp)
+{
+    LatmRegCacheEntry *entry;
+
+    if (reg <= 0 || reg >= 32) {
+        return;
+    }
+    entry = &lsenv->tr_data->regcache.gpr[reg];
+    if (!entry->valid || entry->temp != temp) {
+        return;
+    }
+    if (entry->dirty) {
+        regcache_writeback(entry);
+    }
+    entry->valid = 0;
+    entry->dirty = 0;
+    entry->temp = -1;
+}
+
 static void regcache_release(LatmRegCacheEntry *entry, bool writeback)
 {
     if (!entry->valid) {

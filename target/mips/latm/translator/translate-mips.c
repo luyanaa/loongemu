@@ -170,6 +170,15 @@ static IR2_OPND imm_opnd(int64_t v)
 static void free_gpr_temp(IR2_OPND opnd, int guest_reg)
 {
     if (guest_reg != 0 && mips_la_map[guest_reg] < 0) {
+        /*
+         * The temporary goes back to the shared itemp pool, so the guest
+         * register must stop claiming it: otherwise the next allocation (an
+         * imm_opnd() for a link address, say) writes into the same host register
+         * and a later read of the guest register silently sees that value. That
+         * is how `jalr $25` left the return address in $25 and the kernel ended
+         * up jumping to 0x5ffb5495820b36ec.
+         */
+        latm_regcache_release_temp(guest_reg, opnd._reg_num);
         ra_free_itemp(opnd._reg_num);
     }
 }
