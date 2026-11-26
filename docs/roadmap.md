@@ -292,9 +292,28 @@ Same build, same BSS loop: 100,000 blocks in ~95 ms (0.95 us/block), but a
 the loop. Two runs of the same code cannot both be right, so the leading
 hypothesis is TB-pool churn: the harness's 1 MiB pool holds 128 8 KiB slots and
 the wrapper flushes the cache when it fills, so a long run may be re-translating
-the same block instead of hitting. Instrument that next - translations per block,
-printed with the counters already added - before quoting any per-block number
-again; the 0.95 us figure is withdrawn until then.
+the same block instead of hitting. Instrumented: **2 translations for 100 000 blocks**, so TB-pool churn is
+refuted - the dispatcher hits the cache and the block is not being re-translated.
+
+**But the cost per block grows within a run, which no churn explanation covers.**
+Same build, clean host (no other QEMU), progress every 100 000 blocks with the
+guest PC and the tick counter:
+
+| blocks | PC | ticks | ticks/block |
+|---|---|---|---|
+| 100 000 | 0xffffffff81490020 | 2.8 M | 28 |
+| 500 000 | same | 15.5 M | 31 |
+| 1 000 000 | same | 69.5 M | 70 |
+
+and the wall clock agrees: 100 000 blocks in ~95 ms (0.95 us/block) but 1 000 000
+blocks in ~60 s (60 us/block). The PC never leaves the kernel's BSS-clear loop, so
+the guest is doing identical work; the per-block cost tripling over the run is
+either host/QEMU state that degrades with time or something in the harness that
+grows. Next diagnostic: sample ticks every 10 000 blocks to see whether the cost
+grows smoothly or steps at a particular block count (a step points at the harness,
+a smooth ramp at the host), and check QEMU's translated-block count from
+`-d exec` at two points in the same run. Until that is answered, no per-block
+number here is quoted.
 
 **The earlier attempt, kept because its failure mode is instructive:** `latm_set_ram_window()` plus an
 inlined LD/LW/LWU/SD/SW path (range test, then an indexed access into the host

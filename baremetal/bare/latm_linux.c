@@ -63,6 +63,7 @@ static uint32_t tb_buckets[512];
 static TbCache tb_cache;
 static TranslationBlock tb_live;
 static uint64_t tb_ran;
+static uint64_t tb_translated;
 static uint64_t linux_entry;
 static uint64_t stop_pc;
 static uint64_t stop_cause;
@@ -246,7 +247,7 @@ void kmain(void)
     uint64_t t_start = now_ticks();
     for (unsigned i = 0; i < LINUX_TB_BUDGET; i++) {
         stop_pc = env.active_tc.PC;
-        if (tb_ran && (tb_ran % 1000000u) == 0) {
+        if (tb_ran && (tb_ran % 100000u) == 0) {
             latx_bare_uart_puts("latm-linux: progress tbs=");
             { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(tb_ran>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
             latx_bare_uart_puts(" pc=");
@@ -283,6 +284,8 @@ void kmain(void)
         uint64_t hl = 0, hs = 0, hu = 0;
 
         latm_helper_stats_get(&hl, &hs, &hu);
+        latx_bare_uart_puts(" translations=");
+        { char b[17]; for (int i=15;i>=0;i--) b[15-i]="0123456789abcdef"[(tb_translated>>(i*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
         latx_bare_uart_puts(" helper-loads=");
         { char b[17]; for (int i=15;i>=0;i--) b[15-i]="0123456789abcdef"[(hl>>(i*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
         latx_bare_uart_puts(" helper-stores=");
@@ -339,6 +342,7 @@ static int linux_run_one(CPUMIPSState *env)
             return 0;
         }
         n = tr_ir2_assemble(host);
+        tb_translated++;
         tr_fini();
         if (n <= 0) {
             return 0;
