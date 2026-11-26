@@ -188,6 +188,7 @@ static int s17_have;
 static int beqz_dumped;
 static uint64_t s23_blk, s23_val, s23_next, s23_prev;
 static int s23_have;
+static int child_dumped;
 static unsigned field_n;
 static uint64_t field_pc[FIELD_N], field_val[FIELD_N], field_tb[FIELD_N];
 static uint32_t field_sz[FIELD_N];
@@ -508,6 +509,45 @@ void kmain(void)
             }
         }
 
+        /* Child-block cross-check. TB 81491a4c runs right after the state machine
+         * loaded $4=lw 0x64($6), $3=ld 0x28($6), with $6=ld 0x4b8($23). Compare the
+         * register values the translator produced against the bytes actually in
+         * guest RAM; a mismatch names a mistranslated load. */
+        if (!child_dumped && stop_pc == 0xffffffff81491a4cull) {
+            uint64_t s23v = env.active_tc.gpr[23];
+            uint64_t s6 = env.active_tc.gpr[6];
+            uint64_t r3 = env.active_tc.gpr[3];
+            uint64_t r4 = env.active_tc.gpr[4];
+            uint64_t mem4b8 = 0, mem64 = 0, mem28 = 0;
+
+            child_dumped = 1;
+            #define RD64(va, out) do { \
+                uint64_t _va = (va); \
+                if (_va >= 0xffffffff80000000ull && \
+                    _va + 8ull <= 0xffffffff80000000ull + sizeof(ram)) \
+                    memcpy(&(out), ram + (_va - 0xffffffff80000000ull), 8); \
+            } while (0)
+            RD64(s23v + 0x4b8ull, mem4b8);
+            RD64(s6 + 0x64ull, mem64);
+            RD64(s6 + 0x28ull, mem28);
+            latx_bare_uart_puts("latm-linux: child s23=");
+            { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(s23v>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" s6=");
+            { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(s6>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" reg4=");
+            { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(r4>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" reg3=");
+            { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(r3>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_putc('\n');
+            latx_bare_uart_puts("latm-linux: child mem[s23+4b8]=");
+            { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(mem4b8>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" mem[s6+64]=");
+            { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(mem64>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" mem[s6+28]=");
+            { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(mem28>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_putc('\n');
+            #undef RD64
+         }
         if (!jt_dumped && stop_pc == 0xffffffff81491a7cull) {
             uint64_t idx = env.active_tc.gpr[17];
             uint64_t r2 = env.active_tc.gpr[2];

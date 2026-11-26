@@ -567,6 +567,28 @@ a pointer and been skipped. The kernel clears the field and branches on zero on
 purpose; the non-zero consumers (`bnez` to `0xffffffff81492784` / `0xffffffff81491ac0`)
 are for a value this boot path never writes.
 
+**The child block is not a mistranslation either; every load matches RAM.** A
+cross-check probe at TB `0xffffffff81491a4c` (right after the state machine loaded
+`$4=lw 0x64($6)`, `$3=ld 0x28($6)`, `$6=ld 0x4b8($23)`) compares the register the
+translator produced against the bytes actually in guest RAM:
+
+    s23=ffffffff81a98ed0 s6=ffffffff81a99390
+    reg4=0  reg3=0
+    mem[s23+4b8]=ffffffff81a99390  mem[s6+64]=0  mem[s6+28]=0
+
+`$6` equals `mem[s23+0x4b8]`, `reg4` equals `mem[s6+0x64]`, `reg3` equals
+`mem[s6+0x28]` - the wide-offset `ld`, the child-pointer dereference, and both field
+loads are all bit-correct. Those fields are zero because nothing ever wrote a
+non-zero value to them: a whole-image scan finds only `sw $zero` covering the
+child's `+0x64`, and the only non-zero stores to `+0x60`/`+0x64` anywhere
+(`sd $3,0x60($23)` at `0xffffffff81492840`, `sw $4,0x60($6)` at `0xffffffff81492a74`)
+are on paths this boot never translates. Note `addiu $17,7` at `0xffffffff81491abc`
+is the delay slot of the zero-test `beqz`, so it sets the index regardless of the
+branch; the state index `$17` is therefore 7 by construction, and jump-table entries
+0/2/4/7/8 all point at `b .` (only 1/3/5/6 are real code). Reaching the `b .` at
+`0xffffffff81491b18` is the deterministic result of this memory image, not a
+translation defect.
+
 **The watchdog found the writer.** The harness now checks `$25` and `$31` on every
 dispatch and reports the first non-canonical value together with the PC that had just
 executed:
