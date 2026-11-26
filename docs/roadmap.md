@@ -545,6 +545,18 @@ delay slot of the following `jal` is `sw $zero, 0x28($2)` — `$2` still holds t
 pointer, so the kernel itself clears the field. No later store in this function
 writes a nonzero value there before the test.
 
+**It stays zero because those are the only two stores, and both write zero.**
+A watch on physical `0x1a98ef8` (`$23+0x28`) until that `beqz` records:
+
+    field pc=ffffffff81490020 sz=04 tb=0x112    val=0
+    field pc=ffffffff814912bc sz=04 tb=0x101213 val=0
+
+The first is the kernel's own BSS clear (`sw $zero` at entry+0x20). The second is
+the `sw $zero, 0x28($2)` delay slot, and it does hit this object. Nothing writes a
+nonzero value. The null path at `0xffffffff8149202c` (the target of the earlier
+`beqz` at `0xffffffff81491348`) only clears other fields and branches back to
+`0xffffffff81491350`; it does not fill `+0x28`.
+
 **The watchdog found the writer.** The harness now checks `$25` and `$31` on every
 dispatch and reports the first non-canonical value together with the PC that had just
 executed:

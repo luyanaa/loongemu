@@ -174,6 +174,8 @@ static size_t build_elf(uint8_t *elf, const uint32_t *insns, size_t count)
  * (which also overflowed an 8-entry array). */
 #define WATCH_SLOT 0x1e9add8ull
 #define WATCH_N 48u
+#define FIELD_SLOT 0x1a98ef8ull
+#define FIELD_N 8u
 static LatmPlatform watch_base;
 static unsigned watch_total;
 static int watch_gprs_dumped;
@@ -186,6 +188,9 @@ static int s17_have;
 static int beqz_dumped;
 static uint64_t s23_blk, s23_val, s23_next, s23_prev;
 static int s23_have;
+static unsigned field_n;
+static uint64_t field_pc[FIELD_N], field_val[FIELD_N], field_tb[FIELD_N];
+static uint32_t field_sz[FIELD_N];
 static uint64_t watch_pc[WATCH_N];
 static uint64_t watch_gpa[WATCH_N];
 static uint64_t watch_val[WATCH_N];
@@ -219,6 +224,13 @@ static int watch_write(CPUMIPSState *env, uint64_t gpa, uint64_t value,
         watch_sz[i] = size;
         watch_tb[i] = tb_ran;
         watch_total++;
+    }
+    if (gpa < FIELD_SLOT + 4ull && end > FIELD_SLOT && field_n < FIELD_N) {
+        field_pc[field_n] = env ? env->active_tc.PC : 0;
+        field_val[field_n] = value;
+        field_sz[field_n] = size;
+        field_tb[field_n] = tb_ran;
+        field_n++;
     }
     return watch_base.mem_write ? watch_base.mem_write(env, gpa, value, size)
                                : LATM_MEM_OK;
@@ -480,6 +492,20 @@ void kmain(void)
             latx_bare_uart_puts(" next=");
             { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(s23_next>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
             latx_bare_uart_putc('\n');
+            latx_bare_uart_puts("latm-linux: field-writes=");
+            { char b[3]; b[0]="0123456789abcdef"[(field_n>>4)&15]; b[1]="0123456789abcdef"[field_n&15]; b[2]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_putc('\n');
+            for (unsigned f = 0; f < field_n; f++) {
+                latx_bare_uart_puts("latm-linux: field pc=");
+                { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(field_pc[f]>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+                latx_bare_uart_puts(" sz=");
+                { char b[3]; b[0]="0123456789abcdef"[(field_sz[f]>>4)&15]; b[1]="0123456789abcdef"[field_sz[f]&15]; b[2]=0; latx_bare_uart_puts(b); }
+                latx_bare_uart_puts(" tb=");
+                { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(field_tb[f]>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+                latx_bare_uart_puts(" val=");
+                { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(field_val[f]>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+                latx_bare_uart_putc('\n');
+            }
         }
 
         if (!jt_dumped && stop_pc == 0xffffffff81491a7cull) {
