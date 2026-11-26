@@ -246,6 +246,33 @@ void kmain(void)
 
     uint64_t t_start = now_ticks();
     for (unsigned i = 0; i < LINUX_TB_BUDGET; i++) {
+        /*
+         * Watch the registers that feed jalr/jr. A value that is not a canonical
+         * kernel/stack address cannot be right for either, so the first time one
+         * appears the dispatch that produced it is still the last one executed -
+         * which names the block to look at far better than a post-mortem dump.
+         */
+        for (int g = 25; g <= 31; g += 6) {
+            uint64_t v = env.active_tc.gpr[g];
+
+            if (v != 0 && (v < 0xffffffff80000000ull ||
+                           v >= 0xffffffff80000000ull + sizeof(ram))) {
+                latx_bare_uart_puts("latm-linux: poisoned gpr[");
+                { char b[9]; for (int k=7;k>=0;k--) b[7-k]="0123456789abcdef"[(g>>(k*4))&15]; b[8]=0; latx_bare_uart_puts(b); }
+                latx_bare_uart_puts("]=");
+                { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(v>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+                latx_bare_uart_puts(" after pc=");
+                { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(last_pc>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+                latx_bare_uart_puts(" at tbs=");
+                { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(tb_ran>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+                latx_bare_uart_putc('\n');
+                i = LINUX_TB_BUDGET;
+                break;
+            }
+        }
+        if (i >= LINUX_TB_BUDGET) {
+            break;
+        }
         /* A wild PC is where this kernel currently ends: report it instead of
          * trying to translate whatever the register holds. */
         if (env.active_tc.PC < 0xffffffff80000000ull ||

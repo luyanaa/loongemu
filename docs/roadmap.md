@@ -444,9 +444,22 @@ link, `$25` = target, image at **69 checks**.
 
 **But it was not what killed the kernel.** With the fix in, the same run still ends
 at `tbs=0x607002` with `bad pc=5ffb5495820b36ec` - identical block count, identical
-value. So the wild jump has another source; next diagnostic is a rolling snapshot of
-the last good dispatch (PC plus the GPRs that feed `jalr`/`jr`, sampled every few
-hundred blocks is enough to see which register the bad value appears in first). `latm-isa` keeps the 8-instruction case at `0x814911c8` as the green
+value. So the wild jump has another source.
+
+**The watchdog found the writer.** The harness now checks `$25` and `$31` on every
+dispatch and reports the first non-canonical value together with the PC that had just
+executed:
+
+    poisoned gpr[31]=5ffb5495820b36ec after pc=ffffffff8149051c at tbs=0x607002
+
+`0xffffffff8149051c` is a function epilogue: `ld $17,8($sp); ld $16,0($sp);
+ld $ra,0x18($sp); jr $ra; daddiu $sp,$sp,0x20`. `$ra` is therefore *loaded from the
+stack* and that slot already held the garbage - not a register-allocation bug but a
+corrupted stack frame, and the value is high-entropy rather than a stale pointer,
+which suggests an unwritten slot or a store to the wrong address. Next diagnostic:
+trap writes to the frame slot (`$sp+0x18` at that PC, around `0xffffffff81e9ae00`
+with the `$sp` seen in the post-mortem) or compare the guest `$sp` with what the
+kernel's own prologue expects. `latm-isa` keeps the 8-instruction case at `0x814911c8` as the green
 regression, and `KERNEL_BLOCK_INSNS=<n>` is a build knob for bisecting block
 limits (16 translates, 24 aborts at the first PC). That is the same conclusion the RVV and LATA work reached by a different
 route: count what you emit, do not time what you emulate.
