@@ -387,12 +387,22 @@ summary is printed - the "stall" was the translator dying on the kernel's next
 function. Eight instructions translate fine (0 branches, 191 words), which is why
 the narrow repro looked innocent.
 
-Next fix has two candidates, and the first is the cheap one: keep the 8-instruction
-regression and make the *block translator* bail out gracefully when itemps run out
-(retranslate the same PC with fewer instructions, as `target_disasm`'s limit already
-supports) instead of asserting; the alternative is to free a host GPR for a fourth
-temporary by re-mapping a guest register. Either way the acceptance test is the
-32-instruction translation at `0x814911c8`, which must translate without aborting. That is the same conclusion the RVV and LATA work reached by a different
+**The aborting block is now identified, and it is not the one the ISA repro used.**
+The harness prints the PC of every translation for its first 64 blocks; the last
+line before the stall is `translate pc=ffffffff81491208`, and that block is a long
+run of stack stores with **large negative displacements** (`sd $3,-0x7550($2)` and
+friends) - exactly the shape that needs an extra temporary for the displacement on
+top of the ones the `hcall` itself holds, which is the itemp starvation. Lowering
+the block limit to 16 does not help (tried), so it is not block length but that
+displacement+hcall combination.
+
+Next fix: `trans_store`/`trans_load` in system-memory mode must not hold the
+displacement temporary across `hcall` (and the helper prologue's own flush must not
+need a fourth). The acceptance test is now precise: translate the block at
+`0xffffffff81491208` - it must not abort - and the kernel must get past 1 050 000
+blocks. `latm-isa` keeps the 8-instruction case at `0x814911c8` as the green
+regression, and `KERNEL_BLOCK_INSNS=<n>` is a build knob for bisecting block
+limits (16 translates, 24 aborts at the first PC). That is the same conclusion the RVV and LATA work reached by a different
 route: count what you emit, do not time what you emulate.
 
 **The earlier attempt, kept because its failure mode is instructive:** `latm_set_ram_window()` plus an

@@ -1550,7 +1550,9 @@ build/latm_isa_test.o: baremetal/bare/latm_isa_test.c \
                        target/mips/latm/include/latm-platform.h \
                        target/mips/cpu.h target/mips/internal.h
 	@mkdir -p build
-	$(CLANG) $(LATM_BARE_CFLAGS) -c $< -o $@
+	$(CLANG) $(LATM_BARE_CFLAGS) \
+	   $(if $(KERNEL_BLOCK_INSNS),-DKERNEL_BLOCK_INSNS=$(KERNEL_BLOCK_INSNS),) \
+	   -c $< -o $@
 
 build/latm_miniglib.o: latx/compat/miniglib.c
 	@mkdir -p build

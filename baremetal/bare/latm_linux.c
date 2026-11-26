@@ -330,9 +330,16 @@ static int linux_run_one(CPUMIPSState *env)
         host = (uint8_t *)(uintptr_t)ent->code;
         goto have_host;
     } else {
-        int max = 32;
+        /* 32 aborts the translator on the kernel's post-BSS function
+         * (out of IR2 itemps); 16 translates it. See roadmap. */
+        int max = 16;
         int n;
 
+        if (tb_translated < 64u) {
+            latx_bare_uart_puts("latm-linux: translate pc=");
+            { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(env->active_tc.PC>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_putc('\n');
+        }
         host = tb_pool + tb_next;
         tb_next += 0x2000u;
         memset(&tb_live, 0, sizeof(tb_live));

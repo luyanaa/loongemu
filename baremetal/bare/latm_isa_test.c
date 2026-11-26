@@ -639,6 +639,12 @@ static uint32_t kernel_block_911c8[] __attribute__((aligned(16))) = {
     0xffb300b8, /* sd     $19,0xb8($sp) */
     0xffa30050, /* sd     $3,0x50($sp) */
     0x3c098149, /* lui    $9,0x8149 */
+    0x3c030040, 0x3c1381aa, 0x3c08819a, 0x0043182d,
+    0x65292d90, 0x66738ac0, 0x65088aa8, 0xfca28ab8,
+    0x3c07edb8, 0x3c0281aa, 0xffa40098, 0xfc438ab0,
+    0xffbf00e8, 0xffbe00e0, 0xffb700d8, 0xffb600d0,
+    0xffb500c8, 0xffb400c0, 0xffb200b0, 0xffb100a8,
+    0xffb000a0, 0xffa50010, 0x0109402f, 0xffa00068,
 };
 
 static void test_kernel_block_911c8(void)
@@ -647,7 +653,11 @@ static void test_kernel_block_911c8(void)
     int branches;
 
     latm_set_system_memory(true);
-    branches = translate_count_branches(kernel_block_911c8, 8, &words);
+#ifndef KERNEL_BLOCK_INSNS
+#define KERNEL_BLOCK_INSNS 8
+#endif
+    branches = translate_count_branches(kernel_block_911c8, KERNEL_BLOCK_INSNS,
+                                        &words);
     latx_bare_uart_puts("latm-isa: kernel-911c8 branches=");
     puthex((uint64_t)(branches < 0 ? 0xffff : (unsigned)branches));
     latx_bare_uart_puts(" words=");
