@@ -422,7 +422,19 @@ next defect is a corrupted jump target (a register holding a non-canonical value
 rather than anything block-related. Next diagnostic: run with the guard in place and
 watch the registers at the last good PC (`0xffffffff81492b10`), i.e. print the guest
 GPRs when the PC leaves the image's range, and compare the jump with the kernel's
-own disassembly at that address. `latm-isa` keeps the 8-instruction case at `0x814911c8` as the green
+own disassembly at that address.
+
+**Done, and it points at `jalr`'s link register.** The harness prints all 32 GPRs on
+the bad-PC path; in the failing run the wild value sits in **`$31` (`ra`)** while
+`$25` (`t9`) holds `0xffffffff81490050` - exactly the link address of the
+`jalr $25` at `0xffffffff81490048` in `kernel_entry`. A minimal ISA test reproduces
+it: `lui $25; ori $25; jalr $25; nop`, with the target placed in a separate array so
+target and link differ, ends with `$31 = link` (correct) **and `$25 = link` as
+well**, where `$25` must still hold the target. Suspect: for env-resident `$25`,
+`alloc_gpr_src(25)` takes a temporary from the same pool as `imm_opnd()`, and after
+`free_gpr_temp()` the link reuses that temporary while $25's cache entry still points
+at it. The test is not committed while it fails; next step is to fix the
+invalidate-on-free for that path and then land it as a regression. `latm-isa` keeps the 8-instruction case at `0x814911c8` as the green
 regression, and `KERNEL_BLOCK_INSNS=<n>` is a build knob for bisecting block
 limits (16 translates, 24 aborts at the first PC). That is the same conclusion the RVV and LATA work reached by a different
 route: count what you emit, do not time what you emulate.
