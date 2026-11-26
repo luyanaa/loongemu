@@ -557,6 +557,16 @@ nonzero value. The null path at `0xffffffff8149202c` (the target of the earlier
 `beqz` at `0xffffffff81491348`) only clears other fields and branches back to
 `0xffffffff81491350`; it does not fill `+0x28`.
 
+**No instruction in the image fills `$18+0x28` / `$23+0x28` with a live value.**
+Every other store to offset `0x28` is a stack spill (`$29` or `$30`), except
+`sd $2, 0x28($6)` at `0xffffffff81492aa8`, which stores a later bump-allocation
+return into the child block (`lw`/`sw` at `$6+0x60` in that block; the main object
+is `$18`/`$23`). The watch never saw that PC. Between the clear at `0xffffffff814912bc`
+and the test at `0xffffffff81491338` there is no call, so nothing could have stored
+a pointer and been skipped. The kernel clears the field and branches on zero on
+purpose; the non-zero consumers (`bnez` to `0xffffffff81492784` / `0xffffffff81491ac0`)
+are for a value this boot path never writes.
+
 **The watchdog found the writer.** The harness now checks `$25` and `$31` on every
 dispatch and reports the first non-canonical value together with the PC that had just
 executed:
