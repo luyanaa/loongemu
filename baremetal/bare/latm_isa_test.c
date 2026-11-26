@@ -623,6 +623,56 @@ static uint32_t bss_loop_code[] __attribute__((aligned(16))) = {
     0x14c4fffd, /* bne   $6,$4,-3 */
 };
 
+/*
+ * The first block the Debian kernel reaches after its BSS clear:
+ * 0xffffffff814911c8, called from kernel_entry via `jalr $25`. The harness stops
+ * dispatching entirely there, so the question is whether that block translates
+ * into host code that never returns. Eight instructions are enough to include the
+ * two stack stores and the `ld` from the globals.
+ */
+static uint32_t kernel_block_911c8[] __attribute__((aligned(16))) = {
+    0x67bdff10, /* daddiu $sp,$sp,-0xf0 */
+    0x3c038149, /* lui    $3,0x8149 */
+    0x00801025, /* move   $2,$4 */
+    0x3c0581aa, /* lui    $5,0x81aa */
+    0xdc642d50, /* ld     $4,0x2d50($3) */
+    0xffb300b8, /* sd     $19,0xb8($sp) */
+    0xffa30050, /* sd     $3,0x50($sp) */
+    0x3c098149, /* lui    $9,0x8149 */
+};
+
+static void test_kernel_block_911c8(void)
+{
+    int words = 0;
+    int branches;
+
+    latm_set_system_memory(true);
+    branches = translate_count_branches(kernel_block_911c8, 8, &words);
+    latx_bare_uart_puts("latm-isa: kernel-911c8 branches=");
+    puthex((uint64_t)(branches < 0 ? 0xffff : (unsigned)branches));
+    latx_bare_uart_puts(" words=");
+    puthex((uint64_t)(unsigned)words);
+    latx_bare_uart_putc('\n');
+    check(branches >= 0, 1, "kernel 0x814911c8 translates");
+#ifdef LATM_RUN_KERNEL_BLOCK
+    {
+        static LatmPlatform plat = { .mem_read = platform_read,
+                                     .mem_write = platform_write };
+        static uint8_t scratch[0x8000] __attribute__((aligned(16)));
+
+        /* $3 and $sp must land inside the scratch buffer: this platform treats
+         * the guest physical address as a host pointer. */
+        env.active_tc.gpr[3] = (uint64_t)(uintptr_t)(scratch + 0x3000);
+        env.active_tc.gpr[29] = (uint64_t)(uintptr_t)(scratch + 0x4000);
+        latm_platform_set(&plat);
+        run_block(kernel_block_911c8, 8, "kernel-911c8");
+        latm_platform_set(NULL);
+        check(1, 1, "kernel 0x814911c8 returns");
+    }
+#endif
+    latm_set_system_memory(false);
+}
+
 static void test_bss_loop_opcodes(void)
 {
     int words = 0;
@@ -805,6 +855,7 @@ void kmain(void)
     latx_bare_uart_puts(latx_cpu_has_lbt() ? "1" : "0");
     latx_bare_uart_puts("\n");
     lata_tr_data_init(&env);
+    test_kernel_block_911c8();
     test_bss_loop_opcodes();
     test_regcache_specialisation();
     {

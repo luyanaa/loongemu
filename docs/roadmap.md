@@ -362,7 +362,17 @@ per iteration) rather than in the harness.
 
 So the kernel now gets through its BSS clear and dies at the first call afterwards;
 wall-clock "rates" on this host were measuring how long a stuck run sat there, not
-throughput. That is the same conclusion the RVV and LATA work reached by a different
+throughput.
+
+**And the block itself is innocent.** Rebuilt in `latm-isa` from the ELF bytes at
+`0xffffffff814911c8` (daddiu $sp; lui $3; move $2,$4; lui $5; ld 0x2d50($3);
+sd $19,0xb8($sp); sd $3,0x50($sp); lui $9), it translates to **0 IR2 branches and
+191 host words** - straight-line code that cannot loop - and it is now a
+regression check in the image (67 checks). So "a single dispatch never returns"
+is not explained by this block: the stall is in the harness or dispatch layer after
+the BSS clear, not in the translated code. Next step needs a per-dispatch watchdog
+in the harness (print PC and helper state if a dispatch exceeds a bound) rather
+than more guessing from outside. That is the same conclusion the RVV and LATA work reached by a different
 route: count what you emit, do not time what you emulate.
 
 **The earlier attempt, kept because its failure mode is instructive:** `latm_set_ram_window()` plus an
