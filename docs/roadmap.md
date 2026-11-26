@@ -470,10 +470,20 @@ A first attempt to fix it by mapping guest `$31` to `NOT_DEF` (so it lives in th
 cache) fails one ISA check - `jal link = branch+8` reads 0 - because the `jal` exit
 path relies on that fixed mapping for its link store. Reverted.
 
-Next step, concrete: make `hcall()` save `la_ra` to `env->gpr[31]` immediately before
-the `jirl` and reload it immediately after (two instructions), instead of depending on
-the prologue/epilogue loops - that removes the window entirely and is local to one
-function.
+Tried that too: `hcall()` now saves `la_ra` to `env->gpr[31]` immediately before the
+`jirl` and reloads it immediately after. **The kernel's result is unchanged** - same
+block, same `0x5ffb5495820b36ec` - so the `la_ra` window is not where the value comes
+from either. Reverted (the two extra instructions bought nothing).
+
+Five hypotheses have now been eliminated with measurements (stack contents, `jalr`
+link, helper env pointer, helper PC, exception/trap path, frame loads, `la_ra`
+clobbering), and every blanket fix has either failed the ISA suite or changed nothing.
+The next attempt should stop looking for a writer and instead **freeze the state and
+replay it**: stop the harness at `0xffffffff8149051c`, dump all 32 GPRs plus the frame
+page, and replay that block in `latm-isa` by translating first and *then* loading the
+GPRs into `env` before entering through the normal `cs_bt_to_native` stub (which is
+what the earlier attempt skipped, which is why it saw `$sp == 0`). A failing replay
+there is a two-second loop instead of a 90-second kernel run.
 
 **The watchdog found the writer.** The harness now checks `$25` and `$31` on every
 dispatch and reports the first non-canonical value together with the PC that had just
