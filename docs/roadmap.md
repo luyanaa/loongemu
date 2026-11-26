@@ -475,8 +475,24 @@ holds the store address, not the guest instruction address**:
 that reads or saves the guest PC - a faulting access, `GETPC()`-based exception
 posting, anything spilling registers - then records nonsense, which explains a
 high-entropy `$ra` far better than a corrupted stack. Next step: check how
-`latm_set_pc()` and the `hcall()` argument staging interact, i.e. whether the `a0`
-(env) argument or the PC slot is being overwritten by a staged argument. `latm-isa` keeps the 8-instruction case at `0x814911c8` as the green
+`latm_set_pc()` and the `hcall()` argument staging interact.
+
+**Answered, and it is neither: the PC in a helper is the block-entry PC by design.**
+The translator records the PC it programs and the store helper records what it sees:
+`env` is exactly the harness's env pointer (`0xc64e120` both ways), and the PC seen is
+a *valid guest address* (`0xffffffff81491214`), just not the current instruction
+(`0xffffffff8149052c`), because `latm_set_pc()` runs at block entry rather than per
+instruction. So the earlier "PC tracks the data address" reading was a coincidence of
+the particular store addresses, and the argument staging is fine. The debug taps were
+removed again afterwards: they cost a comparison on every store helper call in the hot
+path and bought an answer, not a fix.
+
+That leaves the wild `$ra` still unexplained, with these eliminated: the stack (write
+watch), the `jalr` link register (fixed and regressed), the env pointer in helpers, and
+the helper PC. The most promising remaining lead is what the *epilogue block itself*
+loads: `ld $ra,0x18($sp)` reads a plausible saved value (`0xffffffff81490528`) as far
+as the watch can see, so the next step is to log the value at the moment of the load -
+inside `latm_helper_load` for that one address - rather than after the block. `latm-isa` keeps the 8-instruction case at `0x814911c8` as the green
 regression, and `KERNEL_BLOCK_INSNS=<n>` is a build knob for bisecting block
 limits (16 translates, 24 aborts at the first PC). That is the same conclusion the RVV and LATA work reached by a different
 route: count what you emit, do not time what you emulate.
