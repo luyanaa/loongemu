@@ -60,6 +60,11 @@ uint64_t latm_helper_sc(CPUMIPSState *env, uint32_t op, uint64_t addr,
                         uint64_t val);
 /* Helper-call counters for the boot harness (see helpers/memory.c). */
 void latm_regcache_release_temp(int reg, int temp);
+/* Exception tap (see helpers/exception.c): enable from the harness, read back the
+ * first eight raises with PC, EPC, BadVAddr and the cause code. */
+extern unsigned latm_exc_tap_enable;
+void latm_exc_tap_get(unsigned *n, uint64_t *pc, uint64_t *epc, uint64_t *bad,
+                      uint64_t *code, unsigned cap);
 void latm_helper_stats_get(uint64_t *loads, uint64_t *stores,
                            uint64_t *unaligned);
 uint64_t latm_helper_load(CPUMIPSState *env, uint32_t op, uint64_t addr);

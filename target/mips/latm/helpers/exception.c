@@ -67,6 +67,29 @@ static int mips_cause_code(uint32_t exception)
     }
 }
 
+/* Exception tap for the boot harness: the first few raises with the state that
+ * decides where the guest resumes. The library records, the harness prints. */
+unsigned latm_exc_tap_enable;
+unsigned latm_exc_tap_n;
+uint64_t latm_exc_tap_pc[8];
+uint64_t latm_exc_tap_epc[8];
+uint64_t latm_exc_tap_bad[8];
+uint64_t latm_exc_tap_code[8];
+
+void latm_exc_tap_get(unsigned *n, uint64_t *pc, uint64_t *epc, uint64_t *bad,
+                      uint64_t *code, unsigned cap)
+{
+    unsigned k = latm_exc_tap_n < cap ? latm_exc_tap_n : cap;
+
+    if (n) *n = latm_exc_tap_n;
+    for (unsigned i = 0; i < k; i++) {
+        if (pc) pc[i] = latm_exc_tap_pc[i];
+        if (epc) epc[i] = latm_exc_tap_epc[i];
+        if (bad) bad[i] = latm_exc_tap_bad[i];
+        if (code) code[i] = latm_exc_tap_code[i];
+    }
+}
+
 void do_raise_exception_err(CPUMIPSState *env, uint32_t exception,
                             int error_code, uintptr_t pc)
 {
@@ -86,6 +109,14 @@ void do_raise_exception_err(CPUMIPSState *env, uint32_t exception,
         }
     }
 
+    if (latm_exc_tap_enable && latm_exc_tap_n < 8u) {
+        unsigned i = latm_exc_tap_n++;
+
+        latm_exc_tap_pc[i] = env->active_tc.PC;
+        latm_exc_tap_epc[i] = epc;
+        latm_exc_tap_bad[i] = env->CP0_BadVAddr;
+        latm_exc_tap_code[i] = cause;
+    }
     env->llvalid = 0;
     env->lladdr = UINT64_MAX;
     env->error_code = error_code;

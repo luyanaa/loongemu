@@ -1444,6 +1444,7 @@ build/test_latm_interrupts: tests/test_latm_interrupts.c \
 	@mkdir -p build
 	$(CC) -I target/mips/latm/compat -I target/mips/latm/include \
 	      -I target/mips -I target/arm/lata/include -I shared/pvir/include -I target/arm/lata \
+	      -I shared/backend/loongarch/include \
 	      -I latx/compat -I latx/upstream/include -I . \
 	      $(CFLAGS) -Wno-gnu-empty-struct \
 	      tests/test_latm_interrupts.c target/mips/latm/helpers/cp0.c \

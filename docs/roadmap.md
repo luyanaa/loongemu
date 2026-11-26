@@ -499,9 +499,22 @@ land at `0x1e9adc0/0x1e9adc8/0x1e9add8` - all inside the watched range - so the
 epilogue's loads are apparently **not reached at all**. That moves the hypothesis from
 "the load returns garbage" to "the block traps before its loads", after which `$31`
 simply keeps whatever it had. The tap cost a comparison on every load helper call and
-was removed again; next step is to instrument the exception path - print
-PC/EPC/BadVAddr when an exception is raised during that block, or check whether
-`latm_check_interrupts` fires just before it. `latm-isa` keeps the 8-instruction case at `0x814911c8` as the green
+was removed again; next step was to instrument the exception path.
+
+**Done: no exception fires at all, and the block's frame loads never go through the
+helper.** The exception tap (PC, EPC, BadVAddr, cause code for the first eight
+raises) recorded **zero raises** over the whole 6.3 M-block run, and the earlier
+load tap recorded zero loads in the frame page. So the epilogue neither traps nor
+performs helper loads: its `ld` instructions are inlined, and `$31` ends up with
+0x5ffb5495820b36ec through some other path - the strongest remaining candidate is
+another instance of the register-cache lifetime class fixed for `free_gpr_temp()`,
+i.e. a value surviving in a host temporary after it was handed to a different owner
+(`alloc_gpr_dst()` reuse, `store_gpr_zero`, or the `latm_spill_*` slots around the
+delay slot).
+
+The exception tap stays in the tree: it costs a branch only on the raise path, and
+without it "no exception" would have remained a guess. `test_latm_interrupts` also
+needed the same `-I shared/backend/loongarch/include` fix as `test_latm_tlb` had. `latm-isa` keeps the 8-instruction case at `0x814911c8` as the green
 regression, and `KERNEL_BLOCK_INSNS=<n>` is a build knob for bisecting block
 limits (16 translates, 24 aborts at the first PC). That is the same conclusion the RVV and LATA work reached by a different
 route: count what you emit, do not time what you emulate.

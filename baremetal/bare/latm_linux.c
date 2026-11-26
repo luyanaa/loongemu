@@ -256,6 +256,7 @@ void kmain(void)
             }
         }
     }
+    latm_exc_tap_enable = 1;
     latm_system_apply_boot_args(&sys, &env);
     env.active_tc.PC = linux_entry;
     lata_tr_data_init(&env);
@@ -404,6 +405,23 @@ void kmain(void)
         latx_bare_uart_puts(" val=");
         { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(watch_val[w]>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
         latx_bare_uart_putc('\n');
+    }
+    {
+        unsigned n = 0;
+        uint64_t pc[8] = { 0 }, epc[8] = { 0 }, bad[8] = { 0 }, code[8] = { 0 };
+
+        latm_exc_tap_get(&n, pc, epc, bad, code, 8);
+        for (unsigned k = 0; k < 8 && k < n; k++) {
+            latx_bare_uart_puts("latm-linux: exc pc=");
+            { char b[17]; for (int q=15;q>=0;q--) b[15-q]="0123456789abcdef"[(pc[k]>>(q*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" epc=");
+            { char b[17]; for (int q=15;q>=0;q--) b[15-q]="0123456789abcdef"[(epc[k]>>(q*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" bad=");
+            { char b[17]; for (int q=15;q>=0;q--) b[15-q]="0123456789abcdef"[(bad[k]>>(q*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" code=");
+            { char b[9]; for (int q=7;q>=0;q--) b[7-q]="0123456789abcdef"[(code[k]>>(q*4))&15]; b[8]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_putc('\n');
+        }
     }
     latx_bare_uart_puts("latm-linux: done\n");
     *(volatile uint32_t *)(uintptr_t)0x100000 = 0x5555u; /* LVZ exit device */
