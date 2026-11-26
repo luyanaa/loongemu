@@ -456,8 +456,24 @@ one of those six writes is the garbage seen at runtime. That is a lifetimes prob
 again, but in the *spill sequence* rather than at a helper call - which is why the
 blanket fixes failed: they targeted helper entries, not these.
 
-Next step: dump that block's IR2 sequence (opcode plus operand registers) around the
-six `st.d` ops to see which temporary each reads and where it was last written.
+Next step was to dump that block's IR2 sequence around the six `st.d` ops.
+
+**Done, and the six spills all read host register 1 - `la_ra` - where guest `$31` lives
+by design.** That is the conflict: `hcall()` emits `li_d(f, fn); jirl ra, f, 0`, and
+`jirl` writes the *host* return address into the same `$ra` that is hosting guest
+`$31`. The prologue spills guest `$31` before the call and the epilogue reloads it
+after, which is why most calls survive - but any path that reads `la_ra` between the
+`jirl` and the reload sees the host link address instead of the guest return address,
+and that is exactly the high-entropy value the kernel ends up returning through.
+
+A first attempt to fix it by mapping guest `$31` to `NOT_DEF` (so it lives in the
+cache) fails one ISA check - `jal link = branch+8` reads 0 - because the `jal` exit
+path relies on that fixed mapping for its link store. Reverted.
+
+Next step, concrete: make `hcall()` save `la_ra` to `env->gpr[31]` immediately before
+the `jirl` and reload it immediately after (two instructions), instead of depending on
+the prologue/epilogue loops - that removes the window entirely and is local to one
+function.
 
 **The watchdog found the writer.** The harness now checks `$25` and `$31` on every
 dispatch and reports the first non-canonical value together with the PC that had just

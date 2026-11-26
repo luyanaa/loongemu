@@ -495,6 +495,23 @@ static int linux_run_one(CPUMIPSState *env)
                     st31++;
                 }
             }
+            if (env->active_tc.PC == 0xffffffff8149051cull) {
+                unsigned shown = 0;
+
+                for (IR2_INST *inst = td->first_ir2; inst != NULL && shown < 300u;
+                     inst = ir2_next(inst), shown++) {
+                    int op = (int)ir2_opcode(inst);
+
+                    if (op == LISA_ST_D && inst->op_count == 3 &&
+                        inst->_opnd[2]._imm32 == env_offset_gpr(31)) {
+                        latx_bare_uart_puts("latm-linux: st31 ir2#");
+                        { char b[9]; for (int k=7;k>=0;k--) b[7-k]="0123456789abcdef"[(shown>>(k*4))&15]; b[8]=0; latx_bare_uart_puts(b); }
+                        latx_bare_uart_puts(" val=r");
+                        { char b[9]; for (int k=7;k>=0;k--) b[7-k]="0123456789abcdef"[(inst->_opnd[0]._reg_num>>(k*4))&15]; b[8]=0; latx_bare_uart_puts(b); }
+                        latx_bare_uart_putc('\n');
+                    }
+                }
+            }
             if (st_env > 0 || env->active_tc.PC == 0xffffffff8149051cull) {
                 latx_bare_uart_puts("latm-linux: ir2 env-stores=");
                 { char b[9]; for (int k=7;k>=0;k--) b[7-k]="0123456789abcdef"[(st_env>>(k*4))&15]; b[8]=0; latx_bare_uart_puts(b); }
