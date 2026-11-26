@@ -396,11 +396,21 @@ top of the ones the `hcall` itself holds, which is the itemp starvation. Lowerin
 the block limit to 16 does not help (tried), so it is not block length but that
 displacement+hcall combination.
 
-Next fix: `trans_store`/`trans_load` in system-memory mode must not hold the
-displacement temporary across `hcall` (and the helper prologue's own flush must not
-need a fourth). The acceptance test is now precise: translate the block at
-`0xffffffff81491208` - it must not abort - and the kernel must get past 1 050 000
-blocks. `latm-isa` keeps the 8-instruction case at `0x814911c8` as the green
+**Fixed, and it was one operand class, not the displacement.** The ten
+system-memory call sites materialised their `op` selector with `imm_opnd()`, which
+allocates an itemp and holds it across `hcall()`; `hcall()` already stages
+immediate operands itself, so that temporary was pure overhead - one itemp of the
+three, for the whole call. Every site now passes a real `IR2_OPND_IMM` and the
+matching `ra_free_itemp()` calls are gone. Result on the real kernel: **6 000 000
+blocks in 2.4 s with no abort**, the last translated PC `0xffffffff81492b10` -
+a million-block-scale run through its own code, where before it died at 1 050 000.
+
+Gates after the change: `latm-isa` 66/0, `test-latm` 14 suites exit 0, and the
+board's three SMP assertions (`latm-smp`, `latm-ipi`, `latm-llsc-ipi`) still pass.
+
+Next: raise the budget and see where the kernel stops now that blocks are no longer
+the limit, and add a `latm-isa` regression that translates the previously aborting
+block at `0xffffffff81491208` so this cannot come back. `latm-isa` keeps the 8-instruction case at `0x814911c8` as the green
 regression, and `KERNEL_BLOCK_INSNS=<n>` is a build knob for bisecting block
 limits (16 translates, 24 aborts at the first PC). That is the same conclusion the RVV and LATA work reached by a different
 route: count what you emit, do not time what you emulate.

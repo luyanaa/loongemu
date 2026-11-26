@@ -311,11 +311,10 @@ static bool trans_alu(DisasContext *s)
     case MIPS_ALU_DADD:
     case MIPS_ALU_DSUB: {
         latm_set_pc(s);
-        IR2_OPND a = imm_opnd(op);
+        IR2_OPND a = ir2_opnd_new(IR2_OPND_IMM, op);
         IR2_OPND b = rs;
         IR2_OPND c = rt;
         IR2_OPND r = hcall3((uintptr_t)latm_helper_arith, a, b, c);
-        ra_free_itemp(a._reg_num);
         store_gpr32_dst_f(s->ir1.rd, r);
         break;
     }
@@ -408,11 +407,10 @@ static bool trans_alu_imm(DisasContext *s)
     case MIPS_IMM_ADDI:
     case MIPS_IMM_DADDI: {
         latm_set_pc(s);
-        IR2_OPND a = imm_opnd(op);
+        IR2_OPND a = ir2_opnd_new(IR2_OPND_IMM, op);
         IR2_OPND b = rs;
         IR2_OPND c = imm_opnd(imm);
         IR2_OPND r = hcall3((uintptr_t)latm_helper_arith, a, b, c);
-        ra_free_itemp(a._reg_num);
         ra_free_itemp(c._reg_num);
         store_gpr32_dst_f(s->ir1.rt, r);
         break;
@@ -652,10 +650,9 @@ static bool trans_muldiv(DisasContext *s)
     case MIPS_MD_DDIV:
     case MIPS_MD_DDIVU: {
         latm_set_pc(s);
-        IR2_OPND a = imm_opnd(op);
+        IR2_OPND a = ir2_opnd_new(IR2_OPND_IMM, op);
         IR2_OPND b = rs, c = rt;
         hcall3((uintptr_t)latm_helper_div, a, b, c);
-        ra_free_itemp(a._reg_num);
         break;
     }
     case MIPS_MD_MADD:
@@ -663,10 +660,9 @@ static bool trans_muldiv(DisasContext *s)
     case MIPS_MD_MSUB:
     case MIPS_MD_MSUBU: {
         latm_set_pc(s);
-        IR2_OPND a = imm_opnd(op);
+        IR2_OPND a = ir2_opnd_new(IR2_OPND_IMM, op);
         IR2_OPND b = rs, c = rt;
         hcall3((uintptr_t)latm_helper_madd, a, b, c);
-        ra_free_itemp(a._reg_num);
         break;
     }
     case MIPS_MD_CLZ:
@@ -760,9 +756,8 @@ static bool trans_load(DisasContext *s)
     emit_addr(addr, s->ir1.rs, s->ir1.simm);
 
     if (latm_system_memory && op <= MIPS_MEM_LD) {
-        IR2_OPND a = imm_opnd(op);
+        IR2_OPND a = ir2_opnd_new(IR2_OPND_IMM, op);
         IR2_OPND r = hcall2((uintptr_t)latm_helper_load, a, addr);
-        ra_free_itemp(a._reg_num);
         store_gpr_dst_f(s->ir1.rt, r);
         ra_free_itemp(addr._reg_num);
         return true;
@@ -770,12 +765,11 @@ static bool trans_load(DisasContext *s)
     if (latm_system_memory &&
         (op == MIPS_MEM_LWL || op == MIPS_MEM_LWR ||
          op == MIPS_MEM_LDL || op == MIPS_MEM_LDR)) {
-        IR2_OPND a = imm_opnd(op);
+        IR2_OPND a = ir2_opnd_new(IR2_OPND_IMM, op);
         IR2_OPND old = alloc_gpr_src(s->ir1.rt);
         IR2_OPND r = hcall3((uintptr_t)latm_helper_unaligned_load,
                             a, addr, old);
         free_gpr_temp(old, s->ir1.rt);
-        ra_free_itemp(a._reg_num);
         if (op == MIPS_MEM_LWL || op == MIPS_MEM_LWR)
             store_gpr32_dst_f(s->ir1.rt, r);
         else
@@ -801,11 +795,10 @@ static bool trans_load(DisasContext *s)
         /* Reservation semantics are handled by a C helper in system mode. */
         latm_set_pc(s);
         {
-            IR2_OPND a = imm_opnd(op);
+            IR2_OPND a = ir2_opnd_new(IR2_OPND_IMM, op);
             IR2_OPND b = addr;
             IR2_OPND r = hcall2((uintptr_t)latm_helper_ll, a, b);
-            ra_free_itemp(a._reg_num);
-            store_gpr_dst_f(s->ir1.rt, r);
+                store_gpr_dst_f(s->ir1.rt, r);
         }
         break;
     default:
@@ -826,9 +819,8 @@ static bool trans_store(DisasContext *s)
     emit_addr(addr, s->ir1.rs, s->ir1.simm);
 
     if (latm_system_memory && op >= MIPS_MEM_SB && op <= MIPS_MEM_SD) {
-        IR2_OPND a = imm_opnd(op);
+        IR2_OPND a = ir2_opnd_new(IR2_OPND_IMM, op);
         hcall3((uintptr_t)latm_helper_store, a, addr, rt);
-        ra_free_itemp(a._reg_num);
         ra_free_itemp(addr._reg_num);
         free_gpr_temp(rt, s->ir1.rt);
         return true;
@@ -836,9 +828,8 @@ static bool trans_store(DisasContext *s)
     if (latm_system_memory &&
         (op == MIPS_MEM_SWL || op == MIPS_MEM_SWR ||
          op == MIPS_MEM_SDL || op == MIPS_MEM_SDR)) {
-        IR2_OPND a = imm_opnd(op);
+        IR2_OPND a = ir2_opnd_new(IR2_OPND_IMM, op);
         hcall3((uintptr_t)latm_helper_unaligned_store, a, addr, rt);
-        ra_free_itemp(a._reg_num);
         ra_free_itemp(addr._reg_num);
         free_gpr_temp(rt, s->ir1.rt);
         return true;
@@ -857,12 +848,11 @@ static bool trans_store(DisasContext *s)
     case MIPS_MEM_SCD:
         latm_set_pc(s);
         {
-            IR2_OPND a = imm_opnd(op);
+            IR2_OPND a = ir2_opnd_new(IR2_OPND_IMM, op);
             IR2_OPND b = addr;
             IR2_OPND c = rt;
             IR2_OPND r = hcall3((uintptr_t)latm_helper_sc, a, b, c);
-            ra_free_itemp(a._reg_num);
-            store_gpr_dst_f(s->ir1.rt, r);
+                store_gpr_dst_f(s->ir1.rt, r);
         }
         break;
     default:
