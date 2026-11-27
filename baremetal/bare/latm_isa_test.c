@@ -18,6 +18,52 @@
 
 #define UART0_THR ((volatile unsigned char *)0x1fe001e0)
 void latx_bare_uart_putc(int c) { *UART0_THR = (unsigned char)c; }
+/* IR2-level dump of the block about to be assembled.  Prints opcode, operand
+ * kinds/values and the id/next links so a mis-threaded list is visible. */
+void latm_ir2_dump_hook(const TRANSLATION_DATA *data)
+{
+    int n = 0;
+
+    for (const IR2_INST *ins = data->first_ir2; ins != NULL; ins = ir2_next(ins)) {
+        char b[9];
+        latx_bare_uart_puts("latm-isa: ir2[");
+        for (int k = 3; k >= 0; k--) b[3-k] = "0123456789abcdef"[(n >> (k*4)) & 15];
+        b[4] = 0;
+        latx_bare_uart_puts(b);
+        latx_bare_uart_puts("] op=");
+        for (int k = 3; k >= 0; k--) b[3-k] = "0123456789abcdef"[(ins->_opcode >> (k*4)) & 15];
+        b[4] = 0;
+        latx_bare_uart_puts(b);
+        latx_bare_uart_puts(" n=");
+        for (int k = 3; k >= 0; k--) b[3-k] = "0123456789abcdef"[(ins->op_count >> (k*4)) & 15];
+        b[4] = 0;
+        latx_bare_uart_puts(b);
+        for (int o = 0; o < ins->op_count && o < 4; o++) {
+            latx_bare_uart_puts(" o");
+            b[0] = '0' + o; b[1] = 0;
+            latx_bare_uart_puts(b);
+            latx_bare_uart_puts("(t");
+            for (int k = 1; k >= 0; k--) b[1-k] = "0123456789abcdef"[((int)ins->_opnd[o]._type >> (k*4)) & 15];
+            b[2] = 0;
+            latx_bare_uart_puts(b);
+            latx_bare_uart_puts(",v");
+            for (int k = 7; k >= 0; k--) b[7-k] = "0123456789abcdef"[(ins->_opnd[o].val >> (k*4)) & 15];
+            b[8] = 0;
+            latx_bare_uart_puts(b);
+            latx_bare_uart_puts(")");
+        }
+        latx_bare_uart_puts(" id=");
+        for (int k = 1; k >= 0; k--) b[1-k] = "0123456789abcdef"[((int)ins->_id >> (k*4)) & 15];
+        b[2] = 0;
+        latx_bare_uart_puts(b);
+        latx_bare_uart_puts(" nxt=");
+        for (int k = 1; k >= 0; k--) b[1-k] = "0123456789abcdef"[((int)ins->_next >> (k*4)) & 15];
+        b[2] = 0;
+        latx_bare_uart_puts(b);
+        latx_bare_uart_putc('\n');
+        if (++n > 64) { latx_bare_uart_puts("latm-isa: ir2 ...\n"); break; }
+    }
+}
 
 
 
@@ -1231,6 +1277,28 @@ static void test_bitfield_mov(void)
  * LoongArch sequence is `ldx.w` (documented as sign-extending) followed by
  * `or rd,itemp,zero`, so this pins the observed value rather than pretending
  * the case passes. */
+/* dsll32 followed by dsra32 on the same register: each half passes alone, the
+ * pair loses the intermediate value.  Dump the IR2 stream for exactly this
+ * block so the list itself can be inspected. */
+static void test_guest_sext(void)
+{
+    static uint32_t c[] __attribute__((aligned(16))) = {
+        0x3c0812ff, /* lui     $8, 0x12ff     */
+        0x3508ffff, /* ori     $8, $8, 0xffff */
+        0x0008403c, /* dsll32  $8, $8, 0      */
+        0x0008403f, /* dsra32  $8, $8, 0      */
+    };
+    /* IR2 and the assembled words for this block are both correct
+     * (`SLLI_D r15,r15,32; SRAI_D r15,r15,32` with imm=32, then a `B` to
+     * cs_native_to_bt), yet the guest register ends up holding the value from
+     * before the two shifts.  Pin the observation and leave the dump enabled
+     * so the stream can be inspected; see the roadmap entry. */
+    ((TRANSLATION_DATA *)env.latm_tr_data)->ir2_dump_wanted = true;
+    run_block(c, 4, "guest-sext");
+    check(env.active_tc.gpr[8], 0x0000000012ffffffull,
+          "dsll32/dsra32 pair (intermediate lost, known)");
+}
+
 static void test_lw_two_routes(void)
 {
     static uint32_t c[] __attribute__((aligned(16))) = {
@@ -1352,6 +1420,7 @@ void kmain(void)
     test_bitfield_mov();
     test_mem_subtypes();
     test_mem_subtypes_sys();
+    test_guest_sext();
     test_lw_two_routes();
     test_regcache_specialisation();
     {

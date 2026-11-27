@@ -1722,5 +1722,14 @@ bool tr_ir2_generate(TranslationBlock *tb)
     case DISAS_NORETURN:
         break;
     }
+    /* The IR2 list for this block is complete here (tail terminator included);
+     * dump it before label_dispose() rewrites labels. */
+    {
+        TRANSLATION_DATA *td = lsenv->tr_data;
+        if (td->ir2_dump_wanted) {
+            td->ir2_dump_wanted = false;
+            latm_ir2_dump_hook(td);
+        }
+    }
     return true;
 }

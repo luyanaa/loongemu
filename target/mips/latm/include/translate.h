@@ -45,6 +45,7 @@ typedef bool (*TranslateFn)(DisasContext *s);
 extern TranslateFn translate_functions[MIPS_OP__COUNT];
 
 void target_disasm(TranslationBlock *tb, int *max_insns, void *cpu);
+void latm_ir2_dump_hook(const TRANSLATION_DATA *data);
 bool tr_ir2_generate(TranslationBlock *tb);
 
 #endif

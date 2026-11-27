@@ -805,10 +805,18 @@ static uint32_t latm_rebase_ir2_offset(const TRANSLATION_DATA *data,
     return new_offset;
 }
 #endif
+/* Weak hook: embedders may want to see the IR2 stream before it is assembled.
+ * Default is a no-op so the core stays free of console dependencies. */
+__attribute__((weak)) void latm_ir2_dump_hook(const TRANSLATION_DATA *data)
+{
+    (void)data;
+}
+
 int tr_ir2_assemble(const void *code_start_addr)
 {
     label_dispose();
     TRANSLATION_DATA *data = lsenv->tr_data;
+
 #if defined(LOONGEMU_IR2_PEEPHOLE) && LOONGEMU_IR2_PEEPHOLE
     LatmTbInsnMap *map = data->active_insn_map;
     if (map != NULL) {

@@ -91,6 +91,7 @@ typedef struct TRANSLATION_DATA {
     uint64_t cs_native_to_bt_ret_0;
     uint64_t cs_native_to_bt;
     bool lock_held;
+    bool ir2_dump_wanted;
 
     union {
         uint32 all_temp_status;
