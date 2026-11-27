@@ -216,11 +216,20 @@ static void milestone_scan(void)
         }
         if (log_contains(log, len, milestones[i].marker)) {
             milestone_hit[i] = true;
-            if (i > milestone_highest) {
+            /* A panic is an event, not progress: a kernel that panicked during
+             * early init reached level 1, not level 12. It is reported by name
+             * and left out of the ordering. */
+            if (i != NMILESTONES - 1 && i > milestone_highest) {
                 milestone_highest = i;
             }
             latx_bare_uart_puts("latr-linux: milestone ");
             latx_bare_uart_puts(milestones[i].name);
+            /* The level is repeated here, not only at exit, because a boot this
+             * slow is normally killed by the runner's watchdog: a gate that
+             * reads a value printed only on the exit path fails every long run
+             * for the wrong reason. */
+            latx_bare_uart_puts("\nlatr-linux: milestone-level=");
+            put_dec(i + 1);
             latx_bare_uart_puts("\n");
         }
     }

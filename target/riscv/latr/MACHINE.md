@@ -321,6 +321,18 @@ chain 检查、翻译、汇编、插入、I-cache 同步 —— 都记在 `TB_CO
 **`PERF=1` 的构建注意。** `latr/build/*.o` 不记录 `PERF`，所以切到 `PERF=1` 前必须
 `make -C latr clean`，否则会链上非 PERF 编的 `perf.o`（符号未定义）或混用两套对象。
 
+**它没有卡住：满一小时后越过了 `mem auto-init`。** 2026-11-27 用 7.3.4 跑了整整
+3600 s（2208 万块），控制台多出一行：
+
+```
+[    0.000000] SLUB: HWalign=64, Order=0-3, MinObjects=0, CPUs=1, Nodes=1
+```
+
+也就是里程碑 **level 6**（`slub`），`uart` 从 2326 字节涨到 2400。所以 §9.3/§9.4 里
+"停在 `mem auto-init` 之后"是**预算不足**，不是死循环——把它跑够就是对的。这也意味着
+此前的"慢"里混了宿主机争用：同一台机器安静时 60 s 就能到 earlycon（约 66k 块/s），
+争用时那 1 小时只走了 2208 万块（约 6.1k 块/s），差 10 倍。
+
 **卡点已经符号化（2026-11-27）。** `vmlinux-to-elf` 恢复的 kallsyms 可用，但它的
 符号值整体偏 `+0x401`（用 panic trace 里 `show_stack`、`vpanic`、`dump_stack_lvl`、
 `mount_root_generic` 四个锚点交叉验证，偏移量完全一致）。校正后，卡住时反复进入的
@@ -400,7 +412,16 @@ harness 在内核自己的控制台输出里认里程碑，命中就打印一次
 
 `make latr-linux-run` 断言 `LATR_LINUX_MIN_LEVEL`（默认 3，即已经达到并保持的
 earlycon）。**这个阈值只许上调**：调到刚好通过一次跑得不远的运行，等于把回归
-写成通过。
+写成通过。默认留在 3 是因为默认的 `LATR_LINUX_TIMEOUT` 只有 1800 s，而 level 6 需要
+跑满一小时；要断言 level 6 就同时抬时限：
+
+```sh
+make latr-linux-run LATR_LINUX_MIN_LEVEL=6 LATR_LINUX_TIMEOUT=3600
+```
+
+已端到端验证两条分支：`LINUX_STEPS=200` 的镜像在默认阈值下报
+`milestone level 3 (minimum 3)` 并通过；同一镜像把阈值抬到 6 则失败并打印当时的
+里程碑与最后几行控制台。
 
 实测一次 640 万块的运行报 `milestone-level=5`，命中 `start_kernel`、`sbi`、
 `earlycon`、`initmem`、`mem_auto_init` 五个 —— 与 §9.3 里"停在 mem auto-init
