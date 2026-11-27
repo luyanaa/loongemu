@@ -888,6 +888,90 @@ static void test_csr(void)
 }
 
 
+/*
+ * minstret accounting.
+ *
+ * The contract, written before the accounting is changed: minstret counts
+ * retired instructions, so (a) a block of N executed instructions adds N,
+ * (b) mcountinhibit.IR stops the counting, (c) an instruction that traps does
+ * not retire and must not be counted, and (d) a write to mcountinhibit inside
+ * the block applies to the instructions that follow it.
+ *
+ * (c) and (d) are the two that a per-block "add N at the exit" scheme gets
+ * wrong, which is why they are pinned here first.
+ */
+#define CSR_MINSTRET_ 0xb02
+#define CSR_MCOUNTINHIBIT_ 0x320
+
+static void test_minstret_accounting(void)
+{
+    /* (a) four plain ALU instructions retire and are counted. */
+    static const uint32_t four[] = {
+        0x00100093, /* addi x1, x0, 1 */
+        0x00200113, /* addi x2, x0, 2 */
+        0x00300193, /* addi x3, x0, 3 */
+        0x00400213, /* addi x4, x0, 4 */
+    };
+    /* (b) the same block with mcountinhibit.IR set. */
+    /* (c) two instructions, then an illegal one that traps. */
+    static const uint32_t trap_at_3[] = {
+        0x00100093, /* addi x1, x0, 1 */
+        0x00200113, /* addi x2, x0, 2 */
+        0x30009073, /* csrrw x0, mstatus, x1 -- illegal from U-mode */
+        0x00300193, /* addi x3, x0, 3 (must not run) */
+    };
+    /* (d) write mcountinhibit inside the block, then two more instructions. */
+    static const uint32_t inhibit_mid_block[] = {
+        0x00500093, /* addi x1, x0, 5        (counted)         */
+        0x00400113, /* addi x2, x0, 4        (counted)         */
+        0x0040a073, /* csrrs x0, mcountinhibit, x1 (IR set)     */
+        0x00600193, /* addi x3, x0, 6        (must not count)  */
+        0x00700213, /* addi x4, x0, 7        (must not count)  */
+    };
+    uint64_t before;
+
+    /* (a) */
+    reset_guest_state();
+    env.privilege = LATR_RISCV_PRIV_M;
+    env.csr[CSR_MINSTRET_] = 0;
+    before = env.csr[CSR_MINSTRET_];
+    check(latr_execute_block(four, 4), 1, "minstret: four-instruction block");
+    check(env.csr[CSR_MINSTRET_] - before, 4,
+          "minstret counts every retired instruction");
+
+    /* (b) */
+    reset_guest_state();
+    env.privilege = LATR_RISCV_PRIV_M;
+    env.csr[CSR_MINSTRET_] = 0;
+    env.csr[CSR_MCOUNTINHIBIT_] = 4; /* IR */
+    before = env.csr[CSR_MINSTRET_];
+    check(latr_execute_block(four, 4), 1, "minstret: inhibited block runs");
+    check(env.csr[CSR_MINSTRET_] - before, 0,
+          "mcountinhibit.IR stops the minstret count");
+
+    /* (c) the trapping instruction does not retire. */
+    reset_guest_state();
+    env.privilege = LATR_RISCV_PRIV_U;
+    env.csr[CSR_MINSTRET_] = 0;
+    env.gpr[1] = 0;
+    before = env.csr[CSR_MINSTRET_];
+    check(run_block(trap_at_3, 4, -1, 0), 1, "minstret: trapping block");
+    check(env.exception, 2, "minstret: the privileged CSR trapped as illegal");
+    check(env.csr[CSR_MINSTRET_] - before, 2,
+          "minstret counts only the instructions before the trap");
+
+    /* (d) the inhibit write takes effect for the rest of the block. */
+    reset_guest_state();
+    env.privilege = LATR_RISCV_PRIV_M;
+    env.csr[CSR_MINSTRET_] = 0;
+    env.gpr[1] = 4;
+    before = env.csr[CSR_MINSTRET_];
+    check(latr_execute_block(inhibit_mid_block, 5), 1,
+          "minstret: mid-block inhibit write");
+    check(env.csr[CSR_MINSTRET_] - before, 2,
+          "minstret stops counting after a mid-block inhibit write");
+}
+
 static void test_hpm_stateen(void)
 {
     static const uint32_t block[] = {
@@ -7652,6 +7736,7 @@ void kmain(void)
     test_fp_fma();
     test_fp_reserved_rounding();
     test_csr();
+    test_minstret_accounting();
     test_hpm_stateen();
     test_mstatus_fs_vs();
     test_delegation();

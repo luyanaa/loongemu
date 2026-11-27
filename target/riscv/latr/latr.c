@@ -936,6 +936,8 @@ void tr_init(void *tb)
     data->label_num = 0;
     data->tb_code_sym_count = 0;
     data->tb_code_sym_overflow = 0;
+    data->instret_pending = 0;
+    data->instret_dynamic = 0;
 #if LATR_IR2_LIST_CHECK
     latr_ir2_cap_at_tb_start = data->ir2_inst_num_max;
 #endif
@@ -1107,6 +1109,28 @@ static int find_pc(const RiscvIR1 *insns, int count, uint64_t pc)
     return -1;
 }
 
+/* Opcodes that cannot raise a guest exception, so they need no minstret flush. */
+static bool latr_insn_cannot_trap(LatrRiscvOpcode opcode)
+{
+    switch (opcode) {
+    case LATR_RV_LUI: case LATR_RV_AUIPC:
+    case LATR_RV_ADDI: case LATR_RV_ADDIW: case LATR_RV_SLTI: case LATR_RV_SLTIU:
+    case LATR_RV_ANDI: case LATR_RV_ORI: case LATR_RV_XORI:
+    case LATR_RV_SLLI: case LATR_RV_SRLI: case LATR_RV_SRAI:
+    case LATR_RV_SLLIW: case LATR_RV_SRLIW: case LATR_RV_SRAIW:
+    case LATR_RV_ADD: case LATR_RV_SUB: case LATR_RV_SLL: case LATR_RV_SLT:
+    case LATR_RV_SLTU: case LATR_RV_XOR: case LATR_RV_SRL: case LATR_RV_SRA:
+    case LATR_RV_OR: case LATR_RV_AND:
+    case LATR_RV_ADDW: case LATR_RV_SUBW: case LATR_RV_SLLW: case LATR_RV_SRLW:
+    case LATR_RV_SRAW:
+    case LATR_RV_BEQ: case LATR_RV_BNE: case LATR_RV_BLT: case LATR_RV_BGE:
+    case LATR_RV_BLTU: case LATR_RV_BGEU: case LATR_RV_JAL:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool has_direct_target(LatrRiscvOpcode opcode)
 {
     switch (opcode) {
@@ -1202,6 +1226,28 @@ bool tr_ir2_generate(TranslationBlock *tb)
         }
     }
 
+    /*
+     * mcountinhibit.IR can be changed by a CSR write inside the block, which
+     * would invalidate a single entry-time check (test (d) in
+     * latr_isa_test's minstret section). Blocks that contain any CSR write keep
+     * the old per-instruction accounting; everything else evaluates the inhibit
+     * bit once and adds a constant at each exit.
+     */
+    data->instret_dynamic = 0;
+    for (int i = 0; i < count; i++) {
+        switch (insns[i].opcode) {
+        case LATR_RV_CSRRW: case LATR_RV_CSRRS: case LATR_RV_CSRRC:
+        case LATR_RV_CSRRWI: case LATR_RV_CSRRSI: case LATR_RV_CSRRCI:
+            if (insns[i].arg.rd != 0 || insns[i].opcode == LATR_RV_CSRRW ||
+                insns[i].opcode == LATR_RV_CSRRWI) {
+                data->instret_dynamic = 1;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    data->instret_pending = 0;
     for (int i = 0; i < count; i++) {
         LatrTranslateContext ctx = { .ir1 = &insns[i] };
         if (has_direct_target(insns[i].opcode)) {
@@ -1231,6 +1277,15 @@ bool tr_ir2_generate(TranslationBlock *tb)
         data->tb_insn_bind_cnt[i] = latr_regcache_snapshot_gpr_binds(
             data->tb_insn_binds[i]);
         (la_label)(labels[i]);
+        /*
+         * Instructions that can trap must leave minstret exact for everything
+         * that retired before them, so the pending count is materialised first.
+         * The whitelist is the set of opcodes that cannot raise: anything not
+         * listed here flushes, which is conservative by construction.
+         */
+        if (!latr_insn_cannot_trap(insns[i].opcode)) {
+            latr_emit_instret_flush();
+        }
         latr_tag(LATR_TAG_INSN);
 #if LATR_OPCODE_STATS
         {
@@ -1279,6 +1334,7 @@ bool tr_ir2_generate(TranslationBlock *tb)
     }
 
     latr_regcache_flush();
+    latr_emit_instret_flush();
     latr_tag(LATR_TAG_PC_EXIT);
     (la_label)(labels[count]);
     store_pc_constant(pc);
@@ -1286,6 +1342,7 @@ bool tr_ir2_generate(TranslationBlock *tb)
 
     for (int i = 0; i < exit_count; i++) {
         latr_regcache_flush();
+        latr_emit_instret_flush();
         latr_tag(LATR_TAG_PC_EXIT);
         (la_label)(exits[i].label);
         store_pc_constant(exits[i].pc);

@@ -142,6 +142,16 @@ typedef struct TRANSLATION_DATA {
     uint8_t curr_ir1_skipped_eflags;
     /* Filled by tr_ir2_generate(), consumed by tr_ir2_assemble(). */
     int tb_insn_count;
+    /*
+     * minstret accounting for the block being translated. `instret_dynamic` is
+     * set when the block contains a CSR write (which can change mcountinhibit
+     * mid-block, so the entry-time check would be wrong); `instret_pending`
+     * counts retired instructions not yet materialised into env.csr[MINSTRET].
+     */
+    int instret_dynamic;
+    int instret_pending;
+    /* Whether the inhibit bit has already been tested at block entry. */
+    int instret_checked;
     uint64_t tb_insn_pc[LATR_TB_MAP_SPANS];
     uint32_t tb_insn_len[LATR_TB_MAP_SPANS];
     int tb_insn_label[LATR_TB_MAP_SPANS + 1];

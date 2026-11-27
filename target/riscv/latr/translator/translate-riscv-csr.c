@@ -934,27 +934,64 @@ void latr_raise_mem_fault(const RiscvIR1 *ir1)
     transfer_exception(cause, ir1->pc, trap_value);
 }
 
-void latr_emit_instret(void)
+/*
+ * minstret accounting.
+ *
+ * The obvious implementation -- load mcountinhibit, test IR, load minstret, add
+ * one, store, on every guest instruction -- was 19.8% of all emitted host code
+ * (measured, see latr.h LATR_TAG_*), which is absurd for a counter nobody reads
+ * in a normal boot.
+ *
+ * Instead the retired count accumulates in the translator and is materialised
+ * (a) before any instruction that can trap, so a trap leaves minstret exact for
+ * the instructions that did retire, and (b) at every block exit. A block that
+ * writes a CSR keeps the per-instruction path: such a write can clear IR
+ * mid-block, and an entry-time test would then be wrong (test (d) in
+ * latr_isa_test's minstret section).
+ */
+void latr_emit_instret_flush(void)
 {
-    latr_tag(LATR_TAG_INSTRET);
-    IR2_OPND inhibit = a0_ir2_opnd;
-    IR2_OPND count = a1_ir2_opnd;
-    IR2_OPND one = a2_ir2_opnd;
-    IR2_OPND skip = ir2_opnd_new_type(IR2_OPND_LABEL);
+    TRANSLATION_DATA *data = lsenv->tr_data;
+    IR2_OPND inhibit;
+    IR2_OPND count;
+    IR2_OPND delta;
+    IR2_OPND skip;
 
+    if (data->instret_dynamic && data->instret_pending == 0) {
+        return;
+    }
+    if (data->instret_pending == 0) {
+        return;
+    }
+    latr_tag(LATR_TAG_INSTRET);
+    inhibit = a0_ir2_opnd;
+    count = a1_ir2_opnd;
+    delta = a2_ir2_opnd;
+    skip = ir2_opnd_new_type(IR2_OPND_LABEL);
     latr_env_load_d(inhibit, env_offset_csr(CSR_MCOUNTINHIBIT));
     la_andi(inhibit, inhibit, 4);
     la_bne(inhibit, zero_ir2_opnd, skip);
     latr_env_load_d(count, env_offset_csr(CSR_MINSTRET));
-    li_d(one, 1);
-    la_add_d(count, count, one);
+    li_d(delta, data->instret_pending);
+    la_add_d(count, count, delta);
     latr_env_store_d(count, env_offset_csr(CSR_MINSTRET));
     la_label(skip);
-    /* Tags are sticky by design (ir2_allocate stamps whatever is current), so
-     * every tagged helper has to hand the tag back. Without this the first
-     * helper in an instruction absorbs everything the instruction emits after
-     * it: fault read 45% of all IR2 while its own body is four instructions. */
+    data->instret_pending = 0;
     latr_tag(LATR_TAG_INSN);
+}
+
+void latr_emit_instret(void)
+{
+    TRANSLATION_DATA *data = lsenv->tr_data;
+
+    if (!data->instret_dynamic) {
+        data->instret_pending++;
+        return;
+    }
+    /* CSR-writing block: one at a time, through the same materialisation. */
+    data->instret_pending = 1;
+    latr_emit_instret_flush();
+    data->instret_pending = 0;
 }
 
 static void emit_csr_access_checks(int csr, IR2_OPND illegal)
