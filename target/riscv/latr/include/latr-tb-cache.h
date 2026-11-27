@@ -28,6 +28,10 @@ typedef struct LatrTbKey {
  * 64-entry direct scan, but a linear scan over a large flat table makes every
  * dispatch O(entries). Four ways per set keeps lookup at four key comparisons
  * while making full-table flushes rare.
+ *
+ * Eight ways were tried (1024 entries, still fitting the 4 MiB arena) against an
+ * AOSC boot: translations per million entries fell only from 11.1 to 9.6, while
+ * host ticks per entry rose from ~2017 to ~2409. No win, so it is back to four.
  */
 #define LATR_TB_CACHE_WAYS 4
 #define LATR_TB_CACHE_SETS 128
