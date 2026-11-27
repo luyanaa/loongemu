@@ -911,6 +911,23 @@ bool latr_service_sbi(CPUArchState *env, LoongemuSbi *sbi)
     env->pc = env->csr[0x341] + 4; /* mepc points at the ECALL */
     env->exception = 0;
     env->privilege = LATR_RISCV_PRIV_S;
+    /*
+     * Return the way `mret` would, because that is what the guest's own
+     * firmware does: MIE <- MPIE, MPIE <- 1, MPP <- U. Leaving MPIE/MPP as the
+     * trap entry set them would make the *next* S-mode trap resume with
+     * interrupts disabled in M-mode, and a kernel that later takes a real trap
+     * (a page fault it handles) would silently lose its timer.
+     */
+    {
+        uint64_t status = env->csr[0x300];
+        uint64_t mpie = (status >> 7) & 1u;
+
+        status &= ~(UINT64_C(1) << 3);          /* MIE <- MPIE */
+        status |= mpie << 3;
+        status |= UINT64_C(1) << 7;             /* MPIE <- 1 */
+        status &= ~(UINT64_C(3) << 11);         /* MPP <- U */
+        env->csr[0x300] = status;
+    }
     return true;
 }
 

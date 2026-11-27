@@ -770,7 +770,7 @@ print("const unsigned int latr_system_guest_elf_len = %d;" % len(d))' $< > $@
 
 latr-sys-ref: build/latr_system_guest.elf
 	@rm -f build/latr_system_guest_qemu.log
-	@timeout 15 $(QEMU_RISCV64) -M virt -cpu rv64 -m 128M -bios none \
+	@$(if $(TIMEOUT),$(TIMEOUT) 15,) $(QEMU_RISCV64) -M virt -cpu rv64 -m 128M -bios none \
 	     -kernel $< -display none -monitor none \
 	     -serial file:build/latr_system_guest_qemu.log -no-reboot 2>/dev/null || true
 	@grep -a 'SYS:' build/latr_system_guest_qemu.log | tail -1
@@ -978,16 +978,36 @@ build/latr_boot_guest_blob.o: build/latr_boot_guest_blob.c
 	$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
 	         -fno-builtin -O2 -c $< -o $@
 
+# S-mode SBI guest for the boot smoke: an ecall-based BASE probe plus a DBCN
+# write, linked at the machine's kernel slot (+2 MiB) so it runs in S-mode with
+# no firmware underneath it.
+build/latr_sbi_guest.bin: baremetal/bare/latr_sbi_guest.S
+	@mkdir -p build
+	$(CLANG) --target=riscv64-unknown-elf -march=rv64i -mabi=lp64 \
+	         -mcmodel=medany -ffreestanding -nostdlib -fno-builtin \
+	         -fuse-ld=lld -Wl,-Ttext=0x80200000 -Wl,-e,_start \
+	         -Wl,--no-relax $< -o build/latr_sbi_guest.elf
+	$(OBJCOPY) -O binary build/latr_sbi_guest.elf $@
+
+build/latr_sbi_guest_blob.o: build/latr_sbi_guest.bin
+	@python3 -c 'import sys; d=open(sys.argv[1],"rb").read(); \
+print("const unsigned char latr_sbi_guest[] = {" + ",".join(str(b) for b in d) + "};"); \
+print("const unsigned int latr_sbi_guest_len = %d;" % len(d))' $< > build/latr_sbi_guest_blob.c
+	@$(CLANG) --target=loongarch64-unknown-none-elf -ffreestanding -nostdlib \
+	         -fno-builtin -O2 -c build/latr_sbi_guest_blob.c -o $@
+
 build/bare_latr_boot.elf: baremetal/bare/latr_boot_smoke.c latr-core \
                           target/riscv/latr/include/latr-system.h \
                           target/riscv/latr/include/latr.h \
                           build/latr_boot_guest_blob.o \
+                          build/latr_sbi_guest_blob.o \
                           build/latr_miniglib.o build/latr_libc_min.o \
                           baremetal/bare/bare.lds
 	@mkdir -p build
 	$(CLANG) $(LATR_BARE_CFLAGS) -I build -c baremetal/bare/latr_boot_smoke.c -o build/latr_boot_smoke.o
 	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
 	   build/latr_boot_smoke.o build/latr_boot_guest_blob.o \
+	   build/latr_sbi_guest_blob.o \
 	   build/latr_miniglib.o build/latr_libc_min.o \
 	   latr/build/liblatr_core.a -o $@
 
@@ -1183,6 +1203,57 @@ latr-bench:
 
 latr-bench-run: latr-isa-run latr-smp-run latr-rand-diff latr-fault-diff
 	@$(PYTHON) tools/latr_bench.py
+
+# ---- Linux boot on the LATR machine ----
+#
+# Local-only, like latm-linux-run: the kernel is a distribution artifact, not
+# vendored. AOSC's /boot/vmlinux-* is a PE-wrapped flat Image and QEMU's
+# -kernel loads the file whole, so the file is used as-is; `make
+# latr-linux-extract` pulls it out of a .deb for you.
+LATR_LINUX_IMAGE ?=
+LATR_LINUX_TIMEOUT ?= 1800
+
+build/linux/Image: $(LATR_LINUX_IMAGE)
+	@test -n "$(LATR_LINUX_IMAGE)" || { \
+	   echo "latr-linux: set LATR_LINUX_IMAGE to a RISC-V Image/vmlinux"; \
+	   exit 1; }
+	@mkdir -p build/linux
+	cp "$(LATR_LINUX_IMAGE)" $@
+
+latr-linux-extract:
+	@test -n "$(LATR_LINUX_DEB)" || { \
+	   echo "latr-linux-extract: set LATR_LINUX_DEB to a riscv64 kernel .deb"; \
+	   exit 1; }
+	@mkdir -p build/linux/deb
+	cd build/linux/deb && ar x ../../$(LATR_LINUX_DEB) && \
+	   zstd -dc data.tar.zst | tar -x ./boot/vmlinux-* && \
+	   cp ./boot/vmlinux-* ../Image
+	@ls -l build/linux/Image
+
+build/latr_linux_blob.o: baremetal/bare/latr_linux_blob.S build/linux/Image
+	@mkdir -p build
+	$(CLANG) $(LATR_BARE_CFLAGS) -c $< -o $@
+
+build/bare_latr_linux.elf: baremetal/bare/latr_linux.c \
+                           build/latr_linux_blob.o latr-core \
+                           build/latr_miniglib.o build/latr_libc_min.o \
+                           baremetal/bare/bare.lds
+	@mkdir -p build
+	$(CLANG) $(LATR_BARE_CFLAGS) -c $< -o build/latr_linux.o
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	   build/latr_linux.o build/latr_linux_blob.o \
+	   build/latr_miniglib.o build/latr_libc_min.o \
+	   latr/build/liblatr_core.a -o $@
+
+latr-linux-image: build/bare_latr_linux.elf
+
+# No PASS assertion on purpose: this target reports how far the kernel got.
+latr-linux-run: build/bare_latr_linux.elf
+	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_latr_linux.elf" \
+	     QEMU_LOG="build/latr_linux.log" QEMU_DONE="latr-linux: done" \
+	     QEMU_TIMEOUT=$(LATR_LINUX_TIMEOUT) CPU=la464 QEMU_MEM=1G \
+	     bash scripts/run_qemu_lata.sh || true
+	@grep -a 'latr-linux' build/latr_linux.log | tail -20
 
 # Delete both logs first: a stale log left by an earlier seed would otherwise be
 # compared and "pass". A missing signature is then a hard error.

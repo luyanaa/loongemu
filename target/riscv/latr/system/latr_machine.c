@@ -44,6 +44,37 @@ static void format_node(char *out, const char *prefix, uint32_t value)
 
 static void latr_machine_msip_notify(void *opaque, uint32_t hartid);
 
+/* SBI service callbacks; defined next to the machine's SBI dispatcher. */
+static int64_t machine_sbi_set_timer(void *opaque, uint64_t when);
+static int64_t machine_sbi_send_ipi(void *opaque, uint64_t hart_mask_base,
+                                    uint32_t hart_mask);
+static int64_t machine_sbi_fence_i(void *opaque, uint64_t hart_mask_base,
+                                   uint32_t hart_mask);
+static int64_t machine_sbi_sfence_vma(void *opaque, uint64_t hart_mask_base,
+                                      uint32_t hart_mask, uint64_t start,
+                                      uint64_t size);
+static int64_t machine_sbi_sfence_vma_asid(void *opaque,
+                                           uint64_t hart_mask_base,
+                                           uint32_t hart_mask, uint64_t start,
+                                           uint64_t size, uint64_t asid);
+static int64_t machine_sbi_hart_start(void *opaque, uint64_t hartid,
+                                      uint64_t start_addr, uint64_t arg);
+static int64_t machine_sbi_hart_stop(void *opaque);
+static int64_t machine_sbi_hart_get_status(void *opaque, uint64_t hartid,
+                                           uint32_t *status);
+static int64_t machine_sbi_hart_suspend(void *opaque, uint32_t suspend_type,
+                                        uint64_t resume_addr, uint64_t arg);
+static int64_t machine_sbi_system_reset(void *opaque, uint32_t reset_type,
+                                        uint32_t reset_reason);
+static int64_t machine_sbi_debug_write(void *opaque, uint64_t guest_addr,
+                                       uint32_t size, uint64_t *written);
+static int64_t machine_sbi_debug_read(void *opaque, uint64_t guest_addr,
+                                      uint32_t size, uint64_t *read);
+static int64_t machine_sbi_debug_write_byte(void *opaque, uint8_t byte);
+static int64_t machine_sbi_console_putchar(void *opaque, uint8_t byte);
+static int64_t machine_sbi_console_getchar(void *opaque, int32_t *ch);
+static int64_t machine_sbi_clear_ipi(void *opaque);
+
 int latr_machine_init(LatrMachine *m, uint8_t *ram, uint64_t ram_size,
                       uint32_t nharts, uint8_t *work, uint32_t work_size)
 {
@@ -126,6 +157,27 @@ int latr_machine_init(LatrMachine *m, uint8_t *ram, uint64_t ram_size,
      * hart, and the write is the only moment the target is reachable. */
     m->sys.clint.msip_notify = latr_machine_msip_notify;
     m->sys.clint.msip_opaque = m;
+    m->sbi_calls.set_timer = machine_sbi_set_timer;
+    m->sbi_calls.send_ipi = machine_sbi_send_ipi;
+    m->sbi_calls.fence_i = machine_sbi_fence_i;
+    m->sbi_calls.sfence_vma = machine_sbi_sfence_vma;
+    m->sbi_calls.sfence_vma_asid = machine_sbi_sfence_vma_asid;
+    m->sbi_calls.hart_start = machine_sbi_hart_start;
+    m->sbi_calls.hart_stop = machine_sbi_hart_stop;
+    m->sbi_calls.hart_get_status = machine_sbi_hart_get_status;
+    m->sbi_calls.hart_suspend = machine_sbi_hart_suspend;
+    m->sbi_calls.system_reset = machine_sbi_system_reset;
+    m->sbi_calls.debug_write = machine_sbi_debug_write;
+    m->sbi_calls.debug_read = machine_sbi_debug_read;
+    m->sbi_calls.debug_write_byte = machine_sbi_debug_write_byte;
+    m->sbi_calls.console_putchar = machine_sbi_console_putchar;
+    m->sbi_calls.console_getchar = machine_sbi_console_getchar;
+    m->sbi_calls.clear_ipi = machine_sbi_clear_ipi;
+    m->sbi.calls = &m->sbi_calls;
+    m->sbi.opaque = m;
+    m->sbi.hart_count = nharts;
+    m->sbi.impl_id = LOONGEMU_SBI_IMPL_ID;
+    m->sbi.impl_version = 1;
     return 1;
 }
 
@@ -149,6 +201,249 @@ void latr_machine_wake_hart(LatrMachine *m, uint32_t hartid)
 uint64_t latr_machine_wake_events(const LatrMachine *m)
 {
     return m == NULL ? 0 : m->wake_events;
+}
+
+/* --- SBI services ---------------------------------------------------------
+ *
+ * The machine answers the S-mode `ecall` itself (see machine_service_sbi), so
+ * these callbacks are the only place where an SBI side effect happens. Every
+ * guest address they take is bounds-checked against the RAM window: the guest
+ * chooses it, and a raw `ram + (addr - base)` on an out-of-range value would
+ * read or write the harness's own memory.
+ */
+static uint8_t *machine_guest_ptr(LatrMachine *m, uint64_t addr, uint64_t len)
+{
+    if (addr < m->sys.ram_base || len > m->sys.ram_size ||
+        addr - m->sys.ram_base > m->sys.ram_size - len) {
+        return NULL;
+    }
+    return m->sys.ram + (addr - m->sys.ram_base);
+}
+
+static int64_t machine_sbi_set_timer(void *opaque, uint64_t when)
+{
+    LatrMachine *m = opaque;
+
+    /* Sstc semantics: the comparator is the hart's own stimecmp, in vclock
+     * nanoseconds (LATR's timebase is 1 GHz). */
+    __atomic_store_n(&m->harts[m->boot_hart].env.csr[LATR_RISCV_CSR_STIMECMP],
+                     when, __ATOMIC_RELEASE);
+    latr_machine_wake_hart(m, m->boot_hart);
+    return LOONGEMU_SBI_SUCCESS;
+}
+
+static int64_t machine_sbi_send_ipi(void *opaque, uint64_t hart_mask_base,
+                                    uint32_t hart_mask)
+{
+    LatrMachine *m = opaque;
+
+    for (uint32_t hart = 0; hart < m->nharts; hart++) {
+        bool selected = hart_mask_base == UINT64_MAX
+                            ? hart != m->boot_hart
+                            : (hart >= hart_mask_base &&
+                               (hart_mask &
+                                (UINT32_C(1) << (hart - hart_mask_base))) != 0);
+        if (!selected || !m->harts[hart].online) {
+            continue;
+        }
+        /* CLINT MSIP is what the target's mip sees; the notify hook wakes it. */
+        __atomic_store_n(&m->sys.clint.msip[hart], 1u, __ATOMIC_RELEASE);
+        latr_machine_wake_hart(m, hart);
+    }
+    return LOONGEMU_SBI_SUCCESS;
+}
+
+static void machine_shootdown_masked(LatrMachine *m, uint64_t hart_mask_base,
+                                     uint32_t hart_mask, int fence_i,
+                                     uint32_t asid)
+{
+    for (uint32_t hart = 0; hart < m->nharts; hart++) {
+        bool selected = hart_mask_base == UINT64_MAX
+                            ? true
+                            : (hart >= hart_mask_base &&
+                               (hart_mask &
+                                (UINT32_C(1) << (hart - hart_mask_base))) != 0);
+        if (!selected || !m->harts[hart].online) {
+            continue;
+        }
+        if (fence_i) {
+            latr_tb_shootdown_all(&m->harts[hart].tb_cache);
+        } else {
+            latr_tb_shootdown_asid(&m->harts[hart].tb_cache, asid);
+        }
+    }
+}
+
+static int64_t machine_sbi_fence_i(void *opaque, uint64_t hart_mask_base,
+                                   uint32_t hart_mask)
+{
+    machine_shootdown_masked(opaque, hart_mask_base, hart_mask, 1, 0);
+    return LOONGEMU_SBI_SUCCESS;
+}
+
+static int64_t machine_sbi_sfence_vma(void *opaque, uint64_t hart_mask_base,
+                                      uint32_t hart_mask, uint64_t start,
+                                      uint64_t size)
+{
+    LatrMachine *m = opaque;
+    uint32_t asid = (uint32_t)m->harts[m->boot_hart].env.csr[0x180];
+
+    (void)start;
+    (void)size;
+    /* The TB key already carries the satp root, and a range fence is a subset
+     * of the ASID fence this applies; conservative and correct. */
+    machine_shootdown_masked(m, hart_mask_base, hart_mask, 0, asid & 0xffffu);
+    return LOONGEMU_SBI_SUCCESS;
+}
+
+static int64_t machine_sbi_sfence_vma_asid(void *opaque,
+                                           uint64_t hart_mask_base,
+                                           uint32_t hart_mask, uint64_t start,
+                                           uint64_t size, uint64_t asid)
+{
+    (void)start;
+    (void)size;
+    machine_shootdown_masked(opaque, hart_mask_base, hart_mask, 0,
+                             (uint32_t)asid);
+    return LOONGEMU_SBI_SUCCESS;
+}
+
+static int64_t machine_sbi_hart_start(void *opaque, uint64_t hartid,
+                                      uint64_t start_addr, uint64_t arg)
+{
+    LatrMachine *m = opaque;
+    LatrMachineHart *h;
+
+    if (hartid >= m->nharts) {
+        return LOONGEMU_SBI_ERR_INVALID_PARAM;
+    }
+    h = &m->harts[hartid];
+    if (h->online && hartid != m->boot_hart) {
+        return LOONGEMU_SBI_ERR_ALREADY_STARTED;
+    }
+    h->online = true;
+    h->env.gpr[10] = hartid; /* a0 = hartid */
+    h->env.gpr[11] = arg;    /* a1 = opaque */
+    h->env.pc = start_addr;
+    h->env.privilege = LATR_RISCV_PRIV_S;
+    latr_hart_set_command(&h->park, LATR_HART_RUN);
+    latr_machine_wake_hart(m, (uint32_t)hartid);
+    return LOONGEMU_SBI_SUCCESS;
+}
+
+static int64_t machine_sbi_hart_stop(void *opaque)
+{
+    LatrMachine *m = opaque;
+
+    latr_hart_set_command(&m->harts[m->boot_hart].park, LATR_HART_STOP);
+    return LOONGEMU_SBI_SUCCESS;
+}
+
+static int64_t machine_sbi_hart_get_status(void *opaque, uint64_t hartid,
+                                           uint32_t *status)
+{
+    LatrMachine *m = opaque;
+
+    *status = m->harts[hartid].online ? LOONGEMU_SBI_HSM_STATE_STARTED
+                                      : LOONGEMU_SBI_HSM_STATE_STOPPED;
+    return LOONGEMU_SBI_SUCCESS;
+}
+
+static int64_t machine_sbi_hart_suspend(void *opaque, uint32_t suspend_type,
+                                        uint64_t resume_addr, uint64_t arg)
+{
+    LatrMachine *m = opaque;
+    LatrMachineHart *h = &m->harts[m->boot_hart];
+
+    if (suspend_type != 0) {
+        return LOONGEMU_SBI_ERR_NOT_SUPPORTED;
+    }
+    /* Default retentive suspend: park until an interrupt arrives, then resume
+     * at the instruction after the ecall (which the caller already set). */
+    (void)resume_addr;
+    (void)arg;
+    latr_hart_set_command(&h->park, LATR_HART_PARKED);
+    return LOONGEMU_SBI_SUCCESS;
+}
+
+static int64_t machine_sbi_system_reset(void *opaque, uint32_t reset_type,
+                                        uint32_t reset_reason)
+{
+    LatrMachine *m = opaque;
+
+    (void)reset_reason;
+    /* Both reset types end the machine the same way here: a reboot is not a
+     * supported target, and pretending otherwise would loop silently. */
+    m->sys.exit_request = reset_type == LOONGEMU_SBI_SRST_TYPE_SHUTDOWN
+                              ? UINT64_C(0x5555)
+                              : UINT64_C(0x7777);
+    return LOONGEMU_SBI_SUCCESS;
+}
+
+static int64_t machine_sbi_debug_write(void *opaque, uint64_t guest_addr,
+                                       uint32_t size, uint64_t *written)
+{
+    LatrMachine *m = opaque;
+    const uint8_t *src = machine_guest_ptr(m, guest_addr, size);
+
+    if (src == NULL) {
+        *written = 0;
+        return LOONGEMU_SBI_ERR_INVALID_ADDRESS;
+    }
+    for (uint32_t i = 0; i < size; i++) {
+        loongemu_uart16550_write(&m->sys.uart, 0, src[i], 1);
+    }
+    *written = size;
+    return LOONGEMU_SBI_SUCCESS;
+}
+
+static int64_t machine_sbi_debug_read(void *opaque, uint64_t guest_addr,
+                                      uint32_t size, uint64_t *read)
+{
+    LatrMachine *m = opaque;
+    uint8_t *dst = machine_guest_ptr(m, guest_addr, size);
+
+    if (dst == NULL) {
+        *read = 0;
+        return LOONGEMU_SBI_ERR_INVALID_ADDRESS;
+    }
+    for (uint32_t i = 0; i < size; i++) {
+        dst[i] = (uint8_t)loongemu_uart16550_read(&m->sys.uart, 0, 1);
+    }
+    *read = size;
+    return LOONGEMU_SBI_SUCCESS;
+}
+
+static int64_t machine_sbi_debug_write_byte(void *opaque, uint8_t byte)
+{
+    LatrMachine *m = opaque;
+
+    loongemu_uart16550_write(&m->sys.uart, 0, byte, 1);
+    return LOONGEMU_SBI_SUCCESS;
+}
+
+static int64_t machine_sbi_console_putchar(void *opaque, uint8_t byte)
+{
+    return machine_sbi_debug_write_byte(opaque, byte);
+}
+
+static int64_t machine_sbi_console_getchar(void *opaque, int32_t *ch)
+{
+    LatrMachine *m = opaque;
+
+    /* The UART model returns 0 when the receive queue is empty; there is no
+     * separate "no data" status here, and nothing in the current tree feeds the
+     * receiver. */
+    *ch = (int32_t)(uint8_t)loongemu_uart16550_read(&m->sys.uart, 0, 1);
+    return LOONGEMU_SBI_SUCCESS;
+}
+
+static int64_t machine_sbi_clear_ipi(void *opaque)
+{
+    LatrMachine *m = opaque;
+
+    __atomic_store_n(&m->sys.clint.msip[m->boot_hart], 0u, __ATOMIC_RELEASE);
+    return LOONGEMU_SBI_SUCCESS;
 }
 
 const LatrChainControl *latr_machine_chain(const LatrMachine *m, uint32_t hartid)
@@ -981,6 +1276,25 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
         latr_chain_break(&h->chain, LATR_CHAIN_BREAK_WFI);
         latr_idle_advance(&h->env);
         h->env.wfi_pending = 0;
+    }
+    /*
+     * An S-mode `ecall` is the guest asking the supervisor for an SBI service,
+     * not a trap the guest can handle itself: with no firmware there is no
+     * M-mode handler, and leaving it latched stops a kernel at its very first
+     * console or timer call. When firmware *is* loaded (real OpenSBI), the
+     * ecall belongs to that firmware's own trap handler and must not be
+     * intercepted here.
+     *
+     * This has to run before the latch is cleared below: latr_service_sbi()
+     * keys on env.exception == 9 and clears it itself, so servicing after the
+     * clear would see a plain return and never answer the call.
+     *
+     * The translator already recorded mcause=9 with MPP=S and redirected PC to
+     * mtvec, so the service rewrites a0/a1, resumes past the ecall and returns
+     * to S-mode.
+     */
+    if (!m->firmware_loaded && latr_service_sbi(&h->env, &m->sbi)) {
+        __atomic_add_fetch(&m->sbicalls_serviced, 1, __ATOMIC_RELAXED);
     }
     /* Guest traps are normal: the translator already redirected PC to the
      * trap vector, so just clear the latched indicators. Keep the first one

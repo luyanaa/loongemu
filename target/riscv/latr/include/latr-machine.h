@@ -132,6 +132,15 @@ typedef struct LatrMachine {
     LatrMachineEnterTb enter_tb;
     LatrMachineTranslateTb translate_tb;
     LatrMachineTranslatedTb translated_tb;
+    /*
+     * SBI services for the S-mode `ecall` this machine intercepts. A Linux
+     * kernel that boots without firmware (or with a stand-in) issues TIME,
+     * IPI, RFENCE, HSRT and DBCN through `ecall`; the machine answers them
+     * itself and never exposes an M-mode trap handler to the guest.
+     */
+    LoongemuSbi sbi;
+    LoongemuSbiCalls sbi_calls;
+    uint64_t sbicalls_serviced;
     char bootargs[256];
     LatrMachineHart harts[LATR_MACHINE_MAX_HARTS];
 } LatrMachine;

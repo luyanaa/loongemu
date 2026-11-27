@@ -190,3 +190,36 @@ make latr-opensbi-run OPEN_SBI_TBS=1500000 OPEN_SBI_STALL=0 OPEN_SBI_CODEWORDS=0
 调试三探针的语义：`T` 有而 `D` 无 = 卡在翻译器；`D` 有而 `>` 无返回 = 生成代码没回来；
 `tb == entered == ret` 三条计数一致 = 每个块都正常 `ret` 回 dispatch。
 
+
+## 9. 第 2 级（Linux earlycon）：已开机，未过 BSS/早期初始化
+
+**已具备**：`make latr-linux-run LATR_LINUX_IMAGE=<Image>` 把发行版内核整体装到 `+2 MiB`，
+机器在无固件 S 模式下启动它，并**自己服务 S 模式的 `ecall`**（BASE/TIME/IPI/RFENCE/HSM/SRST/DBCN，
+`latr_machine.c` 的 `machine_sbi_*`；有固件时该拦截关闭，ecall 归 OpenSBI）。
+`make latr-boot-run` 的第 6 段（`sbi=1`）钉住这条链路：BASE 返回 2.0、DBCN 字节真的落到 UART、
+返回状态与 `mret` 一致（MPP 清零、MPIE 置 1、PC 越过 ecall）。
+
+**未通过**：AOSC `linux-kernel-7.1.13`（PE 包装的 flat Image，QEMU `-kernel` 也是整文件载入）
+跑到 ~18 万块后，在 guest `0x81ae8672` 处宿主 `INE (ecode=13)`、`ERA=0` 停下，`uart=0`、`sbi=0`
+——内核还没发出第一次 SBI 调用。已排除的**测试**问题：缺少宿主 `EENTRY`（现已在
+`baremetal/bare/latr_linux.c` 装上，并打开 `EUEN.FPE/SXE/ASXE/BTE`）、把 BSS 清零循环误判为停滞
+（判定改为"本轮 0 块"）、以及用 `last_code` 当故障点（C1 之后块首是 `NATIVE_INTERNAL`，
+现在改成在块内找 `GUEST_ACCESS` span）。
+
+**下一步的证据面**（harness 已打印）：最后 48 个翻译 PC、16 个 guest GPR、最后进入的 arena 指针，
+以及 fault 时 `ERA/ESTAT/BADV`。目前指向"块内某条指令跳到了宿主地址 0"，即生成代码把 `$ra`
+当成了块返回地址以外的值；对应 guest 序列是 `auipc ra,0; jalr -0x62(ra)` 之后的一段内联。
+
+### 9.1 复现（本机）
+
+```sh
+# 取得镜像（不 vendored）：任一 riscv64 内核 .deb，或已经解开的 vmlinux/Image
+make latr-linux-extract LATR_LINUX_DEB=build/linux/linux-kernel.deb
+make latr-linux-run LATR_LINUX_IMAGE=build/linux/Image LATR_LINUX_TIMEOUT=600
+# 期望：latr-linux: begin image=... / entry=0000000080200000 / tbs=... 
+# 失败时读 build/latr_linux.log 的 HOSTFAULT 一行与 last pcs 环。
+```
+
+`-m 1G` 是必须的：内核 ~61 MiB 代码+数据，128 MiB 机器会在 `mem_init` 里失败，
+日志看起来像翻译器 bug。harness 的 backing store 放在 LoongArch `virt` 的 highmem 窗口
+（`0x80000000` 起，1 GiB 机器下 768 MiB），低端 256 MiB 留给 VMM 映像本身。

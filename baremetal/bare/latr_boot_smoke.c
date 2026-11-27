@@ -17,6 +17,8 @@
 extern void latr_enter_tb(void *env, void *code);
 extern const unsigned char latr_boot_guest[];
 extern const unsigned int latr_boot_guest_len;
+extern const unsigned char latr_sbi_guest[];
+extern const unsigned int latr_sbi_guest_len;
 
 #define UART0_THR ((volatile uint8_t *)0x1fe001e0)
 void latx_bare_uart_putc(int c) { *UART0_THR = (uint8_t)c; }
@@ -192,6 +194,7 @@ static uint32_t machine_saved_dtb;
 static int machine_saved_disk;
 static int machine_saved_initrd;
 static int machine_saved_smp;
+static int machine_saved_sbi;
 
 #define VIO_TEST_BASE    UINT64_C(0x80800000)
 #define VIO_DESC_GPA     (VIO_TEST_BASE + 0x000)
@@ -585,16 +588,47 @@ static int run_machine_phase(void)
      * medeleg was set to all-ones by the firmware and the hart runs in
      * S-mode, so cause 13 (load page fault) targets S: sepc/scause/stval are
      * written, privilege stays S, and the PC lands on the stvec base (the
-     * payload never programmed stvec, so that base is 0). */
+     * payload never programmed stvec, so that base is 0).
+     *
+     * The probe has to fault inside a *guest-access* span. `last_code` points
+     * at the block's first instruction, and since C1 that span is classified
+     * NATIVE_INTERNAL (a plain lui has no guest-visible fault), so the
+     * dispatcher correctly refuses to project a trap there. Walk the recorded
+     * spans of the last block and pick the load/store it actually executed.
+     */
     {
         LatrMachineFaultInfo fault;
-        uint64_t expected_pc = machine.last_pc;
         LatrMachineHart *hart = &machine.harts[0];
+        const LatrTbInsnSpan *span = NULL;
+        uint64_t expected_pc = 0;
+        LatrTranslatorContext *saved;
 
+        saved = latr_context_bind(hart->ctx);
+        latr_set_cpu_env(&hart->env);
+        for (const LatrTbInsnMap *map = hart->ctx->tr_data.insn_map_list;
+             map != NULL && span == NULL; map = map->next) {
+            if (!map->valid || map->code_base != (uintptr_t)hart->last_code) {
+                continue;
+            }
+            for (uint32_t i = 0; i < map->count; i++) {
+                if (map->spans[i].site == LATR_RECOV_GUEST_ACCESS) {
+                    span = &map->spans[i];
+                    expected_pc = span->guest_pc;
+                    break;
+                }
+            }
+        }
+        latr_context_restore(saved);
+        if (span == NULL) {
+            machine_fail("host-fault-span");
+            return 0;
+        }
         if (!latr_machine_host_fault(&machine, 0,
-                                     (uintptr_t)machine.harts[0].last_code,
+                                     (uintptr_t)hart->last_code +
+                                         span->native_start,
                                      13, UINT64_C(0xdead), NULL, NULL, &fault) ||
             !fault.resolved || fault.guest_pc != expected_pc ||
+            fault.site != LATR_RECOV_GUEST_ACCESS ||
             hart->env.csr[0x141] != expected_pc ||          /* sepc */
             hart->env.csr[0x142] != 13 ||                   /* scause */
             hart->env.csr[0x143] != UINT64_C(0xdead) ||     /* stval */
@@ -605,6 +639,20 @@ static int run_machine_phase(void)
             machine_fail("host-fault");
             return 0;
         }
+        /* A native-internal span must be refused, not projected: the same
+         * dispatcher call on the block's first instruction is the negative
+         * case, and a regression that faked a guest trap there would pass the
+         * positive probe above unnoticed. */
+        saved = latr_context_bind(hart->ctx);
+        latr_set_cpu_env(&hart->env);
+        if (latr_machine_host_fault(&machine, 0,
+                                    (uintptr_t)hart->last_code, 13,
+                                    UINT64_C(0xdead), NULL, NULL, &fault) != 0) {
+            latr_context_restore(saved);
+            machine_fail("host-fault-native-internal");
+            return 0;
+        }
+        latr_context_restore(saved);
     }
     /* The guest fetched the virtio magic through an MMIO load. */
     if (load_le32(guest_ptr(LATR_SYSTEM_RAM_BASE + 0x1000)) != 0x74726976u) {
@@ -850,6 +898,59 @@ static int run_direct_smode_phase(void)
     return 1;
 }
 
+/*
+ * Phase 6: SBI services without firmware. An S-mode `ecall` is the kernel
+ * asking for a service, and with no OpenSBI underneath it nothing else would
+ * answer: the machine has to service it and resume the guest as an `mret`
+ * would. The guest probes BASE (spec version in a1) and writes one DBCN byte,
+ * then writes the UART itself: 'ST' in the log means both paths ran, 'F' means
+ * an SBI answer was wrong, and an empty log means the ecall was never serviced.
+ */
+static int run_sbi_phase(void)
+{
+    CPUArchState *h;
+    uint64_t mstatus;
+
+    if (!latr_machine_init(&machine, ram, sizeof(ram), 1, machine_work,
+                           sizeof(machine_work))) {
+        machine_fail("sbi-init");
+        return 0;
+    }
+    latr_machine_set_enter_tb(&machine, machine_enter_tb);
+    if (!latr_machine_load_kernel(&machine, latr_sbi_guest,
+                                  latr_sbi_guest_len) ||
+        !latr_machine_build_dtb(&machine) || !latr_machine_boot(&machine)) {
+        machine_fail("sbi-boot");
+        return 0;
+    }
+    if (latr_machine_run(&machine, 64) != 1 ||
+        machine.sys.exit_request != 0x5555) {
+        machine_fail("sbi-run");
+        return 0;
+    }
+    if (machine.sbicalls_serviced != 2) {
+        machine_fail("sbi-count");
+        return 0;
+    }
+    if (machine.sys.uart_log[0] != 'S' || machine.sys.uart_log[1] != 'T') {
+        machine_fail("sbi-uart");
+        return 0;
+    }
+    /* The return must look like an mret: back in S-mode, MPP cleared, MPIE set,
+     * and a0 holding the DBCN result. */
+    h = &machine.harts[0].env;
+    mstatus = h->csr[0x300];
+    if (h->privilege != LATR_RISCV_PRIV_S ||
+        ((mstatus >> 11) & 3u) != 0u ||
+        ((mstatus >> 7) & 1u) != 1u ||
+        h->gpr[10] != 0) {
+        machine_fail("sbi-return");
+        return 0;
+    }
+    latr_machine_fini(&machine);
+    return 1;
+}
+
 void kmain(void)
 {
     latx_bare_uart_puts("latr-boot: begin\n");
@@ -927,6 +1028,13 @@ void kmain(void)
         latx_bare_uart_puts("latr-boot: FAIL direct\n");
         return;
     }
+    /* Phase 6: SBI serviced by the machine for an S-mode ecall. */
+    if (!run_sbi_phase()) {
+        machine_saved_sbi = 0;
+        latx_bare_uart_puts("latr-boot: FAIL sbi\n");
+        return;
+    }
+    machine_saved_sbi = 1;
 
     latx_bare_uart_puts("latr-boot: PASS uart=");
     latx_bare_uart_puts(sys.uart_log);
@@ -953,6 +1061,8 @@ void kmain(void)
     latx_bare_uart_puts(machine_saved_initrd ? "1" : "0");
     latx_bare_uart_puts(" smp=");
     latx_bare_uart_puts(machine_saved_smp ? "1" : "0");
+    latx_bare_uart_puts(" sbi=");
+    latx_bare_uart_puts(machine_saved_sbi ? "1" : "0");
     latx_bare_uart_puts(" dtb=");
     puthex64(machine_saved_dtb);
     latx_bare_uart_puts("\n");
