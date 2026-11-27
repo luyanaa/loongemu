@@ -837,12 +837,15 @@ static int linux_run_one(CPUMIPSState *env)
         host = (uint8_t *)(uintptr_t)ent->code;
         goto have_host;
     } else {
-        /* 32 aborts the translator on the kernel's post-BSS function
-         * (out of IR2 itemps); 16 translates it. See roadmap. */
-        int max = debug_stop_single ? 1 : 16;
-        int n;
-
-        debug_stop_single = 0;
+        /* The translator runs out of IR2 temporaries on some blocks (32 used to
+         * abort; 16 worked).  Instead of a fixed ceiling, try progressively
+         * smaller blocks and keep the first that translates: a shorter block
+         * needs fewer live temporaries, so an untranslatable region becomes a
+         * chain of smaller blocks.  Only a block that fails at every size is a
+         * real refusal. */
+        static const int max_tries[] = { 16, 12, 8, 6, 4, 3, 2, 1 };
+        int n = 0;
+        int ok = 0;
 
         if (tb_translated < 64u) {
             latx_bare_uart_puts("latm-linux: translate pc=");
@@ -850,19 +853,31 @@ static int linux_run_one(CPUMIPSState *env)
             latx_bare_uart_putc('\n');
         }
         host = tb_pool + tb_next;
-        tb_next += 0x2000u;
-        memset(&tb_live, 0, sizeof(tb_live));
-        tb_live.pc = env->active_tc.PC;
-        tb_live.tc.ptr = host;
-        tb_live.jmp_reset_offset[0] = 0xffff;
-        tb_live.jmp_reset_offset[1] = 0xffff;
-        tcg_ctx->code_ptr = host;
-        tcg_ctx->gen_insn_data = latx_tcg_gen_insn_data;
-        target_disasm(&tb_live, &max, env);
-        if (!tb_live.icount || !tr_ir2_generate(&tb_live)) {
+        for (unsigned attempt = 0;
+             attempt < sizeof(max_tries) / sizeof(max_tries[0]); attempt++) {
+            int max = debug_stop_single ? 1 : max_tries[attempt];
+
+            memset(&tb_live, 0, sizeof(tb_live));
+            tb_live.pc = env->active_tc.PC;
+            tb_live.tc.ptr = host;
+            tb_live.jmp_reset_offset[0] = 0xffff;
+            tb_live.jmp_reset_offset[1] = 0xffff;
+            tcg_ctx->code_ptr = host;
+            tcg_ctx->gen_insn_data = latx_tcg_gen_insn_data;
+            target_disasm(&tb_live, &max, env);
+            if (tb_live.icount && tr_ir2_generate(&tb_live)) {
+                ok = 1;
+                break;
+            }
             tr_fini();
+            if (debug_stop_single) {
+                debug_stop_single = 0;   /* one-instr request: fall back to 16 */
+            }
+        }
+        if (!ok) {
             return 0;
         }
+        tb_next += 0x2000u;
 #ifdef LINUX_WATCH_GPR31
         {
             TRANSLATION_DATA *td = (TRANSLATION_DATA *)env->latm_tr_data;
