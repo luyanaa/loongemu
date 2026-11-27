@@ -1129,36 +1129,108 @@ static void tb_snapshot_guest_code(LatrTbEntry *entry, CPUArchState *env,
     entry->verifiable = 1;
 }
 
-/* The comparison half: exact byte equality of the recorded range. */
+/*
+ * The comparison half: exact byte equality of the recorded range.
+ *
+ * The mapping is resolved once per *page* and reused for every entry on it. A
+ * block is a few dozen bytes and sixteen blocks share a 4 KiB page, so resolving
+ * per entry meant 512 walks per fence -- and Linux patches its text with a fence
+ * roughly every 20 blocks, which made the walk count, not the memcmp, the cost.
+ * Within one verification pass no guest code runs, so a page's mapping cannot
+ * change underneath the cached pointer.
+ */
+struct tb_verify_ctx {
+    CPUArchState *env;
+    uint64_t page;     /* page the cached run belongs to, ~0 = none */
+    uint64_t page_off; /* offset inside that page where `host` starts */
+    uint64_t host;     /* host address of page + page_off */
+    uint32_t run_len;  /* contiguous bytes available from page_off */
+};
+
+/*
+ * Host pointer for [va, va+size). The run is resolved once and reused until an
+ * access falls outside it; a partial resolve at the page end simply shrinks the
+ * run, and the next access there re-resolves.
+ */
+static int tb_page_bytes(struct tb_verify_ctx *c, uint64_t va, uint32_t size,
+                         const uint8_t **out)
+{
+    uint64_t page = va & ~(uint64_t)0xfff;
+    uint64_t off = va - page;
+
+    if (c->page != page || off < c->page_off ||
+        off + size > c->page_off + c->run_len) {
+        uint64_t head = 0;
+        uint64_t scratch = 0;
+        uint64_t tail_va = page + 0xff8;
+        uint64_t tail = 0;
+
+        /*
+         * latr_translate() handles at most 8 bytes, so walking a page in 8-byte
+         * steps would cost 512 calls -- worse than resolving per entry. Two
+         * probes are enough: read the first 8 bytes and the last 8 bytes and
+         * require the host addresses to be exactly 0xff8 apart. Guest RAM is one
+         * flat region, so a contiguous page is the normal case; if the probes
+         * disagree (device memory, hole) fall back to resolving just this entry.
+         */
+        if (latr_translate(c->env, page, LATR_ACCESS_EXEC, 8, &head,
+                           &scratch) == 0 &&
+            latr_translate(c->env, tail_va, LATR_ACCESS_EXEC, 8, &tail,
+                           &scratch) == 0 &&
+            tail == head + 0xff8) {
+            c->page = page;
+            c->page_off = 0;
+            c->host = head;
+            c->run_len = 0x1000;
+        } else {
+            uint32_t got = 0;
+            uint64_t first = 0;
+
+            while (got < size) {
+                uint64_t h = 0;
+                uint64_t ph = 0;
+                unsigned chunk = size - got;
+
+                if (chunk > 8) {
+                    chunk = 8;
+                }
+                if (latr_translate(c->env, va + got, LATR_ACCESS_EXEC, chunk,
+                                   &h, &ph) != 0) {
+                    break;
+                }
+                if (got == 0) {
+                    first = h;
+                } else if (h != first + got) {
+                    break;
+                }
+                got += chunk;
+            }
+            if (got < size) {
+                c->page = ~(uint64_t)0;
+                return 0;
+            }
+            c->page = page;
+            c->page_off = off;
+            c->host = first;
+            c->run_len = got;
+        }
+    }
+    *out = (const uint8_t *)(uintptr_t)(c->host + (off - c->page_off));
+    return 1;
+}
+
 static int tb_code_unchanged(void *ctx, const LatrTbEntry *entry)
 {
-    CPUArchState *env = ctx;
-    uint32_t done = 0;
+    struct tb_verify_ctx *c = ctx;
+    const uint8_t *bytes = 0;
 
     if (!entry->verifiable || entry->guest_size > LATR_TB_CODE_SNAP) {
         return 0;
     }
-    while (done < entry->guest_size) {
-        uint64_t va = entry->guest_pc + done;
-        uint64_t host = 0;
-        uint64_t phys = 0;
-        unsigned chunk = entry->guest_size - done;
-
-        if (chunk > 8) {
-            chunk = 8;
-        }
-        if (latr_translate(env, va, LATR_ACCESS_EXEC, chunk, &host, &phys) != 0) {
-            return 0; /* cannot read it back: assume it changed */
-        }
-        for (unsigned i = 0; i < chunk; i++) {
-            if (entry->snap[done + i] !=
-                ((const uint8_t *)(uintptr_t)host)[i]) {
-                return 0;
-            }
-        }
-        done += chunk;
+    if (!tb_page_bytes(c, entry->guest_pc, entry->guest_size, &bytes)) {
+        return 0;
     }
-    return 1;
+    return memcmp(bytes, entry->snap, entry->guest_size) == 0;
 }
 
 static void tb_drop_map(void *ctx, uintptr_t code)
@@ -1242,8 +1314,9 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
          * lock, and another hart's shootdown could otherwise mutate an entry
          * between the comparison and the drop. With one hart nothing else can.
          */
+        struct tb_verify_ctx verify = { &h->env, ~(uint64_t)0, 0, 0, 0 };
         uint64_t seq = (m->nharts == 1)
-            ? latr_tb_fence_i_local(&h->tb_cache, tb_code_unchanged, &h->env,
+            ? latr_tb_fence_i_local(&h->tb_cache, tb_code_unchanged, &verify,
                                     tb_drop_map, h)
             : latr_tb_fence_begin(0, 1);
 
