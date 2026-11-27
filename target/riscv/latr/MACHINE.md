@@ -202,6 +202,13 @@ make latr-opensbi-run OPEN_SBI_TBS=1500000 OPEN_SBI_STALL=0 OPEN_SBI_CODEWORDS=0
 **已通过（2026-11-27）**：AOSC `linux-kernel-7.1.13`（PE 包装的 flat Image，QEMU `-kernel`
 也是整文件载入）在 LATR 上跑到了 **earlycon**：
 
+> **版本说明，看数据前先读。** 这段转写来自 **7.1.13**。该 .deb 已从 AOSC 的 pool 里下架，
+> 而一次 `make clean` 又把本地缓存删了，所以后续所有测量（§9.3 之后除注明外、§9.5、
+> §9.1 的里程碑）都是在 **7.3.4** 上做的，`make latr-linux-extract` 现在固定下载
+> `linux-kernel-7.3.y` 的 7.3.4。两个版本都停在同一个位置（earlycon 之后、`mem auto-init`
+> 之后没有下一行），但**不要把某个表里的数字当成另一个版本的实测**。
+
+
 ```
 [    0.000000] Booting Linux on hartid 0
 [    0.000000] Linux version 7.1.13-aosc-main ...
@@ -231,7 +238,7 @@ make latr-opensbi-run OPEN_SBI_TBS=1500000 OPEN_SBI_STALL=0 OPEN_SBI_CODEWORDS=0
 
 harness 现在打印三类量，用来把"慢"和"卡"分开：
 
-| 量 | 来源 | 实测（AOSC 7.1.13，768 MiB） |
+| 量 | 来源 | 实测（AOSC 7.1.13，768 MiB；7.3.4 复现同一现象） |
 |---|---|---|
 | `trap/kblk` | `LatrMachine.trap_count` 每窗口增量 | **0**，全程为 0 |
 | `ktick/kblk` | 宿主 `rdtime.d` | 175k–280k，个别窗口到 8M（宿主调度噪声） |
@@ -264,7 +271,9 @@ harness 现在打印三类量，用来把"慢"和"卡"分开：
 在生成代码里占了主导。下一步应该统计"每块访存次数 × 每次访存的宿主指令数"，而不是继续
 找死循环。
 
-### 9.5 归因：翻译占九成，执行只占一成
+### 9.5 归因：执行之外占九成，生成代码只占一成
+
+**本节数据来自 AOSC 7.3.4**（768 MiB，见开头的版本说明）。
 
 用仓库自带的 `LOONGEMU_PERF` 计数器实测（`PERF=1`，768 MiB，一次约 330 s 的运行）：
 
@@ -367,6 +376,8 @@ make latr-linux-run LATR_LINUX_IMAGE=build/linux/Image LATR_LINUX_TIMEOUT=600
 （`0x80000000` 起，1 GiB 机器下 768 MiB），低端 256 MiB 留给 VMM 映像本身。
 
 ### 9.1 启动里程碑是可断言的，不靠读日志
+
+**本节数据来自 AOSC 7.3.4**（`STEP_BUDGET` 覆盖为 320 的那次运行）。
 
 harness 在内核自己的控制台输出里认里程碑，命中就打印一次
 `latr-linux: milestone <name>`，退出时再打 `milestone-highest=` 和数值的
