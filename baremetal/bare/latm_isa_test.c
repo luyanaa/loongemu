@@ -1547,6 +1547,21 @@ void kmain(void)
     check(env.active_tc.gpr[6], 56, "arith dsll");
     check(env.active_tc.gpr[7], 28, "arith dsra");
 
+    {
+        static uint32_t temp_delay_code[] __attribute__((aligned(4096))) = {
+            0x64180010, /* daddiu $24,$0,0x10 */
+            0x64020001, /* daddiu $2,$0,1 */
+            0x64030001, /* daddiu $3,$0,1 */
+            0x10430001, /* beq $2,$3,target */
+            0x67180002, /* daddiu $24,$24,2 (delay) */
+            0x00000000,
+        };
+
+        run_block(temp_delay_code, 6, "temp-delay-slot");
+        check(env.active_tc.gpr[24], 0x12,
+              "unmapped register delay slot commits");
+    }
+
     run_block(branch_taken_code, 6, "branch-taken");
     check(env.active_tc.gpr[4], 0x22, "branch delay slot executed");
     check(env.active_tc.gpr[5], 0, "branch skipped instruction not executed");

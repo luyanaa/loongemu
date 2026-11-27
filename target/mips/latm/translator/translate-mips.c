@@ -996,6 +996,7 @@ static bool trans_branch(DisasContext *s)
         latm_spill_put(0, cond);
         translate_delay_slot(s);
         cond = latm_spill_get(0);
+        latm_regcache_flush();
         gen_goto_tb(s, 0, target);
         la_label(skip);
         gen_goto_tb(s, 1, fall);
@@ -1004,6 +1005,7 @@ static bool trans_branch(DisasContext *s)
         latm_spill_put(0, cond);
         translate_delay_slot(s);
         cond = latm_spill_get(0);
+        latm_regcache_flush();
         la_bnez(cond, taken);
         gen_goto_tb(s, 1, fall);
         la_label(taken);
