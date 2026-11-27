@@ -79,6 +79,9 @@ static uint64_t stop_cause;
 /* Precise stop point state; see debug_dump_args()/linux_run_one(). */
 static uint64_t debug_stop_pc;
 static int debug_stop_single;
+/* Non-zero turns the stop point into a watch: log every entry to debug_stop_pc
+ * and keep running, for this many hits, instead of stopping the guest. */
+static int debug_stop_hits;
 /* Last dispatch, to skip the hash lookup when a block branches to itself - the
  * common case in a tight loop and the entire cost driver for a 3-instruction
  * block. */
@@ -803,13 +806,21 @@ static int linux_run_one(CPUMIPSState *env)
 
     if (debug_stop_pc != 0) {
         if (env->active_tc.PC == debug_stop_pc) {
-            debug_dump_args(env, "stop");
-            debug_stop_pc = 0;
-            debug_stop_single = 1;
-            /* Force a miss so the next translation starts exactly here. */
-            tbc_flush_all(&tb_cache);
-            last_host = NULL;
-        } else if (env->active_tc.PC < debug_stop_pc &&
+            if (debug_stop_hits > 0) {
+                debug_dump_args(env, "hit");
+                if (--debug_stop_hits == 0) {
+                    debug_stop_pc = 0;
+                }
+            } else {
+                debug_dump_args(env, "stop");
+                debug_stop_pc = 0;
+                debug_stop_single = 1;
+                /* Force a miss so the next translation starts exactly here. */
+                tbc_flush_all(&tb_cache);
+                last_host = NULL;
+            }
+        } else if (debug_stop_hits == 0 &&
+                   env->active_tc.PC < debug_stop_pc &&
                    debug_stop_pc - env->active_tc.PC <= 0x40ull) {
             /* The target sits inside a larger block: cut the next block short so
              * one of the walks ends exactly on it.  Truncating to a distance
