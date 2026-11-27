@@ -397,9 +397,29 @@ LATR-INITRAMFS-DONE
 块。这一段每次打补丁都要让已生成的代码失效，因此是"慢"而不是"卡"。ftrace/rcu/`Memory:`
 那三行还没出现。
 
-**为什么这一段只有 ~500 块/s（机制已确认，频率待测）。** 内核打完补丁会执行
-`fence.i`（`__patch_insn_write` → `flush_icache_range`），而 LATR 对 `fence.i` 的处理是
-**整个 TB 缓存失效**：
+**`fence.i` 现在只丢弃"源码真的变了"的块（2026-11-27）。** 一个块的翻译只取决于它的
+guest 字节和缓存键（`pc, cs_base, cr3, cpl`），所以 `fence.i` 不需要清空整个缓存。每个
+`LatrTbEntry` 现在记录最多 32 字节原始 guest 码，`fence.i` 用与取指相同的
+`latr_translate(..., LATR_ACCESS_EXEC, ...)` 读回来逐字节比对，只丢弃不一致的块。
+
+刻意保守的地方（宁可多丢，不可留错）：
+- 块长超过 32 字节、插入时取指失败、或没有快照 → `verifiable = 0`，每次 `fence.i` 都丢；
+- 其他 hart 的缓存仍然整缓存失效 —— 只有它自己的 owner 能读它的 guest 视图；
+- 只有全部条目都没了才设 `reclaim_pending`，arena 不会被无谓回收；
+- 只有 `nharts == 1` 才走窄路，多 hart 保持原行为。
+
+**这里踩了个自死锁，值得记住。** 第一版在**持有缓存自旋锁**的情况下调用比对函数，而比对要
+读 guest 内存、走 MMU 慢路径，那条路径会重新进入缓存 —— 于是第一个 `fence.i` 就死锁：日志
+在 earlycon 之后停住、`fences=1`。用"只把调用点回退成整缓存失效"二分确认（旧路径下
+`fences` 一路涨到 496）。现在 `latr_tb_cache_drop_stale` 明确**不持锁**，并在注释和头文件里
+写清前提：调用方保证该缓存没有并发写者。
+
+契约本身有测试钉住：`tests/test_latr_tb_smp.c` 第 14 段用机器侧同样的两个回调验证
+"只丢被改的那块、邻居留下、回调报告 code 地址、不可验证的一律丢、清空后仍请求回收"
+（121 checks / 0 failures）。
+
+**修之前为什么这一段只有 ~500 块/s。** 内核打完补丁会执行 `fence.i`
+（`__patch_insn_write` → `flush_icache_range`），旧实现对它的处理是**整个 TB 缓存失效**：
 
 ```
 fence.i -> latr_tb_fence_i_all_cores() -> latr_tb_shootdown_all()
@@ -409,11 +429,8 @@ fence.i -> latr_tb_fence_i_all_cores() -> latr_tb_shootdown_all()
 `reclaim_pending` 还会在下一个 safepoint 回收整个 arena，连带丢掉所有 `LatrTbInsnMap`。
 于是**每一次打补丁都要把之后用到的代码全部重译**，而一次翻译约 163k tick（§9.5）。
 alternatives / static keys / ftrace nop 的补丁点是成千上万的，这就是 SLUB 之后立刻从
-"十几万块/s"掉到"500 块/s"的原因。
-
-这是**保守但正确**的实现：RISC-V 的 `fence.i` 只要求本 hart 之后的取指看到它之前的写入，
-并不要求丢弃无关代码，所以按范围（或按被写过的代码页）失效在架构上也是正确的，只是需要
-在 guest store 侧记录"哪些代码页被写过"。要做这一步再说，属于设计改动而不是修 bug。
+"十几万块/s"掉到"500 块/s"的原因。改成按字节比对后（见本节开头），未变的块不再被丢，
+这段的代价应当随"真正被改的块数"而不是"补丁次数"增长。
 
 进度行现在打印 `fences=`（`latr_tb_fence_seq()`），下一次长跑可以直接量到 fence 频率与
 块速率的关系；本次长跑用的还是加计数器之前的镜像，所以这里只有机制、没有频率。
