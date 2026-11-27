@@ -76,6 +76,9 @@ static uint64_t tb_translated;
 static uint64_t linux_entry;
 static uint64_t stop_pc;
 static uint64_t stop_cause;
+/* Precise stop point state; see debug_dump_args()/linux_run_one(). */
+static uint64_t debug_stop_pc;
+static int debug_stop_single;
 /* Last dispatch, to skip the hash lookup when a block branches to itself - the
  * common case in a tight loop and the entire cost driver for a 3-instruction
  * block. */
@@ -758,6 +761,36 @@ void kmain(void)
     }
 }
 
+/* Precise stop point.  A guest PC that sits inside a larger translation block
+ * is never observed as a block entry, so argument registers cannot be sampled
+ * there.  Setting debug_stop_pc makes the dispatcher give exactly that address a
+ * one-instruction block (after dropping its cached block), dump the argument
+ * registers, and then resume normal block sizing.  Zero disables it. */
+static void debug_dump_args(CPUMIPSState *env, const char *tag)
+{
+    static const int gprs[] = { 4, 5, 6, 7, 8, 9, 10, 11,
+                                16, 17, 18, 19, 20, 21, 22, 23, 29, 31 };
+    latx_bare_uart_puts("latm-linux: ");
+    latx_bare_uart_puts(tag);
+    latx_bare_uart_puts(" pc=");
+    { char h[17]; for (int k=15;k>=0;k--) h[15-k]="0123456789abcdef"[(env->active_tc.PC>>(k*4))&15]; h[16]=0; latx_bare_uart_puts(h); }
+    latx_bare_uart_putc('\n');
+    for (unsigned i = 0; i < sizeof(gprs)/sizeof(gprs[0]); i++) {
+        int g = gprs[i];
+        char q[4], h[17];
+        latx_bare_uart_puts("latm-linux:   r");
+        q[0] = "0123456789abcdef"[(g >> 4) & 15];
+        q[1] = "0123456789abcdef"[g & 15];
+        q[2] = 0;
+        latx_bare_uart_puts(q);
+        latx_bare_uart_puts("=");
+        for (int k=15;k>=0;k--) h[15-k]="0123456789abcdef"[(env->active_tc.gpr[g]>>(k*4))&15];
+        h[16]=0;
+        latx_bare_uart_puts(h);
+        latx_bare_uart_putc('\n');
+    }
+}
+
 /* One dispatch: translate on a cache miss, run, count. Returns 0 when the
  * translator refuses a block, which is where a real boot currently stops. */
 static int linux_run_one(CPUMIPSState *env)
@@ -767,6 +800,27 @@ static int linux_run_one(CPUMIPSState *env)
                              (MIPS_HFLAG_UM | MIPS_HFLAG_SM | MIPS_HFLAG_M16));
     TbCacheEntry *ent;
     uint8_t *host;
+
+    if (debug_stop_pc != 0) {
+        if (env->active_tc.PC == debug_stop_pc) {
+            debug_dump_args(env, "stop");
+            debug_stop_pc = 0;
+            debug_stop_single = 1;
+            /* Force a miss so the next translation starts exactly here. */
+            tbc_flush_all(&tb_cache);
+            last_host = NULL;
+        } else if (env->active_tc.PC < debug_stop_pc &&
+                   debug_stop_pc - env->active_tc.PC <= 0x40ull) {
+            /* The target sits inside a larger block: cut the next block short so
+             * one of the walks ends exactly on it.  Truncating to a distance
+             * (not to a single instruction) keeps branch/delay-slot pairs
+             * translatable. */
+            uint64_t span = (debug_stop_pc - env->active_tc.PC) / 4ull;
+            tbc_flush_all(&tb_cache);
+            last_host = NULL;
+            debug_stop_single = span > 16ull ? 16 : (int)span;
+        }
+    }
 
     if (last_host && env->active_tc.PC == last_pc && asid == last_asid &&
         mode == last_mode) {
@@ -785,8 +839,10 @@ static int linux_run_one(CPUMIPSState *env)
     } else {
         /* 32 aborts the translator on the kernel's post-BSS function
          * (out of IR2 itemps); 16 translates it. See roadmap. */
-        int max = 16;
+        int max = debug_stop_single ? 1 : 16;
         int n;
+
+        debug_stop_single = 0;
 
         if (tb_translated < 64u) {
             latx_bare_uart_puts("latm-linux: translate pc=");
