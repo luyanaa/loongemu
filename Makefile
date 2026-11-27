@@ -731,6 +731,11 @@ endif
 ifneq ($(GUEST_RAM_MIB),)
 LATR_BARE_CFLAGS += -DGUEST_RAM_MIB=$(GUEST_RAM_MIB)
 endif
+# Dispatch slices for the bare Linux harness. Only lowered to exercise the
+# harness's own exit path (milestone report) without booting for an hour.
+ifneq ($(LINUX_STEPS),)
+LATR_BARE_CFLAGS += -DSTEP_BUDGET=$(LINUX_STEPS)u
+endif
 
 
 build/latr_isa_test.o: baremetal/bare/latr_isa_test.c \
@@ -1263,13 +1268,28 @@ build/bare_latr_linux.elf: baremetal/bare/latr_linux.c \
 
 latr-linux-image: build/bare_latr_linux.elf
 
-# No PASS assertion on purpose: this target reports how far the kernel got.
+# The harness reports a numeric boot-milestone level: 1 start_kernel, 2 sbi,
+# 3 earlycon, 4 initmem, 5 mem_auto_init, 6 slub, 7 ftrace, 8 rcu,
+# 9 mem_print_info, 10 free_initmem, 11 run_init, 12 panic. Asserting a level is
+# what stops "it got somewhere" from being a matter of how the log reads; raise
+# LATR_LINUX_MIN_LEVEL as the boot goes further, never lower it to make a run
+# pass. 3 is the earlycon milestone the 2026-11-27 boot reached and keeps.
+LATR_LINUX_MIN_LEVEL ?= 3
+
 latr-linux-run: build/bare_latr_linux.elf
 	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_latr_linux.elf" \
 	     QEMU_LOG="build/latr_linux.log" QEMU_DONE="latr-linux: done" \
 	     QEMU_TIMEOUT=$(LATR_LINUX_TIMEOUT) CPU=la464 QEMU_MEM=1G \
 	     bash scripts/run_qemu_lata.sh || true
-	@grep -a 'latr-linux' build/latr_linux.log | tail -20
+	@level=$$(sed -n 's/.*milestone-level=\([0-9]*\).*/\1/p' build/latr_linux.log | tail -1); \
+	 level=$${level:-0}; \
+	 echo "latr-linux: milestone level $$level (minimum $(LATR_LINUX_MIN_LEVEL))"; \
+	 if [ "$$level" -lt "$(LATR_LINUX_MIN_LEVEL)" ]; then \
+	   echo "latr-linux: FAIL below the achieved milestone"; \
+	   grep -a 'milestone\|^\[' build/latr_linux.log | tail -8; \
+	   exit 1; \
+	 fi
+	@grep -a 'milestone\|lastpc=' build/latr_linux.log | tail -20
 
 # Delete both logs first: a stale log left by an earlier seed would otherwise be
 # compared and "pass". A missing signature is then a hard error.

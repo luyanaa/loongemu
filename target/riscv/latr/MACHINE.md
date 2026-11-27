@@ -366,6 +366,39 @@ make latr-linux-run LATR_LINUX_IMAGE=build/linux/Image LATR_LINUX_TIMEOUT=600
 日志看起来像翻译器 bug。harness 的 backing store 放在 LoongArch `virt` 的 highmem 窗口
 （`0x80000000` 起，1 GiB 机器下 768 MiB），低端 256 MiB 留给 VMM 映像本身。
 
+### 9.1 启动里程碑是可断言的，不靠读日志
+
+harness 在内核自己的控制台输出里认里程碑，命中就打印一次
+`latr-linux: milestone <name>`，退出时再打 `milestone-highest=` 和数值的
+`milestone-level=`。顺序与编号：
+
+| level | name | 内核打印的原话 |
+|---|---|---|
+| 1 | `start_kernel` | `Booting Linux` |
+| 2 | `sbi` | `SBI specification` |
+| 3 | `earlycon` | `earlycon: sbi0` |
+| 4 | `initmem` | `Initmem setup node` |
+| 5 | `mem_auto_init` | `mem auto-init` |
+| 6 | `slub` | `SLUB:` |
+| 7 | `ftrace` | `ftrace:` |
+| 8 | `rcu` | `rcu: Preemptible` |
+| 9 | `mem_print_info` | `Memory:` |
+| 10 | `free_initmem` | `Freeing unused kernel memory` |
+| 11 | `run_init` | `Run /init as init process` |
+| 12 | `panic` | `Kernel panic` |
+
+`make latr-linux-run` 断言 `LATR_LINUX_MIN_LEVEL`（默认 3，即已经达到并保持的
+earlycon）。**这个阈值只许上调**：调到刚好通过一次跑得不远的运行，等于把回归
+写成通过。
+
+实测一次 640 万块的运行报 `milestone-level=5`，命中 `start_kernel`、`sbi`、
+`earlycon`、`initmem`、`mem_auto_init` 五个 —— 与 §9.3 里"停在 mem auto-init
+之后"是同一件事，但现在它有数字。
+
+**扫锚点的位置有坑。** 第一版把扫描放在"控制台连续 8 次没有输出"的分支里，结果
+正在打印输出的启动反而永远扫不到。现在每次报告都扫；日志很小，整体重扫比在尾部
+维护部分匹配更简单。
+
 ### 9.2 长启动才暴露的两个固定上限
 
 **1. harness 栈指针必须和数组大小一致。** `_start` 用 `lu12i.w $t0, N` +

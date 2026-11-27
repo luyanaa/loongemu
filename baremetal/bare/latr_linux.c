@@ -93,7 +93,11 @@ __asm__(
 #define GUEST_RAM_MIB 768
 #endif
 #define GUEST_RAM_SIZE ((uint32_t)GUEST_RAM_MIB << 20)
+/* Overridable so a smoke run can reach the harness exit path (and therefore the
+ * milestone report) without booting the kernel for an hour. */
+#ifndef STEP_BUDGET
 #define STEP_BUDGET 20000u
+#endif
 /* How many translated blocks between progress lines: enough to be cheap, small
  * enough that a stall is reported at the PC where it happened. */
 #define PROGRESS_EVERY 20000u
@@ -145,6 +149,105 @@ static void dump_probe(void);
  * "three orders of magnitude slower than qemu-system-riscv64" has no owner:
  * a slow translator and slow generated code need opposite fixes.
  */
+/*
+ * Boot milestones, recognised in the kernel's own console output.
+ *
+ * The alternative -- reading the raw dump and deciding by eye how far it got --
+ * is what made "did it reach SLUB or not?" a matter of opinion across sessions,
+ * and it cannot be asserted on. Each entry is a literal the kernel prints, in
+ * boot order; the harness reports the highest one reached, once, as
+ * `latr-linux: milestone <name>`, plus the full list at exit.
+ */
+static const struct {
+    const char *marker;
+    const char *name;
+} milestones[] = {
+    { "Booting Linux",                "start_kernel" },
+    { "SBI specification",            "sbi" },
+    { "earlycon: sbi0",               "earlycon" },
+    { "Initmem setup node",           "initmem" },
+    { "mem auto-init",                "mem_auto_init" },
+    { "SLUB:",                        "slub" },
+    { "ftrace:",                      "ftrace" },
+    { "rcu: Preemptible",             "rcu" },
+    { "Memory:",                      "mem_print_info" },
+    { "Freeing unused kernel memory", "free_initmem" },
+    { "Run /init as init process",    "run_init" },
+    { "Kernel panic",                 "panic" },
+};
+#define NMILESTONES ((int)(sizeof(milestones) / sizeof(milestones[0])))
+
+static bool milestone_hit[NMILESTONES];
+static int milestone_highest = -1;
+
+static bool log_contains(const char *log, uint32_t len, const char *needle)
+{
+    uint32_t n = 0;
+
+    while (needle[n] != '\0') {
+        n++;
+    }
+    if (n == 0 || len < n) {
+        return false;
+    }
+    for (uint32_t i = 0; i + n <= len; i++) {
+        uint32_t j = 0;
+
+        while (j < n && log[i + j] == needle[j]) {
+            j++;
+        }
+        if (j == n) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A marker never straddles more than a few dozen bytes, and the log is small,
+ * so rescanning the whole buffer is cheaper than tracking a partial match. */
+static void milestone_scan(void)
+{
+    const char *log = latr_system_uart_log(&machine.sys);
+    uint32_t len = machine.sys.uart_log_len;
+
+    for (int i = 0; i < NMILESTONES; i++) {
+        if (milestone_hit[i]) {
+            continue;
+        }
+        if (log_contains(log, len, milestones[i].marker)) {
+            milestone_hit[i] = true;
+            if (i > milestone_highest) {
+                milestone_highest = i;
+            }
+            latx_bare_uart_puts("latr-linux: milestone ");
+            latx_bare_uart_puts(milestones[i].name);
+            latx_bare_uart_puts("\n");
+        }
+    }
+}
+
+static void milestone_report(void)
+{
+    latx_bare_uart_puts("latr-linux: milestones reached:");
+    for (int i = 0; i < NMILESTONES; i++) {
+        if (milestone_hit[i]) {
+            latx_bare_uart_puts(" ");
+            latx_bare_uart_puts(milestones[i].name);
+        }
+    }
+    latx_bare_uart_puts("\nlatr-linux: milestone-highest=");
+    if (milestone_highest < 0) {
+        latx_bare_uart_puts("none");
+    } else {
+        latx_bare_uart_puts(milestones[milestone_highest].name);
+    }
+    /* 1-based so 0 unambiguously means "nothing reached"; the Makefile compares
+     * this against LATR_LINUX_MIN_LEVEL instead of parsing names. */
+    latx_bare_uart_puts("\nlatr-linux: milestone-level=");
+    put_dec(milestone_highest + 1);
+    latx_bare_uart_puts("\n");
+}
+
 static void dump_perf(void)
 {
 #ifdef LOONGEMU_PERF
@@ -643,6 +746,13 @@ static void progress(void)
         console_mirrored = machine.sys.uart_log_len;
     }
     /*
+     * Every report, not only the silent ones: a console that is producing
+     * output is exactly when a new milestone appears, and putting this inside
+     * the silent-window branch meant no milestone was ever recorded on a boot
+     * that was printing.
+     */
+    milestone_scan();
+    /*
      * A console that has emitted nothing for CONSOLE_STALL_REPORTS consecutive
      * reports is either inside a long kernel loop or wedged, and the PC alone
      * cannot tell them apart. Dump the entry ring once per silent window so the
@@ -759,6 +869,7 @@ void kmain(void)
     }
     progress();
     dump_ratio_hist();
+    milestone_report();
     latx_bare_uart_puts("latr-linux: lastpc=");
     puthex64(machine.last_pc);
     latx_bare_uart_puts(" trap=");
