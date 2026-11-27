@@ -344,6 +344,18 @@ static void dump_pc_ring(void)
  * alarm: one guest instruction legitimately expands to 2-6 host instructions,
  * so 87606 of 87606 blocks landed in the top bucket.
  */
+/*
+ * Zero means "arm automatically on the most frequent block of the first silent
+ * window". A compile-time `PROBE_PC=n` still pins a specific block.
+ */
+#ifndef PROBE_PC
+#define PROBE_PC 0
+#endif
+static uint64_t probe_pc = PROBE_PC;
+static uint64_t probe_gpr[2][32];
+static uint64_t probe_insns[2];
+static uint32_t probe_hits;
+
 static uint32_t icount_hist[8];
 static uint32_t icount_worst;
 static uint64_t icount_worst_pc;
@@ -370,6 +382,29 @@ static void pc_hash_record(uint64_t pc)
 
 static void dump_pc_hash(void)
 {
+    uint32_t top = 0;
+
+    for (uint32_t i = 1; i < PC_HASH; i++) {
+        if (pc_hash_count[i] > pc_hash_count[top]) {
+            top = i;
+        }
+    }
+    /*
+     * Arm the register probe on whatever block is actually repeating, instead
+     * of on a hand-picked PC. Picking one by hand burned several long runs on
+     * blocks that are entered once (a function's prologue) rather than on the
+     * loop head that comes back every iteration. The threshold matters: the
+     * first silent window of a boot has every count at 1, and arming there just
+     * pins the kernel's entry block, which is entered exactly once. The next
+     * silent window then prints how the chosen block's registers moved.
+     */
+    if (probe_pc == 0 && pc_hash_count[top] >= 200) {
+        probe_pc = pc_hash_pc[top];
+        probe_hits = 0;
+        latx_bare_uart_puts("latr-linux: probe armed at ");
+        puthex64(probe_pc);
+        latx_bare_uart_puts("\n");
+    }
     latx_bare_uart_puts("latr-linux: top block entries:");
     for (uint32_t n = 0; n < 8; n++) {
         uint32_t best = 0;
@@ -439,13 +474,6 @@ static void ratio_record(uint64_t pc, uint32_t words, uint32_t guest_insns)
  * bound the kernel compares it against, the branch is mis-translated; if it
  * stays inside a small window, the loop is progressing and the cost is real.
  */
-#ifndef PROBE_PC
-#define PROBE_PC 0xffffffff803b2938ull
-#endif
-static uint64_t probe_pc = PROBE_PC;
-static uint64_t probe_gpr[2][32];
-static uint64_t probe_insns[2];
-static uint32_t probe_hits;
 
 static void probe_maybe(void *env, uint64_t pc, uint64_t insns)
 {
