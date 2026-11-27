@@ -382,6 +382,14 @@ void latr_tb_shootdown_asid_all_cores(uint32_t asid)
 /* Global fence sequence; defined here so fence_i_local can bump it. */
 static volatile uint64_t latr_tb_fence_seq_word;
 
+/*
+ * MUST NOT hold the cache lock while calling `same`: it reads guest memory
+ * through the MMU, whose slow path can re-enter the cache (a fill, a recovery,
+ * another fence). Taking the lock here self-deadlocks on the first block whose
+ * bytes need a TLB fill -- measured: the boot stopped dead right after the first
+ * fence.i. The caller therefore guarantees this cache has no concurrent
+ * mutator: single hart, between blocks, nothing else online.
+ */
 uint32_t latr_tb_cache_drop_stale(LatrTbCache *cache, LatrTbSameCode same,
                                   void *same_ctx, LatrTbOnDrop on_drop,
                                   void *drop_ctx)
@@ -391,7 +399,6 @@ uint32_t latr_tb_cache_drop_stale(LatrTbCache *cache, LatrTbSameCode same,
     if (cache == 0 || same == 0) {
         return 0;
     }
-    cache_lock(cache);
     for (int i = 0; i < LATR_TB_CACHE_ENTRIES; i++) {
         LatrTbEntry *e = &cache->entries[i];
         uintptr_t code;
@@ -425,7 +432,6 @@ uint32_t latr_tb_cache_drop_stale(LatrTbCache *cache, LatrTbSameCode same,
         cache->reclaim_pending = 1;
     }
     cache->generation++;
-    cache_unlock(cache);
     return dropped;
 }
 

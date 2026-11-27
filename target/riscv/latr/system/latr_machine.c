@@ -1236,8 +1236,16 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
          * and drop only the blocks whose source actually changed. Other harts
          * still get a full shootdown; only a hart can read its own guest view.
          */
-        uint64_t seq = latr_tb_fence_i_local(&h->tb_cache, tb_code_unchanged,
-                                             &h->env, tb_drop_map, h);
+        /*
+         * Narrowing needs a cache with no concurrent mutator: the comparison
+         * reads guest memory through the MMU, so it cannot run under the cache
+         * lock, and another hart's shootdown could otherwise mutate an entry
+         * between the comparison and the drop. With one hart nothing else can.
+         */
+        uint64_t seq = (m->nharts == 1)
+            ? latr_tb_fence_i_local(&h->tb_cache, tb_code_unchanged, &h->env,
+                                    tb_drop_map, h)
+            : latr_tb_fence_begin(0, 1);
 
         latr_tb_fence_ack(&h->tb_cache);
         latr_tb_fence_complete(m, h, seq);

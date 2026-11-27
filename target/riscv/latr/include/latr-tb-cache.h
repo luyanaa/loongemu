@@ -146,6 +146,7 @@ LatrTbEntry *latr_tb_cache_insert(LatrTbCache *cache, uint64_t pc,
                                   uint32_t code_size, uint32_t icount);
 /* Bumps the generation and drops matching entries (ASID 0 drops all). */
 void latr_tb_shootdown_all(LatrTbCache *cache);
+/* Caller guarantees no concurrent mutator of `cache` (see the definition). */
 uint32_t latr_tb_cache_drop_stale(LatrTbCache *cache, LatrTbSameCode same,
                                   void *same_ctx, LatrTbOnDrop on_drop,
                                   void *drop_ctx);
