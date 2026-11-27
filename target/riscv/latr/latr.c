@@ -1178,9 +1178,24 @@ bool tr_ir2_generate(TranslationBlock *tb)
         data->tb_insn_bind_cnt[i] = latr_regcache_snapshot_gpr_binds(
             data->tb_insn_binds[i]);
         (la_label)(labels[i]);
+#if LATR_OPCODE_STATS
+        {
+            unsigned before = latr_ir2_count_now(data);
+
+            if (!latr_translate_ir1(&ctx)) {
+                return false;
+            }
+            if ((unsigned)insns[i].opcode < LATR_RV_OPCODE_COUNT) {
+                latr_opcode_ir2[insns[i].opcode] +=
+                    latr_ir2_count_now(data) - before;
+                latr_opcode_insns[insns[i].opcode]++;
+            }
+        }
+#else
         if (!latr_translate_ir1(&ctx)) {
             return false;
         }
+#endif
         /*
          * The borrow invariant: an instruction translation must hand every
          * temporary back. A leak is recorded rather than asserted here because
@@ -1408,6 +1423,42 @@ void label_dispose(void)
             ir2_index++;
         }
     }
+}
+
+/*
+ * IR2 instructions emitted per guest opcode, accumulated where the translator
+ * runs rather than where the words are assembled. The assembly-time attribution
+ * looked better but is unusable: label_dispose() runs the peephole first and
+ * removes some per-instruction labels, so those instructions lose their span and
+ * absorb the whole block's word count (measured: ADDIW at "242 words" and SD at
+ * "216", both simply the block size).
+ */
+/*
+ * Off by default: latr_ir2_count_now() walks the whole IR2 list, so leaving the
+ * accounting on would slow translation down by an order of magnitude and make
+ * any timing taken with it meaningless. Enable with -DLATR_OPCODE_STATS=1.
+ */
+#ifndef LATR_OPCODE_STATS
+#define LATR_OPCODE_STATS 0
+#endif
+uint64_t latr_opcode_ir2[LATR_RV_OPCODE_COUNT];
+uint64_t latr_opcode_insns[LATR_RV_OPCODE_COUNT];
+
+/* Human-readable opcode name, generated from the same table the enum uses. */
+const char *latr_opcode_name(unsigned opcode)
+{
+    static const char *const names[] = {
+#define LATR_RV_INSN(tag, name) #tag,
+#define LATR_RV_ALIAS(tag, name)
+#include "ir1/rv64gc-opcodes.def"
+#undef LATR_RV_ALIAS
+#undef LATR_RV_INSN
+    };
+
+    if (opcode >= sizeof(names) / sizeof(names[0])) {
+        return "?";
+    }
+    return names[opcode];
 }
 
 int tr_ir2_assemble(const void *code_start_addr)

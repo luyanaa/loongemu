@@ -319,6 +319,13 @@ void latr_take_guest_trap(CPUArchState *env, uint64_t cause, uint64_t tval);
 void tr_init(void *tb);
 void tr_fini(void);
 int tr_ir2_assemble(const void *code_start_addr);
+/* Emitted words and instruction count per guest opcode (measurement only).
+ * Sized by LATR_RV_OPCODE_COUNT, so ir1.h must be visible here. */
+#include "ir1.h"
+extern uint64_t latr_opcode_ir2[LATR_RV_OPCODE_COUNT];
+extern uint64_t latr_opcode_insns[LATR_RV_OPCODE_COUNT];
+/* Name of an opcode, for the histogram report. */
+const char *latr_opcode_name(unsigned opcode);
 void label_dispose(void);
 
 extern LATR_TLS TRANSLATION_DATA *tr_data;

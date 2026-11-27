@@ -143,6 +143,7 @@ static uint64_t last_ticks;
 static uint64_t last_tbs;
 static uint64_t last_traps;
 
+static void dump_opcode_cost(void);
 static void dump_ratio_hist(void);
 static void dump_pc_hash(void);
 static void dump_probe(void);
@@ -594,6 +595,70 @@ static void dump_pc_hash(void)
     latx_bare_uart_puts("\n");
 }
 
+/*
+ * Which guest opcodes emit the most host instructions. This is the measurement
+ * that "84 host instructions per guest instruction" needs in order to be
+ * actionable: without it every candidate (CSR masking, recovery bindings,
+ * memory access) has a plausible story.
+ */
+static void dump_opcode_cost(void)
+{
+    /*
+     * Non-destructive: an earlier version cleared each printed entry, so the
+     * second dump of a long boot showed nothing and it was impossible to tell a
+     * zeroed counter from a counter that never accumulated.
+     */
+    uint32_t used[10];
+    uint32_t used_n = 0;
+    uint64_t total_ir2 = 0;
+    uint64_t total_insns = 0;
+
+    for (uint32_t op = 1; op < (uint32_t)LATR_RV_OPCODE_COUNT; op++) {
+        total_ir2 += latr_opcode_ir2[op];
+        total_insns += latr_opcode_insns[op];
+    }
+    latx_bare_uart_puts("latr-linux: opcode cost total ir2=");
+    put_dec(total_ir2);
+    latx_bare_uart_puts(" insns=");
+    put_dec(total_insns);
+    latx_bare_uart_puts("\n");
+
+    for (uint32_t n = 0; n < 10 && used_n < 10; n++) {
+        uint32_t best = 0;
+        uint64_t best_cost = 0;
+
+        for (uint32_t op = 1; op < (uint32_t)LATR_RV_OPCODE_COUNT; op++) {
+            bool seen = false;
+
+            for (uint32_t u = 0; u < used_n; u++) {
+                if (used[u] == op) {
+                    seen = true;
+                }
+            }
+            if (seen || latr_opcode_insns[op] == 0) {
+                continue;
+            }
+            if (latr_opcode_ir2[op] > best_cost) {
+                best_cost = latr_opcode_ir2[op];
+                best = op;
+            }
+        }
+        if (best == 0) {
+            break;
+        }
+        used[used_n++] = best;
+        latx_bare_uart_puts("  ");
+        latx_bare_uart_puts(latr_opcode_name(best));
+        latx_bare_uart_puts(" insns=");
+        put_dec(latr_opcode_insns[best]);
+        latx_bare_uart_puts(" ir2=");
+        put_dec(latr_opcode_ir2[best]);
+        latx_bare_uart_puts(" per-insn=");
+        put_dec(latr_opcode_ir2[best] / latr_opcode_insns[best]);
+        latx_bare_uart_puts("\n");
+    }
+}
+
 static void dump_ratio_hist(void)
 {
     latx_bare_uart_puts("latr-linux: guest-insns/block for 1,2,3-4,5-8,9-16,"
@@ -793,6 +858,7 @@ static void progress(void)
         console_stall_reports++;
         if (console_stall_reports == CONSOLE_STALL_REPORTS) {
             dump_pc_ring();
+            dump_opcode_cost();
             dump_probe();
             dump_perf();
             dump_pc_hash();
