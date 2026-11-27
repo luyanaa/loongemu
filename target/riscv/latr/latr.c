@@ -1502,6 +1502,18 @@ const char *latr_opcode_name(unsigned opcode)
     return names[opcode];
 }
 
+/*
+ * Dump the whole IR2 stream of the first few blocks. Counting said a small block
+ * can carry ~200 IR2 that its instruction emitters do not account for; reading
+ * the stream is how that gets identified instead of guessed.
+ */
+#ifndef LATR_IR2_DUMP_BLOCKS
+#define LATR_IR2_DUMP_BLOCKS 0
+#endif
+#if LATR_IR2_DUMP_BLOCKS
+static int latr_ir2_dumped;
+#endif
+
 int tr_ir2_assemble(const void *code_start_addr)
 {
     label_dispose();
@@ -1588,6 +1600,79 @@ int tr_ir2_assemble(const void *code_start_addr)
             latr_block_worst_words = (uint32_t)count;
         }
     }
+#if LATR_IR2_DUMP_BLOCKS
+    if (latr_ir2_dumped < LATR_IR2_DUMP_BLOCKS && count <= 160) {
+        IR2_INST *it;
+
+        latr_ir2_dumped++;
+        /*
+         * A per-opcode histogram rather than ir2_dump(): ir2_to_string() formats
+         * through the ARM/LATA context, so in the LATR bare harness it prints
+         * "undef" for every operand. The numeric opcode is what can be resolved
+         * against shared/backend/loongarch/include/ir2-opcode.h.
+         */
+        {
+            int hist[512];
+            int order[512];
+            int kinds = 0;
+
+            for (int i = 0; i < 512; i++) {
+                hist[i] = 0;
+            }
+            for (it = data->first_ir2; it != NULL; it = ir2_next(it)) {
+                int op = (int)ir2_opcode(it);
+
+                if (op < 0 || op >= 512) {
+                    continue;
+                }
+                if (hist[op]++ == 0 && kinds < 512) {
+                    order[kinds++] = op;
+                }
+            }
+            qemu_log("[LATR] ir2-dump block pc=%llx insns=%d ir2=%d words=%d"
+                     " ops=%d\n", (unsigned long long)data->tb_insn_pc[0],
+                     data->tb_insn_count, latr_ir2_count_now(data), count,
+                     kinds);
+            for (int a = 0; a < kinds; a++) {
+                for (int b = a + 1; b < kinds; b++) {
+                    if (hist[order[b]] > hist[order[a]]) {
+                        int tmp = order[a];
+
+                        order[a] = order[b];
+                        order[b] = tmp;
+                    }
+                }
+            }
+            for (int a = 0; a < kinds && a < 10; a++) {
+                qemu_log("[LATR]   op=%d x%d\n", order[a],
+                         hist[order[a]]);
+            }
+            /*
+             * Immediates of the constant-materialising opcodes. The operand
+             * values say which table the repeated li_d/add pairs are walking
+             * (CSR numbers, PMP slots, page-table levels), which opcode counts
+             * alone cannot.
+             */
+            for (it = data->first_ir2; it != NULL; it = ir2_next(it)) {
+                IR2_OPCODE op = ir2_opcode(it);
+                int last = it->op_count - 1;
+
+                /*
+                 * The immediate is the *last* operand, and its index differs per
+                 * format: LU12I_W is {RD, IMM} while ORI/ADDI_W are {RD, RJ, IMM}.
+                 * Reading _opnd[1] for ORI printed register numbers (1, 5, 21),
+                 * which looks like data and is not.
+                 */
+                if ((op == LISA_LU12I_W || op == LISA_ORI ||
+                     op == LISA_ADDI_W || op == LISA_ADDI_D) &&
+                    last >= 1 && ir2_opnd_is_imm(&it->_opnd[last])) {
+                    qemu_log("[LATR]   imm op=%d v=%lld\n", (int)op,
+                             (long long)ir2_opnd_imm(&it->_opnd[last]));
+                }
+            }
+        }
+    }
+#endif
     latr_tb_insn_map_begin((void *)code_start_addr, (uint32_t)count * 4);
     for (int i = 0; i < data->tb_insn_count; i++) {
         latr_tb_insn_map_add(data->tb_insn_pc[i], span_off[i],

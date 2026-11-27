@@ -34,6 +34,11 @@ LATR_OPCODE_STATS ?= 0
 ifeq ($(LATR_OPCODE_STATS),1)
 DEFS += -DLATR_OPCODE_STATS=1
 endif
+
+# Dump the IR2 stream of the first N blocks (0 = off).
+ifneq ($(LATR_IR2_DUMP_BLOCKS),)
+DEFS += -DLATR_IR2_DUMP_BLOCKS=$(LATR_IR2_DUMP_BLOCKS)
+endif
 BASE := --target=$(TARGET) -ffreestanding -nostdinc -fno-builtin \
         -fno-stack-protector -O2 -g -mno-lsx -mno-lasx -fno-vectorize \
         -fno-slp-vectorize -Wno-unused-parameter -Wno-unused-variable
