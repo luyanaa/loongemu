@@ -712,21 +712,52 @@ guest physical `0x7e50000`-`0x922b400`, extracted from
 `kernel loaded, entry=ffffffff87e50000` and the translator then executes real
 kernel text: over 1.3 M translation blocks with the guest PC sweeping KSEG0
 kernel addresses (`ffffffff8001fe40`/`80083900`/`800bc240`/`800df080`) with
-no `bad pc`, no poisoned report, no wedge - the PC keeps moving instead of
-parking in a halt loop, so the kernel is doing real early-init work. Getting
-here needed two linker fixes in `baremetal/bare/bare.lds`, both forced by the
-backing-store size: the 192 MiB guest RAM cannot live in qemu-virt lowmem
-(0-256 MiB) alongside the VMM image, so it is placed in the highmem RAM
-window via a dedicated `.guest_ram` section at `0x80000000` with its own
-`PT_LOAD` phdr (without phdr isolation ld.lld merges it with `.bss` into one
-1.87 GiB segment that wedges qemu's loader); and the orphan `.got` must be
-pinned inside the lowmem group, because the highmem backing store otherwise
-pushes it past `pcalau12i` reach (+-2 GiB) of `.text`, corrupting cross-TU
-function pointers (`latm_mmio_ram_read` et al.) so any indirect mmio call
-wedged in `latm_system_init_3a4000`. `.guest_ram` uses section-address +
-`NOLOAD` form so images without it are unaffected. Remaining for console
-output: the kernel has not yet emitted serial text, which needs the
-earlycon/`ttyS0` UART clock and register semantics to line up.
+no `bad pc`, and the PC keeps moving instead of parking in a halt loop, so the
+kernel is doing real early-init work. Getting here needed two linker fixes in
+`baremetal/bare/bare.lds`, both forced by the backing-store size: the 192 MiB
+guest RAM cannot live in qemu-virt lowmem (0-256 MiB) alongside the VMM image,
+so it is placed in the highmem RAM window via a dedicated `.guest_ram` section
+at `0x80000000` with its own `PT_LOAD` phdr (without phdr isolation ld.lld
+merges it with `.bss` into one 1.87 GiB segment that wedges qemu's loader); and
+the orphan `.got` must be pinned inside the lowmem group, because the highmem
+backing store otherwise pushes it past `pcalau12i` reach (+-2 GiB) of `.text`,
+corrupting cross-TU function pointers (`latm_mmio_ram_read` et al.) so any
+indirect mmio call wedged in `latm_system_init_3a4000`. `.guest_ram` uses
+section-address + `NOLOAD` form so images without it are unaffected.
+
+**Console output: the self-decompressor now runs to real depth.** The kernel is
+a zImage whose payload is a zstd frame at file offset `0x288d0`; after the BSS
+clear it enters that decompressor and decodes for hundreds of thousands of
+blocks. Three translator bugs had to fall first, each proven by a failing ISA
+case and by the guest's own control flow:
+
+* `DINSU` stores *both* its lsb and msb biased by 32, but only `DINSM` added the
+  bias.  `dinsu $a1,$v0,32,32` - the 64-bit multiply tail of the zstd bit
+  reader - raised a false RI, and the exception vector page is zero-filled, so
+  the guest slid through NOPs forever with `cause=0x28`, `epc=0x87e61710`.
+* `EXT`/`DEXT` were translated reading **RT** as the source.  MIPS reads RS and
+  writes RT (only `INS` is a read-modify-write of RT), so every `dext` extracted
+  from its own destination and returned zero, shredding the decoded bitstream.
+  The generated host word made this unambiguous: `bstrpick.d r10,r10,...`.
+* `ra_alloc_itemp()` called `abort()` when all three itemps were pinned.  It now
+  spills the guest register cache and retries, and `regcache_store()` commits a
+  non-itemp value straight to its env slot instead of asserting.  That abort was
+  the earlier "wedge at 530 k blocks".
+
+The harness side now hands the kernel a real firmware hand-off: the mips
+`fw_init_cmdline()` contract (`fw_arg0` = argc below CKSEG0, `fw_arg1` = a
+**32-bit** KSEG0 pointer array, `argv[0]` skipped) is filled in, the boot cmdline
+is set *before* the DTB is built so `chosen/bootargs` is not empty, the DTB and
+argv live above the decompressed image instead of inside it, `fw_arg2` carries
+the KSEG0 alias of the DTB, and guest 16550 TX bytes are forwarded to the host
+serial console.
+
+`latm-isa` gained `dinsu`, `dext`, `dextu`, `movz`, `movn` and load/store
+subtype coverage (139 checks).  **Known open bug:** `lw` is lowered to
+`ldx.w`, which zero-extends where MIPS sign-extends; the test pins the observed
+behaviour and the fix is the next item.  Until that lands the decoded image can
+still trip zstd's corruption check (`ZSTD_isError` -> `addiu $t7,$0,-0x14` ->
+`b .`), which is where the kernel currently parks.
 
 | SMP | four vCPUs, IPI, cross-core TLB, reservation coherence | P0 |
 | 3A4000 platform | IOCSR/EXTIOI/PCH behaviour aligned with Linux drivers | P0 |
