@@ -29,9 +29,15 @@ typedef struct LatrTbKey {
  * dispatch O(entries). Four ways per set keeps lookup at four key comparisons
  * while making full-table flushes rare.
  *
- * Eight ways were tried (1024 entries, still fitting the 4 MiB arena) against an
- * AOSC boot: translations per million entries fell only from 11.1 to 9.6, while
- * host ticks per entry rose from ~2017 to ~2409. No win, so it is back to four.
+ * Eight ways (1024 entries, still fitting the 4 MiB arena) is an open question,
+ * not a rejected one. One run reached 9.28M entries on 68,608 translations
+ * (7.4 per million) where four ways needed 63,382 for 5.72M (11.1 per million),
+ * i.e. the translation *rate* clearly falls; but paired end-to-end runs could
+ * not be compared because the host load swung the distance travelled by ~40%
+ * between identically-built runs. Measure it on a quiet host: build with PERF=1,
+ * run both geometries for the same wall time, and compare tbs, not the tick
+ * counters -- those are per-phase and a mid-run snapshot matches a different
+ * phase than another run's final one.
  */
 #define LATR_TB_CACHE_WAYS 4
 #define LATR_TB_CACHE_SETS 128
