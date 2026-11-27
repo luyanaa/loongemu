@@ -393,12 +393,15 @@ static void dump_pc_hash(void)
      * Arm the register probe on whatever block is actually repeating, instead
      * of on a hand-picked PC. Picking one by hand burned several long runs on
      * blocks that are entered once (a function's prologue) rather than on the
-     * loop head that comes back every iteration. The threshold matters: the
-     * first silent window of a boot has every count at 1, and arming there just
-     * pins the kernel's entry block, which is entered exactly once. The next
-     * silent window then prints how the chosen block's registers moved.
+     * loop head that comes back every iteration. Two gates matter: before the
+     * console has printed anything every window looks silent, and arming there
+     * pins whatever early-boot helper is hot (vsnprintf, at 1704 entries) rather
+     * than the loop we are chasing, so arming waits for uart_log_len > 0; and
+     * the count threshold keeps it off the kernel's entry block, which is
+     * entered exactly once. The next silent window prints how the chosen
+     * block's registers moved.
      */
-    if (probe_pc == 0 && pc_hash_count[top] >= 200) {
+    if (pc_hash_count[top] >= 200 && machine.sys.uart_log_len > 0) {
         probe_pc = pc_hash_pc[top];
         probe_hits = 0;
         latx_bare_uart_puts("latr-linux: probe armed at ");
