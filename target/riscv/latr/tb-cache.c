@@ -390,6 +390,60 @@ static volatile uint64_t latr_tb_fence_seq_word;
  * fence.i. The caller therefore guarantees this cache has no concurrent
  * mutator: single hart, between blocks, nothing else online.
  */
+/*
+ * Lazy fence handling: nothing is scanned. Every live entry carries the
+ * sequence it was last checked against, so the next dispatch of that entry pays
+ * one verification and then keeps its answer until the sequence moves again.
+ *
+ * With Linux patching its text every ~20 blocks, the eager scan cost 512 checks
+ * per fence and dragged that phase to 444 blocks/s. Moving the check to the
+ * dispatch of each block turns it into at most one check per block entered.
+ */
+int latr_tb_cache_check_entry(LatrTbCache *cache, LatrTbEntry *entry,
+                              LatrTbSameCode same, void *same_ctx)
+{
+    uint64_t seq;
+
+    if (cache == 0 || entry == 0 || !entry->valid) {
+        return 0;
+    }
+    seq = latr_tb_fence_seq();
+    if (entry->verified_seq == seq) {
+        return 1;
+    }
+    /* Once per fence per entry: record the answer even when it is "changed",
+     * because a changed entry is dropped below and never asked again. */
+    entry->verified_seq = seq;
+    if (entry->verifiable && same != 0 && same(same_ctx, entry)) {
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * fence.i without a scan: advance the sequence every entry is checked against
+ * and leave the checking to each block's next dispatch. Other harts still get a
+ * full shootdown -- only a hart can read its own guest view -- so this is for
+ * the single-hart case the machine selects.
+ */
+uint64_t latr_tb_fence_i_lazy(LatrTbCache *self)
+{
+    uint64_t seq = __atomic_add_fetch(&latr_tb_fence_seq_word, 1,
+                                      __ATOMIC_ACQ_REL);
+
+    for (int i = 0; i < LATR_TB_CACHE_MAX_CORES; i++) {
+        LatrTbCache *cache = __atomic_load_n(&latr_tb_cores[i],
+                                             __ATOMIC_ACQUIRE);
+        if (cache != 0 && cache != self) {
+            latr_tb_shootdown_all(cache);
+        }
+        if (cache != 0 && cache->park != 0) {
+            latr_hart_wake(cache->park);
+        }
+    }
+    return seq;
+}
+
 uint32_t latr_tb_cache_drop_stale(LatrTbCache *cache, LatrTbSameCode same,
                                   void *same_ctx, LatrTbOnDrop on_drop,
                                   void *drop_ctx)

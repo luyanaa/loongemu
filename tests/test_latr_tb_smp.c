@@ -160,6 +160,15 @@ static int tb_same_for_test(void *ctx, const LatrTbEntry *e)
     return memcmp(&c->bytes[base], e->snap, e->guest_size) == 0;
 }
 
+static int count_cmp_for_test(void *ctx, const LatrTbEntry *e)
+{
+    int *n = ctx;
+
+    (void)e;
+    (*n)++;
+    return 1;
+}
+
 static void tb_drop_for_test(void *ctx, uintptr_t code)
 {
     int *n = ctx;
@@ -608,6 +617,55 @@ int main(void)
         CHECK(cache_a.count == 0, "cache is empty after the conservative drop");
         CHECK(cache_a.reclaim_pending == 1,
               "dropping every entry still asks for an arena recycle");
+    }
+
+    /*
+     * 15. Lazy verification: one check per entry per fence, never a scan.
+     *
+     * The machine bumps the sequence at fence.i and lets each block prove itself
+     * at its next dispatch. This pins the two properties that make it correct
+     * and cheap: an unchanged entry is accepted and not re-checked until the
+     * sequence moves, and a changed or unverifiable entry is refused.
+     */
+    {
+        static uint8_t guest2[64];
+        struct test_cmp_ctx ctx2 = { guest2 };
+        int compare_calls = 0;
+
+        latr_tb_cache_init(&cache_a, arena_a, sizeof(arena_a));
+        memset(guest2, 0x22, sizeof(guest2));
+        LatrTbEntry *e = latr_tb_cache_insert(&cache_a, 0x80000000u, key(1, 1),
+                                              blob, sizeof(blob), 2);
+        CHECK(e != NULL, "lazy-test insert succeeds");
+        for (int b = 0; b < 8; b++) {
+            e->snap[b] = guest2[b];
+        }
+        e->guest_size = 8;
+        e->verifiable = 1;
+        e->verified_seq = latr_tb_fence_seq();
+        CHECK(latr_tb_cache_check_entry(&cache_a, e, count_cmp_for_test,
+                                       &compare_calls) == 1,
+              "same sequence accepts without comparing");
+        CHECK(compare_calls == 0, "no comparison while the sequence is current");
+
+        /* A fence moves the sequence; the next dispatch compares once. */
+        (void)latr_tb_fence_i_lazy(&cache_a);
+        CHECK(latr_tb_cache_check_entry(&cache_a, e, tb_same_for_test, &ctx2) == 1,
+              "unchanged bytes are accepted after a fence");
+        CHECK(latr_tb_cache_check_entry(&cache_a, e, count_cmp_for_test,
+                                       &compare_calls) == 1,
+              "second dispatch of the same sequence accepts");
+        CHECK(compare_calls == 0, "the entry is not re-compared for this fence");
+
+        (void)latr_tb_fence_i_lazy(&cache_a);
+        guest2[3] ^= 0xff;
+        CHECK(latr_tb_cache_check_entry(&cache_a, e, tb_same_for_test, &ctx2) == 0,
+              "changed bytes are refused after a fence");
+
+        (void)latr_tb_fence_i_lazy(&cache_a);
+        e->verifiable = 0;
+        CHECK(latr_tb_cache_check_entry(&cache_a, e, tb_same_for_test, &ctx2) == 0,
+              "unverifiable entries are refused after a fence");
     }
 
     printf("test-latr-tb-smp: %d checks, %d failures\n", checks, failures);

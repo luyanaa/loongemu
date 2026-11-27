@@ -1314,11 +1314,13 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
          * lock, and another hart's shootdown could otherwise mutate an entry
          * between the comparison and the drop. With one hart nothing else can.
          */
-        struct tb_verify_ctx verify = { &h->env, ~(uint64_t)0, 0, 0, 0 };
-        uint64_t seq = (m->nharts == 1)
-            ? latr_tb_fence_i_local(&h->tb_cache, tb_code_unchanged, &verify,
-                                    tb_drop_map, h)
-            : latr_tb_fence_begin(0, 1);
+        /*
+         * Nothing is scanned here. Linux patches its text roughly every 20
+         * blocks, so 512 checks per fence dominated the phase (444 blocks/s
+         * measured); each block now proves itself at its own dispatch instead.
+         */
+        uint64_t seq = (m->nharts == 1) ? latr_tb_fence_i_lazy(&h->tb_cache)
+                                        : latr_tb_fence_begin(0, 1);
 
         latr_tb_fence_ack(&h->tb_cache);
         latr_tb_fence_complete(m, h, seq);
@@ -1365,6 +1367,30 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
             latr_chain_remember(&h->chain, entry, &key);
         }
     }
+    /*
+     * A fence.i leaves entries in place and bumps a sequence; a block proves its
+     * bytes are still the ones it was built from before it is used. Doing it here
+     * -- once per lookup that survives a fence -- is what keeps the patch phase
+     * from paying 512 checks per fence on a guest that fences every ~20 blocks.
+     *
+     * Chaining is disabled (latr_chain_init(..., 0)), so no block is reached
+     * without passing through this lookup. If chaining is ever enabled, the same
+     * check has to be applied to a chained target before it is entered.
+     */
+    if (m->nharts == 1 && entry != NULL) {
+        struct tb_verify_ctx verify = { &h->env, ~(uint64_t)0, 0, 0, 0 };
+
+        if (!latr_tb_cache_check_entry(&h->tb_cache, entry, tb_code_unchanged,
+                                       &verify)) {
+            latr_tb_insn_map_forget((void *)(uintptr_t)entry->code);
+            entry->valid = 0;
+            if (h->tb_cache.count > 0) {
+                h->tb_cache.count--;
+            }
+            latr_chain_break(&h->chain, LATR_CHAIN_BREAK_EXCEPTION);
+            entry = NULL;
+        }
+    }
     if (entry == NULL) {
         latr_chain_break(&h->chain, LATR_CHAIN_BREAK_MISS);
         if (m->translate_tb != NULL) {
@@ -1406,6 +1432,8 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
             /* Record what this block was translated from, so fence.i can test
              * "source changed?" instead of "cache must be thrown away". */
             tb_snapshot_guest_code(entry, &h->env, tb.pc, tb.size);
+            /* Fresh from the translator: it matches the guest bytes right now. */
+            entry->verified_seq = latr_tb_fence_seq();
             latr_tb_insn_map_rebase(h->code_buf, entry->code);
             /* The insert may have displaced an entry; its map can never be
              * found again, so recycle it now instead of at the next arena

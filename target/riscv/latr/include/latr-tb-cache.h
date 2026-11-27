@@ -68,6 +68,14 @@ typedef struct LatrTbEntry {
     uint16_t guest_size;   /* guest code bytes covered, 0 = not recorded */
     uint8_t verifiable;    /* 1 when snap[] holds all guest_size bytes */
     uint8_t snap[LATR_TB_CODE_SNAP];
+    /*
+     * Fence sequence this entry was last checked against. Clearing the whole
+     * cache on every fence.i did the checks up front; checking 512 entries per
+     * fence while Linux patches its text every ~20 blocks is what made that
+     * phase crawl (measured 444 blocks/s). The work belongs on the far fewer
+     * occasions a block is actually entered: verify once per fence, at dispatch.
+     */
+    uint64_t verified_seq;
     int valid;
 } LatrTbEntry;
 
@@ -150,6 +158,16 @@ void latr_tb_shootdown_all(LatrTbCache *cache);
 uint32_t latr_tb_cache_drop_stale(LatrTbCache *cache, LatrTbSameCode same,
                                   void *same_ctx, LatrTbOnDrop on_drop,
                                   void *drop_ctx);
+
+/*
+ * Lazy variant: bump the sequence and let each entry prove itself the next time
+ * it is dispatched. `latr_tb_cache_check_entry` returns 0 when the entry must
+ * not be entered (its bytes changed, or it cannot be verified), 1 when it is
+ * safe. Requires chaining to be off, so no block is reached without a dispatch.
+ */
+uint64_t latr_tb_fence_i_lazy(LatrTbCache *self);
+int latr_tb_cache_check_entry(LatrTbCache *cache, LatrTbEntry *entry,
+                              LatrTbSameCode same, void *same_ctx);
 void latr_tb_shootdown_asid(LatrTbCache *cache, uint32_t asid);
 void latr_tb_shootdown_privilege(LatrTbCache *cache, uint32_t privilege);
 /*
