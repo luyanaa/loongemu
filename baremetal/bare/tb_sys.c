@@ -2628,7 +2628,7 @@ static int is_host_vmm_va(uint64_t va)
  * whether a guest can read VMM memory, so it is not a place to rely on
  * codegen that has been observed to change under -O.
  */
-static void __attribute__((optnone)) rebuild_host_mappings(void)
+static void rebuild_host_mappings(void)
 {
     uint64_t uart_page = g_uart_base
                              ? (g_uart_base & LAPG_PAGE_MASK)
