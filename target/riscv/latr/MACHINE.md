@@ -332,11 +332,32 @@ chain 检查、翻译、汇编、插入、I-cache 同步 —— 都记在 `TB_CO
 2268 万块、3550 s、同样到 level 6。所以 §9.3/§9.4 里"停在 `mem auto-init` 之后"是
 **预算不足**，不是死循环——把它跑够就是对的。
 
-**每块成本随阶段变化，差一个数量级。** 同一次启动里，前 400 万块（到 earlycon）只要
-≤60 s，即 **≥66k 块/s**；整小时平均只有 **6.4k 块/s**。差别不是宿主争用——两次一小时
-运行都是这个量级——而是 `mem auto-init` 之后那段（页初始化/释放）的**访存密度**高得多：
-§9.5 的 helper 调用就是 2.17 次/进入。所以"块/秒"这个指标不能跨阶段比较，也不能用早期
-阶段的速率去推算整机启动要多久。
+**每块成本随阶段变化，差两个数量级。** 单机单 QEMU（无争用）的实测：
+
+| 阶段 | 速率 |
+|---|---|
+| 前 382 万块（到 earlycon+） | **≈190k 块/s**（20 s 走完） |
+| 紧接着的 1 分钟窗口（cma/SBI HSM 段） | **≈2k 块/s** |
+| 整小时平均（两次运行） | ≈6.4k 块/s |
+
+两者相差约 95 倍，且当时只有这一个 QEMU 在跑 —— 所以不是宿主争用，而是阶段本身的
+**访存密度**差异（§9.5：2.17 次 helper 调用/进入）。后果：**"块/秒"不能跨阶段比较，
+也不能用早期速率外推整机启动时长**；早期那段快得误导。
+
+**initramfs 已经接上。** harness 把 `firmware/initramfs.cpio.gz` 嵌进镜像，装载到 DTB
+下方（实测 `0xafe55000-0xafeffc6b`，DTB 在 `0xaff00000`），chosen 节点带
+`linux,initrd-start/end`。对照组 `qemu-system-riscv64` 用同一内核 + 同一 cpio 能到：
+
+```
+[    0.713336] Trying to unpack rootfs image as initramfs...
+[    3.128070] Freeing unused kernel image (initmem) memory: 11976K
+[    3.129826] Run /init as init process
+[    3.144694] Failed to execute /init (error -8)
+```
+
+`error -8` 是 `ENOEXEC`：仓库里的 `firmware/busybox` 不是 riscv64 可执行文件。也就是说
+**启动链路能到 `run_init`，但要在用户态真正跑起来，还需要一个 riscv64 的 busybox 或别的
+`/init`**。这是资产问题，不是翻译器问题。
 
 **卡点已经符号化（2026-11-27）。** `vmlinux-to-elf` 恢复的 kallsyms 可用，但它的
 符号值整体偏 `+0x401`（用 panic trace 里 `show_stack`、`vpanic`、`dump_stack_lvl`、
@@ -411,9 +432,10 @@ harness 在内核自己的控制台输出里认里程碑，命中就打印一次
 | 7 | `ftrace` | `ftrace:` |
 | 8 | `rcu` | `rcu: Preemptible` |
 | 9 | `mem_print_info` | `Memory:` |
-| 10 | `free_initmem` | `Freeing unused kernel memory` |
-| 11 | `run_init` | `Run /init as init process` |
-| 12 | `panic` | `Kernel panic` |
+| 10 | `initramfs_unpack` | `Trying to unpack rootfs image as initramfs` |
+| 11 | `free_initmem` | `Freeing unused kernel memory` |
+| 12 | `run_init` | `Run /init as init process` |
+| 13 | `panic` | `Kernel panic`（事件，不参与排序） |
 
 `make latr-linux-run` 断言 `LATR_LINUX_MIN_LEVEL`（默认 3，即已经达到并保持的
 earlycon）。**这个阈值只许上调**：调到刚好通过一次跑得不远的运行，等于把回归

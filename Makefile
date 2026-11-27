@@ -1255,14 +1255,21 @@ build/latr_linux_blob.o: baremetal/bare/latr_linux_blob.S build/linux/Image
 	@mkdir -p build
 	$(CLANG) $(LATR_BARE_CFLAGS) -c $< -o $@
 
+# The initramfs the guest is told to mount. Checked in, so no download.
+build/latr_initrd_blob.o: baremetal/bare/latr_initrd_blob.S \
+                          firmware/initramfs.cpio.gz
+	@mkdir -p build
+	$(CLANG) $(LATR_BARE_CFLAGS) -c $< -o $@
+
 build/bare_latr_linux.elf: baremetal/bare/latr_linux.c \
-                           build/latr_linux_blob.o latr-core \
+                           build/latr_linux_blob.o build/latr_initrd_blob.o \
+                           latr-core \
                            build/latr_miniglib.o build/latr_libc_min.o \
                            baremetal/bare/bare.lds
 	@mkdir -p build
 	$(CLANG) $(LATR_BARE_CFLAGS) -c $< -o build/latr_linux.o
 	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
-	   build/latr_linux.o build/latr_linux_blob.o \
+	   build/latr_linux.o build/latr_linux_blob.o build/latr_initrd_blob.o \
 	   build/latr_miniglib.o build/latr_libc_min.o \
 	   latr/build/liblatr_core.a -o $@
 
@@ -1270,7 +1277,8 @@ latr-linux-image: build/bare_latr_linux.elf
 
 # The harness reports a numeric boot-milestone level: 1 start_kernel, 2 sbi,
 # 3 earlycon, 4 initmem, 5 mem_auto_init, 6 slub, 7 ftrace, 8 rcu,
-# 9 mem_print_info, 10 free_initmem, 11 run_init, 12 panic. Asserting a level is
+# 9 mem_print_info, 10 initramfs_unpack, 11 free_initmem, 12 run_init,
+# 13 panic. Asserting a level is
 # what stops "it got somewhere" from being a matter of how the log reads; raise
 # LATR_LINUX_MIN_LEVEL as the boot goes further, never lower it to make a run
 # pass. 3 is the earlycon milestone the 2026-11-27 boot reached and keeps.

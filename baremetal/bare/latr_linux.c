@@ -21,6 +21,12 @@
 #include "translate.h"
 #include "loongemu-perf.h"
 
+/* Supplied by latr_linux_blob.S / latr_initrd_blob.S. */
+extern const uint8_t latr_linux_image[];
+extern const uint8_t latr_linux_image_end[];
+extern const uint8_t latr_initrd_image[];
+extern const uint8_t latr_initrd_image_end[];
+
 extern void latr_enter_tb(void *env, void *code);
 extern const unsigned char latr_linux_image[];
 extern const unsigned char latr_linux_image_end[];
@@ -171,6 +177,9 @@ static const struct {
     { "ftrace:",                      "ftrace" },
     { "rcu: Preemptible",             "rcu" },
     { "Memory:",                      "mem_print_info" },
+    /* Inserted after mem_print_info so the levels already used by the gate and
+     * quoted in MACHINE.md (1-9) do not move. */
+    { "Trying to unpack rootfs image as initramfs", "initramfs_unpack" },
     { "Freeing unused kernel memory", "free_initmem" },
     { "Run /init as init process",    "run_init" },
     { "Kernel panic",                 "panic" },
@@ -823,6 +832,26 @@ void kmain(void)
     if (!latr_machine_load_kernel(&machine, latr_linux_image, image_len)) {
         latx_bare_uart_puts("latr-linux: FAIL load\n");
         return;
+    }
+    /*
+     * Load the initramfs before the DTB is built: the chosen node carries
+     * linux,initrd-start/end, so the properties have to exist when the tree is
+     * written. Without an initrd the kernel has no root= to mount and panics in
+     * mount_root_generic, which is exactly where the reference boot stops too.
+     */
+    {
+        uint64_t initrd_len =
+            (uint64_t)(uintptr_t)(latr_initrd_image_end - latr_initrd_image);
+
+        if (!latr_machine_load_initrd(&machine, latr_initrd_image, initrd_len)) {
+            latx_bare_uart_puts("latr-linux: FAIL initrd\n");
+            return;
+        }
+        latx_bare_uart_puts("latr-linux: initrd=");
+        puthex64(machine.initrd_start);
+        latx_bare_uart_puts("-");
+        puthex64(machine.initrd_end);
+        latx_bare_uart_puts("\n");
     }
     if (!latr_machine_build_dtb(&machine) || !latr_machine_boot(&machine)) {
         latx_bare_uart_puts("latr-linux: FAIL boot\n");
