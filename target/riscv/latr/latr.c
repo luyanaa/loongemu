@@ -1186,9 +1186,15 @@ bool tr_ir2_generate(TranslationBlock *tb)
                 return false;
             }
             if ((unsigned)insns[i].opcode < LATR_RV_OPCODE_COUNT) {
-                latr_opcode_ir2[insns[i].opcode] +=
-                    latr_ir2_count_now(data) - before;
+                unsigned delta = (unsigned)(latr_ir2_count_now(data) - before);
+
+                latr_opcode_ir2[insns[i].opcode] += delta;
                 latr_opcode_insns[insns[i].opcode]++;
+                if (delta > latr_insn_worst_ir2) {
+                    latr_insn_worst_ir2 = delta;
+                    latr_insn_worst_pc = insns[i].pc;
+                    latr_insn_worst_opcode = (uint32_t)insns[i].opcode;
+                }
             }
         }
 #else
@@ -1441,6 +1447,19 @@ void label_dispose(void)
 #ifndef LATR_OPCODE_STATS
 #define LATR_OPCODE_STATS 0
 #endif
+uint32_t latr_insn_worst_ir2;
+uint64_t latr_insn_worst_pc;
+uint32_t latr_insn_worst_opcode;
+uint64_t latr_block_entry_ir2;
+uint64_t latr_block_exit_ir2;
+uint64_t latr_block_ir2_total;
+uint64_t latr_block_words_total;
+uint64_t latr_block_count;
+uint64_t latr_block_worst_ratio;
+uint64_t latr_block_worst_pc;
+uint32_t latr_block_worst_icount;
+uint32_t latr_block_worst_ir2;
+uint32_t latr_block_worst_words;
 uint64_t latr_opcode_ir2[LATR_RV_OPCODE_COUNT];
 uint64_t latr_opcode_insns[LATR_RV_OPCODE_COUNT];
 
@@ -1473,12 +1492,20 @@ int tr_ir2_assemble(const void *code_start_addr)
         span_off[i] = 0;
     }
     int ir2_index = 0;
+    int entry_ir2 = -1;   /* IR2 emitted before the first instruction */
+    int exit_ir2 = -1;    /* IR2 emitted after the last instruction */
     for (IR2_INST *inst = data->first_ir2; inst != NULL; inst = ir2_next(inst)) {
         if (ir2_opcode(inst) == LISA_LABEL) {
             int id = ir2_opnd_label_id(&inst->_opnd[0]);
             for (int i = 0; i <= data->tb_insn_count; i++) {
                 if (data->tb_insn_label[i] == id) {
                     span_off[i] = (uint32_t)(count * 4);
+                    if (i == 0 && entry_ir2 < 0) {
+                        entry_ir2 = ir2_index;
+                    }
+                    if (i == data->tb_insn_count && exit_ir2 < 0) {
+                        exit_ir2 = ir2_index;
+                    }
                 }
             }
             continue;
@@ -1504,6 +1531,41 @@ int tr_ir2_assemble(const void *code_start_addr)
         }
     }
 
+    /*
+     * Per-block IR2 vs emitted words, and the block with the worst IR2-per-word.
+     * Bounded to one list walk per block, so it is safe to leave on: it answers
+     * "is a 241-IR2 ADDIW a flush storm inside one block, or a broken
+     * per-instruction attribution?" without needing a special build.
+     */
+    {
+        int ir2_total = latr_ir2_count_now(data);
+
+        /*
+         * Split the block into "before the first instruction" (entry code),
+         * "the instructions" and "after the last one" (exit code). If the entry
+         * part is the bulk of a block, the 91 host instructions per guest
+         * instruction are per-block setup, not per-instruction translation, and
+         * the fix is a cheaper entry/exit -- not a cheaper ADDIW.
+         */
+        if (entry_ir2 >= 0) {
+            latr_block_entry_ir2 += (uint64_t)entry_ir2;
+        }
+        if (exit_ir2 >= 0 && exit_ir2 <= ir2_total) {
+            latr_block_exit_ir2 += (uint64_t)(ir2_total - exit_ir2);
+        }
+        latr_block_ir2_total += (uint64_t)ir2_total;
+        latr_block_words_total += (uint64_t)count;
+        latr_block_count++;
+        if ((uint64_t)count > 0 &&
+            (uint64_t)ir2_total / (uint64_t)count >
+                latr_block_worst_ratio) {
+            latr_block_worst_ratio = (uint64_t)ir2_total / (uint64_t)count;
+            latr_block_worst_pc = data->tb_insn_pc[0];
+            latr_block_worst_icount = (uint32_t)data->tb_insn_count;
+            latr_block_worst_ir2 = (uint32_t)ir2_total;
+            latr_block_worst_words = (uint32_t)count;
+        }
+    }
     latr_tb_insn_map_begin((void *)code_start_addr, (uint32_t)count * 4);
     for (int i = 0; i < data->tb_insn_count; i++) {
         latr_tb_insn_map_add(data->tb_insn_pc[i], span_off[i],

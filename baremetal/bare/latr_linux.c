@@ -617,6 +617,34 @@ static void dump_opcode_cost(void)
         total_ir2 += latr_opcode_ir2[op];
         total_insns += latr_opcode_insns[op];
     }
+    latx_bare_uart_puts("latr-linux: blocks=");
+    put_dec(latr_block_count);
+    latx_bare_uart_puts(" ir2=");
+    put_dec(latr_block_ir2_total);
+    latx_bare_uart_puts(" words=");
+    put_dec(latr_block_words_total);
+    latx_bare_uart_puts(" entry=");
+    put_dec(latr_block_entry_ir2);
+    latx_bare_uart_puts(" exit=");
+    put_dec(latr_block_exit_ir2);
+    latx_bare_uart_puts(" ir2/word=");
+    put_dec(latr_block_words_total != 0
+                ? latr_block_ir2_total / latr_block_words_total : 0);
+    latx_bare_uart_puts("\nlatr-linux: worst insn pc=");
+    puthex64(latr_insn_worst_pc);
+    latx_bare_uart_puts(" op=");
+    latx_bare_uart_puts(latr_opcode_name(latr_insn_worst_opcode));
+    latx_bare_uart_puts(" ir2=");
+    put_dec(latr_insn_worst_ir2);
+    latx_bare_uart_puts("\nlatr-linux: worst block pc=");
+    puthex64(latr_block_worst_pc);
+    latx_bare_uart_puts(" insns=");
+    put_dec(latr_block_worst_icount);
+    latx_bare_uart_puts(" ir2=");
+    put_dec(latr_block_worst_ir2);
+    latx_bare_uart_puts(" words=");
+    put_dec(latr_block_worst_words);
+    latx_bare_uart_puts("\n");
     latx_bare_uart_puts("latr-linux: opcode cost total ir2=");
     put_dec(total_ir2);
     latx_bare_uart_puts(" insns=");

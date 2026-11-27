@@ -322,6 +322,19 @@ int tr_ir2_assemble(const void *code_start_addr);
 /* Emitted words and instruction count per guest opcode (measurement only).
  * Sized by LATR_RV_OPCODE_COUNT, so ir1.h must be visible here. */
 #include "ir1.h"
+extern uint32_t latr_insn_worst_ir2;
+extern uint64_t latr_insn_worst_pc;
+extern uint32_t latr_insn_worst_opcode;
+extern uint64_t latr_block_entry_ir2;
+extern uint64_t latr_block_exit_ir2;
+extern uint64_t latr_block_ir2_total;
+extern uint64_t latr_block_words_total;
+extern uint64_t latr_block_count;
+extern uint64_t latr_block_worst_ratio;
+extern uint64_t latr_block_worst_pc;
+extern uint32_t latr_block_worst_icount;
+extern uint32_t latr_block_worst_ir2;
+extern uint32_t latr_block_worst_words;
 extern uint64_t latr_opcode_ir2[LATR_RV_OPCODE_COUNT];
 extern uint64_t latr_opcode_insns[LATR_RV_OPCODE_COUNT];
 /* Name of an opcode, for the histogram report. */
