@@ -27,6 +27,13 @@ PERF ?= 0
 ifeq ($(PERF),1)
 DEFS += -DLOONGEMU_PERF
 endif
+
+# Per-opcode IR2 accounting. Off by default: it costs a counter per instruction
+# and only exists to answer "which guest opcode emits this code".
+LATR_OPCODE_STATS ?= 0
+ifeq ($(LATR_OPCODE_STATS),1)
+DEFS += -DLATR_OPCODE_STATS=1
+endif
 BASE := --target=$(TARGET) -ffreestanding -nostdinc -fno-builtin \
         -fno-stack-protector -O2 -g -mno-lsx -mno-lasx -fno-vectorize \
         -fno-slp-vectorize -Wno-unused-parameter -Wno-unused-variable

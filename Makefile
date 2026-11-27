@@ -736,6 +736,11 @@ endif
 ifneq ($(LINUX_STEPS),)
 LATR_BARE_CFLAGS += -DSTEP_BUDGET=$(LINUX_STEPS)u
 endif
+# Per-opcode IR2 accounting in the translator. Off by default because it must be
+# consistent with the library build; turning it on is a measurement decision.
+ifneq ($(LATR_OPCODE_STATS),)
+LATR_BARE_CFLAGS += -DLATR_OPCODE_STATS=1
+endif
 
 
 build/latr_isa_test.o: baremetal/bare/latr_isa_test.c \

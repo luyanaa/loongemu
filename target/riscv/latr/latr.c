@@ -296,14 +296,16 @@ static LatrRegCacheStats latr_regcache_stats_counters;
  */
 static int latr_ir2_count_now(TRANSLATION_DATA *data)
 {
-    int n = 0;
-
-    for (IR2_INST *it = data->first_ir2; it != NULL; it = ir2_next(it)) {
-        if (ir2_opcode(it) != LISA_LABEL) {
-            n++;
-        }
-    }
-    return n;
+    /*
+     * `ir2_inst_num_current` is the array index `ir2_allocate()` hands out, so
+     * it is the authoritative count of IR2 slots issued; labels are allocated
+     * the same way and tracked separately. This used to walk the list instead,
+     * which read as "the counter is never incremented" -- it is, in
+     * ir2_allocate() step 2 -- and a list walk is both O(n) per query and at the
+     * mercy of `ir2_next()` being acyclic, which is exactly the bug class
+     * MACHINE.md 7.2 records.
+     */
+    return data->ir2_inst_num_current - data->label_num;
 }
 
 void latr_emit_code_symbol(IR2_OPND dst, const void *sym)
