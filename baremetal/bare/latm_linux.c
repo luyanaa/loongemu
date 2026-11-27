@@ -771,7 +771,7 @@ void kmain(void)
  * registers, and then resume normal block sizing.  Zero disables it. */
 static void debug_dump_args(CPUMIPSState *env, const char *tag)
 {
-    static const int gprs[] = { 4, 5, 6, 7, 8, 9, 10, 11,
+    static const int gprs[] = { 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
                                 16, 17, 18, 19, 20, 21, 22, 23, 29, 31 };
     latx_bare_uart_puts("latm-linux: ");
     latx_bare_uart_puts(tag);
@@ -789,6 +789,27 @@ static void debug_dump_args(CPUMIPSState *env, const char *tag)
         latx_bare_uart_puts("=");
         for (int k=15;k>=0;k--) h[15-k]="0123456789abcdef"[(env->active_tc.gpr[g]>>(k*4))&15];
         h[16]=0;
+        latx_bare_uart_puts(h);
+        latx_bare_uart_putc('\n');
+    }
+    {   /* Bytes at the first argument, to see what the guest actually reads. */
+        uint64_t a = env->active_tc.gpr[4];
+        uint64_t phys = a & 0x1fffffffull;
+        char h[17];
+
+        if (phys + 8u <= (uint64_t)sizeof(ram)) {
+            const uint8_t *p = (const uint8_t *)(void *)(ram + phys);
+
+            for (int k = 0; k < 8; k++) {
+                h[2*k] = "0123456789abcdef"[p[k] >> 4];
+                h[2*k+1] = "0123456789abcdef"[p[k] & 15];
+            }
+            h[16] = 0;
+        } else {
+            for (int k = 0; k < 16; k++) h[k] = '?';
+            h[16] = 0;
+        }
+        latx_bare_uart_puts("latm-linux:   @a0=");
         latx_bare_uart_puts(h);
         latx_bare_uart_putc('\n');
     }
