@@ -569,6 +569,34 @@ void latr_regcache_reset(void)
 }
 
 /*
+ * Emitter tagging. latr_tag() sets the tag applied to every IR2 allocated until
+ * the next call; ir2_allocate() stamps it, so a helper nested inside the
+ * instruction translation is still attributed to whoever called it.
+ */
+unsigned latr_current_tag;
+uint64_t latr_tag_ir2[LATR_TAG_COUNT];
+
+void latr_tag(unsigned tag)
+{
+    latr_current_tag = tag;
+}
+
+int latr_emit_tag_get(void)
+{
+    return (int)latr_current_tag;
+}
+
+const char *latr_tag_name(unsigned tag)
+{
+    static const char *const names[LATR_TAG_COUNT] = {
+        "insn", "instret", "resolve", "mmio", "writeback", "release",
+        "pc-exit", "fault", "other",
+    };
+
+    return tag < LATR_TAG_COUNT ? names[tag] : "?";
+}
+
+/*
  * IR2 spent on register-cache flushes. A flush writes back every dirty resident
  * guest register and releases every temporary; the translator flushes at every
  * label and every branch edge, so this is the prime suspect for the ~230 IR2
@@ -1098,9 +1126,12 @@ static bool has_direct_target(LatrRiscvOpcode opcode)
 static void store_pc_constant(uint64_t pc)
 {
     IR2_OPND value = ra_alloc_itemp();
+
+    latr_tag(LATR_TAG_PC_EXIT);
     li_d(value, (int64_t)pc);
     la_st_d(value, env_ir2_opnd, env_offset_pc());
     ra_free_temp(value);
+    latr_tag(LATR_TAG_INSN);
 }
 
 bool tr_ir2_generate(TranslationBlock *tb)
@@ -1200,6 +1231,7 @@ bool tr_ir2_generate(TranslationBlock *tb)
         data->tb_insn_bind_cnt[i] = latr_regcache_snapshot_gpr_binds(
             data->tb_insn_binds[i]);
         (la_label)(labels[i]);
+        latr_tag(LATR_TAG_INSN);
 #if LATR_OPCODE_STATS
         {
             unsigned before = latr_ir2_count_now(data);
@@ -1247,12 +1279,14 @@ bool tr_ir2_generate(TranslationBlock *tb)
     }
 
     latr_regcache_flush();
+    latr_tag(LATR_TAG_PC_EXIT);
     (la_label)(labels[count]);
     store_pc_constant(pc);
     la_jirl(zero_ir2_opnd, ra_ir2_opnd, 0);
 
     for (int i = 0; i < exit_count; i++) {
         latr_regcache_flush();
+        latr_tag(LATR_TAG_PC_EXIT);
         (la_label)(exits[i].label);
         store_pc_constant(exits[i].pc);
         la_jirl(zero_ir2_opnd, ra_ir2_opnd, 0);
@@ -1588,6 +1622,15 @@ int tr_ir2_assemble(const void *code_start_addr)
             latr_block_exit_ir2 += (uint64_t)(ir2_total - exit_ir2);
         }
         latr_block_ir2_total += (uint64_t)ir2_total;
+        {
+            IR2_INST *it;
+
+            for (it = data->first_ir2; it != NULL; it = ir2_next(it)) {
+                if (it->_tag < LATR_TAG_COUNT) {
+                    latr_tag_ir2[it->_tag]++;
+                }
+            }
+        }
         latr_block_words_total += (uint64_t)count;
         latr_block_count++;
         if ((uint64_t)count > 0 &&

@@ -247,6 +247,8 @@ void latr_emit_resolve(IR2_OPND address, unsigned access, unsigned size)
 {
     IR2_OPND target = ra_alloc_itemp();
 
+    latr_tag(LATR_TAG_RESOLVE);
+
     latr_env_store_d(address, env_offset_mem_va());
     la_mov64(a0_ir2_opnd, env_ir2_opnd);
     la_mov64(a1_ir2_opnd, address);
@@ -257,6 +259,7 @@ void latr_emit_resolve(IR2_OPND address, unsigned access, unsigned size)
     la_jirl(ra_ir2_opnd, target, 0);
     ra_free_temp(target);
     latr_env_load_d(ra_ir2_opnd, env_offset_host_return_address());
+    latr_tag(LATR_TAG_INSN);
 }
 
 /* Branches to `fault` when the last resolve failed (host address 0 may be a
@@ -265,9 +268,12 @@ void latr_emit_branch_on_fault(IR2_OPND fault)
 {
     IR2_OPND cause = ra_alloc_itemp();
 
+    latr_tag(LATR_TAG_FAULT);
+
     latr_env_load_d(cause, env_offset_mem_fault_cause());
     la_bne(cause, zero_ir2_opnd, fault);
     ra_free_temp(cause);
+    latr_tag(LATR_TAG_INSN);
 }
 
 static uint64_t latr_read_time(CPUArchState *env)
@@ -930,6 +936,7 @@ void latr_raise_mem_fault(const RiscvIR1 *ir1)
 
 void latr_emit_instret(void)
 {
+    latr_tag(LATR_TAG_INSTRET);
     IR2_OPND inhibit = a0_ir2_opnd;
     IR2_OPND count = a1_ir2_opnd;
     IR2_OPND one = a2_ir2_opnd;
@@ -943,6 +950,11 @@ void latr_emit_instret(void)
     la_add_d(count, count, one);
     latr_env_store_d(count, env_offset_csr(CSR_MINSTRET));
     la_label(skip);
+    /* Tags are sticky by design (ir2_allocate stamps whatever is current), so
+     * every tagged helper has to hand the tag back. Without this the first
+     * helper in an instruction absorbs everything the instruction emits after
+     * it: fault read 45% of all IR2 while its own body is four instructions. */
+    latr_tag(LATR_TAG_INSN);
 }
 
 static void emit_csr_access_checks(int csr, IR2_OPND illegal)

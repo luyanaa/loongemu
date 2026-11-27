@@ -106,6 +106,13 @@ typedef struct IR2_INST {
     int16 _prev;
     int16 _next;
     int op_count;
+    /*
+     * Which translator site emitted this IR2 (latr.h LATR_TAG_*). Stamped in
+     * ir2_allocate() from a current-tag global, so a helper nested three calls
+     * deep is attributed to the site that called it. Diagnostic only; nothing
+     * reads it on any fast path.
+     */
+    unsigned char _tag; /* see latr.h LATR_TAG_* */
     IR2_OPND _opnd[4]; /*LA has 4 opnds*/
 } IR2_INST;
 

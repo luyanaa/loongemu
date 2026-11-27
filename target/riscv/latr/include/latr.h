@@ -322,6 +322,29 @@ int tr_ir2_assemble(const void *code_start_addr);
 /* Emitted words and instruction count per guest opcode (measurement only).
  * Sized by LATR_RV_OPCODE_COUNT, so ir1.h must be visible here. */
 #include "ir1.h"
+/*
+ * Emitter tags. Every IR2 records the site that emitted it, so "who produced
+ * these 15 env-field address computations" is a histogram rather than a guess.
+ */
+enum {
+    LATR_TAG_INSN = 0,   /* the guest instruction's own translation */
+    LATR_TAG_INSTRET,    /* latr_emit_instret() */
+    LATR_TAG_RESOLVE,    /* latr_emit_resolve() */
+    LATR_TAG_MMIO,       /* MMIO dispatch call */
+    LATR_TAG_WRITEBACK,  /* register-cache writeback */
+    LATR_TAG_RELEASE,    /* register-cache release / temp free */
+    LATR_TAG_PC_EXIT,    /* store_pc_constant + block exit */
+    LATR_TAG_FAULT,      /* branch-on-fault / trap entry */
+    LATR_TAG_OTHER,      /* anything else */
+    LATR_TAG_COUNT
+};
+
+extern unsigned latr_current_tag;
+extern uint64_t latr_tag_ir2[LATR_TAG_COUNT];
+const char *latr_tag_name(unsigned tag);
+/* Sets the tag for every IR2 emitted until the next call. */
+void latr_tag(unsigned tag);
+
 extern uint64_t latr_flush_ir2;
 extern uint64_t latr_flush_emit_calls;
 extern uint32_t latr_insn_worst_ir2;

@@ -49,6 +49,28 @@ uint32 ir2_assemble(IR2_INST *ir2){
     return ins;
 }
 
+/*
+ * One answer to "does this node become a machine word": the format table gives
+ * every pseudo opcode (LABEL, X86_INST, DUP, MOV64 aliases, ...) an opcode
+ * field of 0. Used by the counter in ir2_append(), by ir2_assemble() itself
+ * and by the peephole's word accounting, so the three cannot drift.
+ *
+ * The drift mattered: `real_ir2_inst_num` is read by the LATA exit stubs to
+ * compute a branch offset, and being one word short turned every TB exit into a
+ * branch to an unrelated address.
+ */
+bool ir2_opcode_emits_word(IR2_OPCODE op)
+{
+    if (op <= LISA_INVALID) {
+        return false;
+    }
+    if ((size_t)(op - LISA_INVALID) * sizeof(lisa_format_table[0]) >=
+        sizeof(lisa_format_table)) {
+        return false;
+    }
+    return lisa_format_table[op - LISA_INVALID].opcode != 0;
+}
+
 bool ir2_op_check(IR2_INST *ir2)
 {
     /* get the instrution format in LA*/

@@ -446,7 +446,14 @@ void ir2_append(IR2_INST *ir2)
         t->first_ir2 = ir2;
     }
 
-    if(ir2->_opcode >= LISA_GR2SCR)
+    /*
+     * Count only nodes that become a machine word. The old test
+     * (`_opcode >= LISA_GR2SCR`) counted pseudo aliases too, so this counter
+     * ran ahead of what the assembler emitted. LATA's exit stubs read it to
+     * compute a branch offset, so being one word off turned every TB exit into
+     * a branch to an unrelated address.
+     */
+    if (ir2_opcode_emits_word(ir2->_opcode))
         t->real_ir2_inst_num++;
 }
 
@@ -517,6 +524,13 @@ void ir2_insert_after(IR2_INST *ir2, IR2_INST *prev)
     }
 }
 
+/* Weak default: builds that do not track emitter tags (ARM/LATA) get 0.
+ * The LATR translator defines this strongly. */
+__attribute__((weak)) int latr_emit_tag_get(void)
+{
+    return 0;
+}
+
 IR2_INST *ir2_allocate(void)
 {
     TRANSLATION_DATA *t = lsenv->tr_data;
@@ -551,6 +565,11 @@ IR2_INST *ir2_allocate(void)
     /* 2. allocate one */
     IR2_INST *p = t->ir2_inst_array + t->ir2_inst_num_current;
     ir2_set_id(p, t->ir2_inst_num_current);
+    /*
+     * Attribute the instruction to the site that asked for it. Declared weak in
+     * the ARM/LATA build path, where no tag is tracked and the value stays 0.
+     */
+    p->_tag = (uint8_t)latr_emit_tag_get();
     t->ir2_inst_num_current++;
 
     /* 3. return it */

@@ -79,9 +79,34 @@ IR2_INST *ir2_next(const IR2_INST *);
 
 void ir2_append(IR2_INST *);
 void ir2_remove(IR2_INST *);
+
+/*
+ * True when a node becomes one machine word.
+ *
+ * Three places need this answer and they used to disagree:
+ *
+ *   ir2_append()     counted `_opcode >= LISA_GR2SCR`, which includes LISA_DUP,
+ *                    LISA_MOV64 and the other aliases that expand to something
+ *                    else - so the counter drifted ahead of what was emitted;
+ *   the assembler    skips LISA_LABEL and LISA_X86_INST by name;
+ *   ir2-peephole     does the same, by name.
+ *
+ * `real_ir2_inst_num` is read by the LATA exit stubs to compute a branch
+ * offset, so a one-word drift there turns every TB exit into a wild jump -
+ * which is exactly the bug this predicate exists to make impossible.
+ */
+bool ir2_opcode_emits_word(IR2_OPCODE op);
+
+void ir2_remove(IR2_INST *);
 void ir2_insert_before(IR2_INST *ir2, IR2_INST *next);
 void ir2_insert_after(IR2_INST *ir2, IR2_INST *prev);
 IR2_INST *ir2_allocate(void);
+/*
+ * Current emitter tag, implemented by the LATR translator. The ARM/LATA build
+ * has no tag tracking and provides this returning 0 (see latr_emit_tag_get's
+ * definition there), so ir2_allocate() can stamp unconditionally.
+ */
+int latr_emit_tag_get(void);
 
 uint32 ir2_assemble(IR2_INST *);
 /* IR2-stream checkpoint/rollback. Covers ONLY the instruction stream itself:

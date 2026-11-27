@@ -159,6 +159,7 @@ static void emit_load(const RiscvIR1 *ir1)
     {
         /* a0 carries the guest physical address; a1 receives it. */
         IR2_OPND target = ra_alloc_itemp();
+        latr_tag(LATR_TAG_MMIO);
         la_mov64(a1_ir2_opnd, a0_ir2_opnd);
         li_d(a2_ir2_opnd, size);
         la_mov64(a0_ir2_opnd, env_ir2_opnd);
@@ -167,6 +168,7 @@ static void emit_load(const RiscvIR1 *ir1)
         la_jirl(ra_ir2_opnd, target, 0);
         ra_free_temp(target);
         latr_env_load_d(ra_ir2_opnd, env_offset_host_return_address());
+        latr_tag(LATR_TAG_INSN);
     }
     latr_emit_branch_on_fault(fault);
     {

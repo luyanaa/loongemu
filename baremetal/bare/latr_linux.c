@@ -649,6 +649,22 @@ static void dump_opcode_cost(void)
     latx_bare_uart_puts(" words=");
     put_dec(latr_block_worst_words);
     latx_bare_uart_puts("\n");
+    {
+        uint64_t total = 0;
+
+        for (uint32_t i = 0; i < LATR_TAG_COUNT; i++) {
+            total += latr_tag_ir2[i];
+        }
+        latx_bare_uart_puts("latr-linux: emitter tags total=");
+        put_dec(total);
+        for (uint32_t i = 0; i < LATR_TAG_COUNT; i++) {
+            latx_bare_uart_puts(" ");
+            latx_bare_uart_puts(latr_tag_name(i));
+            latx_bare_uart_puts("=");
+            put_dec(latr_tag_ir2[i]);
+        }
+        latx_bare_uart_puts("\n");
+    }
     latx_bare_uart_puts("latr-linux: opcode cost total ir2=");
     put_dec(total_ir2);
     latx_bare_uart_puts(" insns=");
