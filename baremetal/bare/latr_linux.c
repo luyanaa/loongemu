@@ -133,6 +133,8 @@ static uint64_t last_tbs;
 static uint64_t last_traps;
 
 static void dump_ratio_hist(void);
+static void dump_pc_hash(void);
+static void dump_probe(void);
 static void dump_pc_ring(void);
 
 
@@ -346,6 +348,51 @@ static uint32_t icount_hist[8];
 static uint32_t icount_worst;
 static uint64_t icount_worst_pc;
 
+/*
+ * Entry-frequency sketch. A wedged kernel re-enters the same handful of blocks
+ * forever, and that is visible without any symbol table: the top buckets are
+ * the loop body. Index by the low bits of the guest PC, count entries, and
+ * print the leaders so the loop can be disassembled from the image directly.
+ */
+#define PC_HASH 256
+static uint32_t pc_hash_count[PC_HASH];
+static uint64_t pc_hash_pc[PC_HASH];
+
+static void pc_hash_record(uint64_t pc)
+{
+    uint32_t h = (uint32_t)((pc >> 2) & (PC_HASH - 1));
+
+    if (pc_hash_count[h] == 0) {
+        pc_hash_pc[h] = pc;
+    }
+    pc_hash_count[h]++;
+}
+
+static void dump_pc_hash(void)
+{
+    latx_bare_uart_puts("latr-linux: top block entries:");
+    for (uint32_t n = 0; n < 8; n++) {
+        uint32_t best = 0;
+        for (uint32_t i = 1; i < PC_HASH; i++) {
+            if (pc_hash_count[i] > pc_hash_count[best]) {
+                best = i;
+            }
+        }
+        if (pc_hash_count[best] == 0) {
+            break;
+        }
+        latx_bare_uart_puts(" ");
+        puthex64(pc_hash_pc[best]);
+        latx_bare_uart_puts("x");
+        put_dec(pc_hash_count[best]);
+        pc_hash_count[best] = 0;
+    }
+    for (uint32_t i = 0; i < PC_HASH; i++) {
+        pc_hash_count[i] = 0;
+    }
+    latx_bare_uart_puts("\n");
+}
+
 static void dump_ratio_hist(void)
 {
     latx_bare_uart_puts("latr-linux: guest-insns/block for 1,2,3-4,5-8,9-16,"
@@ -384,11 +431,74 @@ static void ratio_record(uint64_t pc, uint32_t words, uint32_t guest_insns)
     }
 }
 
+/*
+ * One-shot register snapshot at a chosen block, 1000 entries apart.
+ *
+ * A loop that never terminates and a loop that is merely long look identical in
+ * PC samples. The loop *counter* tells them apart: if it keeps growing past the
+ * bound the kernel compares it against, the branch is mis-translated; if it
+ * stays inside a small window, the loop is progressing and the cost is real.
+ */
+#ifndef PROBE_PC
+#define PROBE_PC 0xffffffff803b2938ull
+#endif
+static uint64_t probe_pc = PROBE_PC;
+static uint64_t probe_gpr[2][32];
+static uint64_t probe_insns[2];
+static uint32_t probe_hits;
+
+static void probe_maybe(void *env, uint64_t pc, uint64_t insns)
+{
+    CPUArchState *e = (CPUArchState *)env;
+
+    if (probe_pc == 0 || pc != probe_pc) {
+        return;
+    }
+    probe_hits++;
+    if (probe_hits == 1) {
+        for (int i = 0; i < 32; i++) {
+            probe_gpr[0][i] = e->gpr[i];
+        }
+        probe_insns[0] = insns;
+    } else if (probe_hits == 1001) {
+        for (int i = 0; i < 32; i++) {
+            probe_gpr[1][i] = e->gpr[i];
+        }
+        probe_insns[1] = insns;
+    }
+}
+
+static void dump_probe(void)
+{
+    if (probe_hits < 1001) {
+        return;
+    }
+    latx_bare_uart_puts("latr-linux: probe at ");
+    puthex64(probe_pc);
+    latx_bare_uart_puts(" hits=");
+    put_dec(probe_hits);
+    latx_bare_uart_puts("\n");
+    for (int i = 0; i < 32; i++) {
+        if (probe_gpr[0][i] == probe_gpr[1][i]) {
+            continue;
+        }
+        latx_bare_uart_puts("  x");
+        put_dec((uint32_t)i);
+        latx_bare_uart_puts(" ");
+        puthex64(probe_gpr[0][i]);
+        latx_bare_uart_puts(" -> ");
+        puthex64(probe_gpr[1][i]);
+        latx_bare_uart_puts("\n");
+    }
+}
+
 static void hook_translated(void *env, uint64_t pc, uint32_t host_words,
                             uint32_t guest_insns)
 {
     (void)env;
     ratio_record(pc, host_words, guest_insns);
+    pc_hash_record(pc);
+    probe_maybe(env, pc, machine.harts[0].tbs);
     last_translated = pc;
     /* Record *entries*, not only translations. Once a block is cached it is
      * never translated again, so a translation-only ring is frozen and says
@@ -470,6 +580,8 @@ static void progress(void)
         console_stall_reports++;
         if (console_stall_reports == CONSOLE_STALL_REPORTS) {
             dump_pc_ring();
+            dump_probe();
+            dump_pc_hash();
             dump_ratio_hist();
             console_stall_reports = 0;
         }

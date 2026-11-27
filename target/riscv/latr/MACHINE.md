@@ -248,9 +248,32 @@ harness 现在打印三类量，用来把"慢"和"卡"分开：
    （768 MiB 是 196608），但同样停在 `mem auto-init`、同样在 500 万块左右，
    相差不到 15%。按页数应是三倍差距，所以这一阶段不是"逐页初始化"。
 
-尚未定论的是那段时间到底在执行什么：PC ring 的窗口在 `0x81808xxx`（`__init` 文本）
-里推进，48 槽里 23 个不同地址，跨多个报告窗口重复同一组地址——形如一个反复执行的
-循环体。下一步应在这个窗口上做**同一 PC 重复次数**统计，而不是继续看孤立 PC。
+**卡点已经符号化（2026-11-27）。** `vmlinux-to-elf` 恢复的 kallsyms 可用，但它的
+符号值整体偏 `+0x401`（用 panic trace 里 `show_stack`、`vpanic`、`dump_stack_lvl`、
+`mount_root_generic` 四个锚点交叉验证，偏移量完全一致）。校正后，卡住时反复进入的
+块是：
+
+| 热块 | 符号 |
+|---|---|
+| `0xffffffff803b2938` | `memmap_init_range+0x80` |
+| `0xffffffff80406dd0` | `__set_pfnblock_flags_mask.constprop.0+0x30` |
+| `0xffffffff8040b608` | `init_pageblock_migratetype` |
+| `0xffffffff8036b160` | `jump_label_cmp+0x28` |
+| `0xffffffff80b77432` | `__sort_r+0x17a` |
+| `0xffffffff803b3ce0` | `pcpu_find_block_fit+0x50` |
+| `0xffffffff815e6d9c` | `memset` |
+| `0xffffffff80b93d88` | `blake2s_compress_generic` |
+
+也就是内核正在逐页初始化 `struct page`（`memmap_init_range` → 设置 pageblock
+migratetype）。这一阶段在 `qemu-system-riscv64` 上是**微秒级**：对照启动里
+`mem auto-init` 和紧接着的 `SLUB: HWalign=64, ...` 时间戳都是 `[0.000000]`，
+整机到 `mount_root` 只用了 2.7 秒。所以 LATR 上 500 万块还停在这里不是"慢"，
+而是**这个循环没有正常推进**。
+
+下一步的实验已经装好但还没跑到（该函数出现在 500 万块之后，而带探针的那次运行只到
+410 万块）：`probe_pc` 在第 1 次和第 1001 次进入该块时各存一份 32 个 GPR，`dump_probe`
+只打印变化过的寄存器。如果循环计数已越过边界还在继续，就是比较/分支译错；如果它
+在窗口内单调前进，那就是每页成本异常。`PROBE_PC` 可编译期指定。
 
 **这段距离里修掉的两个真实缺陷**（都在 `tb-insn-map.c` / `tb-cache.c`，详见 §9.2）：
 `LatrTbInsnMap` 每块一张 ~22 KiB 且宿主 `free()` 是 no-op，以及 `rebase` 之后
