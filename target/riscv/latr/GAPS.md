@@ -160,6 +160,6 @@ ELF 装载器已抽成不依赖机器模型的 `system/latr_elf.c`（`include/la
 - [~] 真实 OpenSBI 启动：`latr-opensbi-run` 已接入 Homebrew 的真实 `fw_dynamic` 镜像，
   DTB 经 QEMU 验证可启动同一镜像，但 LATR 上固件无 trap 地停在 M 模式自旋、UART 零输出；
   诊断数据与下一步方向见 [`MACHINE.md`](MACHINE.md) §7。
-- [~] 真实 Linux 启动：**已进 earlycon**（`make latr-linux-extract` 取 AOSC `vmlinux`，`make latr-linux-run` 整文件装到 +2 MiB，机器自带 SBI 服务）。AOSC 7.1.13 打出 `Linux version 7.1.13-aosc-main`、识别 SBI 2.0 全部扩展（TIME/IPI/RFENCE/HSM/SRST/DBCN）、`earlycon: sbi0` 生效，并推进到 `mem auto-init`（zonelists/initmem 已建）。之后逐页初始化 196608 页在 1000 万块内未完成，尚未到 initramfs/rootfs。见 `MACHINE.md` §9。
+- [~] 真实 Linux 启动：**已进 earlycon**（`make latr-linux-extract` 取 AOSC `vmlinux`，`make latr-linux-run` 整文件装到 +2 MiB，机器自带 SBI 服务）。AOSC 7.1.13 打出 `Linux version 7.1.13-aosc-main`、识别 SBI 2.0 全部扩展（TIME/IPI/RFENCE/HSM/SRST/DBCN）、`earlycon: sbi0` 生效，并推进到 `mem auto-init`（zonelists/initmem 已建）。之后停在 `mem auto-init`：`trap/kblk=0`、块均值 ≈6.8 条 guest 指令、256 MiB 与 768 MiB 停在同一处，所以既不是异常风暴也不是页数线性耗时；尚未到 initramfs/rootfs。测量与待查项见 `MACHINE.md` §9.3。
 - [ ] RISC-V PCI ECAM / MSI 与 AIA/IMSIC/APLIC：需要新的机器设备模型。
 - [ ] `la-pvir.h`/ARM64 path 相关 PVIR 核心扩展：按本轮约束不修改 `target/arm/lata/include/la-pvir.h`。

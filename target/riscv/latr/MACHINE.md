@@ -227,6 +227,31 @@ make latr-opensbi-run OPEN_SBI_TBS=1500000 OPEN_SBI_STALL=0 OPEN_SBI_CODEWORDS=0
 的逐页循环是线性的，页数减三倍，越过该阶段的块数也应减三倍。`ram` 由链接脚本钉在
 `0x80000000`，所以只有 `_guest_ram_end` 会动（256 MiB → `0x90000000`），校验方法就是看它。
 
+### 9.3 `mem auto-init` 之后为什么没有下一行
+
+harness 现在打印三类量，用来把"慢"和"卡"分开：
+
+| 量 | 来源 | 实测（AOSC 7.1.13，768 MiB） |
+|---|---|---|
+| `trap/kblk` | `LatrMachine.trap_count` 每窗口增量 | **0**，全程为 0 |
+| `ktick/kblk` | 宿主 `rdtime.d` | 175k–280k，个别窗口到 8M（宿主调度噪声） |
+| `guest-insns/block` | `translated_tb` 的 `tb.icount` | 均值 ≈ 6.8，最差 59 |
+| 控制台 | `uart_log_len` | 停在 2326/2333 字节，即 `mem auto-init` 那一行 |
+
+结论有三条，逐条都有对照：
+
+1. **不是陷阱风暴。** `trap/kblk` 始终为 0；如果有翻译错误被当成异常反复投递，这个数
+   会立刻变成几百。
+2. **不是块被切碎。** 块大小分布正常（多数 3–16 条 guest 指令），所以不是"每块一条
+   指令"那种派发开销病。
+3. **不是页数线性耗时。** `GUEST_RAM_MIB=256` 时内核报 `Total pages: 65536`
+   （768 MiB 是 196608），但同样停在 `mem auto-init`、同样在 500 万块左右，
+   相差不到 15%。按页数应是三倍差距，所以这一阶段不是"逐页初始化"。
+
+尚未定论的是那段时间到底在执行什么：PC ring 的窗口在 `0x81808xxx`（`__init` 文本）
+里推进，48 槽里 23 个不同地址，跨多个报告窗口重复同一组地址——形如一个反复执行的
+循环体。下一步应在这个窗口上做**同一 PC 重复次数**统计，而不是继续看孤立 PC。
+
 **这段距离里修掉的两个真实缺陷**（都在 `tb-insn-map.c` / `tb-cache.c`，详见 §9.2）：
 `LatrTbInsnMap` 每块一张 ~22 KiB 且宿主 `free()` 是 no-op，以及 `rebase` 之后
 `begin()` 再也找不到同一张 map，导致 ~1450 块就耗尽 32 MiB 裸机 arena。
