@@ -9,5 +9,10 @@
     .globl latr_initrd_image
     .globl latr_initrd_image_end
 latr_initrd_image:
-    .incbin "firmware/initramfs.cpio.gz"
+/* LATR_INITRD_PATH is passed by the Makefile so the default stays the repo
+ * asset while a riscv64 userspace can be selected without editing this file. */
+#ifndef LATR_INITRD_PATH
+#define LATR_INITRD_PATH "firmware/initramfs.cpio.gz"
+#endif
+    .incbin LATR_INITRD_PATH
 latr_initrd_image_end:

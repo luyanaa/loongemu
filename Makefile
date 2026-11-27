@@ -1227,6 +1227,11 @@ LATR_LINUX_TIMEOUT ?= 1800
 # download, so the extracted image is cached outside build/ and the .deb is
 # staged there too. Losing it to a clean used to mean re-fetching by hand.
 LATR_LINUX_CACHE ?= $(HOME)/.cache/loongemu/linux
+# Which initramfs the guest is handed. The repo default carries an x86-64
+# busybox, so a RISC-V guest reaching `Run /init` gets ENOEXEC and panics; the
+# riscv64 one is built by latr-initramfs-riscv64 below and lets the boot finish
+# in userspace.
+LATR_INITRD ?= firmware/initramfs.cpio.gz
 LATR_LINUX_DEB_URL ?= \
   https://repo.aosc.io/debs/pool/linux-kernel-7.3.y/main/l/linux-kernel-7.3.4_7.3.4-1~pre20261113T115334Z_riscv64.deb
 LATR_LINUX_CACHE_IMAGE := $(LATR_LINUX_CACHE)/Image
@@ -1256,10 +1261,26 @@ build/latr_linux_blob.o: baremetal/bare/latr_linux_blob.S build/linux/Image
 	$(CLANG) $(LATR_BARE_CFLAGS) -c $< -o $@
 
 # The initramfs the guest is told to mount. Checked in, so no download.
-build/latr_initrd_blob.o: baremetal/bare/latr_initrd_blob.S \
-                          firmware/initramfs.cpio.gz
+build/latr_initrd_blob.o: baremetal/bare/latr_initrd_blob.S $(LATR_INITRD)
 	@mkdir -p build
-	$(CLANG) $(LATR_BARE_CFLAGS) -c $< -o $@
+	$(CLANG) $(LATR_BARE_CFLAGS) -DLATR_INITRD_PATH='"$(LATR_INITRD)"' \
+	   -c $< -o $@
+
+# A riscv64 userspace small enough to boot: static busybox plus an /init that
+# prints a marker, mounts proc and powers off. Alpine's apk is just a tar.gz
+# holding bin/busybox.static.
+LATR_BUSYBOX_RISCV64_URL ?= \
+  https://dl-cdn.alpinelinux.org/alpine/v3.20/main/riscv64/busybox-static-1.36.1-r31.apk
+LATR_RISCV64_INITRD ?= firmware/latr-initramfs-riscv64.cpio.gz
+
+$(LATR_RISCV64_INITRD):
+	@mkdir -p build/riscv64-initrd
+	curl -fL "$(LATR_BUSYBOX_RISCV64_URL)" -o build/riscv64-initrd/bb.apk
+	cd build/riscv64-initrd && tar -xzf bb.apk bin/busybox.static
+	python3 scripts/mk_riscv64_initramfs.py \
+	   build/riscv64-initrd/bin/busybox.static $@
+
+latr-initramfs-riscv64: $(LATR_RISCV64_INITRD)
 
 build/bare_latr_linux.elf: baremetal/bare/latr_linux.c \
                            build/latr_linux_blob.o build/latr_initrd_blob.o \

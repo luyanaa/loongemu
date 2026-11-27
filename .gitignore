@@ -27,3 +27,6 @@ firmware/busybox
 firmware/initramfs.cpio.gz
 
 .slim/deepwork/
+
+# Built by `make latr-initramfs-riscv64`; a downloaded test asset, not source
+firmware/latr-initramfs-riscv64.cpio.gz

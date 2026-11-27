@@ -359,6 +359,44 @@ chain 检查、翻译、汇编、插入、I-cache 同步 —— 都记在 `TB_CO
 **启动链路能到 `run_init`，但要在用户态真正跑起来，还需要一个 riscv64 的 busybox 或别的
 `/init`**。这是资产问题，不是翻译器问题。
 
+**riscv64 用户态已经有了。** `make latr-initramfs-riscv64` 取 Alpine 的
+`busybox-static`（riscv64，静态）并用 `scripts/mk_riscv64_initramfs.py` 打一个
+`firmware/latr-initramfs-riscv64.cpio.gz`（约 673 KiB），里面是 `/init` 脚本 +
+`/bin/busybox` + 常用 applet 符号链接 + `/dev/console`。`LATR_INITRD=<path>` 选择用哪个：
+
+```sh
+make latr-initramfs-riscv64
+make latr-linux-run LATR_INITRD=firmware/latr-initramfs-riscv64.cpio.gz \
+     LATR_LINUX_MIN_LEVEL=12 LATR_LINUX_TIMEOUT=7200
+```
+
+参考实现上已验证到用户态：
+
+```
+[    4.722832] Run /init as init process
+LATR-INITRAMFS-OK
+LATR-INITRAMFS-PROCFS Linux version 7.3.4-aosc-main ...
+LATR-INITRAMFS-DONE
+```
+
+即 `/init` 真的执行了，procfs 挂上、`/proc/version` 读出来、然后 poweroff。
+
+**写 cpio 踩过的两个坑（都会伪装成"格式错误"）：**
+
+1. **归档必须以 `.` 条目开头。** 首条是 `bin` 时内核报
+   `Initramfs unpacking failed: no cpio magic`——听上去像 magic 错，其实是解析顶层名字
+   失败。加上 `.` 就好。
+2. **名字后的填充要按 `110 + namesize` 对齐到 4，不是只按 `namesize`。** 110 是 2 mod 4，
+   按 namesize 对齐会让所有 `namesize % 4 != 2` 的条目错位，内核报
+   `Initramfs unpacking failed: broken padding`，又指向负载而不是算术。
+   `scripts/mk_initramfs.py` 里也是按 namesize 算的，只是因为它的条目刚好
+   `namesize % 4 == 2` 或位于 TRAILER 之后才没暴露。
+
+**当前进度（同一晚的长跑）：** 越过 SLUB 之后内核进入**改自己代码**的阶段
+（`__patch_insn_write`，alternatives / static keys），22.26M 块到 22.76M 块只推进了 50 万
+块。这一段每次打补丁都要让已生成的代码失效，因此是"慢"而不是"卡"。ftrace/rcu/`Memory:`
+那三行还没出现。
+
 **卡点已经符号化（2026-11-27）。** `vmlinux-to-elf` 恢复的 kallsyms 可用，但它的
 符号值整体偏 `+0x401`（用 panic trace 里 `show_stack`、`vpanic`、`dump_stack_lvl`、
 `mount_root_generic` 四个锚点交叉验证，偏移量完全一致）。校正后，卡住时反复进入的
