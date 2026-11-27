@@ -1109,6 +1109,25 @@ static int find_pc(const RiscvIR1 *insns, int count, uint64_t pc)
     return -1;
 }
 
+/*
+ * Opcodes whose fault path materialises the pending count itself, inside
+ * latr_raise_mem_fault(). Only plain loads and stores qualify: atomics raise
+ * misaligned traps from their own sequence, and CSR ops must flush *before*
+ * they run so a read of minstret sees the count -- both keep the
+ * per-instruction flush.
+ */
+static bool latr_insn_mem_fault_site(LatrRiscvOpcode opcode)
+{
+    switch (opcode) {
+    case LATR_RV_LB: case LATR_RV_LH: case LATR_RV_LW: case LATR_RV_LD:
+    case LATR_RV_LBU: case LATR_RV_LHU: case LATR_RV_LWU:
+    case LATR_RV_SB: case LATR_RV_SH: case LATR_RV_SW: case LATR_RV_SD:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* Opcodes that cannot raise a guest exception, so they need no minstret flush. */
 static bool latr_insn_cannot_trap(LatrRiscvOpcode opcode)
 {
@@ -1290,17 +1309,20 @@ bool tr_ir2_generate(TranslationBlock *tb)
         /*
          * Materialise the pending retired count before any instruction that can
          * trap, so a trap leaves minstret exact for what retired before it, and
-         * again at every exit. This is the conservative placement: one guarded
-         * add per trap-capable instruction.
+         * again at every exit.
          *
-         * Moving it to each fault label with a compile-time constant (one add
-         * per fault site) was attempted and withdrawn: it needs a test that
-         * faults on a load, and this harness has no address that faults -- a
-         * load from 0x100000000 succeeds here and, worse, corrupts the harness
-         * enough that the suite later hangs in its conversion section. Without
-         * that test the change could not be verified, so it is not in the tree.
+         * Plain loads and stores are exempt: latr_raise_mem_fault() adds the
+         * same constant at each fault label, which is on the cold path, so the
+         * hot path stops paying a minstret update per access. Emitted code is
+         * not smaller (a fault site per access), only better placed.
+         *
+         * CSR ops must still flush here: a read of minstret has to see the count
+         * of the instructions before it. Atomics keep it too, because their
+         * misaligned trap comes from their own sequence rather than from
+         * latr_raise_mem_fault.
          */
-        if (!latr_insn_cannot_trap(insns[i].opcode)) {
+        if (!latr_insn_cannot_trap(insns[i].opcode) &&
+            !latr_insn_mem_fault_site(insns[i].opcode)) {
             latr_emit_instret_flush();
         }
         latr_tag(LATR_TAG_INSN);

@@ -960,6 +960,50 @@ static void test_minstret_accounting(void)
     check(env.csr[CSR_MINSTRET_] - before, 2,
           "minstret counts only the instructions before the trap");
 
+    /*
+     * (e) a load that faults: only the instructions before it retire.
+     *
+     * The default test map covers host memory, so no guest address faults and
+     * the earlier attempts at this test simply read mapped memory (one of them
+     * corrupted the harness badly enough that the suite later hung in its
+     * conversion section). A private map that covers the block itself but not
+     * the data address gives a real access fault while the instruction fetch
+     * still translates.
+     */
+    {
+        static const uint32_t trap_on_load[] = {
+            0x00100093, /* addi x1, x0, 1 */
+            0x00200113, /* addi x2, x0, 2 */
+            0x00033183, /* ld x3, 0(x6) -- x6 points into the hole */
+            0x00300193, /* addi x3, x0, 3 (must not run) */
+        };
+        static LoongemuMemMap fault_map;
+
+        loongemu_mem_map_init(&fault_map);
+        check(loongemu_mem_map_add(
+                  &fault_map,
+                  (uint64_t)(uintptr_t)trap_on_load & ~UINT64_C(0xfff),
+                  UINT64_C(0x2000),
+                  (uint64_t)(uintptr_t)trap_on_load & ~UINT64_C(0xfff),
+                  LOONGEMU_MEM_RAM, "minstret-code"), 1,
+              "minstret: code page maps");
+        /*
+         * latr_execute_block() runs the environment as-is; run_block() resets it,
+         * which would wipe the private map along with the register setup.
+         */
+        reset_guest_state();
+        env.privilege = LATR_RISCV_PRIV_M;
+        env.csr[CSR_MINSTRET_] = 0;
+        env.gpr[6] = UINT64_C(0x9000);
+        env.mem_map = &fault_map;
+        before = env.csr[CSR_MINSTRET_];
+        check(latr_execute_block(trap_on_load, 4), 1,
+              "minstret: faulting load block");
+        check(env.exception, 5, "minstret: the load raised a load access fault");
+        check(env.csr[CSR_MINSTRET_] - before, 2,
+              "minstret counts only the instructions before a load fault");
+    }
+
     /* (d) the inhibit write takes effect for the rest of the block. */
     reset_guest_state();
     env.privilege = LATR_RISCV_PRIV_M;

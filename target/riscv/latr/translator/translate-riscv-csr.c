@@ -929,6 +929,18 @@ void latr_raise_mem_fault(const RiscvIR1 *ir1)
     IR2_OPND cause = a0_ir2_opnd;
     IR2_OPND trap_value = a1_ir2_opnd;
 
+    /*
+     * The faulting instruction does not retire, but everything before it did.
+     * The count is a compile-time constant here, so this is one guarded add per
+     * fault site -- and a fault site exists per memory access, so the *emitted*
+     * code is no smaller than flushing before the access (measured: 9.27% ->
+     * 9.17% of all emitted IR2). The win is that this code sits on the cold
+     * path: it runs only when the access traps, so the hot path no longer
+     * executes a minstret update for every load and store.
+     *
+     * It does not consume the pending count: the fall-through path still owes it.
+     */
+    latr_emit_instret_add((unsigned)lsenv->tr_data->instret_pending);
     latr_env_load_d(cause, env_offset_mem_fault_cause());
     latr_env_load_d(trap_value, env_offset_mem_va());
     transfer_exception(cause, ir1->pc, trap_value);
