@@ -726,6 +726,11 @@ LATR_BARE_CFLAGS := --target=loongarch64-unknown-none-elf -ffreestanding -nostdl
 ifeq ($(PERF),1)
 LATR_BARE_CFLAGS += -DLOONGEMU_PERF
 endif
+# Guest RAM size for the bare Linux harness. Left at the default 768 MiB unless
+# a caller overrides it; used to separate "slow" from "wedged".
+ifneq ($(GUEST_RAM_MIB),)
+LATR_BARE_CFLAGS += -DGUEST_RAM_MIB=$(GUEST_RAM_MIB)
+endif
 
 
 build/latr_isa_test.o: baremetal/bare/latr_isa_test.c \
@@ -1213,22 +1218,33 @@ latr-bench-run: latr-isa-run latr-smp-run latr-rand-diff latr-fault-diff
 LATR_LINUX_IMAGE ?=
 LATR_LINUX_TIMEOUT ?= 1800
 
-build/linux/Image: $(LATR_LINUX_IMAGE)
-	@test -n "$(LATR_LINUX_IMAGE)" || { \
-	   echo "latr-linux: set LATR_LINUX_IMAGE to a RISC-V Image/vmlinux"; \
-	   exit 1; }
-	@mkdir -p build/linux
-	cp "$(LATR_LINUX_IMAGE)" $@
+# `make clean` is `rm -rf build`, and a distribution kernel is a 60 MiB
+# download, so the extracted image is cached outside build/ and the .deb is
+# staged there too. Losing it to a clean used to mean re-fetching by hand.
+LATR_LINUX_CACHE ?= $(HOME)/.cache/loongemu/linux
+LATR_LINUX_DEB_URL ?= \
+  https://repo.aosc.io/debs/pool/linux-kernel-7.3.y/main/l/linux-kernel-7.3.4_7.3.4-1~pre20261113T115334Z_riscv64.deb
+LATR_LINUX_CACHE_IMAGE := $(LATR_LINUX_CACHE)/Image
 
-latr-linux-extract:
-	@test -n "$(LATR_LINUX_DEB)" || { \
-	   echo "latr-linux-extract: set LATR_LINUX_DEB to a riscv64 kernel .deb"; \
-	   exit 1; }
-	@mkdir -p build/linux/deb
-	cd build/linux/deb && ar x ../../$(LATR_LINUX_DEB) && \
+# Download + unpack once. `ar` members in these packages are zstd tarballs.
+$(LATR_LINUX_CACHE_IMAGE):
+	@mkdir -p $(LATR_LINUX_CACHE)/deb
+	@if [ -n "$(LATR_LINUX_DEB)" ]; then \
+	   cp "$(LATR_LINUX_DEB)" $(LATR_LINUX_CACHE)/kernel.deb; \
+	 else \
+	   echo "latr-linux: fetching $(LATR_LINUX_DEB_URL)"; \
+	   curl -fL "$(LATR_LINUX_DEB_URL)" -o $(LATR_LINUX_CACHE)/kernel.deb; \
+	 fi
+	cd $(LATR_LINUX_CACHE)/deb && ar x ../kernel.deb && \
 	   zstd -dc data.tar.zst | tar -x ./boot/vmlinux-* && \
-	   cp ./boot/vmlinux-* ../Image
-	@ls -l build/linux/Image
+	   cp ./boot/vmlinux-* $(LATR_LINUX_CACHE_IMAGE)
+	@ls -l $(LATR_LINUX_CACHE_IMAGE)
+
+build/linux/Image: $(LATR_LINUX_CACHE_IMAGE)
+	@mkdir -p build/linux
+	cp $(LATR_LINUX_CACHE_IMAGE) $@
+
+latr-linux-extract: $(LATR_LINUX_CACHE_IMAGE)
 
 build/latr_linux_blob.o: baremetal/bare/latr_linux_blob.S build/linux/Image
 	@mkdir -p build
