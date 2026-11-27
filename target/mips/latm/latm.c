@@ -485,8 +485,16 @@ static void regcache_free_borrow(IR2_OPND value)
 static void regcache_store(int reg, IR2_OPND value)
 {
     LatmRegCacheEntry *entry = &lsenv->tr_data->regcache.gpr[reg];
-    lsassertm(regcache_temp_slot(value._reg_num) >= 0,
-              "guest register writeback requires an itemp");
+
+    if (regcache_temp_slot(value._reg_num) < 0) {
+        /* The value lives in a non-itemp host register (a directly mapped
+         * guest register, a helper result, ...).  It cannot live in the
+         * register cache, so commit it straight to its env slot.  The old
+         * cached copy is superseded and dropped without writeback. */
+        regcache_release(entry, false);
+        latm_env_st_d(value, env_offset_gpr(reg));
+        return;
+    }
 
     if (entry->valid && entry->temp == value._reg_num) {
         entry->dirty = 1;

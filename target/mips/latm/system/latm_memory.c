@@ -122,8 +122,12 @@ void latm_boot_info_set_dtb(LatmBootInfo *info, uint64_t dtb_gpa,
     (void)dtb_size;
     if (!info) return;
     info->dtb_gpa = dtb_gpa;
-    /* Linux loongson64 checks fw_arg2 for FDT_MAGIC. */
-    info->a2 = dtb_gpa;
+    /* Linux loongson64 prom_dtb_init_env() only treats fw_arg2 as an external
+     * FDT pointer when it lies in CKSEG0..CKSEG1 (or XKPHYS..XKSEG); a bare
+     * physical address falls outside every window and makes the kernel ignore
+     * our DTB entirely, falling back to the built-in loongson64_2core_2k1000
+     * blob. Hand over the CKSEG0 alias of the DTB physical address instead. */
+    info->a2 = UINT64_C(0xffffffff80000000) + dtb_gpa;
 }
 
 void latm_boot_info_set_initrd(LatmBootInfo *info, uint64_t start, uint64_t end)
@@ -138,6 +142,20 @@ void latm_boot_info_set_cmdline(LatmBootInfo *info, const char *cmdline)
     if (!info) return;
     if (!cmdline) { info->cmdline[0] = 0; return; }
     snprintf(info->cmdline, sizeof(info->cmdline), "%s", cmdline);
+}
+
+void latm_boot_info_set_argv(LatmBootInfo *info, uint64_t argc,
+                             uint64_t argv_gpa)
+{
+    if (!info) return;
+    /* mips fw_init_cmdline() reads fw_arg0 as argc (low 16 bits) and fw_arg1
+     * as the firmware argv pointer array, concatenating argv[1..argc-1] into
+     * arcs_cmdline.  setup_early_printk() scans arcs_cmdline, so without real
+     * firmware argv the "earlyprintk" token is never seen and the hardcoded
+     * loongson 8250 early console never activates.  fw_arg1 must be a KSEG0
+     * virtual address so the kernel can dereference it directly. */
+    info->a0 = argc;
+    info->a1 = UINT64_C(0xffffffff80000000) + argv_gpa;
 }
 
 void latm_boot_info_apply_args(LatmBootInfo *info, void *envp)

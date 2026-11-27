@@ -102,6 +102,8 @@ void latm_boot_info_set_dtb(LatmBootInfo *info, uint64_t dtb_gpa,
                             uint64_t dtb_size);
 void latm_boot_info_set_initrd(LatmBootInfo *info, uint64_t start, uint64_t end);
 void latm_boot_info_set_cmdline(LatmBootInfo *info, const char *cmdline);
+void latm_boot_info_set_argv(LatmBootInfo *info, uint64_t argc,
+                             uint64_t argv_gpa);
 void latm_boot_info_apply_args(LatmBootInfo *info, void *env);
 
 /* FDT builder.  The caller owns the output buffer. */

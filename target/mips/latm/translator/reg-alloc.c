@@ -159,6 +159,11 @@ IR2_OPND ra_alloc_itemp(void)
     uint16_t full = (uint16_t)((1u << itemp_status_num) - 1);
     if ((lsenv->tr_data->itemp_status & full) == full) {
         latm_regcache_evict_itemp();
+        if ((lsenv->tr_data->itemp_status & full) == full) {
+            /* Every itemp is pinned: nothing evictable.  Spill and release the
+             * whole guest register cache so its temps return to the pool. */
+            latm_regcache_flush();
+        }
     }
     int idx = ra_alloc_temp_idx(lsenv->tr_data->itemp_status, 16);
     lsassertm(idx < (int)(sizeof(reg_itemp_map) / sizeof(int)),

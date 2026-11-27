@@ -56,6 +56,14 @@ void latx_bare_uart_puts(const char *s)
     while (*s) latx_bare_uart_putc(*s++);
 }
 
+/* guest-16550 TX sink: forward each byte the kernel writes to the emulated
+ * UART onto the host serial console so kernel output reaches the log. */
+static void guest_uart_emit(void *ctx, uint8_t byte)
+{
+    (void)ctx;
+    latx_bare_uart_putc(byte);
+}
+
 static uint8_t ram[192u << 20] __attribute__((aligned(4096), section(".guest_ram")));
 static uint8_t tb_pool[1u << 20] __attribute__((aligned(4096)));
 static uint32_t tb_next;
@@ -261,7 +269,13 @@ void kmain(void)
         return;
     }
     latx_bare_uart_puts("latm-linux: init-ok\n");
+    sys.uart.tx_emit = guest_uart_emit;
+    sys.uart.tx_emit_ctx = 0;
     latm_set_system_memory(true);
+    /* boot args (incl. cmdline) must be set before the dtb is built,
+     * since the dtb chosen/bootargs node copies sys->boot.cmdline. */
+    latm_system_set_boot_args(&sys, 0x9620000, 0, 0,
+                              "console=ttyS0 earlyprintk");
     size_t dtb_len = latm_system_build_dtb(&sys, dtb, sizeof(dtb),
                                            dtb_struct, sizeof(dtb_struct),
                                            dtb_strings, sizeof(dtb_strings));
@@ -270,9 +284,38 @@ void kmain(void)
         return;
     }
     latx_bare_uart_puts("latm-linux: dtb-ok\n");
-    memcpy(ram + 0x100000, dtb, dtb_len);
-    latm_system_set_boot_args(&sys, 0x100000, 0, 0,
-                              "console=ttyS0 earlycon");
+    memcpy(ram + 0x9620000, dtb, dtb_len);
+    /* Build the firmware argv vector that mips fw_init_cmdline() expects:
+     * a NULL-terminated char* array (KSEG0 virtual pointers) followed by the
+     * argument strings, all in guest RAM.  argv[0] is a program name and is
+     * skipped; the rest are concatenated into arcs_cmdline, which is where
+     * setup_early_printk() looks for the "earlyprintk" token.  Placed at
+     * phys 0x180000, clear of the dtb (0x100000) and kernel text. */
+    {
+        static const char *argv_strs[] = { "boot", "console=ttyS0", "earlyprintk" };
+        const uint64_t argv_gpa = 0x9600000;   /* 150MB: above the whole kernel
+                                                * image+BSS (126-146MB phys) */
+        uint8_t *arr = ram + argv_gpa;          /* int32 pointer array */
+        uint8_t *strs = arr + 4 * 4;            /* strings after 4 int slots */
+        uint64_t str_gpa = argv_gpa + 4 * 4;
+        int argc = 0;
+        for (int i = 0; i < 3; i++) {
+            /* mips firmware argv elements are 32-bit KSEG0 pointers
+             * (sign-extended ints), NOT 64-bit pointers: _fw_argv is int*. */
+            uint32_t vp = 0x80000000u + (uint32_t)str_gpa;
+            for (int k = 0; k < 4; k++) arr[i * 4 + k] = (uint8_t)(vp >> (k * 8));
+            const char *s = argv_strs[i];
+            unsigned len = 0;
+            while (s[len]) { strs[len] = (uint8_t)s[len]; len++; }
+            strs[len] = 0;
+            strs += len + 1;
+            str_gpa += len + 1;
+            argc++;
+        }
+        for (int k = 0; k < 4; k++) arr[3 * 4 + k] = 0;  /* NULL terminator */
+        latm_boot_info_set_argv(&sys.boot, (uint64_t)argc, argv_gpa);
+    }
+    latx_bare_uart_puts("latm-linux: argv-ok\n");
     latx_bare_uart_puts("latm-linux: bootargs-ok\n");
     if (!tbc_init(&tb_cache, tb_entries, tb_buckets, 512)) {
         latx_bare_uart_puts("latm-linux: FAIL tb cache\n");
@@ -364,51 +407,11 @@ void kmain(void)
             s23_prev = s23_val;
         }
         /*
-         * Watch the registers that feed jalr/jr. A value that is not a canonical
-         * kernel/stack address cannot be right for either, so the first time one
-         * appears the dispatch that produced it is still the last one executed -
-         * which names the block to look at far better than a post-mortem dump.
+         * Note: an earlier heuristic treated any non-KSEG0 value in $t9/$ra as
+         * a poisoned jump target and ended the run.  The pre-boot decompressor
+         * legally uses $t9 as a scratch scalar, so that check produced false
+         * positives; jump-target sanity is left to the guest's own traps.
          */
-        for (int g = 25; g <= 31; g += 6) {
-            uint64_t v = env.active_tc.gpr[g];
-
-            if (v != 0 && (v < 0xffffffff80000000ull ||
-                           v >= 0xffffffff80000000ull + sizeof(ram))) {
-                latx_bare_uart_puts("latm-linux: poisoned gpr[");
-                { char b[9]; for (int k=7;k>=0;k--) b[7-k]="0123456789abcdef"[(g>>(k*4))&15]; b[8]=0; latx_bare_uart_puts(b); }
-                latx_bare_uart_puts("]=");
-                { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(v>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
-                latx_bare_uart_puts(" after pc=");
-                { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(last_pc>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
-                latx_bare_uart_puts(" sp=");
-                { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(env.active_tc.gpr[29]>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
-                {
-                    /* Delay slot already did `addiu $sp,$sp,0x20`, so the slot
-                     * `ld $ra,0x18($sp)` read is at the new $sp-8, not $sp+0x18. */
-                    uint64_t old_sp = env.active_tc.gpr[29] - 0x20u;
-
-                    latx_bare_uart_puts(" frame");
-                    for (unsigned off = 0; off < 0x40u; off += 8u) {
-                        uint64_t pa = old_sp + off;
-                        uint64_t mem = 0;
-
-                        latx_bare_uart_putc(' ');
-                        if (pa >= 0xffffffff80000000ull &&
-                            pa + 8u <= 0xffffffff80000000ull + sizeof(ram)) {
-                            memcpy(&mem, ram + (pa - 0xffffffff80000000ull), 8);
-                            { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(mem>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
-                        } else {
-                            latx_bare_uart_puts("????????????????");
-                        }
-                    }
-                }
-                latx_bare_uart_puts(" at tbs=");
-                { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(tb_ran>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
-                latx_bare_uart_putc('\n');
-                i = LINUX_TB_BUDGET;
-                break;
-            }
-        }
         if (i >= LINUX_TB_BUDGET) {
             break;
         }
@@ -620,6 +623,23 @@ void kmain(void)
             latx_bare_uart_puts(" ticks=");
             { char b[17]; uint64_t d = now_ticks() - t_start;
               for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(d>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" utx=");
+            { char b[17]; for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(sys.uart.tx_count>>(k*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" urd=");
+            { char b[9]; for (int k=7;k>=0;k--) b[7-k]="0123456789abcdef"[(sys.uart.rd_count>>(k*4))&15]; b[8]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" uwr=");
+            { char b[9]; for (int k=7;k>=0;k--) b[7-k]="0123456789abcdef"[(sys.uart.wr_count>>(k*4))&15]; b[8]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" lro=");
+            { char b[3]; b[0]="0123456789abcdef"[(sys.uart.last_rd_off>>4)&15]; b[1]="0123456789abcdef"[sys.uart.last_rd_off&15]; b[2]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" lwo=");
+            { char b[3]; b[0]="0123456789abcdef"[(sys.uart.last_wr_off>>4)&15]; b[1]="0123456789abcdef"[sys.uart.last_wr_off&15]; b[2]=0; latx_bare_uart_puts(b); }
+            latx_bare_uart_puts(" ins=");
+            { uint64_t phys = env.active_tc.PC & 0x1fffffffull; char b[9];
+              if (phys + 4u <= (uint64_t)sizeof(ram)) {
+                  uint32_t w = *(volatile uint32_t *)(void *)(ram + phys);
+                  for (int k=7;k>=0;k--) b[7-k] = "0123456789abcdef"[(w>>(k*4))&15];
+              } else { for (int k=0;k<8;k++) b[k]='?'; }
+              b[8]=0; latx_bare_uart_puts(b); }
             latx_bare_uart_putc('\n');
         }
         if (!linux_run_one(&env)) {
@@ -630,6 +650,34 @@ void kmain(void)
         }
     }
     stop_cause = env.CP0_Cause;
+    /* Diagnostic: where did anything actually get written in guest RAM?
+     * Scans page granularity and prints contiguous non-zero extents. */
+    {
+        uint64_t nz_start = 0, nz_end = 0;
+        int shown = 0;
+        const uint64_t pages = (uint64_t)sizeof(ram) / 4096u;
+        for (uint64_t pg = 0; pg <= pages; pg++) {
+            int nz = 0;
+            if (pg < pages) {
+                const uint8_t *p = ram + pg * 4096u;
+                for (unsigned q = 0; q < 4096u; q++) { if (p[q]) { nz = 1; break; } }
+            }
+            if (nz && nz_end == pg) { nz_end = pg + 1; continue; }
+            if (nz) { nz_start = pg; nz_end = pg + 1; continue; }
+            if (nz_end > nz_start && shown < 24) {
+                char b[17];
+                latx_bare_uart_puts("latm-linux: nz start=");
+                for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(nz_start*4096u>>(k*4))&15];
+                b[16]=0; latx_bare_uart_puts(b);
+                latx_bare_uart_puts(" end=");
+                for (int k=15;k>=0;k--) b[15-k]="0123456789abcdef"[(nz_end*4096u>>(k*4))&15];
+                b[16]=0; latx_bare_uart_puts(b);
+                latx_bare_uart_putc('\n');
+                shown++;
+            }
+            nz_start = nz_end = 0;
+        }
+    }
     latx_bare_uart_puts("\nlatm-linux: tbs=");
     { char b[17]; for (int i=15;i>=0;i--) b[15-i]="0123456789abcdef"[(tb_ran>>(i*4))&15]; b[16]=0; latx_bare_uart_puts(b); }
     latx_bare_uart_puts(" pc=");

@@ -24,7 +24,9 @@ void latm_uart_rx_push(LatmUart *u, uint8_t value)
 uint64_t latm_uart_read(void *opaque, uint64_t off, unsigned size)
 {
     LatmUart *u = opaque;
-    if (!u || size != 1) return 0;
+    if (!u) return 0;
+    u->rd_count++;
+    u->last_rd_off = off & 7;
     int dlab = (u->lcr & 0x80) != 0;
     switch (off & 7) {
     case 0:
@@ -53,7 +55,8 @@ uint64_t latm_uart_read(void *opaque, uint64_t off, unsigned size)
 void latm_uart_write(void *opaque, uint64_t off, uint64_t value, unsigned size)
 {
     LatmUart *u = opaque;
-    if (!u || size != 1) return;
+    if (!u) return;
+    u->wr_count++;
     int dlab = (u->lcr & 0x80) != 0;
     switch (off & 7) {
     case 0:
@@ -61,6 +64,7 @@ void latm_uart_write(void *opaque, uint64_t off, uint64_t value, unsigned size)
         else {
             u->tx_count++;
             if (u->ier & 2) u->tx_pending = 1;
+            if (u->tx_emit) u->tx_emit(u->tx_emit_ctx, (uint8_t)value);
         }
         break;
     case 1:

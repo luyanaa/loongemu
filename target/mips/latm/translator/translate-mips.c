@@ -547,26 +547,39 @@ static bool trans_bitfield(DisasContext *s)
     unsigned op = s->ir1.subop;
     unsigned pos = s->ir1.sa;
     unsigned rd_field = s->ir1.rd; /* size-1 for EXT/DEXT, msb for INS/DINS */
-    IR2_OPND rt = alloc_gpr_src(s->ir1.rt);
     IR2_OPND rd;
 
     switch (op) {
-    case MIPS_BF_EXT: {
-        unsigned width = rd_field + 1;
-        if (pos + width > 32) return trans_ri(s);
+    case MIPS_BF_EXT:
+    case MIPS_BF_DEXT:
+    case MIPS_BF_DEXTM:
+    case MIPS_BF_DEXTU: {
+        /* EXT/DEXT read their source from RS and write RT; only the INS
+         * family is a read-modify-write of RT. */
+        unsigned p = pos + (op == MIPS_BF_DEXTU ? 32u : 0u);
+        unsigned width = rd_field + 1u + (op == MIPS_BF_DEXTM ? 32u : 0u);
+        IR2_OPND rs;
+        if ((op == MIPS_BF_EXT && pos + width > 32) || p + width > 64) {
+            return trans_ri(s);
+        }
+        rs = alloc_gpr_src(s->ir1.rs);
         rd = alloc_gpr_dst(s->ir1.rt);
-        if (pos == 0 && width == 32) {
-            la_slli_w(rd, rt, 0);
+        if (op == MIPS_BF_EXT && p == 0 && width == 32) {
+            la_slli_w(rd, rs, 0);
         } else {
-            la_bstrpick_d(rd, rt, pos + width - 1, pos);
+            la_bstrpick_d(rd, rs, p + width - 1, p);
         }
         store_gpr_dst_f(s->ir1.rt, rd);
+        free_gpr_temp(rs, s->ir1.rs);
         break;
     }
     case MIPS_BF_INS: {
         unsigned msb = rd_field;
         IR2_OPND rs = alloc_gpr_src(s->ir1.rs);
-        if (pos > msb) return trans_ri(s);
+        if (pos > msb) {
+            free_gpr_temp(rs, s->ir1.rs);
+            return trans_ri(s);
+        }
         rd = alloc_gpr_src(s->ir1.rt);
         la_bstrins_d(rd, rs, msb, pos);
         la_slli_w(rd, rd, 0);
@@ -574,24 +587,17 @@ static bool trans_bitfield(DisasContext *s)
         free_gpr_temp(rs, s->ir1.rs);
         break;
     }
-    case MIPS_BF_DEXT:
-    case MIPS_BF_DEXTM:
-    case MIPS_BF_DEXTU: {
-        unsigned p = pos + (op == MIPS_BF_DEXTU ? 32 : 0);
-        unsigned width = rd_field + 1 + (op == MIPS_BF_DEXTM ? 32 : 0);
-        if (p + width > 64) return trans_ri(s);
-        rd = alloc_gpr_dst(s->ir1.rt);
-        la_bstrpick_d(rd, rt, p + width - 1, p);
-        store_gpr_dst_f(s->ir1.rt, rd);
-        break;
-    }
     case MIPS_BF_DINS:
     case MIPS_BF_DINSM:
     case MIPS_BF_DINSU: {
-        unsigned p = pos + (op == MIPS_BF_DINSU ? 32 : 0);
-        unsigned msb = rd_field + (op == MIPS_BF_DINSM ? 32 : 0);
+        unsigned p = pos + (op == MIPS_BF_DINSU ? 32u : 0u);
+        unsigned msb = rd_field +
+                       ((op == MIPS_BF_DINSM || op == MIPS_BF_DINSU) ? 32u : 0u);
         IR2_OPND rs = alloc_gpr_src(s->ir1.rs);
-        if (p > msb) return trans_ri(s);
+        if (p > msb) {
+            free_gpr_temp(rs, s->ir1.rs);
+            return trans_ri(s);
+        }
         rd = alloc_gpr_src(s->ir1.rt);
         la_bstrins_d(rd, rs, msb, p);
         store_gpr_dst_f(s->ir1.rt, rd);
@@ -601,7 +607,6 @@ static bool trans_bitfield(DisasContext *s)
     default:
         return trans_ri(s);
     }
-    free_gpr_temp(rt, s->ir1.rt);
     return true;
 }
 
@@ -768,7 +773,19 @@ static bool trans_load(DisasContext *s)
     if (latm_system_memory && op <= MIPS_MEM_LD) {
         IR2_OPND a = ir2_opnd_new(IR2_OPND_IMM, op);
         IR2_OPND r = hcall2((uintptr_t)latm_helper_load, a, addr);
-        store_gpr_dst_f(s->ir1.rt, r);
+        /* LB/LH/LW sign-extend to 64 bits.  hcall returns the host a0, which
+         * the epilogue has just reloaded from the guest env; stage the value
+         * in an itemp so the 32-bit sign-extending shift cannot race with it. */
+        if (op == MIPS_MEM_LB || op == MIPS_MEM_LH || op == MIPS_MEM_LW) {
+            /* MIPS LB/LH/LW sign-extend into the 64-bit GPR; the helper already
+             * returns the sign-extended 64-bit value, so keep it intact and
+             * store it verbatim.  (LoongArch slli.w would zero the upper half,
+             * and its result register cannot be reused safely here.) */
+            store_gpr_dst(s->ir1.rt, r);
+            free_alloc_gpr(r);
+        } else {
+            store_gpr_dst_f(s->ir1.rt, r);
+        }
         ra_free_itemp(addr._reg_num);
         return true;
     }
@@ -793,7 +810,16 @@ static bool trans_load(DisasContext *s)
     case MIPS_MEM_LBU: rd = alloc_gpr_dst(s->ir1.rt); la_ldx_bu(rd, addr, zero_ir2_opnd); store_gpr_dst_f(s->ir1.rt, rd); break;
     case MIPS_MEM_LH:  rd = alloc_gpr_dst(s->ir1.rt); la_ldx_h(rd, addr, zero_ir2_opnd); store_gpr_dst_f(s->ir1.rt, rd); break;
     case MIPS_MEM_LHU: rd = alloc_gpr_dst(s->ir1.rt); la_ldx_hu(rd, addr, zero_ir2_opnd); store_gpr_dst_f(s->ir1.rt, rd); break;
-    case MIPS_MEM_LW:  rd = alloc_gpr_dst(s->ir1.rt); la_ldx_w(rd, addr, zero_ir2_opnd); store_gpr_dst_f(s->ir1.rt, rd); break;
+    case MIPS_MEM_LW: {
+        IR2_OPND t = ra_alloc_itemp();
+        la_ldx_w(t, addr, zero_ir2_opnd);
+        la_slli_d(t, t, 32);         /* sign-extend the loaded word */
+        la_srai_d(t, t, 32);
+        rd = alloc_gpr_dst(s->ir1.rt);
+        store_gpr_dst_f(s->ir1.rt, t);
+        (void)rd;
+        break;
+    }
     case MIPS_MEM_LWU: rd = alloc_gpr_dst(s->ir1.rt); la_ldx_wu(rd, addr, zero_ir2_opnd); store_gpr_dst_f(s->ir1.rt, rd); break;
     case MIPS_MEM_LD:  rd = alloc_gpr_dst(s->ir1.rt); la_ldx_d(rd, addr, zero_ir2_opnd); store_gpr_dst_f(s->ir1.rt, rd); break;
     case MIPS_MEM_LWL: rd = alloc_gpr_src(s->ir1.rt); la_ldl_w(rd, addr, 0); store_gpr_dst_f(s->ir1.rt, rd); break;

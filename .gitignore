@@ -3,6 +3,7 @@ qemu-system-loongarch64
 /build/
 /baremetal/build/
 /lata/build/
+/latm/build/
 /latr/build/
 /latr/build-host/
 

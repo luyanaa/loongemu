@@ -10,6 +10,12 @@ typedef struct LatmUart {
     uint8_t rx_fifo[16];
     unsigned rx_head, rx_tail;
     uint64_t tx_count;
+    uint64_t rd_count, wr_count;
+    uint64_t last_rd_off, last_wr_off;
+    /* Optional host-side sink for transmitted bytes.  NULL until the
+     * harness wires the guest serial console to the host output. */
+    void (*tx_emit)(void *ctx, uint8_t byte);
+    void *tx_emit_ctx;
 } LatmUart;
 
 void latm_uart_init(LatmUart *u);
