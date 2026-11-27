@@ -160,6 +160,6 @@ ELF 装载器已抽成不依赖机器模型的 `system/latr_elf.c`（`include/la
 - [~] 真实 OpenSBI 启动：`latr-opensbi-run` 已接入 Homebrew 的真实 `fw_dynamic` 镜像，
   DTB 经 QEMU 验证可启动同一镜像，但 LATR 上固件无 trap 地停在 M 模式自旋、UART 零输出；
   诊断数据与下一步方向见 [`MACHINE.md`](MACHINE.md) §7。
-- [~] 真实 Linux 启动：**已进 earlycon**（`make latr-linux-extract` 取 AOSC `vmlinux`，`make latr-linux-run` 整文件装到 +2 MiB，机器自带 SBI 服务）。AOSC 7.1.13 打出 `Linux version 7.1.13-aosc-main`、识别 SBI 2.0 全部扩展（TIME/IPI/RFENCE/HSM/SRST/DBCN）、`earlycon: sbi0` 生效，并推进到 `mem auto-init`（zonelists/initmem 已建），跑满 3600 s（2208 万块）**越过它进入 SLUB**（里程碑 level 6），`uart` 从 2326 涨到 2400 —— 所以之前"停在那里"是预算不足，不是阻塞；`trap/kblk=0`、块均值 ≈6.8 条 guest 指令。瓶颈是吞吐量（`MACHINE.md` §9.5），尚未到 initramfs/rootfs。`make latr-linux-run LATR_LINUX_MIN_LEVEL=6 LATR_LINUX_TIMEOUT=3600` 断言到这一级。
+- [~] 真实 Linux 启动：**已进 earlycon**（`make latr-linux-extract` 取 AOSC `vmlinux`，`make latr-linux-run` 整文件装到 +2 MiB，机器自带 SBI 服务）。AOSC 7.1.13 打出 `Linux version 7.1.13-aosc-main`、识别 SBI 2.0 全部扩展（TIME/IPI/RFENCE/HSM/SRST/DBCN）、`earlycon: sbi0` 生效，并推进到 `mem auto-init`（zonelists/initmem 已建），跑满 3600 s（两次独立运行分别 2208 万/2268 万块）**越过它进入 SLUB**（里程碑 level 6），`uart` 从 2326 涨到 2400 —— 所以之前"停在那里"是预算不足，不是阻塞；`trap/kblk=0`、块均值 ≈6.8 条 guest 指令。瓶颈是吞吐量（`MACHINE.md` §9.5），尚未到 initramfs/rootfs。`make latr-linux-run LATR_LINUX_MIN_LEVEL=6 LATR_LINUX_TIMEOUT=3600` 断言到这一级。
 - [ ] RISC-V PCI ECAM / MSI 与 AIA/IMSIC/APLIC：需要新的机器设备模型。
 - [ ] `la-pvir.h`/ARM64 path 相关 PVIR 核心扩展：按本轮约束不修改 `target/arm/lata/include/la-pvir.h`。
