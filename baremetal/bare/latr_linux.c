@@ -732,6 +732,10 @@ static void progress(void)
      */
     latx_bare_uart_puts(" fences=");
     put_dec(latr_tb_fence_seq());
+    latx_bare_uart_puts(" vfy=");
+    put_dec(machine.verify_checks);
+    latx_bare_uart_puts("/");
+    put_dec(machine.verify_drops);
     {
         /*
          * Ticks per 1000 blocks and traps per 1000 blocks for the window just

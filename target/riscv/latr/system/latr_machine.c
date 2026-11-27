@@ -1380,8 +1380,12 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
     if (m->nharts == 1 && entry != NULL) {
         struct tb_verify_ctx verify = { &h->env, ~(uint64_t)0, 0, 0, 0 };
 
+        if (entry->verified_seq != latr_tb_fence_seq()) {
+            __atomic_add_fetch(&m->verify_checks, 1, __ATOMIC_RELAXED);
+        }
         if (!latr_tb_cache_check_entry(&h->tb_cache, entry, tb_code_unchanged,
                                        &verify)) {
+            __atomic_add_fetch(&m->verify_drops, 1, __ATOMIC_RELAXED);
             latr_tb_insn_map_forget((void *)(uintptr_t)entry->code);
             entry->valid = 0;
             if (h->tb_cache.count > 0) {

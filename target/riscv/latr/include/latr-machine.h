@@ -136,6 +136,15 @@ typedef struct LatrMachine {
      * when the guest PCs look like ordinary code.
      */
     uint64_t trap_count;
+    /*
+     * fence.i verification bookkeeping. `verify_checks` counts lookups that had
+     * to prove their block after a fence; `verify_drops` counts the ones refused
+     * (and therefore re-translated). A drop rate that is not near zero means the
+     * byte comparison is rejecting blocks it should accept, and the phase cost is
+     * re-translation, not verification.
+     */
+    uint64_t verify_checks;
+    uint64_t verify_drops;
     uint64_t dispatch_count;
     uint64_t wake_events;
     LatrMachineEnterTb enter_tb;
