@@ -19,6 +19,7 @@
 #include "latr-system.h"
 #include "latr-machine.h"
 #include "translate.h"
+#include "loongemu-perf.h"
 
 extern void latr_enter_tb(void *env, void *code);
 extern const unsigned char latr_linux_image[];
@@ -135,6 +136,47 @@ static uint64_t last_traps;
 static void dump_ratio_hist(void);
 static void dump_pc_hash(void);
 static void dump_probe(void);
+/*
+ * Where the host time goes, when built with PERF=1.
+ *
+ * TB_COMPILE_TICKS is translate+assemble, TB_EXEC_TICKS is time spent inside
+ * generated code, and the memory counters say how often a guest load/store
+ * needed the software TLB, a walk, or an MMIO dispatch. Without this split,
+ * "three orders of magnitude slower than qemu-system-riscv64" has no owner:
+ * a slow translator and slow generated code need opposite fixes.
+ */
+static void dump_perf(void)
+{
+#ifdef LOONGEMU_PERF
+    latx_bare_uart_puts("latr-linux: perf tb=");
+    put_dec(loongemu_perf_tb_count());
+    latx_bare_uart_puts(" host-insns=");
+    put_dec(loongemu_perf_host_insns());
+    latx_bare_uart_puts(" guest-insns=");
+    put_dec(loongemu_perf_guest_insns());
+    latx_bare_uart_puts(" compile/exec=");
+    put_dec(loongemu_perf_read(LOONGEMU_PERF_TB_COMPILE_TICKS));
+    latx_bare_uart_puts("/");
+    put_dec(loongemu_perf_read(LOONGEMU_PERF_TB_EXEC_TICKS));
+    latx_bare_uart_puts(" helper=");
+    put_dec(loongemu_perf_read(LOONGEMU_PERF_HELPER_CALLS));
+    latx_bare_uart_puts(" tlb-hit/miss=");
+    put_dec(loongemu_perf_read(LOONGEMU_PERF_TLB_HIT));
+    latx_bare_uart_puts("/");
+    put_dec(loongemu_perf_read(LOONGEMU_PERF_TLB_MISS));
+    latx_bare_uart_puts(" fast/plan=");
+    put_dec(loongemu_perf_read(LOONGEMU_PERF_FAST_HIT));
+    latx_bare_uart_puts("/");
+    put_dec(loongemu_perf_read(LOONGEMU_PERF_PLAN_HIT));
+    latx_bare_uart_puts(" mmio=");
+    put_dec(loongemu_perf_read(LOONGEMU_PERF_MMIO_ACCESS));
+    latx_bare_uart_puts("\n");
+#else
+    /* Everything reads zero without PERF=1, and a line of zeros in every log
+     * reads as a measurement instead of as an absent one. */
+#endif
+}
+
 static void dump_pc_ring(void);
 
 
@@ -612,6 +654,7 @@ static void progress(void)
         if (console_stall_reports == CONSOLE_STALL_REPORTS) {
             dump_pc_ring();
             dump_probe();
+            dump_perf();
             dump_pc_hash();
             dump_ratio_hist();
             console_stall_reports = 0;
