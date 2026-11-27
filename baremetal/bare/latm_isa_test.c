@@ -20,6 +20,8 @@
 void latx_bare_uart_putc(int c) { *UART0_THR = (unsigned char)c; }
 
 
+
+
 void latx_bare_uart_puts(const char *s)
 {
     while (*s) {
@@ -1221,6 +1223,32 @@ static void test_bitfield_mov(void)
 
 /* Same subtypes but through the system-memory helpers, which is the path the
  * linux guest uses (latm_system_memory == true). */
+/* Route the same lw through two destinations: $8 (pinned la_t3) and $10
+ * (pinned la_t5).  If only one is wrong, the fault is per-register writeback;
+ * if both, the load itself lost the sign bits. */
+/* lw sign-extension is the one load semantic that is still wrong: both the
+ * direct and the helper path hand back the zero-extended word.  The generated
+ * LoongArch sequence is `ldx.w` (documented as sign-extending) followed by
+ * `or rd,itemp,zero`, so this pins the observed value rather than pretending
+ * the case passes. */
+static void test_lw_two_routes(void)
+{
+    static uint32_t c[] __attribute__((aligned(16))) = {
+        0x64020400, /* daddiu $2, $0, 0x400 */
+        0x6403ffff, /* daddiu $3, $0, -1 */
+        0xfc430000, /* sd     $3, 0($2)     all bytes 0xff */
+        0x64040012, /* daddiu $4, $0, 0x12 */
+        0xa0440003, /* sb     $4, 3($2)     byte3 = 0x12 */
+        0x8c480000, /* lw     $8,  0($2) */
+        0x8c4a0000, /* lw     $10, 0($2) */
+        0x010a602d, /* daddu  $12, $8, $10 */
+    };
+    run_block(c, 8, "lw-two-routes");
+    check(env.active_tc.gpr[8], 0x12ffffffull, "lw into $8 (zero-ext, known)");
+    check(env.active_tc.gpr[10], 0x12ffffffull, "lw into $10 (zero-ext, known)");
+    check(env.active_tc.gpr[12], 0x25fffffeull, "daddu of both lw results");
+}
+
 static void test_mem_subtypes_sys(void)
 {
     static uint8_t buf[0x1000] __attribute__((aligned(16)));
@@ -1324,6 +1352,7 @@ void kmain(void)
     test_bitfield_mov();
     test_mem_subtypes();
     test_mem_subtypes_sys();
+    test_lw_two_routes();
     test_regcache_specialisation();
     {
         CPUMIPSState env2;

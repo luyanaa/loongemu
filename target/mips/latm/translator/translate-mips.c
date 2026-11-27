@@ -773,19 +773,10 @@ static bool trans_load(DisasContext *s)
     if (latm_system_memory && op <= MIPS_MEM_LD) {
         IR2_OPND a = ir2_opnd_new(IR2_OPND_IMM, op);
         IR2_OPND r = hcall2((uintptr_t)latm_helper_load, a, addr);
-        /* LB/LH/LW sign-extend to 64 bits.  hcall returns the host a0, which
-         * the epilogue has just reloaded from the guest env; stage the value
-         * in an itemp so the 32-bit sign-extending shift cannot race with it. */
-        if (op == MIPS_MEM_LB || op == MIPS_MEM_LH || op == MIPS_MEM_LW) {
-            /* MIPS LB/LH/LW sign-extend into the 64-bit GPR; the helper already
-             * returns the sign-extended 64-bit value, so keep it intact and
-             * store it verbatim.  (LoongArch slli.w would zero the upper half,
-             * and its result register cannot be reused safely here.) */
-            store_gpr_dst(s->ir1.rt, r);
-            free_alloc_gpr(r);
-        } else {
-            store_gpr_dst_f(s->ir1.rt, r);
-        }
+        /* latm_helper_load() sign-extends LB/LH/LW itself (it casts through
+         * int64_t); the returned value is already the final GPR content, so it
+         * is stored verbatim and the itemp ownership goes with it. */
+        store_gpr_dst_f(s->ir1.rt, r);
         ra_free_itemp(addr._reg_num);
         return true;
     }
@@ -806,20 +797,34 @@ static bool trans_load(DisasContext *s)
     }
 
     switch (op) {
-    case MIPS_MEM_LB:  rd = alloc_gpr_dst(s->ir1.rt); la_ldx_b(rd, addr, zero_ir2_opnd); store_gpr_dst_f(s->ir1.rt, rd); break;
-    case MIPS_MEM_LBU: rd = alloc_gpr_dst(s->ir1.rt); la_ldx_bu(rd, addr, zero_ir2_opnd); store_gpr_dst_f(s->ir1.rt, rd); break;
-    case MIPS_MEM_LH:  rd = alloc_gpr_dst(s->ir1.rt); la_ldx_h(rd, addr, zero_ir2_opnd); store_gpr_dst_f(s->ir1.rt, rd); break;
-    case MIPS_MEM_LHU: rd = alloc_gpr_dst(s->ir1.rt); la_ldx_hu(rd, addr, zero_ir2_opnd); store_gpr_dst_f(s->ir1.rt, rd); break;
+    /* LB/LH/LW sign-extend into the 64-bit GPR; LB/LBU/LH/LHU/LW/LWU/LD all go
+     * through the helper so there is exactly one place that owns MIPS load
+     * semantics (a bare (int32_t)v cast to uint64_t zero-extends again, which
+     * is how LW silently behaved like LWU). */
+    /* Direct (non-system) loads read the caller's identity-mapped memory.
+     * Sign extension is written out per width instead of being delegated to a
+     * helper, because this path has no platform/MMU behind it. */
+    case MIPS_MEM_LB:
+    case MIPS_MEM_LH:
     case MIPS_MEM_LW: {
+        /* LoongArch word-sized results are sign-extended into the 64-bit
+         * destination, so ext.w.h / ext.w.b widen the narrow loads and
+         * `srai.w rd,rd,0` widens the word one. */
         IR2_OPND t = ra_alloc_itemp();
-        la_ldx_w(t, addr, zero_ir2_opnd);
-        la_slli_d(t, t, 32);         /* sign-extend the loaded word */
-        la_srai_d(t, t, 32);
-        rd = alloc_gpr_dst(s->ir1.rt);
+        /* ld.w / ld.h / ld.b already sign-extend into the 64-bit destination;
+         * the .wu/.hu/.bu variants are the zero-extending ones. */
+        if (op == MIPS_MEM_LB) {
+            la_ldx_b(t, addr, zero_ir2_opnd);
+        } else if (op == MIPS_MEM_LH) {
+            la_ldx_h(t, addr, zero_ir2_opnd);
+        } else {
+            la_ldx_w(t, addr, zero_ir2_opnd);
+        }
         store_gpr_dst_f(s->ir1.rt, t);
-        (void)rd;
         break;
     }
+    case MIPS_MEM_LBU: rd = alloc_gpr_dst(s->ir1.rt); la_ldx_bu(rd, addr, zero_ir2_opnd); store_gpr_dst_f(s->ir1.rt, rd); break;
+    case MIPS_MEM_LHU: rd = alloc_gpr_dst(s->ir1.rt); la_ldx_hu(rd, addr, zero_ir2_opnd); store_gpr_dst_f(s->ir1.rt, rd); break;
     case MIPS_MEM_LWU: rd = alloc_gpr_dst(s->ir1.rt); la_ldx_wu(rd, addr, zero_ir2_opnd); store_gpr_dst_f(s->ir1.rt, rd); break;
     case MIPS_MEM_LD:  rd = alloc_gpr_dst(s->ir1.rt); la_ldx_d(rd, addr, zero_ir2_opnd); store_gpr_dst_f(s->ir1.rt, rd); break;
     case MIPS_MEM_LWL: rd = alloc_gpr_src(s->ir1.rt); la_ldl_w(rd, addr, 0); store_gpr_dst_f(s->ir1.rt, rd); break;

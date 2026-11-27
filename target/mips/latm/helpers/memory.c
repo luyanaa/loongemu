@@ -370,25 +370,33 @@ uint64_t latm_helper_load(CPUMIPSState *env, uint32_t op, uint64_t addr)
             do_raise_exception(env, EXCP_AdEL, GETPC());
             return 0;
         }
-        switch (op) {
-        case MIPS_MEM_LB: return (int8_t)v;
-        case MIPS_MEM_LBU: return (uint8_t)v;
-        case MIPS_MEM_LH: return (int16_t)v;
-        case MIPS_MEM_LHU: return (uint16_t)v;
-        case MIPS_MEM_LW: return (int32_t)v;
-        case MIPS_MEM_LWU: return (uint32_t)v;
-        default: return v;
+        /* Sign-extend explicitly and keep the cast visible: converting
+         * (int32_t)v straight to the uint64_t return type zero-extends, which
+         * silently turned every MIPS LW into LWU. */
+        {
+            int64_t s;
+            switch (op) {
+            case MIPS_MEM_LB:  s = (int8_t)v; break;
+            case MIPS_MEM_LH:  s = (int16_t)v; break;
+            case MIPS_MEM_LW:  s = (int32_t)v; break;
+            default:           return v;
+            }
+            return (uint64_t)s;
         }
     }
-    switch (op) {
-    case MIPS_MEM_LB:  return (int8_t)cpu_ldub_mmuidx_ra(env, addr, 0, 0);
-    case MIPS_MEM_LBU: return cpu_ldub_mmuidx_ra(env, addr, 0, 0);
-    case MIPS_MEM_LH:  return (int16_t)cpu_lduw_mmuidx_ra(env, addr, 0, 0);
-    case MIPS_MEM_LHU: return cpu_lduw_mmuidx_ra(env, addr, 0, 0);
-    case MIPS_MEM_LW:  return (int32_t)cpu_ldl_mmuidx_ra(env, addr, 0, 0);
-    case MIPS_MEM_LWU: return cpu_ldl_mmuidx_ra(env, addr, 0, 0);
-    case MIPS_MEM_LD:  return cpu_ldq_mmuidx_ra(env, addr, 0, 0);
-    default: return 0;
+    {
+        int64_t s;
+        switch (op) {
+        case MIPS_MEM_LB:  s = (int8_t)cpu_ldub_mmuidx_ra(env, addr, 0, 0); break;
+        case MIPS_MEM_LH:  s = (int16_t)cpu_lduw_mmuidx_ra(env, addr, 0, 0); break;
+        case MIPS_MEM_LW:  s = (int32_t)cpu_ldl_mmuidx_ra(env, addr, 0, 0); break;
+        case MIPS_MEM_LBU: return cpu_ldub_mmuidx_ra(env, addr, 0, 0);
+        case MIPS_MEM_LHU: return cpu_lduw_mmuidx_ra(env, addr, 0, 0);
+        case MIPS_MEM_LWU: return cpu_ldl_mmuidx_ra(env, addr, 0, 0);
+        case MIPS_MEM_LD:  return cpu_ldq_mmuidx_ra(env, addr, 0, 0);
+        default: return 0;
+        }
+        return (uint64_t)s;
     }
 }
 
