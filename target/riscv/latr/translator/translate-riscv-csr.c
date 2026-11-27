@@ -949,35 +949,42 @@ void latr_raise_mem_fault(const RiscvIR1 *ir1)
  * mid-block, and an entry-time test would then be wrong (test (d) in
  * latr_isa_test's minstret section).
  */
-void latr_emit_instret_flush(void)
+/* Adds `count` to minstret unless mcountinhibit.IR is set. Does not touch the
+ * translator's pending count: a fault path materialises the same constant the
+ * fall-through path still owes. */
+void latr_emit_instret_add(unsigned count)
 {
-    TRANSLATION_DATA *data = lsenv->tr_data;
     IR2_OPND inhibit;
-    IR2_OPND count;
+    IR2_OPND counter;
     IR2_OPND delta;
     IR2_OPND skip;
 
-    if (data->instret_dynamic && data->instret_pending == 0) {
-        return;
-    }
-    if (data->instret_pending == 0) {
+    if (count == 0) {
         return;
     }
     latr_tag(LATR_TAG_INSTRET);
     inhibit = a0_ir2_opnd;
-    count = a1_ir2_opnd;
+    counter = a1_ir2_opnd;
     delta = a2_ir2_opnd;
     skip = ir2_opnd_new_type(IR2_OPND_LABEL);
     latr_env_load_d(inhibit, env_offset_csr(CSR_MCOUNTINHIBIT));
     la_andi(inhibit, inhibit, 4);
     la_bne(inhibit, zero_ir2_opnd, skip);
-    latr_env_load_d(count, env_offset_csr(CSR_MINSTRET));
-    li_d(delta, data->instret_pending);
-    la_add_d(count, count, delta);
-    latr_env_store_d(count, env_offset_csr(CSR_MINSTRET));
+    latr_env_load_d(counter, env_offset_csr(CSR_MINSTRET));
+    li_d(delta, count);
+    la_add_d(counter, counter, delta);
+    latr_env_store_d(counter, env_offset_csr(CSR_MINSTRET));
     la_label(skip);
-    data->instret_pending = 0;
     latr_tag(LATR_TAG_INSN);
+}
+
+void latr_emit_instret_flush(void)
+{
+    TRANSLATION_DATA *data = lsenv->tr_data;
+    unsigned pending = (unsigned)data->instret_pending;
+
+    data->instret_pending = 0;
+    latr_emit_instret_add(pending);
 }
 
 void latr_emit_instret(void)

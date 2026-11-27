@@ -18,7 +18,7 @@ LLD_PREFIX ?= $(shell brew --prefix lld 2>/dev/null)
 LD_LLD   ?= $(if $(LLD_PREFIX),$(LLD_PREFIX)/bin/ld.lld,ld.lld)
 QEMU_PREFIX ?= $(shell brew --prefix qemu 2>/dev/null)
 
-.PHONY: all test test-pvir test-fpsr test-riscv-sbi test-riscv-virtio test-riscv-acpi test-riscv-plic test-riscv-uart test-riscv-clint test-riscv-fw test-sve-decode test-sve-pvir test-sve-helper-support test-sve-helper-lifecycle test-vcache test-arm-state test-cpu test-lapaging test-pci-host test-hyperv test-tbc test-soft-ras test-p0 test-plv3-isolation tb-sys-run tb-sys-smp-run vmm-efi vmm-boot vmm-integrated vmm-integrated-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot test-latr latr-core latr-isa-image latr-isa-run latr-riscv-ref latr-check latr-boot-image latr-boot-run latr-sys-ref latr-sys-run latr-sys-diff latr-opensbi-image latr-opensbi-run latr-opensbi-trace latr-opensbi-trace-run latr-opensbi-test test-latm test-latm-decode latm-core latm-isa-image latm-isa-run latm-riscv-ref clean
+.PHONY: all test test-pvir test-fpsr test-riscv-sbi test-riscv-virtio test-riscv-acpi test-riscv-plic test-riscv-uart test-riscv-clint test-riscv-fw test-sve-decode test-sve-pvir test-sve-helper-support test-sve-helper-lifecycle test-vcache test-arm-state test-cpu test-lapaging test-pci-host test-hyperv test-tbc test-soft-ras test-p0 test-plv3-isolation tb-sys-run tb-sys-smp-run vmm-efi vmm-boot vmm-integrated vmm-integrated-boot vmm-loader vmm-loader-boot test-paging test-libc test-libm test-loongarch test-loongarch-fallback efi-selftest efi-boot test-latr latr-core latr-isa-image latr-isa-run latr-riscv-ref latr-check latr-boot-image latr-boot-run latr-sys-ref latr-sys-run latr-sys-diff latr-opensbi-image latr-opensbi-run latr-opensbi-trace latr-opensbi-trace-run latr-opensbi-test test-latm test-latm-decode latm-core latm-isa-image latm-isa-run latm-riscv-ref clean
 
 all: test
 
@@ -614,7 +614,8 @@ LIBC_RENAMES := -Dmemcpy=latx_memcpy -Dmemmove=latx_memmove -Dmemset=latx_memset
                 -Dputchar=latx_putchar -Dfflush=latx_fflush \
                 -Dmalloc=latx_malloc -Dcalloc=latx_calloc -Drealloc=latx_realloc \
                 -Dfree=latx_free -Dabort=latx_abort -Dexit=latx_exit \
-                -Dqemu_log=latx_qemu_log
+                -Dqemu_log=latx_qemu_log \
+                -Dqsort=latx_qsort
 
 build/libc-host/.stamp: latx/compat/libc_min.c latx/compat/miniglib.c \
                         latx/compat/*.h latx/compat/qemu/*.h
@@ -748,6 +749,9 @@ build/latr_isa_test.o: baremetal/bare/latr_isa_test.c \
                        target/riscv/latr/include/latr.h \
                        target/riscv/latr/include/mmu.h \
                        target/riscv/latr/include/translate.h \
+                       shared/backend/loongarch/include/ir2.h \
+                       shared/backend/loongarch/include/la-ir2.h \
+                       shared/backend/loongarch/include/ir2-opcode.h \
                        tests/latr_isa_diff_vectors.h \
                        build/latr_rand_vectors.h
 	@mkdir -p build
@@ -1399,6 +1403,9 @@ lbt-smoke-run: build/lbt_smoke.elf
 	@grep -a 'lbt-smoke:' build/lbt_smoke.log | tail -9
 	@grep -qa 'lbt-smoke: PASS' build/lbt_smoke.log
 
+lata-core:
+	$(MAKE) -C lata all
+
 lata-isa-image: build/bare_lata_isa.elf
 
 # Stage 1 regression: aarch64 constructs through the translator, checked in the
@@ -1410,6 +1417,34 @@ lata-isa-run: lata-isa-image
 	     bash scripts/run_qemu_lata.sh
 	@grep -aE 'lata-isa' build/lata_isa.log | head -30
 	@grep -qa 'lata-isa: PASS' build/lata_isa.log
+
+# Multi-TB dispatch: the guest is a real AArch64 loop driven through
+# target/arm/lata/dispatch.c, the production translation of LataDispatchOps.
+# The ISA image cannot cover this: it translates each block once and enters it
+# directly, so it never exercises the cache, the arena arithmetic or the
+# word-to-byte conversion that decides where the next block is emitted.
+build/lata_dispatch_test.o: baremetal/bare/lata_dispatch_test.c \
+                            target/arm/lata/include/lata-dispatch.h \
+                            include/loongemu/lata_dispatch.h
+	@mkdir -p build
+	$(CLANG) $(LATA_BARE_CFLAGS) -Iinclude -c $< -o $@
+
+build/bare_lata_dispatch.elf: build/lata_dispatch_test.o build/lata_miniglib.o \
+                              build/lata_libc_min.o lata-core \
+                              baremetal/bare/bare.lds
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e _start \
+	   build/lata_dispatch_test.o build/lata_miniglib.o build/lata_libc_min.o \
+	   lata/build/liblata_core.a -o $@
+
+lata-dispatch-image: build/bare_lata_dispatch.elf
+
+lata-dispatch-run: lata-dispatch-image
+	@env QEMU_BIN="$(QLVZ_REPO)" QEMU_KERNEL="build/bare_lata_dispatch.elf" \
+	     QEMU_LOG="build/lata_dispatch.log" QEMU_DONE="lata-dispatch: done" \
+	     QEMU_TIMEOUT=60 CPU=la464 \
+	     bash scripts/run_qemu_lata.sh
+	@grep -aE 'lata-dispatch' build/lata_dispatch.log | head -40
+	@grep -qa 'lata-dispatch: PASS' build/lata_dispatch.log
 
 lata-smoke-image: build/bare_lata.elf
 

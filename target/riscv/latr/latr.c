@@ -1236,10 +1236,20 @@ bool tr_ir2_generate(TranslationBlock *tb)
     data->instret_dynamic = 0;
     for (int i = 0; i < count; i++) {
         switch (insns[i].opcode) {
-        case LATR_RV_CSRRW: case LATR_RV_CSRRS: case LATR_RV_CSRRC:
-        case LATR_RV_CSRRWI: case LATR_RV_CSRRSI: case LATR_RV_CSRRCI:
-            if (insns[i].arg.rd != 0 || insns[i].opcode == LATR_RV_CSRRW ||
-                insns[i].opcode == LATR_RV_CSRRWI) {
+        case LATR_RV_CSRRW: case LATR_RV_CSRRWI:
+            /* Always write. */
+            data->instret_dynamic = 1;
+            break;
+        case LATR_RV_CSRRS: case LATR_RV_CSRRC:
+        case LATR_RV_CSRRSI: case LATR_RV_CSRRCI:
+            /* csrrs/csrrc with a zero source are pure reads (rd is irrelevant:
+             * csrrs x0, X, x1 still writes X). */
+            if (insns[i].opcode == LATR_RV_CSRRSI ||
+                insns[i].opcode == LATR_RV_CSRRCI) {
+                if (insns[i].arg.rs1 != 0) {
+                    data->instret_dynamic = 1;
+                }
+            } else if (insns[i].arg.rs1 != 0) {
                 data->instret_dynamic = 1;
             }
             break;
@@ -1278,10 +1288,17 @@ bool tr_ir2_generate(TranslationBlock *tb)
             data->tb_insn_binds[i]);
         (la_label)(labels[i]);
         /*
-         * Instructions that can trap must leave minstret exact for everything
-         * that retired before them, so the pending count is materialised first.
-         * The whitelist is the set of opcodes that cannot raise: anything not
-         * listed here flushes, which is conservative by construction.
+         * Materialise the pending retired count before any instruction that can
+         * trap, so a trap leaves minstret exact for what retired before it, and
+         * again at every exit. This is the conservative placement: one guarded
+         * add per trap-capable instruction.
+         *
+         * Moving it to each fault label with a compile-time constant (one add
+         * per fault site) was attempted and withdrawn: it needs a test that
+         * faults on a load, and this harness has no address that faults -- a
+         * load from 0x100000000 succeeds here and, worse, corrupts the harness
+         * enough that the suite later hangs in its conversion section. Without
+         * that test the change could not be verified, so it is not in the tree.
          */
         if (!latr_insn_cannot_trap(insns[i].opcode)) {
             latr_emit_instret_flush();

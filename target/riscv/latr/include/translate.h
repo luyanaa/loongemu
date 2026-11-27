@@ -18,6 +18,8 @@ bool latr_translate_privileged(const RiscvIR1 *ir1);
 void latr_emit_instret(void);
 /* Materialises the block's pending retired-instruction count into minstret. */
 void latr_emit_instret_flush(void);
+/* Adds a constant to minstret, guarded by mcountinhibit.IR; leaves pending alone. */
+void latr_emit_instret_add(unsigned count);
 void latr_emit_store(IR2_OPND address, IR2_OPND value, unsigned size);
 /* Walk the guest page table; leaves the host address in a0 (0 on fault). */
 void latr_emit_resolve(IR2_OPND address, unsigned access, unsigned size);
