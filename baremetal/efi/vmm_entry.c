@@ -26,9 +26,23 @@
 #define VMM_PAGE_ALIGN_UP(v) \
     (((v) + LAPG_PAGE_SIZE - 1u) & ~(uint64_t)(LAPG_PAGE_SIZE - 1u))
 
-#ifndef VMM_STANDALONE_PROBE
+#if !defined(VMM_STANDALONE_PROBE) && !defined(LOONGEMU_PAYLOAD_FROM_ESP)
 extern const uint8_t _ovmf_code_start[], _ovmf_code_end[];
 extern const uint8_t _ovmf_vars_start[], _ovmf_vars_end[];
+#endif
+
+#ifdef LOONGEMU_PAYLOAD_FROM_ESP
+/*
+ * Runtime payload loading: the guest firmware is read from the boot volume
+ * before ExitBootServices (baremetal/efi/efi_payload.c) instead of being
+ * linked in.  Paths are fixed and documented rather than configurable, so a
+ * boot volume can be prepared without knowing build-time flags.
+ */
+#define PAYLOAD_CODE_PATH "\\EFI\\loongemu\\ovmf_code.fd"
+#define PAYLOAD_VARS_PATH "\\EFI\\loongemu\\ovmf_vars.fd"
+int efi_payload_read(EFI_BOOT_SERVICES *bs, EFI_HANDLE image_handle,
+                     const char *path, EFI_PHYSICAL_ADDRESS *out_base,
+                     uint64_t *out_size);
 #endif
 
 #ifdef VMM_STANDALONE_PROBE
@@ -837,6 +851,31 @@ int efi_main(void *image, void *systab)
     if (EFI_ERROR(status)) { LOG("pool alloc failed"); return 1; }
     g_pool = addr;
 #else
+#ifdef LOONGEMU_PAYLOAD_FROM_ESP
+    /*
+     * Runtime payload: efi_payload_read() allocates page-granular loader
+     * memory and reads the file into it, so no extra copy step is needed and
+     * the sizes come from the files themselves rather than from link-time
+     * symbols.  Both buffers must still survive ExitBootServices, which
+     * EfiLoaderData does.
+     */
+    {
+        uint64_t ovmf_code_size = 0;
+        uint64_t ovmf_vars_size = 0;
+
+        if (!efi_payload_read(bs, image, PAYLOAD_CODE_PATH,
+                              &g_ovmf_code, &ovmf_code_size) ||
+            !efi_payload_read(bs, image, PAYLOAD_VARS_PATH,
+                              &g_ovmf_vars, &ovmf_vars_size)) {
+            LOG("guest firmware not found on the boot volume");
+            return 1;
+        }
+        g_vmm_handoff.ovmf_code_hpa = g_ovmf_code;
+        g_vmm_handoff.ovmf_code_size = ovmf_code_size;
+        g_vmm_handoff.ovmf_vars_hpa = g_ovmf_vars;
+        g_vmm_handoff.ovmf_vars_size = ovmf_vars_size;
+    }
+#else
     uint64_t ovmf_code_file_size =
         (uint64_t)(_ovmf_code_end - _ovmf_code_start);
     uint64_t ovmf_vars_file_size =
@@ -848,6 +887,7 @@ int efi_main(void *image, void *systab)
         LOG("invalid OVMF payload sizes");
         return 1;
     }
+#endif
 
     status = bs->AllocatePages(AllocateAnyPages, EfiLoaderData,
                                VMM_GUEST_RAM_PAGES, &addr);
@@ -861,6 +901,7 @@ int efi_main(void *image, void *systab)
     if (EFI_ERROR(status)) { LOG("fb fallback alloc failed"); return 1; }
     g_fb_fallback = addr;
 
+#ifndef LOONGEMU_PAYLOAD_FROM_ESP
     addr = 0;
     status = bs->AllocatePages(AllocateAnyPages, EfiLoaderData,
                                (UINTN)(ovmf_code_size / LAPG_PAGE_SIZE), &addr);
@@ -872,16 +913,19 @@ int efi_main(void *image, void *systab)
                                (UINTN)(ovmf_vars_size / LAPG_PAGE_SIZE), &addr);
     if (EFI_ERROR(status)) { LOG("OVMF vars alloc failed"); return 1; }
     g_ovmf_vars = addr;
+#endif
 
     g_vmm_handoff.guest_ram_hpa = g_guest_ram;
     g_vmm_handoff.guest_ram_size = g_guest_ram_bytes;
     g_vmm_handoff.fb_fallback_hpa = g_fb_fallback;
     g_vmm_handoff.fb_fallback_size =
         (uint64_t)VMM_FB_FALLBACK_PAGES * LAPG_PAGE_SIZE;
+#ifndef LOONGEMU_PAYLOAD_FROM_ESP
     g_vmm_handoff.ovmf_code_hpa = g_ovmf_code;
     g_vmm_handoff.ovmf_code_size = ovmf_code_size;
     g_vmm_handoff.ovmf_vars_hpa = g_ovmf_vars;
     g_vmm_handoff.ovmf_vars_size = ovmf_vars_size;
+#endif
 
 #endif
 
@@ -923,10 +967,12 @@ int efi_main(void *image, void *systab)
 #ifndef VMM_STANDALONE_PROBE
     copy_and_fill(g_fb_fallback, 0, 0,
                   (uint64_t)VMM_FB_FALLBACK_PAGES * LAPG_PAGE_SIZE, 0);
+#ifndef LOONGEMU_PAYLOAD_FROM_ESP
     copy_and_fill(g_ovmf_code, _ovmf_code_start, ovmf_code_file_size,
                   g_vmm_handoff.ovmf_code_size, 0xffu);
     copy_and_fill(g_ovmf_vars, _ovmf_vars_start, ovmf_vars_file_size,
                   g_vmm_handoff.ovmf_vars_size, 0xffu);
+#endif
 #endif
 
     /*

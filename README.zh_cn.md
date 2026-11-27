@@ -203,6 +203,12 @@ make vmm-efi && make vmm-boot
 # 集成宿主 UEFI -> System VMM，需要 x86-64 OVMF CODE 和 VARS
 make vmm-integrated OVMF_CODE=/path/to/OVMF_CODE.fd OVMF_VARS=/path/to/OVMF_VARS.fd
 make vmm-integrated-boot OVMF_CODE=/path/to/OVMF_CODE.fd OVMF_VARS=/path/to/OVMF_VARS.fd
+
+# 同一个 VMM，但 x86 固件在运行时从启动卷读取，而不是链接进镜像。
+# ESP 需要这三个文件：
+#   EFI/BOOT/BOOTLOONGARCH64.EFI、EFI/loongemu/ovmf_code.fd、
+#   EFI/loongemu/ovmf_vars.fd
+make vmm-loader-boot OVMF_CODE=/path/to/OVMF_CODE.fd OVMF_VARS=/path/to/OVMF_VARS.fd
 ```
 
 QEMU 运行都有时间限制（recipe 中使用 `timeout` 或固定等待后结束客户机），日志写入

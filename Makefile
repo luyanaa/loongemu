@@ -2038,6 +2038,75 @@ build/vmm_integrated.efi: build/vmm_integrated.elf
 
 vmm-integrated: build/vmm_integrated.efi
 
+# ---- Runtime payload loader: guest firmware comes from the boot volume -----
+#
+# Same VMM, same handoff, but the x86 firmware is not linked in.  The image is
+# therefore a few hundred KiB instead of 130 MB and stays valid when the guest
+# firmware file changes; the ESP must carry
+#
+#     EFI/BOOT/BOOTLOONGARCH64.EFI        this image
+#     EFI/loongemu/ovmf_code.fd           guest OVMF code
+#     EFI/loongemu/ovmf_vars.fd           guest OVMF variables
+#
+# vmm_entry.c reads both files before ExitBootServices (efi_payload.c) and
+# hands their physical addresses over in LoongemuVmmHandoff, so everything
+# after the handoff is identical to the integrated build.
+PAYLOAD_DEFS := -DLOONGEMU_BOOT_OVMF -DLOONGEMU_PAYLOAD_FROM_ESP
+
+build/vmm_loader_entry.o: baremetal/efi/vmm_entry.c include/loongemu/vmm_handoff.h \
+                          include/loongemu/loongarch_paging.h baremetal/efi/efi_min.h \
+                          baremetal/efi/efi_payload.c
+	@mkdir -p build
+	$(CLANG) $(VMM_EFI_CFLAGS) $(BARE_DEPFLAGS) $(PAYLOAD_DEFS) -c $< -o $@
+
+build/vmm_loader_payload.o: baremetal/efi/efi_payload.c baremetal/efi/efi_min.h \
+                            include/loongemu/loongarch_paging.h
+	@mkdir -p build
+	$(CLANG) $(VMM_EFI_CFLAGS) $(BARE_DEPFLAGS) $(PAYLOAD_DEFS) -c $< -o $@
+
+build/vmm_loader_tb_sys.o: baremetal/bare/tb_sys.c include/loongemu/vmm_handoff.h \
+                           include/loongemu/hyperv.h baremetal/bare/tb_harness.h
+	@mkdir -p build
+	$(CLANG) $(BARE_CFLAGS) $(BARE_DEPFLAGS) -DLOONGEMU_BOOT_OVMF -Iinclude -Ibaremetal/bare -c $< -o $@
+
+build/vmm_loader.elf: build/vmm_loader_entry.o build/vmm_loader_payload.o \
+                      build/vmm_loader_tb_sys.o build/tb_harness.o \
+                      build/tb_cache_bare.o build/loongarch_paging_bare.o \
+                      build/lbt_emu.o build/acpi_tables_bare.o \
+                      build/vmlinux_text.o build/vmlinux_segs.o \
+                      baremetal/build/liblatx_core.a baremetal/bare/bare.lds
+	$(LD_LLD) --emit-relocs -T baremetal/bare/bare.lds -e efi_main \
+	   build/vmm_loader_entry.o build/vmm_loader_payload.o \
+	   build/vmm_loader_tb_sys.o build/tb_harness.o build/tb_cache_bare.o \
+	   build/loongarch_paging_bare.o build/lbt_emu.o build/acpi_tables_bare.o \
+	   build/vmlinux_text.o build/vmlinux_segs.o \
+	   baremetal/build/liblatx_core.a -o $@
+
+build/vmm_loader.efi: build/vmm_loader.elf
+	$(GENFW) -o $@ -e UEFI_APPLICATION $<
+
+vmm-loader: build/vmm_loader.efi
+
+vmm-loader-boot: vmm-loader
+	@test -r "$(OVMF_CODE)" || { echo "Set OVMF_CODE to an x86-64 OVMF_CODE.fd file" >&2; exit 1; }
+	@test -r "$(OVMF_VARS)" || { echo "Set OVMF_VARS to an x86-64 OVMF_VARS.fd file" >&2; exit 1; }
+	@rm -rf build/esp_vmm_loader && mkdir -p build/esp_vmm_loader/EFI/BOOT \
+	                                          build/esp_vmm_loader/EFI/loongemu
+	@cp build/vmm_loader.efi build/esp_vmm_loader/EFI/BOOT/BOOTLOONGARCH64.EFI
+	@cp "$(OVMF_CODE)" build/esp_vmm_loader/EFI/loongemu/ovmf_code.fd
+	@cp "$(OVMF_VARS)" build/esp_vmm_loader/EFI/loongemu/ovmf_vars.fd
+	@ls -l build/vmm_loader.efi build/esp_vmm_loader/EFI/loongemu/
+	@rm -f build/vmm-loader-serial.log
+	@( qemu-system-loongarch64 -M virt -cpu la464 -m 2G \
+	     -bios firmware/QEMU_EFI.fd \
+	     -drive id=esp,file=fat:rw:build/esp_vmm_loader,format=raw,if=none \
+	     -device virtio-blk-pci,drive=esp \
+	     -display none -monitor none -serial file:build/vmm-loader-serial.log -no-reboot 2>/dev/null & \
+	   echo $$! > build/qemu_vmm_loader.pid )
+	@sleep 60; kill $$(cat build/qemu_vmm_loader.pid) 2>/dev/null; true
+	@grep -aE 'vmm:|tb-sys:' build/vmm-loader-serial.log | tail -40
+	@! grep -qa 'guest firmware not found\|refusing to start' build/vmm-loader-serial.log
+
 vmm-integrated-boot: vmm-integrated
 	@rm -rf build/esp_vmm_integrated && mkdir -p build/esp_vmm_integrated/EFI/BOOT
 	@cp build/vmm_integrated.efi build/esp_vmm_integrated/EFI/BOOT/BOOTLOONGARCH64.EFI

@@ -77,6 +77,16 @@ typedef enum {
     MaxAllocateType = 3,
 } EFI_ALLOCATE_TYPE;
 
+/*
+ * LocateHandleBuffer search type (UefiSpec.h EFI_LOCATE_SEARCH_TYPE).
+ * ByProtocol is the only one this loader needs.
+ */
+typedef enum {
+    AllHandles = 0,
+    ByRegisterNotify = 1,
+    ByProtocol = 2,
+} EFI_LOCATE_SEARCH_TYPE;
+
 typedef struct {
     uint32_t Data1;
     uint16_t Data2;
@@ -146,7 +156,11 @@ typedef struct {
     void *CloseProtocol;
     void *OpenProtocolInformation;
     void *ProtocolsPerHandle;
-    void *LocateHandleBuffer;
+    EFI_STATUS (EFIAPI *LocateHandleBuffer)(EFI_LOCATE_SEARCH_TYPE SearchType,
+                                            const EFI_GUID *Protocol,
+                                            void *SearchKey,
+                                            UINTN *NoHandles,
+                                            EFI_HANDLE **Buffer);
     EFI_STATUS (EFIAPI *LocateProtocol)(const EFI_GUID *Protocol,
                                         void *Registration,
                                         void **Interface);
@@ -245,4 +259,81 @@ typedef struct {
     EFI_CONFIGURATION_TABLE *ConfigurationTable;
 } EFI_SYSTEM_TABLE;
 
-#endif
+/*
+ * Simple File System Protocol: {964e5b22-6459-11d2-8e39-00a0c969723b}
+ *
+ * Only the members this loader calls carry real prototypes; the rest stay
+ * opaque to keep their slots the right width.
+ */
+#define EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID \
+    { 0x964e5b22u, 0x6459u, 0x11d2u, \
+      { 0x8eu, 0x39u, 0x00u, 0xa0u, 0xc9u, 0x69u, 0x72u, 0x3bu } }
+
+typedef struct EFI_FILE_PROTOCOL EFI_FILE_PROTOCOL;
+
+struct EFI_FILE_PROTOCOL {
+    uint64_t Revision;
+    EFI_STATUS (EFIAPI *Open)(EFI_FILE_PROTOCOL *This,
+                              EFI_FILE_PROTOCOL **NewHandle,
+                              const CHAR16 *FileName,
+                              uint64_t OpenMode,
+                              uint64_t Attributes);
+    EFI_STATUS (EFIAPI *Close)(EFI_FILE_PROTOCOL *This);
+    EFI_STATUS (EFIAPI *Delete)(EFI_FILE_PROTOCOL *This);
+    EFI_STATUS (EFIAPI *Read)(EFI_FILE_PROTOCOL *This,
+                             UINTN *BufferSize,
+                             void *Buffer);
+    EFI_STATUS (EFIAPI *Write)(EFI_FILE_PROTOCOL *This,
+                               UINTN *BufferSize,
+                               const void *Buffer);
+    EFI_STATUS (EFIAPI *GetPosition)(EFI_FILE_PROTOCOL *This, uint64_t *Position);
+    EFI_STATUS (EFIAPI *SetPosition)(EFI_FILE_PROTOCOL *This, uint64_t Position);
+    EFI_STATUS (EFIAPI *GetInfo)(EFI_FILE_PROTOCOL *This,
+                                 const EFI_GUID *InformationType,
+                                 UINTN *BufferSize,
+                                 void *Buffer);
+    EFI_STATUS (EFIAPI *SetInfo)(EFI_FILE_PROTOCOL *This,
+                                 const EFI_GUID *InformationType,
+                                 UINTN BufferSize,
+                                 const void *Buffer);
+    EFI_STATUS (EFIAPI *Flush)(EFI_FILE_PROTOCOL *This);
+};
+
+/* EFI_FILE_MODE_READ */
+#define EFI_FILE_MODE_READ 0x0000000000000001ULL
+
+/* EFI_FILE_INFO GUID: {09576e92-6d3f-11d2-8e39-00a0c969723b} */
+#define EFI_FILE_INFO_GUID \
+    { 0x09576e92u, 0x6d3fu, 0x11d2u, \
+      { 0x8eu, 0x39u, 0x00u, 0xa0u, 0xc9u, 0x69u, 0x72u, 0x3bu } }
+
+/* Minimal EFI_FILE_INFO prefix: the size and the attributes this loader reads. */
+typedef struct {
+    uint64_t Size;
+    uint64_t FileSize;
+    uint64_t PhysicalSize;
+} EFI_FILE_INFO_HEAD;
+
+typedef struct {
+    uint64_t Revision;
+    EFI_STATUS (EFIAPI *OpenVolume)(void *This, EFI_FILE_PROTOCOL **Root);
+} EFI_SIMPLE_FILE_SYSTEM_PROTOCOL;
+
+/*
+ * Loaded Image Protocol is declared above; these complete the two image
+ * services the runtime loader needs.  Replacing the `void *` placeholders in
+ * EFI_BOOT_SERVICES would change that struct's member types, so the loader
+ * casts the slot it wants: the layout (one pointer per member) is what
+ * matters for offset correctness.
+ */
+typedef EFI_STATUS (EFIAPI *EFI_IMAGE_LOAD)(int BootPolicy,
+                                            EFI_HANDLE ParentImageHandle,
+                                            void *DevicePath,
+                                            void *SourceBuffer,
+                                            UINTN SourceSize,
+                                            EFI_HANDLE *ImageHandle);
+typedef EFI_STATUS (EFIAPI *EFI_IMAGE_START)(EFI_HANDLE ImageHandle,
+                                             UINTN *ExitDataSize,
+                                             CHAR16 **ExitData);
+
+#endif /* LOONGEMU_EFI_MIN_H */

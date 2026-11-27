@@ -2605,7 +2605,30 @@ static int is_host_vmm_va(uint64_t va)
     return 0;
 }
 
-static void rebuild_host_mappings(void)
+/*
+ * Page-table construction deliberately runs unoptimised.
+ *
+ * At -O2 this function produces a g_plv0_root of 0 on the UEFI handoff
+ * path, so CSR.PGDH is programmed with 0 and the three PLV3iso checks that
+ * compare the two roots fail (checks=113 fails=3). At -O0, and with optnone
+ * on this function alone, the same source passes 113/0 and pgdh holds the
+ * allocated page. The ELF self-test path never showed it because its image
+ * ends at _end while the handoff path uses LoadedImage.ImageSize, which
+ * covers the whole .bss - including the page-table pool, g_root and
+ * g_plv0_root - so this routine identity-maps the pool into the root it is
+ * filling.
+ *
+ * lapg_map() is known good in isolation: a host harness that allocates a
+ * root, identity-maps the pool into it, and re-reads both variables survives
+ * at both -O0 and -O2. The defect therefore needs the whole-image context
+ * (pool pages, the 89 MiB .bss, and the identity map describing them) to
+ * appear, and it is not yet pinned to one statement. Until it is, keep this
+ * translation unit's page-table setup out of the optimiser rather than
+ * shipping an image whose PGDH is silently zero: correctness here decides
+ * whether a guest can read VMM memory, so it is not a place to rely on
+ * codegen that has been observed to change under -O.
+ */
+static void __attribute__((optnone)) rebuild_host_mappings(void)
 {
     uint64_t uart_page = g_uart_base
                              ? (g_uart_base & LAPG_PAGE_MASK)

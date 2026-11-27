@@ -218,6 +218,12 @@ make vmm-efi && make vmm-boot
 # Integrated host UEFI -> System VMM; requires x86-64 OVMF CODE and VARS
 make vmm-integrated OVMF_CODE=/path/to/OVMF_CODE.fd OVMF_VARS=/path/to/OVMF_VARS.fd
 make vmm-integrated-boot OVMF_CODE=/path/to/OVMF_CODE.fd OVMF_VARS=/path/to/OVMF_VARS.fd
+
+# Same VMM, but the x86 firmware is read from the boot volume at run time
+# instead of linked in. The ESP needs the two firmware files:
+#   EFI/BOOT/BOOTLOONGARCH64.EFI, EFI/loongemu/ovmf_code.fd,
+#   EFI/loongemu/ovmf_vars.fd
+make vmm-loader-boot OVMF_CODE=/path/to/OVMF_CODE.fd OVMF_VARS=/path/to/OVMF_VARS.fd
 ```
 
 QEMU runs are time-bounded (the recipes use `timeout` or a fixed sleep and then
