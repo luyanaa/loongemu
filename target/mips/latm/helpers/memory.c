@@ -370,9 +370,10 @@ uint64_t latm_helper_load(CPUMIPSState *env, uint32_t op, uint64_t addr)
             do_raise_exception(env, EXCP_AdEL, GETPC());
             return 0;
         }
-        /* Sign-extend explicitly and keep the cast visible: converting
-         * (int32_t)v straight to the uint64_t return type zero-extends, which
-         * silently turned every MIPS LW into LWU. */
+        /* Narrow the value to the loaded width, then widen it back through
+         * int64_t so a negative field keeps its sign bits.  (Converting a
+         * negative (int32_t) straight to uint64_t already wraps modulo 2^64;
+         * the int64_t hop just makes that intent explicit.) */
         {
             int64_t s;
             switch (op) {

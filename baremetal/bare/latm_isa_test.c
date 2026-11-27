@@ -18,6 +18,14 @@
 
 #define UART0_THR ((volatile unsigned char *)0x1fe001e0)
 void latx_bare_uart_putc(int c) { *UART0_THR = (unsigned char)c; }
+/* CPUCFG1.ARCH is FIELD(CPUCFG1, ARCH, 0, 2): 0=LA32R 1=LA32 2=LA64.
+ * Every dword translator opcode is gated on it (QEMU: avail_64). */
+static unsigned int read_cpucfg(unsigned int idx)
+{
+    unsigned int v = 0;
+    __asm__ volatile("cpucfg %0, %1" : "=r"(v) : "r"(idx));
+    return v;
+}
 /* IR2-level dump of the block about to be assembled.  Prints opcode, operand
  * kinds/values and the id/next links so a mis-threaded list is visible. */
 void latm_ir2_dump_hook(const TRANSLATION_DATA *data)
@@ -1272,31 +1280,51 @@ static void test_bitfield_mov(void)
 /* Route the same lw through two destinations: $8 (pinned la_t3) and $10
  * (pinned la_t5).  If only one is wrong, the fault is per-register writeback;
  * if both, the load itself lost the sign bits. */
-/* lw sign-extension is the one load semantic that is still wrong: both the
- * direct and the helper path hand back the zero-extended word.  The generated
- * LoongArch sequence is `ldx.w` (documented as sign-extending) followed by
- * `or rd,itemp,zero`, so this pins the observed value rather than pretending
- * the case passes. */
+/* lw must sign-extend bit31 of the loaded word.  0x12ffffff is positive and
+ * therefore unchanged; the negative case below proves the extension happens. */
 /* dsll32 followed by dsra32 on the same register: each half passes alone, the
  * pair loses the intermediate value.  Dump the IR2 stream for exactly this
  * block so the list itself can be inspected. */
 static void test_guest_sext(void)
 {
+    /* 0x92ffffff has bit31 set, so 32->64 sign extension is observable.  A
+     * value like 0x12ffffff is already positive and extends to itself, which is
+     * what made an earlier expectation look like a hardware bug. */
     static uint32_t c[] __attribute__((aligned(16))) = {
-        0x3c0812ff, /* lui     $8, 0x12ff     */
+        0x3c0892ff, /* lui     $8, 0x92ff     */
         0x3508ffff, /* ori     $8, $8, 0xffff */
         0x0008403c, /* dsll32  $8, $8, 0      */
         0x0008403f, /* dsra32  $8, $8, 0      */
     };
-    /* IR2 and the assembled words for this block are both correct
-     * (`SLLI_D r15,r15,32; SRAI_D r15,r15,32` with imm=32, then a `B` to
-     * cs_native_to_bt), yet the guest register ends up holding the value from
-     * before the two shifts.  Pin the observation and leave the dump enabled
-     * so the stream can be inspected; see the roadmap entry. */
     ((TRANSLATION_DATA *)env.latm_tr_data)->ir2_dump_wanted = true;
     run_block(c, 4, "guest-sext");
-    check(env.active_tc.gpr[8], 0x0000000012ffffffull,
-          "dsll32/dsra32 pair (intermediate lost, known)");
+    check(env.active_tc.gpr[8], 0xffffffff92ffffffull,
+          "dsll32/dsra32 sign-extend a negative word");
+
+    {
+        /* Control: the same 32->64 widening through SLL, which lowers to
+         * slli.w (avail_ALL) instead of slli.d (avail_64).  If this passes
+         * while the pair above fails, the dword gate is the difference. */
+        static uint32_t cs[] __attribute__((aligned(16))) = {
+            0x3c0892ff, /* lui $8, 0x92ff */
+            0x3508ffff, /* ori $8, $8, 0xffff */
+            0x00084000, /* sll $8, $8, 0     -> slli.w rd,rd,0 */
+        };
+        run_block(cs, 3, "sext-via-slli.w");
+        check(env.active_tc.gpr[8], 0xffffffff92ffffffull,
+              "sll(sa=0) sign-extends through slli.w");
+    }
+    {
+        /* Second control: dsll32 alone, to show the dword shift by 32 does
+         * reach the register when it is the last instruction of the block. */
+        static uint32_t cd[] __attribute__((aligned(16))) = {
+            0x3c0892ff, 0x3508ffff,
+            0x0008403c, /* dsll32 $8,$8,0 */
+        };
+        run_block(cd, 3, "dsll32-only");
+        check(env.active_tc.gpr[8], 0x92ffffff00000000ull,
+              "dsll32 alone shifts by 32");
+    }
 }
 
 static void test_lw_two_routes(void)
@@ -1312,9 +1340,23 @@ static void test_lw_two_routes(void)
         0x010a602d, /* daddu  $12, $8, $10 */
     };
     run_block(c, 8, "lw-two-routes");
-    check(env.active_tc.gpr[8], 0x12ffffffull, "lw into $8 (zero-ext, known)");
-    check(env.active_tc.gpr[10], 0x12ffffffull, "lw into $10 (zero-ext, known)");
-    check(env.active_tc.gpr[12], 0x25fffffeull, "daddu of both lw results");
+    check(env.active_tc.gpr[8], 0x0000000012ffffffull, "lw into $8");
+    check(env.active_tc.gpr[10], 0x0000000012ffffffull, "lw into $10");
+    check(env.active_tc.gpr[12], 0x0000000025fffffeull, "daddu of both lw results");
+    {
+        /* Negative word: byte3 = 0x92 makes bit31 set. */
+        static uint32_t cn[] __attribute__((aligned(16))) = {
+            0x64020400, /* daddiu $2, $0, 0x400 */
+            0x6403ffff, /* daddiu $3, $0, -1 */
+            0xfc430000, /* sd     $3, 0($2) */
+            0x64040092, /* daddiu $4, $0, 0x92 */
+            0xa0440003, /* sb     $4, 3($2)   -> word 0x92ffffff */
+            0x8c480000, /* lw     $8, 0($2)   -> 0xffffffff92ffffff */
+        };
+        run_block(cn, 6, "lw-negative");
+        check(env.active_tc.gpr[8], 0xffffffff92ffffffull,
+              "lw sign-extends a negative word");
+    }
 }
 
 static void test_mem_subtypes_sys(void)
@@ -1351,7 +1393,7 @@ static void test_mem_subtypes_sys(void)
           "sys: sb touches one byte only");
     check(env.active_tc.gpr[8], 0x12ff, "sys: lhu of bytes ff,12");
     check(env.active_tc.gpr[9], 0x12ff, "sys: lh of bytes ff,12 (positive)");
-    check(env.active_tc.gpr[10], 0x12ffffffull, "sys: lw (zero-ext) known issue");
+    check(env.active_tc.gpr[10], 0x0000000012ffffffull, "sys: lw of a positive word");
     check(env.active_tc.gpr[11], 0x12ffffffull, "sys: lwu zero-extends");
 }
 
@@ -1381,9 +1423,9 @@ static void test_mem_subtypes(void)
     check(env.active_tc.gpr[7], 0xffffffffffffffffull, "lb of 0xff is -1");
     check(env.active_tc.gpr[8], 0x12ff, "lhu of bytes ff,12");
     check(env.active_tc.gpr[9], 0x12ff, "lh of bytes ff,12 (positive)");
-    /* KNOWN ISSUE: lw lowering returns the zero-extended word; tracked in the
-     * roadmap.  Assert the observed value so the gate stays honest. */
-    check(env.active_tc.gpr[10], 0x12ffffffull, "lw (zero-ext) known issue");
+    /* 0x12ffffff is positive (bit31 == 0), so lw yields it unchanged. */
+    check(env.active_tc.gpr[10], 0x0000000012ffffffull,
+          "lw of a positive word");
     {
         /* Same load, but consumed by daddu into a low guest register so the
          * result cannot be masked by the register cache writeback path. */
@@ -1400,6 +1442,14 @@ static void test_mem_subtypes(void)
 void kmain(void)
 {
     latx_bare_uart_puts("latm-isa: begin\n");
+    {
+        unsigned int c1 = read_cpucfg(1);
+        latx_bare_uart_puts("latm-isa: cpucfg1=");
+        { char b[9]; for (int k=7;k>=0;k--) b[7-k]="0123456789abcdef"[(c1>>(k*4))&15]; b[8]=0; latx_bare_uart_puts(b); }
+        latx_bare_uart_puts(" ARCH=");
+        { char b[2]; b[0] = '0' + (c1 & 3); b[1] = 0; latx_bare_uart_puts(b); }
+        latx_bare_uart_puts(" (2=LA64; dword ops gated on it)\n");
+    }
 #ifdef LATM_FORCE_NO_LBT
     /* Emulators can advertise CPUCFG.2[22] and still fail to decode
      * `gr2scr`/`jiscr0` (qemu 10/11 do); this build exercises the plain `jirl`

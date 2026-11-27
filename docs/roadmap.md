@@ -752,12 +752,26 @@ argv live above the decompressed image instead of inside it, `fw_arg2` carries
 the KSEG0 alias of the DTB, and guest 16550 TX bytes are forwarded to the host
 serial console.
 
-`latm-isa` gained `dinsu`, `dext`, `dextu`, `movz`, `movn` and load/store
-subtype coverage (139 checks).  **Known open bug:** `lw` is lowered to
-`ldx.w`, which zero-extends where MIPS sign-extends; the test pins the observed
-behaviour and the fix is the next item.  Until that lands the decoded image can
-still trip zstd's corruption check (`ZSTD_isError` -> `addiu $t7,$0,-0x14` ->
-`b .`), which is where the kernel currently parks.
+`latm-isa` gained `dinsu`, `dext`, `dextu`, `movz`, `movn`, load/store subtype
+coverage and a 32->64 sign-extension matrix (146 checks, 0 fails).
+
+**A cautionary correction.** An earlier entry here claimed `lw` was zero-
+extending and that a `dsll32`/`dsra32` pair lost its intermediate value.  Both
+were test bugs, not translator bugs: the probe value was `0x12ffffff`, whose
+bit31 is **0**, so a correct 32->64 sign extension returns it unchanged.  Re-run
+with `0x92ffffff` (bit31 set) and every path agrees - `ldx.w`, `slli.w`/`srai.w`
+and `slli.d`/`srai.d` all sign-extend.  The IR2 dump added for that hunt
+(`ir2_dump_wanted` + weak `latm_ir2_dump_hook`) is kept because it is the fastest
+way to settle this class of question, and `cpucfg1` is now printed by the ISA
+harness (`0x03f2f2fe`, ARCH=2 = LA64, so the `avail_64` gate on every dword
+opcode is satisfied).
+
+With loads and shifts verified, the remaining blocker is a genuine one: the
+decoded image still trips zstd's error check (`ZSTD_isError` ->
+`addiu $t7,$0,-0x14` -> `b .`), which is where the kernel parks.  The
+decompressor reaches ~190 distinct blocks and 2.9 M translations before that
+trap, so the fault is inside the FSE/Huffman table build rather than in the
+load/store path.
 
 | SMP | four vCPUs, IPI, cross-core TLB, reservation coherence | P0 |
 | 3A4000 platform | IOCSR/EXTIOI/PCH behaviour aligned with Linux drivers | P0 |

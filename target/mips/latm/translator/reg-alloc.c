@@ -158,10 +158,10 @@ IR2_OPND ra_alloc_itemp(void)
 {
     uint16_t full = (uint16_t)((1u << itemp_status_num) - 1);
     if ((lsenv->tr_data->itemp_status & full) == full) {
-        /* Try to retire one cached guest register.  A full-cache flush is
-         * deliberately NOT used here: it would emit env writebacks in the
-         * middle of the block, and any later alloc_gpr_src() would reload from
-         * env *before* those stores run, resurrecting a stale value. */
+        /* Retire one cached guest register.  A full-cache flush is deliberately
+         * not used here: it emits env writebacks in the middle of the block, so
+         * a later alloc_gpr_src() would reload from env before those stores run
+         * and pick up the pre-writeback value. */
         latm_regcache_evict_itemp();
     }
     int idx = ra_alloc_temp_idx(lsenv->tr_data->itemp_status, 16);
