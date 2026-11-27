@@ -588,9 +588,12 @@ static void machine_translate_tb(void *env, uint64_t pc)
 /* Fires once the block is assembled and about to run. A 'T' line with no 'D'
  * means the translator itself is spinning; 'D' with no '>' means the generated
  * code never comes back. */
-static void machine_translated_tb(void *env, uint64_t pc)
+static void machine_translated_tb(void *env, uint64_t pc,
+                                  uint32_t host_words, uint32_t guest_insns)
 {
     (void)env;
+    (void)host_words;
+    (void)guest_insns;
 #if LATR_OPEN_SBI_PCLOG_FROM > 0
     if (tb_total >= (uint64_t)LATR_OPEN_SBI_PCLOG_FROM) {
         putc_raw('D');

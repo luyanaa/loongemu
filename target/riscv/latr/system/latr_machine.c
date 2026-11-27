@@ -1221,7 +1221,8 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
         words = tr_ir2_assemble(h->code_buf);
         tr_fini();
         if (m->translated_tb != NULL) {
-            m->translated_tb(&h->env, tb.pc);
+            m->translated_tb(&h->env, tb.pc, (uint32_t)words,
+                             (uint32_t)tb.icount);
         }
         entry = latr_tb_cache_insert(&h->tb_cache, tb.pc, key, h->code_buf,
                                      (uint32_t)words * 4u, tb.icount);

@@ -132,6 +132,7 @@ static uint64_t last_ticks;
 static uint64_t last_tbs;
 static uint64_t last_traps;
 
+static void dump_ratio_hist(void);
 static void dump_pc_ring(void);
 
 
@@ -330,9 +331,64 @@ static void dump_pc_ring(void)
     latx_bare_uart_puts("\n");
 }
 
-static void hook_translated(void *env, uint64_t pc)
+/*
+ * Guest instructions per translated block, logarithmic buckets:
+ * 1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, 65+.
+ *
+ * This -- not the host/guest ratio -- is what decides throughput here: every
+ * block costs one dispatch (cache lookup, key compare, chain handoff), so a
+ * kernel that ends a block every one or two instructions pays that cost per
+ * instruction. The host/guest ratio was measured first and is useless as an
+ * alarm: one guest instruction legitimately expands to 2-6 host instructions,
+ * so 87606 of 87606 blocks landed in the top bucket.
+ */
+static uint32_t icount_hist[8];
+static uint32_t icount_worst;
+static uint64_t icount_worst_pc;
+
+static void dump_ratio_hist(void)
+{
+    latx_bare_uart_puts("latr-linux: guest-insns/block for 1,2,3-4,5-8,9-16,"
+                        "17-32,33-64,65+:");
+    for (uint32_t i = 0; i < 8; i++) {
+        latx_bare_uart_puts(" ");
+        put_dec(icount_hist[i]);
+    }
+    latx_bare_uart_puts(" worst=");
+    put_dec(icount_worst);
+    latx_bare_uart_puts(" at ");
+    puthex64(icount_worst_pc);
+    latx_bare_uart_puts("\n");
+}
+
+static void ratio_record(uint64_t pc, uint32_t words, uint32_t guest_insns)
+{
+    int b;
+
+    (void)words;
+    if (guest_insns == 0) {
+        return;
+    }
+    b = guest_insns <= 1   ? 0
+      : guest_insns == 2   ? 1
+      : guest_insns <= 4   ? 2
+      : guest_insns <= 8   ? 3
+      : guest_insns <= 16  ? 4
+      : guest_insns <= 32  ? 5
+      : guest_insns <= 64  ? 6
+                           : 7;
+    icount_hist[b]++;
+    if (guest_insns > icount_worst) {
+        icount_worst = guest_insns;
+        icount_worst_pc = pc;
+    }
+}
+
+static void hook_translated(void *env, uint64_t pc, uint32_t host_words,
+                            uint32_t guest_insns)
 {
     (void)env;
+    ratio_record(pc, host_words, guest_insns);
     last_translated = pc;
     /* Record *entries*, not only translations. Once a block is cached it is
      * never translated again, so a translation-only ring is frozen and says
@@ -414,6 +470,7 @@ static void progress(void)
         console_stall_reports++;
         if (console_stall_reports == CONSOLE_STALL_REPORTS) {
             dump_pc_ring();
+            dump_ratio_hist();
             console_stall_reports = 0;
         }
     } else {
@@ -515,6 +572,7 @@ void kmain(void)
         }
     }
     progress();
+    dump_ratio_hist();
     latx_bare_uart_puts("latr-linux: lastpc=");
     puthex64(machine.last_pc);
     latx_bare_uart_puts(" trap=");

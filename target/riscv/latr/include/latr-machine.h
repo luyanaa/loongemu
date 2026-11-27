@@ -52,7 +52,9 @@ typedef void (*LatrMachineTranslateTb)(void *env, uint64_t pc);
  * code. Together with translate_tb this splits a stall into "stuck in the
  * translator" (only translate_tb fires) versus "stuck executing generated
  * code" (both fire, enter_tb fires, and nothing comes back). */
-typedef void (*LatrMachineTranslatedTb)(void *env, uint64_t pc);
+typedef void (*LatrMachineTranslatedTb)(void *env, uint64_t pc,
+                                        uint32_t host_words,
+                                        uint32_t guest_insns);
 
 typedef struct LatrMachineFaultInfo {
     uint64_t host_pc;
