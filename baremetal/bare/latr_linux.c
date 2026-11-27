@@ -724,6 +724,14 @@ static void progress(void)
     put_dec(machine.sys.uart_log_len);
     latx_bare_uart_puts(" traps=");
     put_dec(machine.trap_count);
+    /*
+     * fence.i / sfence.vma sequence number. A guest that patches its own text
+     * issues fence.i per patch site, and LATR treats each one as a whole-cache
+     * invalidation, so this number climbing in step with tbs is the signature of
+     * a boot whose time goes into re-translating code that was just thrown away.
+     */
+    latx_bare_uart_puts(" fences=");
+    put_dec(latr_tb_fence_seq());
     {
         /*
          * Ticks per 1000 blocks and traps per 1000 blocks for the window just

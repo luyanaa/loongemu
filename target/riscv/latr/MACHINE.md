@@ -397,6 +397,27 @@ LATR-INITRAMFS-DONE
 块。这一段每次打补丁都要让已生成的代码失效，因此是"慢"而不是"卡"。ftrace/rcu/`Memory:`
 那三行还没出现。
 
+**为什么这一段只有 ~500 块/s（机制已确认，频率待测）。** 内核打完补丁会执行
+`fence.i`（`__patch_insn_write` → `flush_icache_range`），而 LATR 对 `fence.i` 的处理是
+**整个 TB 缓存失效**：
+
+```
+fence.i -> latr_tb_fence_i_all_cores() -> latr_tb_shootdown_all()
+        -> 每个 entries[i].valid = 0, count = 0, reclaim_pending = 1
+```
+
+`reclaim_pending` 还会在下一个 safepoint 回收整个 arena，连带丢掉所有 `LatrTbInsnMap`。
+于是**每一次打补丁都要把之后用到的代码全部重译**，而一次翻译约 163k tick（§9.5）。
+alternatives / static keys / ftrace nop 的补丁点是成千上万的，这就是 SLUB 之后立刻从
+"十几万块/s"掉到"500 块/s"的原因。
+
+这是**保守但正确**的实现：RISC-V 的 `fence.i` 只要求本 hart 之后的取指看到它之前的写入，
+并不要求丢弃无关代码，所以按范围（或按被写过的代码页）失效在架构上也是正确的，只是需要
+在 guest store 侧记录"哪些代码页被写过"。要做这一步再说，属于设计改动而不是修 bug。
+
+进度行现在打印 `fences=`（`latr_tb_fence_seq()`），下一次长跑可以直接量到 fence 频率与
+块速率的关系；本次长跑用的还是加计数器之前的镜像，所以这里只有机制、没有频率。
+
 **卡点已经符号化（2026-11-27）。** `vmlinux-to-elf` 恢复的 kallsyms 可用，但它的
 符号值整体偏 `+0x401`（用 panic trace 里 `show_stack`、`vpanic`、`dump_stack_lvl`、
 `mount_root_generic` 四个锚点交叉验证，偏移量完全一致）。校正后，卡住时反复进入的
