@@ -199,16 +199,29 @@ make latr-opensbi-run OPEN_SBI_TBS=1500000 OPEN_SBI_STALL=0 OPEN_SBI_CODEWORDS=0
 `make latr-boot-run` 的第 6 段（`sbi=1`）钉住这条链路：BASE 返回 2.0、DBCN 字节真的落到 UART、
 返回状态与 `mret` 一致（MPP 清零、MPIE 置 1、PC 越过 ecall）。
 
-**未通过**：AOSC `linux-kernel-7.1.13`（PE 包装的 flat Image，QEMU `-kernel` 也是整文件载入）
-跑到 ~18 万块后，在 guest `0x81ae8672` 处宿主 `INE (ecode=13)`、`ERA=0` 停下，`uart=0`、`sbi=0`
-——内核还没发出第一次 SBI 调用。已排除的**测试**问题：缺少宿主 `EENTRY`（现已在
-`baremetal/bare/latr_linux.c` 装上，并打开 `EUEN.FPE/SXE/ASXE/BTE`）、把 BSS 清零循环误判为停滞
-（判定改为"本轮 0 块"）、以及用 `last_code` 当故障点（C1 之后块首是 `NATIVE_INTERNAL`，
-现在改成在块内找 `GUEST_ACCESS` span）。
+**已通过（2026-11-27）**：AOSC `linux-kernel-7.1.13`（PE 包装的 flat Image，QEMU `-kernel`
+也是整文件载入）在 LATR 上跑到了 **earlycon**：
 
-**下一步的证据面**（harness 已打印）：最后 48 个翻译 PC、16 个 guest GPR、最后进入的 arena 指针，
-以及 fault 时 `ERA/ESTAT/BADV`。目前指向"块内某条指令跳到了宿主地址 0"，即生成代码把 `$ra`
-当成了块返回地址以外的值；对应 guest 序列是 `auipc ra,0; jalr -0x62(ra)` 之后的一段内联。
+```
+[    0.000000] Booting Linux on hartid 0
+[    0.000000] Linux version 7.1.13-aosc-main ...
+[    0.000000] Machine model: latr-riscv64-virt
+[    0.000000] SBI specification v2.0 detected     (TIME/IPI/RFENCE/SRST/DBCN 全部识别)
+[    0.000000] earlycon: sbi0 at I/O port 0x0 (options '')
+[    0.000000] earlycon: sbi0 at I/O port 0x0 (options '')  -> printk 走 SBI DBCN
+[    0.000000] riscv: base ISA extensions acdfim
+[    0.000000] Initmem setup node 0 [mem 0x80000000-0xafffffff]
+[    0.000000] mem auto-init: stack:off, heap alloc:on, heap free:off
+```
+
+即：S 模式直启 → DTB 解析 → SBI 2.0 协商 → **DBCN 控制台** → 内存/NUMA/zone 建立。
+之后的内核逐页初始化（196608 页）在 1000 万翻译块内没有跑完，所以还没到 initramfs。
+
+**这段距离里修掉的两个真实缺陷**（都在 `tb-insn-map.c` / `tb-cache.c`，详见 §9.2）：
+`LatrTbInsnMap` 每块一张 ~22 KiB 且宿主 `free()` 是 no-op，以及 `rebase` 之后
+`begin()` 再也找不到同一张 map，导致 ~1450 块就耗尽 32 MiB 裸机 arena。
+在此之前的表现是 `HOSTFAULT ecode=13 era=0` + `$s8` 被写坏（§9.2 第 1 条：
+harness 栈指针与数组大小不一致），非常像翻译器写坏了 env base。
 
 ### 9.1 复现（本机）
 
@@ -223,3 +236,31 @@ make latr-linux-run LATR_LINUX_IMAGE=build/linux/Image LATR_LINUX_TIMEOUT=600
 `-m 1G` 是必须的：内核 ~61 MiB 代码+数据，128 MiB 机器会在 `mem_init` 里失败，
 日志看起来像翻译器 bug。harness 的 backing store 放在 LoongArch `virt` 的 highmem 窗口
 （`0x80000000` 起，1 GiB 机器下 768 MiB），低端 256 MiB 留给 VMM 映像本身。
+
+### 9.2 长启动才暴露的两个固定上限
+
+**1. harness 栈指针必须和数组大小一致。** `_start` 用 `lu12i.w $t0, N` +
+`add.d $sp, $sp, $t0` 把 `$sp` 挪到栈顶，`lu12i.w` 的立即数是 4096 的倍数，
+所以 `N` 必须等于 `sizeof(stack) >> 12`。Linux harness 最初写的是 512（2 MiB）
+而数组只有 1 MiB，`$sp` 从数组外 1 MiB 开始跑，第一次深调用就写进 `.bss`，
+表现是 `HOSTFAULT ecode=13 era=0` + `$s8` 被覆盖成小整数——非常像翻译器把
+`$s8`（env base）写坏了。`latr_boot_smoke`（128/512 KiB）与 `latr_opensbi_smoke`
+（256/1 MiB）都是对得上的，只有新 harness 错，所以这类错误只能靠对照发现。
+
+**2. `LatrTbInsnMap` 的生命周期从此跟 TB 条目绑定。** 一张 map 是
+512 spans + 512 bindings ≈ 22 KiB，每个翻译块一张。宿主 `free()` 在
+freestanding 构建里是 no-op，而 map 原来只在 arena 回收时整批丢弃；arena 要
+50 万块左右才回收一次，于是 32 MiB 的 `LATX_BARE_ARENA_SIZE` 在约 1450 张 map
+时就耗尽，`malloc` 里 `g_assert_not_reached`（现在会打印 want/used/cap）。
+
+修法有两层，都在 `tb-insn-map.c` / `tb-cache.c`：
+- `latr_tb_cache_insert` 淘汰某一条时把它的 code 地址记进
+  `LatrTbCache.evicted_code`，调度器随即 `latr_tb_insn_map_forget()` 精确回收那
+  一张——被淘汰的条目永远不可能再被查到，而它描述的代码字节仍在 arena 里
+  （可能还有 hart 在执行），所以故障归因不受影响。
+- `drop_map` 不再把内存还给 allocator，而是压入
+  `TRANSLATION_DATA.insn_map_free_list`；`latr_tb_insn_map_begin` 优先复用。
+  这样常驻 map 数上界是"活跃 TB 数 + 复用池"，而不是"曾经翻译过的块数"。
+
+修完的效果：AOSC 内核从 18 万块（`sbi=0`，死在 `0x81ae8672`）推进到 162 万块、
+`sbi=4`、PC 已进入内核 KSEG 高地址 `0xffffffff81513afc`。

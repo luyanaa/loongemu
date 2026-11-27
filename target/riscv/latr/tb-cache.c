@@ -165,6 +165,17 @@ LatrTbEntry *latr_tb_cache_insert(LatrTbCache *cache, uint64_t pc,
          * set rotating through all of its ways without a per-set counter. */
         slot = (int)(set + (cache->victim % LATR_TB_CACHE_WAYS));
         cache->victim = (uint32_t)(slot + 1);
+        /*
+         * Drop the victim's recovery map with the entry. The old code bytes
+         * stay in the arena (a hart may still be executing them), so a host
+         * fault there still resolves -- but nothing can ever *find* this entry
+         * again, and a map is ~22 KiB. Without this, a boot that translates
+         * hundreds of thousands of blocks holds one map per block ever
+         * translated and dies in malloc long before the arena is recycled.
+         */
+        cache->evicted_code = cache->entries[slot].valid
+                                  ? (uintptr_t)cache->entries[slot].code
+                                  : 0;
         cache->entries[slot].valid = 0;
         cache->count--;
     }

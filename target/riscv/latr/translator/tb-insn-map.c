@@ -21,7 +21,10 @@ static LatrTbInsnMap *find_map(uintptr_t code)
     }
     for (LatrTbInsnMap *map = t->insn_map_list; map != NULL;
          map = map->next) {
-        if (map->valid && map->code_base == code) {
+        /* Match the staging address too: after a rebase code_base points into
+         * the arena, but the next block is assembled at stage_base again. */
+        if (map->valid &&
+            (map->code_base == code || map->stage_base == code)) {
             return map;
         }
     }
@@ -38,16 +41,29 @@ void latr_tb_insn_map_begin(void *code, uint32_t code_size)
     }
     map = find_map((uintptr_t)code);
     if (map == NULL) {
-        map = mm_calloc(1, sizeof(*map));
-        if (map == NULL) {
-            t->active_insn_map = NULL;
-            return;
+        /*
+         * Reuse a recycled map before asking the allocator: on the freestanding
+         * build free() is a no-op, so one allocation per block would grow until
+         * the arena is gone (see TRANSLATION_DATA.insn_map_free_list). The
+         * recycled block is fully re-initialised here, and `next` is the only
+         * field the free list owns.
+         */
+        if (t->insn_map_free_list != NULL) {
+            map = t->insn_map_free_list;
+            t->insn_map_free_list = map->next;
+        } else {
+            map = mm_calloc(1, sizeof(*map));
+            if (map == NULL) {
+                t->active_insn_map = NULL;
+                return;
+            }
         }
         map->next = t->insn_map_list;
         t->insn_map_list = map;
         t->insn_map_count++;
     }
     map->code_base = (uintptr_t)code;
+    map->stage_base = (uintptr_t)code;
     map->code_size = code_size;
     map->count = 0;
     map->bind_pool_used = 0;
@@ -157,6 +173,8 @@ void latr_tb_insn_map_rebase(void *old_code, void *new_code)
 
     if (map != NULL) {
         map->code_base = (uintptr_t)new_code;
+        /* stage_base keeps pointing at the assembler's buffer: the next
+         * block is written there and begin() must find this map again. */
     }
 }
 
@@ -179,7 +197,19 @@ static void drop_map(TRANSLATION_DATA *t, LatrTbInsnMap *map)
         }
     }
     t->insn_map_count--;
-    mm_free(map);
+    /*
+     * Push the map onto the context's free list instead of returning it to the
+     * allocator. A map is ~22 KiB and a boot assembles hundreds of thousands of
+     * blocks, so handing each one back would either leak (freestanding free()
+     * is a no-op) or churn. The payload is stale but every field is rewritten
+     * before the map is used again: begin() resets code_base/size/count/valid/
+     * generation, and bind_pool_used is reset with them.
+     */
+    map->valid = false;
+    map->count = 0;
+    map->bind_pool_used = 0;
+    map->next = t->insn_map_free_list;
+    t->insn_map_free_list = map;
 }
 
 void latr_tb_insn_map_forget(void *code)

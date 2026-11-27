@@ -67,6 +67,24 @@ static gpointer arena_alloc(size_t n)
     ArenaHdr *h;
 
     if (payload < n || g_arena_used + sizeof(ArenaHdr) + payload > LATX_BARE_ARENA_SIZE) {
+        /* Name the request and the remaining room: "assert" alone cannot tell a
+         * single oversized allocation from a long run that finally exhausted
+         * the arena, and those need opposite fixes. */
+        latx_bare_uart_puts("latx: malloc exhausted");
+        {
+            static const char hex[] = "0123456789abcdef";
+            const size_t vals[3] = { payload, g_arena_used,
+                                     (size_t)LATX_BARE_ARENA_SIZE };
+            static const char *const labels[3] = { " want=", " used=", " cap=" };
+
+            for (int v = 0; v < 3; v++) {
+                latx_bare_uart_puts(labels[v]);
+                for (int i = (int)(sizeof(size_t) * 8) - 4; i >= 0; i -= 4) {
+                    latx_bare_uart_putc(hex[(vals[v] >> i) & 15]);
+                }
+            }
+        }
+        latx_bare_uart_puts("\n");
         g_assert_not_reached();
     }
     h = (ArenaHdr *)(void *)(g_arena + g_arena_used);

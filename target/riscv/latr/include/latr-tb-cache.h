@@ -72,6 +72,13 @@ typedef struct LatrTbCache {
     /* Set by shootdown; the owner resets the arena at its next safe point. */
     uint32_t reclaim_pending;
     /*
+     * Code address of the entry the last insert evicted, 0 when it took a free
+     * slot. The caller drops that block's recovery map: the bytes stay mapped
+     * but the entry is unreachable, and keeping one ~22 KiB map per evicted
+     * block is what exhausts the freestanding allocator.
+     */
+    uintptr_t evicted_code;
+    /*
      * Fence-completion bookkeeping (design: docs/design/latr-smp-concurrency.md
      * section 5). `applied_seq` is the last shootdown sequence this hart has
      * observed while outside generated code; `in_code` counts live executions.

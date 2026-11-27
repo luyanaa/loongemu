@@ -99,6 +99,7 @@ static uint8_t ram[GUEST_RAM_SIZE] __attribute__((aligned(4096),
 static uint8_t machine_work[8u << 20] __attribute__((aligned(4096)));
 static LatrMachine machine;
 static uint64_t last_reported;
+static uint32_t console_mirrored;
 static uint64_t last_translated;
 /* Written from the enter_tb trampoline (inline asm), so it must not be static:
  * the asm names it with a relocation the linker resolves by symbol. */
@@ -128,6 +129,14 @@ static uint32_t pc_ring_at;
 volatile uint64_t host_fault_era;
 volatile uint64_t host_fault_estat;
 volatile uint64_t host_fault_badv;
+/* Host register file at the fault. The wedged block is generated code, so its
+ * own `$ra`/`$sp`/`$s8` are the only way to tell "returned to the trampoline"
+ * from "jumped into nothing". */
+volatile uint64_t host_fault_ra;
+volatile uint64_t host_fault_sp;
+volatile uint64_t host_fault_s8;
+volatile uint64_t host_fault_r21;
+volatile uint64_t host_fault_a0;
 
 void latr_host_fault_report(void)
 {
@@ -149,14 +158,46 @@ void latr_host_fault_report(void)
     puthex64(machine.harts[0].env.pc);
     latx_bare_uart_puts(" entered=");
     puthex64(last_entered);
+    latx_bare_uart_puts("\nlatr-linux: hostregs ra=");
+    puthex64(host_fault_ra);
+    latx_bare_uart_puts(" sp=");
+    puthex64(host_fault_sp);
+    latx_bare_uart_puts(" s8=");
+    puthex64(host_fault_s8);
+    latx_bare_uart_puts(" r21=");
+    puthex64(host_fault_r21);
+    latx_bare_uart_puts(" a0=");
+    puthex64(host_fault_a0);
     latx_bare_uart_puts("\n");
     if (code != NULL) {
-        latx_bare_uart_puts("latr-linux: words:");
+        latx_bare_uart_puts("latr-linux: words at era:");
         for (int i = 0; i < 6; i++) {
             latx_bare_uart_puts(" ");
             puthex64(code[i]);
         }
         latx_bare_uart_puts("\n");
+    }
+    /* The entered block is the evidence that matters: a block that jumps to host
+     * address 0 has a `jirl $zero, $ra, 0` whose $ra was clobbered, so its own
+     * words show both the clobber and the return. */
+    {
+        const uint32_t *blk = (const uint32_t *)(uintptr_t)last_entered;
+
+        if (blk >= (const uint32_t *)(uintptr_t)machine_work &&
+            blk + 400 <= (const uint32_t *)(uintptr_t)machine_work +
+                            sizeof(machine_work) / sizeof(uint32_t)) {
+            latx_bare_uart_puts("latr-linux: block:");
+            for (int i = 0; i < 400; i++) {
+                if (i % 8 == 0) {
+                    latx_bare_uart_puts("\nlatr-linux:  ");
+                    puthex64((uint64_t)(uintptr_t)&blk[i]);
+                    latx_bare_uart_puts(":");
+                }
+                latx_bare_uart_puts(" ");
+                puthex64(blk[i]);
+            }
+            latx_bare_uart_puts("\n");
+        }
     }
     latx_bare_uart_puts("latr-linux: last pcs:");
     for (uint32_t i = 0; i < PC_RING; i++) {
@@ -166,7 +207,31 @@ void latr_host_fault_report(void)
     latx_bare_uart_puts("\n");
     {
         CPUArchState *h = &machine.harts[0].env;
-        latx_bare_uart_puts("latr-linux: gprs:");
+        {
+        CPUArchState *h = &machine.harts[0].env;
+        latx_bare_uart_puts("latr-linux: env pc=");
+        puthex64(h->pc);
+        latx_bare_uart_puts(" exc=");
+        puthex64(h->csr[0x342]);   /* mcause */
+        latx_bare_uart_puts(" mepc=");
+        puthex64(h->csr[0x341]);
+        latx_bare_uart_puts(" mtvec=");
+        puthex64(h->csr[0x305]);
+        latx_bare_uart_puts(" stvec=");
+        puthex64(h->csr[0x105]);
+        latx_bare_uart_puts(" priv=");
+        put_dec(h->privilege);
+        latx_bare_uart_puts(" e-exc=");
+        puthex64(h->exception);
+        latx_bare_uart_puts(" e-bad=");
+        puthex64(h->badaddr);
+        latx_bare_uart_puts(" hostra=");
+        puthex64(h->host_return_address);
+        latx_bare_uart_puts(" satp=");
+        puthex64(h->csr[0x180]);
+        latx_bare_uart_puts("\n");
+    }
+    latx_bare_uart_puts("latr-linux: gprs:");
         for (int i = 1; i < 32; i++) {
             if (i % 8 == 0) {
                 latx_bare_uart_puts("\nlatr-linux:   ");
@@ -201,6 +266,16 @@ __asm__(
 "  csrrd  $t0, 0x7\n"         /* BADV */
 "  la.local $t2, host_fault_badv\n"
 "  st.d   $t0, $t2, 0\n"
+"  la.local $t2, host_fault_ra\n"
+"  st.d   $ra, $t2, 0\n"
+"  la.local $t2, host_fault_sp\n"
+"  st.d   $sp, $t2, 0\n"
+"  la.local $t2, host_fault_s8\n"
+"  st.d   $s8, $t2, 0\n"
+"  la.local $t2, host_fault_r21\n"
+"  st.d   $r21, $t2, 0\n"
+"  la.local $t2, host_fault_a0\n"
+"  st.d   $a0, $t2, 0\n"
 "  bl     latr_host_fault_report\n"
 "1: b 1b\n");
 
@@ -255,6 +330,24 @@ static void progress(void)
     latx_bare_uart_puts(" uart=");
     put_dec(machine.sys.uart_log_len);
     latx_bare_uart_puts("\n");
+    /*
+     * Mirror whatever the kernel wrote since the last report. The full log is
+     * only dumped when the harness exits, and a long boot is normally killed by
+     * the runner's watchdog -- which used to throw away every console line the
+     * kernel had produced. Streaming the delta is what makes the log readable
+     * after a timeout.
+     */
+    if (machine.sys.uart_log_len > console_mirrored) {
+        const char *log = latr_system_uart_log(&machine.sys);
+        uint32_t i = console_mirrored;
+
+        latx_bare_uart_puts("latr-linux: console <<\n");
+        for (; i < machine.sys.uart_log_len; i++) {
+            latx_bare_uart_putc((unsigned char)log[i]);
+        }
+        latx_bare_uart_puts("\nlatr-linux: >>\n");
+        console_mirrored = machine.sys.uart_log_len;
+    }
     last_reported = h->tbs;
 }
 
@@ -264,7 +357,11 @@ __asm__(".text\n.globl _start\n_start:\n"
         "  addi.d $sp, $sp, %pc_lo12(linux_stack)\n"
         "  lu12i.w $t0, 512\n  add.d $sp, $sp, $t0\n"
         "  bl kmain\n1: b 1b\n");
-static uint8_t linux_stack[1u << 20] __attribute__((aligned(16), used));
+/* 2 MiB: the `lu12i.w $t0, 512` in _start adds exactly this, and the two must
+ * agree or $sp starts above the array and the first deep call overwrites
+ * whatever the linker put next. The translator recurses further than a 1 MiB
+ * stack allows, so this is not just bookkeeping. */
+static uint8_t linux_stack[2u << 20] __attribute__((aligned(16), used));
 
 void kmain(void)
 {

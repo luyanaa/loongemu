@@ -1238,6 +1238,15 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
         }
         if (entry != NULL) {
             latr_tb_insn_map_rebase(h->code_buf, entry->code);
+            /* The insert may have displaced an entry; its map can never be
+             * found again, so recycle it now instead of at the next arena
+             * reset (which on a long boot is hundreds of thousands of blocks
+             * later, and the map is ~22 KiB). */
+            if (h->tb_cache.evicted_code != 0) {
+                latr_tb_insn_map_forget(
+                    (void *)(uintptr_t)h->tb_cache.evicted_code);
+                h->tb_cache.evicted_code = 0;
+            }
         }
         /*
          * The block has just written machine code into the arena (or into

@@ -57,7 +57,17 @@ _Static_assert(sizeof(LatrTbInsnSpan) == sizeof(LeRecoverySpan),
 #define latr_span_set_raw_len(s,v) ((s)->aux = (v))
 
 typedef struct LatrTbInsnMap {
+    /* Where the code lives *now* (the arena slot after rebase); this is what
+     * host-PC lookups match. */
     uintptr_t code_base;
+    /*
+     * Where the block was assembled, i.e. the translator's staging buffer.
+     * latr_tb_insn_map_rebase() moves code_base but the next block is always
+     * assembled at the same staging address, so begin() must find this map by
+     * the staging address -- otherwise every block allocated a fresh ~22 KiB
+     * map and a long boot exhausted the freestanding allocator.
+     */
+    uintptr_t stage_base;
     uint32_t code_size;
     uint32_t count;
     uint32_t generation;
@@ -167,6 +177,16 @@ typedef struct TRANSLATION_DATA {
     uint32_t insn_map_count;
     uint32_t insn_map_generation;
     LatrTbInsnMap *active_insn_map;
+    /*
+     * Recycled maps. A map is ~22 KiB (512 spans + 512 bindings) and a boot
+     * translates hundreds of thousands of blocks, so one calloc per assembled
+     * block exhausts the freestanding 32 MiB arena in ~1500 blocks and the
+     * harness dies in malloc -- which looks like a translator bug. The arena
+     * recycles whole code ranges every few hundred blocks, so dropping those
+     * maps to the allocator and reusing them here keeps the working set at the
+     * number of live TBs instead of the number of TBs ever translated.
+     */
+    LatrTbInsnMap *insn_map_free_list;
 } TRANSLATION_DATA;
 
 typedef struct ENV {

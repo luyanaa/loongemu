@@ -182,6 +182,12 @@ void latr_context_destroy(LatrTranslatorContext *ctx)
         ctx->tr_data.insn_map_list = dead->next;
         mm_free(dead);
     }
+    /* Recycled maps are off the live list but still owned by this context. */
+    while (ctx->tr_data.insn_map_free_list != NULL) {
+        LatrTbInsnMap *dead = ctx->tr_data.insn_map_free_list;
+        ctx->tr_data.insn_map_free_list = dead->next;
+        mm_free(dead);
+    }
     latr_pvir_cache_destroy(ctx->pvir_cache);
     mm_free(ctx);
 }
