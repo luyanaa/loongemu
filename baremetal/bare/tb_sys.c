@@ -2243,8 +2243,33 @@ extern int latx_gen_prologue(void *code_buf);
 static uint64_t g_pool_mem[LAPG_POOL_PAGES * (LAPG_PAGE_SIZE / 8)]
     __attribute__((aligned(LAPG_PAGE_SIZE)));
 static LapgPagePool g_pool;
-static uint64_t g_root;
-static uint64_t g_plv0_root;
+/*
+ * The two page-table roots live in one object, addressed as field 0 and
+ * field 1. That layout is load bearing for GenFw, not for the C.
+ *
+ * GenFw rewrites a LoongArch R_LARCH_PCALA_LO12 by pairing it with the
+ * nearest *preceding* R_LARCH_PCALA_HI20 that carries the same symbol and the
+ * same addend; it never checks that the two are one relaxed HI/LO unit. When
+ * the two roots were separate adjacent statics, g_plv0_root sat at
+ * g_root + 8 and the compiler could fold that +8 into a load immediate,
+ * emitting a PCALA_LO12 whose matching HI20 was at a different PC. GenFw then
+ * paired the load with an unrelated HI20 of the same symbol - the one built
+ * for the lapg_pool_alloc() call - and recomputed the immediate from 8 to
+ * 0xd04 (0xa64 in another layout). The load then read ~0xcfc bytes past
+ * g_plv0_root, into zeroed .bss, so CSR.PGDH was programmed with 0 and the
+ * three PLV3iso checks failed while PGDL was correct.
+ *
+ * With one object the compiler materialises &g_roots once and reaches the
+ * second field by a plain ld.d offset, which carries no relocation: the
+ * instruction is byte-identical in the ELF and in the PE/COFF GenFw emits.
+ */
+struct PageTableRoots {
+    uint64_t plv0;   /* CSR.PGDH: PLV0-only root */
+    uint64_t plv3;   /* CSR.PGDL: guest root      */
+};
+static struct PageTableRoots g_roots;
+#define g_root      (g_roots.plv3)
+#define g_plv0_root (g_roots.plv0)
 
 static volatile int g_probe_touched;
 static volatile uint64_t g_hw_tlb_fills;
@@ -2605,29 +2630,6 @@ static int is_host_vmm_va(uint64_t va)
     return 0;
 }
 
-/*
- * Page-table construction deliberately runs unoptimised.
- *
- * At -O2 this function produces a g_plv0_root of 0 on the UEFI handoff
- * path, so CSR.PGDH is programmed with 0 and the three PLV3iso checks that
- * compare the two roots fail (checks=113 fails=3). At -O0, and with optnone
- * on this function alone, the same source passes 113/0 and pgdh holds the
- * allocated page. The ELF self-test path never showed it because its image
- * ends at _end while the handoff path uses LoadedImage.ImageSize, which
- * covers the whole .bss - including the page-table pool, g_root and
- * g_plv0_root - so this routine identity-maps the pool into the root it is
- * filling.
- *
- * lapg_map() is known good in isolation: a host harness that allocates a
- * root, identity-maps the pool into it, and re-reads both variables survives
- * at both -O0 and -O2. The defect therefore needs the whole-image context
- * (pool pages, the 89 MiB .bss, and the identity map describing them) to
- * appear, and it is not yet pinned to one statement. Until it is, keep this
- * translation unit's page-table setup out of the optimiser rather than
- * shipping an image whose PGDH is silently zero: correctness here decides
- * whether a guest can read VMM memory, so it is not a place to rely on
- * codegen that has been observed to change under -O.
- */
 static void rebuild_host_mappings(void)
 {
     uint64_t uart_page = g_uart_base
