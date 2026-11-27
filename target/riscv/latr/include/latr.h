@@ -322,6 +322,8 @@ int tr_ir2_assemble(const void *code_start_addr);
 /* Emitted words and instruction count per guest opcode (measurement only).
  * Sized by LATR_RV_OPCODE_COUNT, so ir1.h must be visible here. */
 #include "ir1.h"
+extern uint64_t latr_flush_ir2;
+extern uint64_t latr_flush_emit_calls;
 extern uint32_t latr_insn_worst_ir2;
 extern uint64_t latr_insn_worst_pc;
 extern uint32_t latr_insn_worst_opcode;

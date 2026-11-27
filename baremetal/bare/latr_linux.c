@@ -623,6 +623,10 @@ static void dump_opcode_cost(void)
     put_dec(latr_block_ir2_total);
     latx_bare_uart_puts(" words=");
     put_dec(latr_block_words_total);
+    latx_bare_uart_puts(" flush-ir2=");
+    put_dec(latr_flush_ir2);
+    latx_bare_uart_puts(" flush-calls=");
+    put_dec(latr_flush_emit_calls);
     latx_bare_uart_puts(" entry=");
     put_dec(latr_block_entry_ir2);
     latx_bare_uart_puts(" exit=");

@@ -568,11 +568,21 @@ void latr_regcache_reset(void)
     }
 }
 
+/*
+ * IR2 spent on register-cache flushes. A flush writes back every dirty resident
+ * guest register and releases every temporary; the translator flushes at every
+ * label and every branch edge, so this is the prime suspect for the ~230 IR2
+ * that land on an instruction whose own emitter is a dozen.
+ */
+uint64_t latr_flush_ir2;
+uint64_t latr_flush_emit_calls;
+
 void latr_regcache_flush(void)
 {
     LatrRegCache *cache = &lsenv->tr_data->regcache;
     LatrRegCacheEntry *gpr = regcache_entries(false);
     LatrRegCacheEntry *fpr = regcache_entries(true);
+    int ir2_before = lsenv->tr_data->ir2_inst_num_current;
 
     latr_regcache_stats_counters.flushes++;
     if (cache->gpr_valid == 0 && cache->fpr_valid == 0) {
@@ -632,6 +642,16 @@ void latr_regcache_flush(void)
     lsassertm(cache->gpr_valid == 0 && cache->fpr_valid == 0 &&
               cache->gpr_dirty == 0 && cache->fpr_dirty == 0,
               "register-cache counters desynced after flush");
+
+    {
+        uint64_t emitted =
+            (uint64_t)(lsenv->tr_data->ir2_inst_num_current - ir2_before);
+
+        if (emitted != 0) {
+            latr_flush_ir2 += emitted;
+            latr_flush_emit_calls++;
+        }
+    }
 }
 
 bool latr_regcache_evict_itemp(void)
