@@ -1596,6 +1596,27 @@ void kmain(void)
         static LatmPlatform plat = { .mem_read = platform_read,
                                      .mem_write = platform_write };
         latm_platform_set(&plat);
+    {
+        /* Guest $23..$28 have no fixed host register, so their values live in
+         * a temp; the block exit must commit them to the architectural state
+         * or the following block reloads a stale value. */
+        static const int probe_rt[6] = { 23, 24, 25, 26, 27, 28 };
+        static uint32_t pf_code[2];
+
+        for (unsigned k = 0; k < 6; k++) {
+            int rt = probe_rt[k];
+
+            pf_code[0] = 0x24000003u | ((unsigned)rt << 16);  /* addiu rt,zero,3 */
+            run_block(pf_code, 1, "temp-register-exit");
+            check(env.active_tc.gpr[rt], 3, "temp register survives block exit");
+        }
+        pf_code[0] = 0x24190003u;   /* addiu $25,zero,3 */
+        pf_code[1] = 0x03201025u;   /* move  $2,$25 */
+        run_block(pf_code, 2, "temp-register-read");
+        check(env.active_tc.gpr[2], 3, "temp value visible in block");
+        check(env.active_tc.gpr[25], 3, "temp value committed at exit");
+    }
+
         latm_set_system_memory(true);
         run_block(mem_code, 19, "memory-system");
         latm_set_system_memory(false);

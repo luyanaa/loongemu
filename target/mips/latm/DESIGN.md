@@ -549,6 +549,9 @@ typedef struct CPUArchState {
 
 - 进入 TB：保存 host callee-saved；入口约定 `$a0 = CPUArchState *`，prologue 把 `env_ir2_opnd` 固定到 `$tp`（`reg_statics_map[S_ENV] = la_tp`），从 env 载入 guest 直接映射的 GPR/FPR，`jirl zero, tb_addr, 0`。后续 helper 调用仍用 `$a0` 传 env 参数。
 - 退出 TB：把 guest 直接映射的 GPR/FPR 写回 env，恢复 host callee-saved，`jirl zero, ra, 0`。
+  共用退出桩只能写回**直接映射**的寄存器；`$23..$28` 没有固定宿主寄存器，值在 itemp 里，
+  因此每个 TB 在跳向退出桩（含 TB 链接的快路径）之前必须先 `latm_regcache_flush()` 把
+  dirty 的 env-resident 寄存器落回 env，否则下一个 TB 会从 env 读到上一块之前的旧值。
 - 不发射 LATA 的 `la_armmtflag`/FCSR 代码；阶段 4 再按 MIPS FCSR 单独同步。
 - helper 调用约定：`a0=env`，`a1/a2=参数`，`a3=返回值` 或直接返回；调用前后保存/恢复 guest 映射寄存器（LATA 的 `lata_gen_call_helper_prologue/epilogue` 模板）。
 

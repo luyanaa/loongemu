@@ -211,6 +211,11 @@ static inline void li_tb(IR2_OPND opnd, int64_t value)
 static void lata_gen_exit_tb_ret_0(DisasContext *s)
 {
     IR2_OPND addr;
+
+    /* The exit stub only writes back guest registers that own a fixed host
+     * register; anything the cache holds in a temp (guest $23..$28) would be
+     * lost here, so commit those to env before leaving the block. */
+    latm_regcache_flush();
     int64_t curr_ins_pos = (uintptr_t)s->base->tb->tc.ptr +
                            (lsenv->tr_data->real_ir2_inst_num << 2);
     int64_t exit_offset = lsenv->tr_data->cs_native_to_bt_ret_0 - curr_ins_pos;
@@ -225,6 +230,10 @@ static void gen_goto_tb(DisasContext *s, int n, uint64_t dest)
     IR2_OPND addr;
     TranslationBlock *tb = lsenv->tr_data->curr_tb;
 
+    /* Same reason as lata_gen_exit_tb_ret_0: the stub cannot know which guest
+     * registers live in temps, so they must be in env before the jump - both
+     * for the linked path and for the slow one. */
+    latm_regcache_flush();
     la_label(goto_label);
     tb->jmp_reset_offset[n] = ir2_opnd_label_id(&goto_label);
     ir2_opnd_build(&addr, IR2_OPND_IMM, 1);
