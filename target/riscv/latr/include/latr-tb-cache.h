@@ -43,14 +43,44 @@ typedef struct LatrTbKey {
 #define LATR_TB_CACHE_SETS 128
 #define LATR_TB_CACHE_ENTRIES (LATR_TB_CACHE_WAYS * LATR_TB_CACHE_SETS)
 
+/*
+ * Guest code bytes kept per block so a fence.i can tell "this block's source
+ * changed" from "some unrelated page was patched".
+ *
+ * A block's translation is a function of its guest bytes and its cache key
+ * (pc, cs_base, cr3, cpl) -- anything else it specializes on is already part of
+ * the key. Comparing the bytes is therefore an exact test, not a heuristic, and
+ * it needs no write tracking: the emitted fast path stores straight to guest RAM
+ * and is not visible from C.
+ *
+ * 32 bytes covers 8 32-bit instructions, which is most blocks; a longer block is
+ * marked unverifiable and is still dropped on every fence.i, i.e. it keeps the
+ * old conservative behaviour.
+ */
+#define LATR_TB_CODE_SNAP 32
+
 typedef struct LatrTbEntry {
     uint64_t guest_pc;
     uint8_t *code;
     uint32_t code_size;
     uint32_t icount;
     LatrTbKey key;
+    uint16_t guest_size;   /* guest code bytes covered, 0 = not recorded */
+    uint8_t verifiable;    /* 1 when snap[] holds all guest_size bytes */
+    uint8_t snap[LATR_TB_CODE_SNAP];
     int valid;
 } LatrTbEntry;
+
+/*
+ * Drops the blocks whose guest code changed. `same` answers "are this entry's
+ * bytes still exactly what it was translated from"; a false answer, a faulted
+ * read or an unverifiable entry all mean "drop". `on_drop` receives the code
+ * address of each dropped entry so the caller can release its recovery map,
+ * which the cache itself does not own.
+ */
+typedef int (*LatrTbSameCode)(void *ctx, const LatrTbEntry *entry);
+typedef void (*LatrTbOnDrop)(void *ctx, uintptr_t code);
+
 
 /*
  * Hot-region accounting. A "region" for AOT purposes is a guest 4 KiB page:
@@ -116,6 +146,9 @@ LatrTbEntry *latr_tb_cache_insert(LatrTbCache *cache, uint64_t pc,
                                   uint32_t code_size, uint32_t icount);
 /* Bumps the generation and drops matching entries (ASID 0 drops all). */
 void latr_tb_shootdown_all(LatrTbCache *cache);
+uint32_t latr_tb_cache_drop_stale(LatrTbCache *cache, LatrTbSameCode same,
+                                  void *same_ctx, LatrTbOnDrop on_drop,
+                                  void *drop_ctx);
 void latr_tb_shootdown_asid(LatrTbCache *cache, uint32_t asid);
 void latr_tb_shootdown_privilege(LatrTbCache *cache, uint32_t privilege);
 /*
@@ -176,5 +209,15 @@ int latr_tb_cache_register(LatrTbCache *cache);
 void latr_tb_cache_unregister(LatrTbCache *cache);
 void latr_tb_shootdown_asid_all_cores(uint32_t asid);
 void latr_tb_fence_i_all_cores(void);
+/*
+ * fence.i for the hart that issued it: verify that hart's cache block by block
+ * and drop only the stale ones, then fall back to a full shootdown for every
+ * other hart (their bytes can only be compared by their own owner). Bumps the
+ * same completion sequence as latr_tb_fence_begin(0, 1), so the acknowledgement
+ * protocol is unchanged.
+ */
+uint64_t latr_tb_fence_i_local(LatrTbCache *self, LatrTbSameCode same,
+                               void *same_ctx, LatrTbOnDrop on_drop,
+                               void *drop_ctx);
 
 #endif

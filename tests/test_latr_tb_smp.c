@@ -140,6 +140,35 @@ static void *execute_during_shootdown(void *opaque)
     return NULL;
 }
 
+/*
+ * Callbacks for section 14: `tb_same_for_test` answers "are this entry's bytes
+ * still the ones it was built from", reading them from the fake guest buffer the
+ * test patches; `tb_drop_for_test` counts the reported code addresses.
+ */
+struct test_cmp_ctx {
+    uint8_t *bytes;
+};
+
+static int tb_same_for_test(void *ctx, const LatrTbEntry *e)
+{
+    const struct test_cmp_ctx *c = ctx;
+    uint64_t base = e->guest_pc - 0x80000000u;
+
+    if (!e->verifiable || base + e->guest_size > 64) {
+        return 0;
+    }
+    return memcmp(&c->bytes[base], e->snap, e->guest_size) == 0;
+}
+
+static void tb_drop_for_test(void *ctx, uintptr_t code)
+{
+    int *n = ctx;
+
+    if (code != 0) {
+        (*n)++;
+    }
+}
+
 int main(void)
 {
     /* 1. Key derivation. */
@@ -522,6 +551,65 @@ int main(void)
         CHECK(harts[0].cache.count == 0,
               "unregistered harts no longer receive invalidations");
     }
+    /*
+     * 14. FENCE.I only drops blocks whose guest bytes actually changed.
+     *
+     * This is the contract the narrowing rests on: the translation is a
+     * function of the guest bytes and the key, so an unchanged block is still
+     * correct after a fence. The test drives the two callbacks the machine
+     * supplies and checks what survives.
+     */
+    {
+        static uint8_t guest[64];
+        static int dropped_maps;
+
+        latr_tb_cache_init(&cache_a, arena_a, sizeof(arena_a));
+
+        /* Two blocks from two byte ranges. */
+        memset(guest, 0x11, sizeof(guest));
+        for (int i = 0; i < 2; i++) {
+            /* 8 bytes apart, both inside the 64-byte fake guest range. */
+            LatrTbEntry *e = latr_tb_cache_insert(
+                &cache_a, 0x80000000u + (uint64_t)i * 8, key(1, 1), blob,
+                sizeof(blob), 2);
+            CHECK(e != NULL, "stale-test insert succeeds");
+            if (e != NULL) {
+                for (int b = 0; b < 8; b++) {
+                    e->snap[b] = guest[i * 8 + b];
+                }
+                e->guest_size = 8;
+                e->verifiable = 1;
+            }
+        }
+        CHECK(cache_a.count == 2, "two blocks live before the fence");
+
+        /* Patch the first block's bytes only. The comparator reads `guest`
+         * through the same range each entry recorded, which is exactly what the
+         * machine does with latr_translate(EXEC). */
+        struct test_cmp_ctx ctx = { guest };
+        guest[0] ^= 0xff;
+
+        dropped_maps = 0;
+        uint32_t dropped = latr_tb_cache_drop_stale(
+            &cache_a, tb_same_for_test, &ctx, tb_drop_for_test, &dropped_maps);
+        CHECK(dropped == 1, "only the patched block is dropped");
+        CHECK(cache_a.count == 1, "the unchanged block stays live");
+        CHECK(dropped_maps == 1, "the dropped block reports its code address");
+
+        /* A block whose bytes could not be recorded must always be dropped. */
+        for (int i = 0; i < LATR_TB_CACHE_ENTRIES; i++) {
+            if (cache_a.entries[i].valid) {
+                cache_a.entries[i].verifiable = 0;
+            }
+        }
+        dropped = latr_tb_cache_drop_stale(&cache_a, tb_same_for_test, &ctx,
+                                           tb_drop_for_test, &dropped_maps);
+        CHECK(dropped == 1, "unverifiable blocks are dropped conservatively");
+        CHECK(cache_a.count == 0, "cache is empty after the conservative drop");
+        CHECK(cache_a.reclaim_pending == 1,
+              "dropping every entry still asks for an arena recycle");
+    }
+
     printf("test-latr-tb-smp: %d checks, %d failures\n", checks, failures);
     if (failures == 0) {
         printf("test-latr-tb-smp: PASS\n");

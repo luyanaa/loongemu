@@ -379,6 +379,85 @@ void latr_tb_shootdown_asid_all_cores(uint32_t asid)
     }
 }
 
+/* Global fence sequence; defined here so fence_i_local can bump it. */
+static volatile uint64_t latr_tb_fence_seq_word;
+
+uint32_t latr_tb_cache_drop_stale(LatrTbCache *cache, LatrTbSameCode same,
+                                  void *same_ctx, LatrTbOnDrop on_drop,
+                                  void *drop_ctx)
+{
+    uint32_t dropped = 0;
+
+    if (cache == 0 || same == 0) {
+        return 0;
+    }
+    cache_lock(cache);
+    for (int i = 0; i < LATR_TB_CACHE_ENTRIES; i++) {
+        LatrTbEntry *e = &cache->entries[i];
+        uintptr_t code;
+
+        if (!e->valid) {
+            continue;
+        }
+        /*
+         * verifiable == 0 means the guest bytes could not be recorded (block
+         * longer than the snapshot, or the fetch faulted at translate time), so
+         * the only safe answer is the old one: drop it.
+         */
+        if (e->verifiable && same(same_ctx, e)) {
+            continue;
+        }
+        code = (uintptr_t)e->code;
+        e->valid = 0;
+        cache->count--;
+        dropped++;
+        if (on_drop != 0) {
+            on_drop(drop_ctx, code);
+        }
+        cache->victim = (uint32_t)i;
+    }
+    /*
+     * Reclaim only when nothing is live: the arena bytes of a dropped block may
+     * still be executing on this hart until the next safe point, and a partial
+     * drop leaves plenty of room, so recycling the whole arena buys nothing.
+     */
+    if (cache->count == 0) {
+        cache->reclaim_pending = 1;
+    }
+    cache->generation++;
+    cache_unlock(cache);
+    return dropped;
+}
+
+uint64_t latr_tb_fence_i_local(LatrTbCache *self, LatrTbSameCode same,
+                               void *same_ctx, LatrTbOnDrop on_drop,
+                               void *drop_ctx)
+{
+    uint64_t seq = __atomic_add_fetch(&latr_tb_fence_seq_word, 1,
+                                      __ATOMIC_ACQ_REL);
+
+    if (self != 0) {
+        (void)latr_tb_cache_drop_stale(self, same, same_ctx, on_drop,
+                                       drop_ctx);
+    }
+    /*
+     * Other harts: their own owner must do the comparison, and the scheduler has
+     * no way to hand a filter to them, so they keep the conservative full
+     * shootdown. On the single-hart machine this loop finds only the caller.
+     */
+    for (int i = 0; i < LATR_TB_CACHE_MAX_CORES; i++) {
+        LatrTbCache *cache = __atomic_load_n(&latr_tb_cores[i],
+                                             __ATOMIC_ACQUIRE);
+        if (cache != 0 && cache != self) {
+            latr_tb_shootdown_all(cache);
+        }
+        if (cache != 0 && cache->park != 0) {
+            latr_hart_wake(cache->park);
+        }
+    }
+    return seq;
+}
+
 void latr_tb_fence_i_all_cores(void)
 {
     for (int i = 0; i < LATR_TB_CACHE_MAX_CORES; i++) {
@@ -397,7 +476,6 @@ void latr_tb_fence_i_all_cores(void)
  * point (between TBs), which is what makes "the hart is outside code fetched
  * before the request" true rather than probabilistic.
  */
-static volatile uint64_t latr_tb_fence_seq_word;
 static volatile uint64_t latr_tb_fence_timeout_count;
 static volatile uint64_t latr_tb_fence_missing_hart;
 

@@ -1093,6 +1093,84 @@ static inline void latr_icache_sync(void)
  * (which happens before they execute anything, because the invalidation is
  * already applied by latr_tb_fence_begin()).
  */
+/*
+ * Record the guest bytes a block was translated from, so a later fence.i can ask
+ * "did this block's source change?" instead of assuming it did. Reads go through
+ * the same EXEC translation the fetch used; a fault or an over-long block leaves
+ * verifiable = 0 and the block keeps the old drop-on-any-fence behaviour.
+ */
+static void tb_snapshot_guest_code(LatrTbEntry *entry, CPUArchState *env,
+                                   uint64_t pc, uint32_t size)
+{
+    uint32_t done = 0;
+
+    entry->guest_size = (uint16_t)(size > 0xffffu ? 0xffffu : size);
+    entry->verifiable = 0;
+    if (entry == NULL || size == 0 || size > LATR_TB_CODE_SNAP) {
+        return;
+    }
+    while (done < size) {
+        uint64_t va = pc + done;
+        uint64_t host = 0;
+        uint64_t phys = 0;
+        unsigned chunk = size - done;
+
+        if (chunk > 8) {
+            chunk = 8;
+        }
+        if (latr_translate(env, va, LATR_ACCESS_EXEC, chunk, &host, &phys) != 0) {
+            return;
+        }
+        for (unsigned i = 0; i < chunk; i++) {
+            entry->snap[done + i] = (uint8_t)((const uint8_t *)(uintptr_t)host)[i];
+        }
+        done += chunk;
+    }
+    entry->verifiable = 1;
+}
+
+/* The comparison half: exact byte equality of the recorded range. */
+static int tb_code_unchanged(void *ctx, const LatrTbEntry *entry)
+{
+    CPUArchState *env = ctx;
+    uint32_t done = 0;
+
+    if (!entry->verifiable || entry->guest_size > LATR_TB_CODE_SNAP) {
+        return 0;
+    }
+    while (done < entry->guest_size) {
+        uint64_t va = entry->guest_pc + done;
+        uint64_t host = 0;
+        uint64_t phys = 0;
+        unsigned chunk = entry->guest_size - done;
+
+        if (chunk > 8) {
+            chunk = 8;
+        }
+        if (latr_translate(env, va, LATR_ACCESS_EXEC, chunk, &host, &phys) != 0) {
+            return 0; /* cannot read it back: assume it changed */
+        }
+        for (unsigned i = 0; i < chunk; i++) {
+            if (entry->snap[done + i] !=
+                ((const uint8_t *)(uintptr_t)host)[i]) {
+                return 0;
+            }
+        }
+        done += chunk;
+    }
+    return 1;
+}
+
+static void tb_drop_map(void *ctx, uintptr_t code)
+{
+    LatrMachineHart *h = ctx;
+
+    if (code != 0) {
+        latr_tb_insn_map_forget((void *)code);
+    }
+    (void)h;
+}
+
 static void latr_tb_fence_complete(LatrMachine *m, LatrMachineHart *h,
                                    uint64_t seq)
 {
@@ -1151,9 +1229,15 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
     }
     if (h->env.fence_i_pending) {
         latr_chain_break(&h->chain, LATR_CHAIN_BREAK_FENCE_I);
-        /* FENCE.I is the guest's SMC notification; every hart's cache may
-         * contain translations of the overwritten page. */
-        uint64_t seq = latr_tb_fence_begin(0, 1);
+        /*
+         * FENCE.I is the guest's SMC notification. Rather than throwing the
+         * whole cache away -- which is what made Linux's text patching cost more
+         * than the rest of the boot -- compare each block's recorded guest bytes
+         * and drop only the blocks whose source actually changed. Other harts
+         * still get a full shootdown; only a hart can read its own guest view.
+         */
+        uint64_t seq = latr_tb_fence_i_local(&h->tb_cache, tb_code_unchanged,
+                                             &h->env, tb_drop_map, h);
 
         latr_tb_fence_ack(&h->tb_cache);
         latr_tb_fence_complete(m, h, seq);
@@ -1238,6 +1322,9 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
                                          tb.icount);
         }
         if (entry != NULL) {
+            /* Record what this block was translated from, so fence.i can test
+             * "source changed?" instead of "cache must be thrown away". */
+            tb_snapshot_guest_code(entry, &h->env, tb.pc, tb.size);
             latr_tb_insn_map_rebase(h->code_buf, entry->code);
             /* The insert may have displaced an entry; its map can never be
              * found again, so recycle it now instead of at the next arena
