@@ -217,6 +217,16 @@ make latr-opensbi-run OPEN_SBI_TBS=1500000 OPEN_SBI_STALL=0 OPEN_SBI_CODEWORDS=0
 即：S 模式直启 → DTB 解析 → SBI 2.0 协商 → **DBCN 控制台** → 内存/NUMA/zone 建立。
 之后的内核逐页初始化（196608 页）在 1000 万翻译块内没有跑完，所以还没到 initramfs。
 
+**内核镜像的获取不必手动。** `make latr-linux-extract` 现在自己从 AOSC 的
+`linux-kernel-7.3.y` topic 下载 riscv64 `.deb`（`LATR_LINUX_DEB_URL` 可覆盖，或用
+`LATR_LINUX_DEB` 指向本地文件），解包出的 `vmlinux` 存在
+`~/.cache/loongemu/linux/Image`。以前放在 `build/linux/`，而 `make clean` 就是
+`rm -rf build`——一次 clean 会把 60 MiB 的发行版内核连同下载一起删掉，再想跑就得重新找 URL。
+
+**`GUEST_RAM_MIB=256` 可缩小 guest RAM。** 用于把"慢"和"卡死"分开：`free_area_init`
+的逐页循环是线性的，页数减三倍，越过该阶段的块数也应减三倍。`ram` 由链接脚本钉在
+`0x80000000`，所以只有 `_guest_ram_end` 会动（256 MiB → `0x90000000`），校验方法就是看它。
+
 **这段距离里修掉的两个真实缺陷**（都在 `tb-insn-map.c` / `tb-cache.c`，详见 §9.2）：
 `LatrTbInsnMap` 每块一张 ~22 KiB 且宿主 `free()` 是 no-op，以及 `rebase` 之后
 `begin()` 再也找不到同一张 map，导致 ~1450 块就耗尽 32 MiB 裸机 arena。

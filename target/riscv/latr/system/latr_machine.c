@@ -1311,6 +1311,9 @@ static int run_hart(LatrMachine *m, LatrMachineHart *h)
     if (h->env.exception || h->env.mem_fault_cause || h->env.fetch_faulted) {
         latr_chain_break(&h->chain, LATR_CHAIN_BREAK_EXCEPTION);
     }
+    if (h->env.exception || h->env.mem_fault_cause || h->env.fetch_faulted) {
+        __atomic_add_fetch(&m->trap_count, 1, __ATOMIC_RELAXED);
+    }
     if ((h->env.exception || h->env.mem_fault_cause ||
          h->env.fetch_faulted) && !m->trapped) {
         m->first_trap_pc = pc_before;

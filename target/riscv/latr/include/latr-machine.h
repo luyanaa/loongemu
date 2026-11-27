@@ -127,6 +127,13 @@ typedef struct LatrMachine {
     uint64_t first_trap_fetch;
     uint64_t first_trap_mem;
     uint64_t last_pc;
+    /*
+     * Every guest trap the dispatcher delivers. The harness prints its delta
+     * per window: a kernel loop that is merely slow keeps this near zero, while
+     * a translator that keeps taking an exception path shows a high rate even
+     * when the guest PCs look like ordinary code.
+     */
+    uint64_t trap_count;
     uint64_t dispatch_count;
     uint64_t wake_events;
     LatrMachineEnterTb enter_tb;

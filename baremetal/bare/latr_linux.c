@@ -88,7 +88,10 @@ __asm__(
 /* The backing store lives in the LoongArch virt machine's highmem window,
  * which starts at 0x80000000 and is 768 MiB with -m 1G (the lowmem window
  * holds the VMM image itself). */
-#define GUEST_RAM_SIZE (768u << 20)
+#ifndef GUEST_RAM_MIB
+#define GUEST_RAM_MIB 768
+#endif
+#define GUEST_RAM_SIZE ((uint32_t)GUEST_RAM_MIB << 20)
 #define STEP_BUDGET 20000u
 /* How many translated blocks between progress lines: enough to be cheap, small
  * enough that a stall is reported at the PC where it happened. */
@@ -100,6 +103,9 @@ static uint8_t machine_work[8u << 20] __attribute__((aligned(4096)));
 static LatrMachine machine;
 static uint64_t last_reported;
 static uint32_t console_mirrored;
+static uint32_t console_last_len;
+static uint32_t console_stall_reports;
+#define CONSOLE_STALL_REPORTS 8u
 static uint64_t last_translated;
 /* Written from the enter_tb trampoline (inline asm), so it must not be static:
  * the asm names it with a relocation the linker resolves by symbol. */
@@ -110,6 +116,23 @@ uint64_t last_entered;
 #define PC_RING 48
 static uint64_t pc_ring[PC_RING];
 static uint32_t pc_ring_at;
+
+/* Host stable counter. Only used for *ratios* here: what matters is whether a
+ * phase runs at the same blocks-per-tick as the one before it, which is
+ * frequency-free and comparable across runs. */
+static uint64_t now_ticks(void)
+{
+    uint64_t v;
+
+    __asm__ volatile("rdtime.d %0, $zero" : "=r"(v));
+    return v;
+}
+
+static uint64_t last_ticks;
+static uint64_t last_tbs;
+static uint64_t last_traps;
+
+static void dump_pc_ring(void);
 
 
 /*
@@ -199,12 +222,7 @@ void latr_host_fault_report(void)
             latx_bare_uart_puts("\n");
         }
     }
-    latx_bare_uart_puts("latr-linux: last pcs:");
-    for (uint32_t i = 0; i < PC_RING; i++) {
-        latx_bare_uart_puts(" ");
-        puthex64(pc_ring[(pc_ring_at + i) % PC_RING]);
-    }
-    latx_bare_uart_puts("\n");
+    dump_pc_ring();
     {
         CPUArchState *h = &machine.harts[0].env;
         {
@@ -302,17 +320,32 @@ static void enable_host_units(void)
  * `enter_tb` through the trampoline below. A block that never returns leaves
  * exactly these two at the wedged PC, which is the only evidence available
  * once generated code owns the CPU. */
+static void dump_pc_ring(void)
+{
+    latx_bare_uart_puts("latr-linux: last pcs (oldest first):");
+    for (uint32_t i = 0; i < PC_RING; i++) {
+        latx_bare_uart_puts(" ");
+        puthex64(pc_ring[(pc_ring_at + i) % PC_RING]);
+    }
+    latx_bare_uart_puts("\n");
+}
+
 static void hook_translated(void *env, uint64_t pc)
 {
     (void)env;
     last_translated = pc;
+    /* Record *entries*, not only translations. Once a block is cached it is
+     * never translated again, so a translation-only ring is frozen and says
+     * nothing about where a wedged kernel is spinning. */
+    pc_ring[pc_ring_at++ % PC_RING] = pc;
 }
 
 static void hook_translate(void *env, uint64_t pc)
 {
     (void)env;
+    /* No ring entry here: a translation always ends in an entry, so recording
+     * both made every block appear twice and halved the ring's useful window. */
     last_translated = pc;
-    pc_ring[pc_ring_at++ % PC_RING] = pc;
 }
 
 static void progress(void)
@@ -329,6 +362,28 @@ static void progress(void)
     put_dec(__atomic_load_n(&machine.sbicalls_serviced, __ATOMIC_RELAXED));
     latx_bare_uart_puts(" uart=");
     put_dec(machine.sys.uart_log_len);
+    latx_bare_uart_puts(" traps=");
+    put_dec(machine.trap_count);
+    {
+        /*
+         * Ticks per 1000 blocks and traps per 1000 blocks for the window just
+         * finished. A phase that suddenly costs 20x more ticks per block, or
+         * that starts trapping thousands of times per window, is the difference
+         * between "a slow kernel loop" and "the translator took a slow path".
+         */
+        uint64_t t = now_ticks();
+        uint64_t dt = t - last_ticks;
+        uint64_t db = h->tbs - last_tbs;
+        uint64_t dr = machine.trap_count - last_traps;
+
+        latx_bare_uart_puts(" ktick/kblk=");
+        put_dec(db != 0 ? dt * 1000u / db : 0);
+        latx_bare_uart_puts(" trap/kblk=");
+        put_dec(db != 0 ? dr * 1000u / db : 0);
+        last_ticks = t;
+        last_tbs = h->tbs;
+        last_traps = machine.trap_count;
+    }
     latx_bare_uart_puts("\n");
     /*
      * Mirror whatever the kernel wrote since the last report. The full log is
@@ -347,6 +402,23 @@ static void progress(void)
         }
         latx_bare_uart_puts("\nlatr-linux: >>\n");
         console_mirrored = machine.sys.uart_log_len;
+    }
+    /*
+     * A console that has emitted nothing for CONSOLE_STALL_REPORTS consecutive
+     * reports is either inside a long kernel loop or wedged, and the PC alone
+     * cannot tell them apart. Dump the entry ring once per silent window so the
+     * log shows the spin set (a handful of addresses) or a walk (a moving
+     * window) without waiting for the runner's watchdog.
+     */
+    if (machine.sys.uart_log_len == console_last_len) {
+        console_stall_reports++;
+        if (console_stall_reports == CONSOLE_STALL_REPORTS) {
+            dump_pc_ring();
+            console_stall_reports = 0;
+        }
+    } else {
+        console_last_len = machine.sys.uart_log_len;
+        console_stall_reports = 0;
     }
     last_reported = h->tbs;
 }
@@ -438,6 +510,7 @@ void kmain(void)
             latx_bare_uart_puts(" wfi=");
             put_dec(machine.harts[0].env.wfi_pending);
             latx_bare_uart_puts("\n");
+            dump_pc_ring();
             break;
         }
     }
