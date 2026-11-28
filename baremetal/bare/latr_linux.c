@@ -73,24 +73,12 @@ static void put_dec(uint64_t v)
  * `jirl $zero, $ra, 0`. Without the `$s8` bind every env access in generated
  * code would address the harness's own state.
  *
- * `$a1` (the code pointer) is stashed in last_entered before the jump: the
- * machine's guest PC is not enough to name a wedged block, because the same PC
- * has several arena copies over the life of a boot. */
-__asm__(
-".text\n"
-".globl latr_enter_tb\n"
-"latr_enter_tb:\n"
-"  addi.d $sp, $sp, -16\n"
-"  st.d   $ra, $sp, 0\n"
-"  st.d   $s8, $sp, 8\n"
-"  la.local $t6, last_entered\n"
-"  st.d   $a1, $t6, 0\n"
-"  move   $s8, $a0\n"
-"  jirl   $ra, $a1, 0\n"
-"  ld.d   $ra, $sp, 0\n"
-"  ld.d   $s8, $sp, 8\n"
-"  addi.d $sp, $sp, 16\n"
-"  jirl   $zero, $ra, 0\n");
+ * The machine's guest PC is not enough to name a wedged block, because the same
+ * PC has several arena copies over the life of a boot; harts[0].last_code is
+ * the code pointer, recorded by the machine just before the enter. */
+/* latr_enter_tb lives in latx/compat/miniglib.c: one copy for every
+ * LATR bare-metal image, so the saved register set cannot drift between
+ * harnesses. */
 
 /* The backing store lives in the LoongArch virt machine's highmem window,
  * which starts at 0x80000000 and is 768 MiB with -m 1G (the lowmem window
@@ -118,9 +106,12 @@ static uint32_t console_last_len;
 static uint32_t console_stall_reports;
 #define CONSOLE_STALL_REPORTS 8u
 static uint64_t last_translated;
-/* Written from the enter_tb trampoline (inline asm), so it must not be static:
- * the asm names it with a relocation the linker resolves by symbol. */
-uint64_t last_entered;
+/*
+ * The code pointer of the block most recently entered. The machine records it
+ * (harts[0].last_code) immediately before the enter, so the harness reads that
+ * instead of having the trampoline stash it -- the trampoline is now shared by
+ * every harness and carries no per-harness bookkeeping.
+ */
 
 /* Ring of the guest PCs that were translated, so a wedge names the last few
  * blocks instead of only the one that never returned. */
@@ -347,7 +338,7 @@ void latr_host_fault_report(void)
     latx_bare_uart_puts(" guestpc=");
     puthex64(machine.harts[0].env.pc);
     latx_bare_uart_puts(" entered=");
-    puthex64(last_entered);
+    puthex64(machine.harts[0].last_code);
     latx_bare_uart_puts("\nlatr-linux: hostregs ra=");
     puthex64(host_fault_ra);
     latx_bare_uart_puts(" sp=");
@@ -371,7 +362,7 @@ void latr_host_fault_report(void)
      * address 0 has a `jirl $zero, $ra, 0` whose $ra was clobbered, so its own
      * words show both the clobber and the return. */
     {
-        const uint32_t *blk = (const uint32_t *)(uintptr_t)last_entered;
+        const uint32_t *blk = (const uint32_t *)(uintptr_t)machine.harts[0].last_code;
 
         if (blk >= (const uint32_t *)(uintptr_t)machine_work &&
             blk + 400 <= (const uint32_t *)(uintptr_t)machine_work +
@@ -1019,7 +1010,7 @@ void kmain(void)
             latx_bare_uart_puts(" translated=");
             puthex64(last_translated);
             latx_bare_uart_puts(" entered=");
-            puthex64(last_entered);
+            puthex64(machine.harts[0].last_code);
             latx_bare_uart_puts(" cmd=");
             put_dec(latr_hart_command(&machine.harts[0].park));
             latx_bare_uart_puts(" exit-req=");

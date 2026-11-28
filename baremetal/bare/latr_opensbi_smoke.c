@@ -71,24 +71,15 @@ static void puthex(uint64_t v)
 /* Counts how often generated code handed control back to the trampoline. A
  * block that runs off into the weeds shows up here as a count that stops
  * advancing while the dispatch entry count keeps climbing. */
-volatile uint64_t latr_ret_count;
-__asm__(
-".text\n"
-".globl latr_enter_tb\n"
-"latr_enter_tb:\n"
-"  addi.d $sp, $sp, -16\n"
-"  st.d   $ra, $sp, 0\n"
-"  st.d   $s8, $sp, 8\n"
-"  move   $s8, $a0\n"
-"  jirl   $ra, $a1, 0\n"
-"  la.local $t6, latr_ret_count\n"
-"  ld.d   $t7, $t6, 0\n"
-"  addi.d $t7, $t7, 1\n"
-"  st.d   $t7, $t6, 0\n"
-"  ld.d   $ra, $sp, 0\n"
-"  ld.d   $s8, $sp, 8\n"
-"  addi.d $sp, $sp, 16\n"
-"  jirl   $zero, $ra, 0\n");
+/*
+ * Returns from generated code. The machine increments dispatch_count right after
+ * the enter returns, which is exactly what the old per-harness trampoline
+ * counted, so this is now a read of machine state.
+ */
+#define latr_ret_count (machine.dispatch_count)
+/* latr_enter_tb lives in latx/compat/miniglib.c: one copy for every
+ * LATR bare-metal image, so the saved register set cannot drift between
+ * harnesses. */
 
 void kmain(void);
 __asm__(".text\n.globl _start\n_start:\n  pcalau12i $sp, %pc_hi20(opensbi_stack)\n  addi.d $sp, $sp, %pc_lo12(opensbi_stack)\n"

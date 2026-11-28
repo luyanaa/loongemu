@@ -182,3 +182,43 @@ void g_assert_not_reached(void)
     for (;;) {
     }
 }
+
+/*
+ * The single trampoline that enters generated code.
+ *
+ * Every LATR bare-metal harness used to define its own copy of this, and two of
+ * them added bookkeeping inside the copy (the last entered block, a return
+ * count). Eight copies of an ABI boundary is how a change to the saved register
+ * set gets applied to six harnesses and forgotten in two, so it lives here,
+ * where every LATR bare image links it.
+ *
+ * Conventions:
+ *   $a0 = guest env     -> bound to $s8, which generated code reads the env
+ *                          through for every guest state access
+ *   $a1 = code pointer  -> called with $ra as the return address
+ *
+ * $s0 is preserved because generated code reserves it as the minstret
+ * accumulator. It is callee-saved in the host ABI, so the C side of the
+ * dispatcher assumes this call preserves it; a block that clobbers it without
+ * this save/restore would corrupt the caller's state in ways no test observes
+ * directly.
+ *
+ * The two diagnostics that used to live in per-harness copies are available
+ * from the machine instead: harts[0].last_code is written immediately before
+ * the enter, and dispatch_count is incremented immediately after the return.
+ */
+__asm__(
+".text\n"
+".globl latr_enter_tb\n"
+"latr_enter_tb:\n"
+"  addi.d $sp, $sp, -32\n"
+"  st.d   $ra, $sp, 0\n"
+"  st.d   $s8, $sp, 8\n"
+"  st.d   $s0, $sp, 16\n"
+"  move   $s8, $a0\n"
+"  jirl   $ra, $a1, 0\n"
+"  ld.d   $ra, $sp, 0\n"
+"  ld.d   $s8, $sp, 8\n"
+"  ld.d   $s0, $sp, 16\n"
+"  addi.d $sp, $sp, 32\n"
+"  jirl   $zero, $ra, 0\n");

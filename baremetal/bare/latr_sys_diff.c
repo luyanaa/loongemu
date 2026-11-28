@@ -11,19 +11,9 @@
 
 extern void latr_enter_tb(void *env, void *code);
 
-__asm__(
-".text\n"
-".globl latr_enter_tb\n"
-"latr_enter_tb:\n"
-"  addi.d $sp, $sp, -16\n"
-"  st.d   $ra, $sp, 0\n"
-"  st.d   $s8, $sp, 8\n"
-"  move   $s8, $a0\n"
-"  jirl   $ra, $a1, 0\n"
-"  ld.d   $ra, $sp, 0\n"
-"  ld.d   $s8, $sp, 8\n"
-"  addi.d $sp, $sp, 16\n"
-"  jirl   $zero, $ra, 0\n");
+/* latr_enter_tb lives in latx/compat/miniglib.c: one copy for every
+ * LATR bare-metal image, so the saved register set cannot drift between
+ * harnesses. */
 
 #define UART0_THR ((volatile uint8_t *)0x1fe001e0)
 void latx_bare_uart_putc(int c) { *UART0_THR = (uint8_t)c; }
