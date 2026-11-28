@@ -309,6 +309,28 @@ load/store 付 `minstret` 更新。端到端加速未测。
 **代码页**的 `LoongemuMemMap`，数据地址落在空洞里，用 `latr_execute_block()` 执行
 （`run_block()` 内部会 `reset_guest_state()`，把 `mem_map` 和寄存器设置一起清掉）。
 
+**进入生成代码的蹦床只有一份了（2026-11-28）。** 原先八个裸机 harness 各自内联一份
+`latr_enter_tb`，其中两份还在副本里塞了自己的计数/记录逻辑。现在它在
+`latx/compat/miniglib.c`，所有 LATR 裸机镜像都链接它，并且保存 `$ra`、`$s8`（guest env
+绑定）和 **`$s0`**。`$s0` 是保留给 `minstret` 累加器的：它是宿主 ABI 的 callee-saved，
+C 侧调度器假设这次调用会保住它，而生成的代码若破坏它，**没有任何测试能直接观测到** ——
+所以"一份蹦床"不是洁癖，是让保存集合只有一处可改。
+
+两处 per-harness 插桩改成读机器状态，二者本就有等价字段：`harts[0].last_code` 在 enter 前
+写入（替代 `last_entered`），`dispatch_count` 在返回后自增（替代 `latr_ret_count`）。
+
+**专用寄存器做 `minstret` 是净负收益，已放弃（附算术）。** 计数上一轮就移进了翻译器，
+热路径本来零发射；剩下的开销只有"把计数写回 `env->csr[MINSTRET]`"。
+
+| 项 | 现在 | 改用 `$s0` 累加 |
+|---|---|---|
+| 每条指令 | 0 | +1（`addi s0,s0,1`） |
+| 每个刷写点 | 8 条（`ld inhibit; andi; bne; ld minstret; li Δ; add; store; label`） | 7 条（`add` 取代 `li`+`add`） |
+| 每块（6.4 指令 / 3 刷写点） | **24** | **27** |
+
+寄存器消不掉那次内存更新，只省掉刷写点的 `li`。要再降只能让 `minstret` 允许滞后：跨块批量
+写回、在被 `csrrs` 读取时补齐 —— 那是语义改动，需要新的观测协议与测试，属于另一轮。
+
 **构建陷阱（真缺陷）。** `build/latr_isa_test.o` 原先不依赖 `la-ir2.h`。给 `IR2_INST` 加字段
 改变 `sizeof` 后该对象仍是旧布局，症状是套件挂死；而且在此之前跑的 `checks=1840` 结果是**在
 布局不匹配的对象上**得到的，不可信。依赖现已补 `ir2.h` / `la-ir2.h` / `ir2-opcode.h`。
